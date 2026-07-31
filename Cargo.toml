@@ -18,3 +18,4 @@ blake3 = "1"
 ulid = "3"
 ipnet = { version = "2", features = ["serde"] }
 proptest = "1"
+time = { version = "0.3", features = ["parsing"] }

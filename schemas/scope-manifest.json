@@ -1,0 +1,90 @@
+{
+  "$defs": {
+    "Budgets": {
+      "additionalProperties": false,
+      "description": "Hard ceilings. The scheduler aborts the scan when any is exhausted; these\nare not advisory hints. Every field is mandatory: an unbounded scan is not\nan expressible request.",
+      "properties": {
+        "maximum_packets": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_packets_per_second": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_runtime_seconds": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maximum_packets",
+        "maximum_runtime_seconds",
+        "maximum_packets_per_second"
+      ],
+      "type": "object"
+    },
+    "NonEmpty_of_string": {
+      "description": "A vector guaranteed to hold at least one element.\n\nUsed so that a `Finding` cannot be constructed without evidence. The\nguarantee lives in the type system rather than in a validation pass,\nbecause a validation pass can be forgotten.\n\n`NonEmpty<T>` is instantiated at more than one `T` in this crate (e.g.\n`NonEmpty<String>` in `request.rs`, `NonEmpty<Digest>` in `event.rs`), so\neach instantiation needs its own name in the generated JSON Schema's\n`$defs`. Without `#[schemars(rename = ...)]`, schemars_derive 1.2.2 names\nevery generic struct after its bare Rust identifier\n(`schemars_derive-1.2.2/src/lib.rs`'s `derive_json_schema`: `let name =\ncont.name();` is just the struct ident when no `rename` is set, with no\nreference to the type parameter) and disambiguates collisions by\n*declaration order* within a `SchemaGenerator` run, appending \"2\", \"3\",\netc. That makes `$defs` key names depend on unrelated field-ordering\ndecisions elsewhere in the crate -- reordering or adding a field renames\nthem, producing spurious diffs against the schemas committed under\n`schemas/` (checked by `xtask check-schemas`).\n\nThe fix uses the format-string form of `#[schemars(rename = \"...\")]`,\nwhich is schemars' own built-in mechanism for this: \"If set on a struct\nor enum with generic type parameters, then the given name may contain\nthem enclosed in curly braces (e.g. `{T}`) and they will be replaced with\nthe concrete type names when the schema is generated\"\n(`schemars_derive-1.2.2/attributes.md`, the `rename` section). This is\nalso exactly the pattern schemars uses for its own builtin generic\nimpls, e.g. `Vec<T>`'s `schema_name()` is\n`format!(\"Array_of_{}\", T::schema_name())`\n(`schemars-1.2.2/src/json_schema_impls/sequences.rs`) -- `_of_`, not\n`_for_`. Confirmed empirically with a throwaway probe crate against this\nworkspace's exact schemars 1.2.2: a struct holding `NonEmpty<String>` and\n`NonEmpty<u8>` emits `$defs` keys `NonEmpty_of_string` and\n`NonEmpty_of_uint8` regardless of the two fields' declaration order, each\nstill carrying its own `minItems: 1`.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "ScopeId": {
+      "description": "Identifies an authorization scope manifest.",
+      "pattern": "^scope_[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Wire/schema mirror of `sonde_scope::manifest::ScopeManifest`'s on-disk\nJSON form.\n\nLives here, not in `sonde-scope`, purely so `sonde_types::schema::all()`\ncan publish `scope-manifest.json` without `sonde-types` -- a\nzero-internal-dependency, pure contract crate -- taking on `ipnet`'s\nCIDR-parsing behavior as a dependency. Accordingly, `allowed_cidrs` and\n`denied_cidrs` are plain strings here, not `ipnet::IpNet`: this type\ndescribes the wire *shape*, it does not validate that each string is a\nsyntactically valid CIDR (that validation, and the reserved-range and\ndeny-beats-allow policy `ScopeManifestDto` deliberately says nothing\nabout, live in `sonde_scope::manifest::ScopeManifest::load`, which is the\nonly code path that may ever decide whether a packet is authorized).\n\n`allowed_cidrs` still uses `NonEmpty<String>` rather than `Vec<String>`,\nfor the same reason `ScanRequest::targets` and\n`PortSelection::Explicit::explicit` do (see `request.rs`): a\n`#[schemars(length(min = 1))]` attribute alone only shows up in the\n*published* schema, it does not stop `{\"allowed_cidrs\": []}` from\ndeserializing through this type. `sonde_scope::manifest::Raw` (a\nseparate, unrelated deserialization target) enforces the same \"at least\none allowed CIDR\" rule independently via its own explicit empty check,\nsince `ScopeManifest::load` does not deserialize through this DTO at\nall -- keep both in sync by hand if the rule ever changes.\n\nThis type is a schema/documentation artifact, not part of any runtime\nauthorization path. `sonde_scope::manifest::ScopeManifest` is the sole\nauthority on what a manifest means; this mirror must be kept in sync\nwith it by hand.",
+  "properties": {
+    "allowed_cidrs": {
+      "$ref": "#/$defs/NonEmpty_of_string",
+      "description": "CIDR strings, e.g. `\"10.30.0.0/24\"`. Parsed and validated by\n`sonde-scope` at load time, not by this type."
+    },
+    "budget_ceiling": {
+      "$ref": "#/$defs/Budgets"
+    },
+    "denied_cidrs": {
+      "default": [],
+      "description": "CIDR strings. Deny always beats allow, regardless of specificity.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "description": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/$defs/ScopeId"
+    },
+    "not_after": {
+      "description": "RFC 3339 instant after which the manifest is no longer valid.",
+      "type": "string"
+    },
+    "signature": {
+      "description": "Reserved for v0.2 detached-signature verification; accepted on the\nwire but NOT cryptographically verified by this version. See\n`sonde_scope::manifest::ScopeManifest::signature_verified`.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "description",
+    "not_after",
+    "allowed_cidrs",
+    "budget_ceiling"
+  ],
+  "title": "ScopeManifestDto",
+  "type": "object"
+}

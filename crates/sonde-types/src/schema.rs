@@ -5,22 +5,20 @@ use serde_json::Value;
 /// Every type that crosses a public wire boundary, keyed by the filename it
 /// is committed under in `schemas/`.
 ///
-/// # Task 6 scope (controller resolution of an ordering conflict)
+/// # Task 6/7 scope (controller resolution of an ordering conflict)
 ///
 /// The full set this milestone promises (AC-1.22) is four schemas:
-/// `ScanRequest`, `Event`, `TaskHandle`, and `ScopeManifestDto`. Only the
-/// first two exist in this crate as of this task -- `TaskHandle` is created
-/// in Task 8 and `ScopeManifestDto` in Task 7 -- and `schemars::schema_for!`
-/// requires a concrete, already-defined type, so referencing either here now
-/// would not compile. AC-1.22's four-schema requirement is therefore a
-/// **milestone** exit criterion, satisfied by the end of Milestone 1, not a
-/// Task 6 obligation; the two not-yet-existing types are deliberately not
-/// stubbed.
+/// `ScanRequest`, `Event`, `TaskHandle`, and `ScopeManifestDto`. As of this
+/// task, three exist -- `TaskHandle` is created in Task 8, and
+/// `schemars::schema_for!` requires a concrete, already-defined type, so
+/// referencing it here now would not compile. AC-1.22's four-schema
+/// requirement is therefore a **milestone** exit criterion, satisfied by the
+/// end of Milestone 1, not a Task 7 obligation; `TaskHandle` is deliberately
+/// not stubbed.
 ///
-/// Extension point for Tasks 7 and 8: add one `m.insert(...)` line each,
-/// following the pattern of the two calls already below, for:
-///   - Task 7: `crate::scope_dto::ScopeManifestDto`, keyed `"scope-manifest"`
-///   - Task 8: `crate::task::TaskHandle`, keyed `"task-handle"`
+/// Extension point for Task 8: add one `m.insert(...)` line, following the
+/// pattern of the three calls already below, for
+/// `crate::task::TaskHandle`, keyed `"task-handle"`.
 pub fn all() -> BTreeMap<&'static str, Value> {
     let mut m = BTreeMap::new();
     m.insert(
@@ -31,7 +29,10 @@ pub fn all() -> BTreeMap<&'static str, Value> {
         "event",
         to_value(schemars::schema_for!(crate::event::Event)),
     );
-    // Task 7 adds: m.insert("scope-manifest", to_value(schemars::schema_for!(crate::scope_dto::ScopeManifestDto)));
+    m.insert(
+        "scope-manifest",
+        to_value(schemars::schema_for!(crate::scope_dto::ScopeManifestDto)),
+    );
     // Task 8 adds: m.insert("task-handle", to_value(schemars::schema_for!(crate::task::TaskHandle)));
     m
 }
@@ -49,7 +50,7 @@ mod tests {
         let schemas = all();
         let mut names: Vec<&str> = schemas.keys().copied().collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["event", "scan-request"]);
+        assert_eq!(names, vec!["event", "scan-request", "scope-manifest"]);
     }
 
     #[test]
