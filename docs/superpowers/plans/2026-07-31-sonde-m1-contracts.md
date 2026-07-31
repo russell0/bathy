@@ -614,9 +614,16 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Used so that a `Finding` cannot be constructed without evidence. The
 /// guarantee lives in the type system rather than in a validation pass,
 /// because a validation pass can be forgotten.
+/// `rename = "NonEmpty_of_{T}"` is load-bearing. Without it schemars names every
+/// instantiation by the bare identifier and disambiguates by DECLARATION ORDER
+/// (`NonEmpty`, `NonEmpty2`), so adding or reordering a field silently swaps
+/// which definition holds which item type — producing spurious diffs in the
+/// committed `schemas/` that AC-1.22's drift check would flag for no semantic
+/// reason. `{T}` is schemars' documented concrete-type substitution, and `_of_`
+/// matches its own builtin `Array_of_{}` convention.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(transparent)]
-#[schemars(transparent)]
+#[schemars(transparent, rename = "NonEmpty_of_{T}")]
 pub struct NonEmpty<T>(Vec<T>);
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -984,8 +991,8 @@ git commit -m "feat(types): ScanRequest with mandatory budgets and closed object
 - Create: `crates/sonde-types/src/event.rs`
 
 **Interfaces:**
-- Consumes: `ScanId`, `EventId`, `Digest`, `Confidence`, `NonEmpty`.
-- Produces: `Event`, `EventBody`, `Endpoint`, `Transport`, `PortState`, `Observation`, `Finding`, `Target`.
+- Consumes: `ScanId`, `Digest`, `Confidence`, `NonEmpty`.
+- Produces: `Event`, `EventBody`, `Endpoint`, `Transport`, `PortState`, `Observation`, `Target`. (`Finding` and `EventId` are NOT produced here — an earlier draft listed them; `EventId` is generated in M2 and `Finding` is not a v0.1 type. The provenance guarantee it was meant to carry lives in `EventBody::ServiceObserved.evidence_refs: NonEmpty<Digest>`.)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1121,8 +1128,25 @@ pub struct Observation {
     pub confidence: Confidence,
 }
 
+/// `deny_unknown_fields` lives HERE, not on `Event`.
+///
+/// `Event` carries `#[serde(flatten)] body: EventBody`, and serde's
+/// `deny_unknown_fields` is incompatible with `flatten`: combined, it does not
+/// merely fail to catch unknown fields, it **rejects every input including
+/// valid ones** (`unknown field \`event_type\`` on the canonical example).
+/// Verified empirically. Placing it on the tagged enum preserves runtime
+/// rejection of unrecognized fields at both the outer and variant level.
+///
+/// Residual gap, accepted deliberately: the generated schema cannot express
+/// `additionalProperties: false` for this shape, so the runtime is stricter
+/// than the published schema. That is the fail-CLOSED direction — a document
+/// with a stray field is rejected rather than silently trusted — unlike a
+/// runtime looser than its schema, which is fail-open and must never be
+/// allowed. (This is a schemars 1.2.2 limitation, not a JSON Schema one:
+/// 2020-12's `unevaluatedProperties` is designed for exactly this
+/// oneOf-plus-flatten shape, but schemars does not emit it.)
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "event_type")]
+#[serde(tag = "event_type", deny_unknown_fields)]
 pub enum EventBody {
     #[serde(rename = "scan.started")]
     ScanStarted { plan_hash: Digest, estimated_targets: u64, estimated_probes: u64 },
@@ -1182,8 +1206,9 @@ impl EventBody {
 ///
 /// `sequence` is gap-free and monotonic per scan; resumption replays from the
 /// last persisted sequence, so a gap means data loss and is a hard error.
+// NO `deny_unknown_fields` here — it is incompatible with the `flatten` below
+// and would reject all input. See the note on `EventBody`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
 pub struct Event {
     pub scan_id: ScanId,
     pub sequence: u64,
