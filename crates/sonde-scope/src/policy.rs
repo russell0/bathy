@@ -361,12 +361,23 @@ mod tests {
         /// inside a single /24 with probability ~1/16.7M, so an unweighted
         /// strategy would burn its whole case budget re-proving the trivial
         /// half of the invariant (far-away addresses are denied) and
-        /// essentially never reach the interesting boundary -- the CIDR's
-        /// first and last address, the explicitly denied `/32`, and
-        /// ordinary in-range addresses. The second arm of `prop_oneof!`
-        /// below fixes the first three octets to `10.30.0` and randomizes
-        /// only the last, guaranteeing every one of those 256 boundary
-        /// cases is reachable.
+        /// essentially never reach the interesting boundary.
+        ///
+        /// What is actually guaranteed, and by which arm: the single denied
+        /// host `10.30.0.1` and the subnet's `.0`/`.255` boundary addresses
+        /// each have their own `Just(..)` arm below, so each is sampled on
+        /// roughly 1 in 5 test cases. That is a real guarantee. The
+        /// swept-fourth-octet arm (second below) makes all 256 addresses in
+        /// `10.30.0.0/24` merely *reachable* -- possible, not reliably
+        /// sampled -- which is not the same thing and previously was not
+        /// enough: mutation testing caught deleting the deny-set check in
+        /// `manifest.rs` only 5 times out of 8 runs before the `Just` arms
+        /// existed, because that arm alone gives the denied host roughly a
+        /// (1/2) * (1/256) chance per case, i.e. per-run miss probability
+        /// (255/256)^128 ≈ 61% at proptest's default case count. An earlier
+        /// version of this comment claimed the swept arm alone guaranteed
+        /// coverage of "every one of those 256 boundary cases" -- that was
+        /// the reachable-vs-sampled conflation this paragraph now corrects.
         #[test]
         fn no_target_outside_the_allow_set_is_ever_approved(octets in octets_strategy()) {
             let ip = IpAddr::from(octets);
@@ -401,8 +412,23 @@ mod tests {
             any::<[u8; 4]>(),
             // Any address inside 10.30.0.0/24 -- sweeps every value of the
             // fourth octet, so both CIDR boundaries and the denied host are
-            // always reachable, not just occasionally sampled.
+            // *possible* outcomes of this arm, though not reliably sampled
+            // by it alone (see the three `Just` arms below for the actual
+            // per-case guarantee -- C4).
             (0u8..=255).prop_map(|d| [10u8, 30, 0, d]),
+            // The single denied host, and the subnet's network/broadcast
+            // boundary addresses, each as their own arm: `prop_oneof!`
+            // gives every arm equal weight, so each of these three is
+            // sampled on roughly 1 in 5 test cases -- not merely reachable
+            // via the swept arm above, but reliably exercised by every run.
+            // This is what makes this test's headline claim ("nothing
+            // outside the allow set is ever approved") actually hold with
+            // overwhelming per-run probability, rather than the ~39% catch
+            // rate the swept arm alone provided (see the doc comment on
+            // the test above for the mutation-testing evidence).
+            Just([10u8, 30, 0, 1]),
+            Just([10u8, 30, 0, 0]),
+            Just([10u8, 30, 0, 255]),
         ]
     }
 }

@@ -4,5 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 111683aa1382d21dac845eb7a544e553f3b4ed5e354f8fd7505399a449481ea4 # shrinks to octets = [224, 0, 0, 0]
-cc fd1c41bd01f827b358bbcd4b6dba58f3a42b9bbc5d3f93a25b475e5a8899ad1f # shrinks to octets = [10, 30, 0, 1]
+cc 9f58ebaa575d4a32e6f121bc5ef6bce7f3f46800a0c76ad5ca199527c0c9b255 # shrinks to octets = [10, 30, 0, 1]

@@ -1272,12 +1272,37 @@ mod tests {
     // regardless of what the manifest's CIDRs say. Task 8 adds an
     // equivalent property test over `evaluate()`; this one is scoped to
     // `allows()` itself, which is the function every other property in the
-    // system is built on top of. ---
+    // system is built on top of.
+    //
+    // C4: a fully uniform `proptest::collection::vec(0u8..=255, 4)` (as this
+    // used before this fix) lands inside 10.30.0.0/24 with probability
+    // ~1/16.7M and hits the single denied host 10.30.0.1 with probability
+    // ~1/4.3B -- over proptest's default case count that is, in practice,
+    // never. Deleting the deny-set check at `allows`'s own `if self.denied
+    // ...` (above) would not have been reliably caught by this test at all.
+    // `allows_octets_strategy` below is weighted the same way, and for the
+    // same reason, as `sonde_scope::policy`'s `octets_strategy` (see that
+    // function's doc comment for the full mutation-testing rationale): the
+    // denied host and the subnet's `.0`/`.255` boundary addresses each get
+    // their own `Just(..)` arm, sampled on roughly 1 in 5 cases, rather than
+    // being merely *reachable* through a swept-but-not-reliably-sampled
+    // arm. ---
+
+    fn allows_octets_strategy() -> impl proptest::strategy::Strategy<Value = [u8; 4]> {
+        use proptest::prelude::*;
+        prop_oneof![
+            any::<[u8; 4]>(),
+            (0u8..=255).prop_map(|d| [10u8, 30, 0, d]),
+            Just([10u8, 30, 0, 1]),
+            Just([10u8, 30, 0, 0]),
+            Just([10u8, 30, 0, 255]),
+        ]
+    }
 
     proptest::proptest! {
         #[test]
         fn allows_never_permits_anything_outside_the_allow_set(
-            octets in proptest::collection::vec(0u8..=255, 4)
+            octets in allows_octets_strategy()
         ) {
             let m = ScopeManifest::load(MANIFEST).unwrap(); // allows 10.30.0.0/24, denies 10.30.0.1/32
             let addr = IpAddr::V4(std::net::Ipv4Addr::new(
