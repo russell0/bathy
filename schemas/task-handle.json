@@ -14,7 +14,7 @@
     },
     "ScanId": {
       "description": "Identifies one scan task.",
-      "pattern": "^scan_[0-9A-HJKMNP-TV-Z]{26}$",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
       "type": "string"
     },
     "TaskStatus": {

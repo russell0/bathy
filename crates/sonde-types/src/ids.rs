@@ -166,6 +166,29 @@ macro_rules! prefixed_id {
                 if rest.bytes().any(|b| b.is_ascii_lowercase()) {
                     return Err(IdError::BadUlid);
                 }
+                // C2: 26 Crockford characters carry 130 bits into a
+                // 128-bit `Ulid`; `ulid` 3.x's decoder silently discards
+                // the two overflow bits (`value = (value << 5) | val`,
+                // repeated 26 times over a `u128` -- see
+                // `ulid::base32::decode`), so on its own it is not
+                // injective. Concretely: a first character's decoded
+                // value only survives mod 8, so any first character above
+                // `7` aliases the same `Ulid` as some character in
+                // `0`-`7` -- e.g. `scan_81ARZ...` and `scan_01ARZ...`
+                // parse to the same id today (8 mod 8 == 0), as do
+                // `scan_Z1ARZ...` and `scan_71ARZ...` (31 mod 8 == 7).
+                // Only `0`-`7` are canonical first characters; rejecting
+                // anything else makes parsing injective and guarantees
+                // round-tripping. The published pattern's first character
+                // class is tightened to match (`[0-7]`, not the full
+                // alphabet) so schema and runtime agree.
+                if !rest
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|b| (b'0'..=b'7').contains(b))
+                {
+                    return Err(IdError::BadUlid);
+                }
                 Ok(Self(
                     ulid::Ulid::from_string(rest).map_err(|_| IdError::BadUlid)?,
                 ))
@@ -192,7 +215,10 @@ macro_rules! prefixed_id {
             fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
                 schemars::json_schema!({
                     "type": "string",
-                    "pattern": concat!("^", $prefix, "_[0-9A-HJKMNP-TV-Z]{26}$"),
+                    // First character restricted to `0`-`7`, not the full
+                    // Crockford alphabet: only those 8 values keep parsing
+                    // injective (see C2's comment on `FromStr` above).
+                    "pattern": concat!("^", $prefix, "_[0-7][0-9A-HJKMNP-TV-Z]{25}$"),
                     "description": $doc,
                 })
             }
@@ -361,8 +387,9 @@ mod tests {
     }
 
     // --- C1: the published pattern for `ScanId`/`EventId`/`ScopeId` is
-    // uppercase-only Crockford (`^..._[0-9A-HJKMNP-TV-Z]{26}$`), and this
-    // type must accept exactly what it publishes -- the same rule already
+    // uppercase-only Crockford (see the schema tests below for the exact
+    // pattern), and this type must accept exactly what it publishes -- the
+    // same rule already
     // enforced for `Digest` above (`digest_rejects_uppercase_hex_via_*`,
     // `digest_rejects_mixed_case_hex_via_*`), now applied to the
     // `prefixed_id!` macro too. One generic helper, monomorphized over all
@@ -469,7 +496,7 @@ mod tests {
         let value = serde_json::to_value(&schema).unwrap();
         assert_eq!(
             value.get("pattern").and_then(|v| v.as_str()),
-            Some("^scan_[0-9A-HJKMNP-TV-Z]{26}$"),
+            Some("^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$"),
             "schema was {value:#}"
         );
         assert_eq!(value.get("type").and_then(|v| v.as_str()), Some("string"));
@@ -480,45 +507,138 @@ mod tests {
         let evt_value = serde_json::to_value(schemars::schema_for!(EventId)).unwrap();
         assert_eq!(
             evt_value.get("pattern").and_then(|v| v.as_str()),
-            Some("^evt_[0-9A-HJKMNP-TV-Z]{26}$")
+            Some("^evt_[0-7][0-9A-HJKMNP-TV-Z]{25}$")
         );
 
         let scope_value = serde_json::to_value(schemars::schema_for!(ScopeId)).unwrap();
         assert_eq!(
             scope_value.get("pattern").and_then(|v| v.as_str()),
-            Some("^scope_[0-9A-HJKMNP-TV-Z]{26}$")
+            Some("^scope_[0-7][0-9A-HJKMNP-TV-Z]{25}$")
         );
     }
 
     #[test]
     fn ulid_pattern_excludes_ambiguous_crockford_characters() {
         // Crockford base32 excludes I, L, O, U to avoid visual confusion
-        // with 1, 1, 0, V. Confirm the character class in the pattern
-        // really omits them, and only them, from the alphabet.
-        let re = regex_lite_pattern_chars();
+        // with 1, 1, 0, V. Confirm the character class the pattern
+        // *actually publishes* really omits them, and only them, from the
+        // alphabet -- reading the pattern out of the generated schema
+        // rather than an independent hand-written character list, which
+        // would not catch the published pattern drifting out of sync with
+        // the code that produces it (e.g. C2's `[0-7]` first-character
+        // restriction landing here as a copy-paste of the full alphabet
+        // instead).
+        let schema = schemars::schema_for!(ScanId);
+        let value = serde_json::to_value(&schema).unwrap();
+        let pattern = value
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .expect("ScanId schema must have a pattern");
+        let classes = char_classes_in(pattern);
+        // `[0-7]` (C2's canonical-first-character restriction), then the
+        // full Crockford alphabet for the remaining 25 characters.
+        assert_eq!(
+            classes.len(),
+            2,
+            "expected exactly two bracket character classes in {pattern:?}"
+        );
+        let full_alphabet = &classes[1];
         for excluded in ['I', 'L', 'O', 'U'] {
             assert!(
-                !re.contains(&excluded),
-                "pattern character class must not contain {excluded}"
+                !full_alphabet.contains(&excluded),
+                "pattern character class must not contain {excluded}: {pattern:?}"
             );
         }
         // 26 allowed letters minus the 4 excluded = 22, plus 10 digits = 32.
-        assert_eq!(re.len(), 32, "expected 32 Crockford symbols, got {re:?}");
+        assert_eq!(
+            full_alphabet.len(),
+            32,
+            "expected 32 Crockford symbols, got {full_alphabet:?} from {pattern:?}"
+        );
     }
 
-    /// Expands the literal character class used in the ULID pattern
-    /// (`[0-9A-HJKMNP-TV-Z]`) into its member characters, without relying on
-    /// a regex engine dependency.
-    fn regex_lite_pattern_chars() -> Vec<char> {
-        let mut chars = Vec::new();
-        chars.extend('0'..='9');
-        chars.extend('A'..='H');
-        chars.push('J');
-        chars.push('K');
-        chars.push('M');
-        chars.push('N');
-        chars.extend('P'..='T');
-        chars.extend('V'..='Z');
-        chars
+    /// Extracts every bracket (`[...]`) character class out of a regex
+    /// pattern string, expanding each into its member characters (so
+    /// `A-H` becomes `A`, `B`, ..., `H`), without relying on a regex engine
+    /// dependency. Used to read a published pattern's actual alphabet back
+    /// out, rather than hand-writing an independent copy of it that could
+    /// silently drift out of sync with the code that generates the pattern.
+    fn char_classes_in(pattern: &str) -> Vec<Vec<char>> {
+        let mut classes = Vec::new();
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '[' {
+                continue;
+            }
+            let mut class_chars = Vec::new();
+            let mut inside: Vec<char> = Vec::new();
+            for c2 in chars.by_ref() {
+                if c2 == ']' {
+                    break;
+                }
+                inside.push(c2);
+            }
+            let mut i = 0;
+            while i < inside.len() {
+                if i + 2 < inside.len() && inside[i + 1] == '-' {
+                    class_chars.extend(inside[i]..=inside[i + 2]);
+                    i += 3;
+                } else {
+                    class_chars.push(inside[i]);
+                    i += 1;
+                }
+            }
+            classes.push(class_chars);
+        }
+        classes
+    }
+
+    // --- C2: 26 Crockford characters carry 130 bits into a 128-bit `Ulid`;
+    // `ulid` 3.x's decoder silently discards the two overflow bits, so on
+    // its own it is not injective. Only a first character in `0`-`7` keeps
+    // parsing injective; verified above (`digest_rejects_...` for the case
+    // rule) and here for the first-character restriction. ---
+
+    #[test]
+    fn scan_id_rejects_first_ulid_char_above_seven() {
+        for bad in [
+            "scan_81ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "scan_91ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "scan_Z1ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "scan_A1ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ] {
+            assert_eq!(
+                bad.parse::<ScanId>(),
+                Err(IdError::BadUlid),
+                "{bad} must be rejected: only 0-7 are canonical first characters"
+            );
+        }
+        // Positive control: 0-7 themselves remain accepted.
+        for ok_first in ['0', '1', '7'] {
+            let ok = format!("scan_{ok_first}1ARZ3NDEKTSV4RRFFQ69G5FAV");
+            assert!(ok.parse::<ScanId>().is_ok(), "{ok} should still parse");
+        }
+    }
+
+    #[test]
+    fn ulid_parse_is_injective_previously_aliasing_inputs_no_longer_collide() {
+        // Before this fix: `scan_81ARZ3NDEKTSV4RRFFQ69G5FAV` parsed
+        // successfully and was `==` to `scan_01ARZ3NDEKTSV4RRFFQ69G5FAV`
+        // (8 mod 8 == 0); `scan_Z1ARZ3NDEKTSV4RRFFQ69G5FAV` parsed
+        // successfully and was `==` to `scan_71ARZ3NDEKTSV4RRFFQ69G5FAV`
+        // (31 mod 8 == 7) -- verified empirically against `ulid` 3.0.0's
+        // decoder before writing this fix. Both previously-aliasing first
+        // characters are now rejected outright, so distinct wire strings
+        // are never silently collapsed to the same id.
+        assert_eq!(
+            "scan_81ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<ScanId>(),
+            Err(IdError::BadUlid)
+        );
+        assert!("scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<ScanId>().is_ok());
+        assert_eq!(
+            "scan_Z1ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<ScanId>(),
+            Err(IdError::BadUlid)
+        );
+        assert!("scan_71ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<ScanId>().is_ok());
     }
 }

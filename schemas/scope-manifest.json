@@ -37,7 +37,7 @@
     },
     "ScopeId": {
       "description": "Identifies an authorization scope manifest.",
-      "pattern": "^scope_[0-9A-HJKMNP-TV-Z]{26}$",
+      "pattern": "^scope_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
       "type": "string"
     }
   },
