@@ -1,0 +1,7 @@
+# Develop on stable. 1.85 is the MSRV, declared as `rust-version` in the
+# workspace manifest and verified by a dedicated CI job — pinning the
+# toolchain to the MSRV itself would force every contributor to download an
+# old compiler and would hide warnings that newer compilers catch.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]

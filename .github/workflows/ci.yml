@@ -1,0 +1,43 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo run -p xtask -- check-deps
+      - run: cargo run -p xtask -- check-schemas
+      - name: no unsafe outside packetd
+        run: |
+          ! grep -rn --include='*.rs' 'unsafe ' crates/ \
+            | grep -v '^crates/sonde-packetd/'
+      # Lines that legitimately name the phrase — this rule, its tests, its
+      # enforcement — carry the [phrase-rule] marker and are excluded. Without
+      # that exclusion this step fails on its own source. See the overview's
+      # sentinel convention.
+      - name: forbidden determinism claim
+        run: |
+          # Bracket expression matches the phrase without this line containing it.
+          ! grep -rniIE "deterministic[ ]results" . --exclude-dir=target --exclude-dir=.git \
+            | grep -v '\[phrase-rule\]'
+  # The MSRV is a promise to downstream consumers, so it gets its own job.
+  # Without this, MSRV rots silently the first time someone uses a newer API.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
+      - run: cargo check --workspace --all-targets
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
