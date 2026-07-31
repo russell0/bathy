@@ -84,7 +84,37 @@ pub trait Clock: Send + Sync {
     fn new_event_id(&self) -> EventId;
 }
 
-pub struct SystemClock;
+/// NOTE: `Ulid::new()` was REMOVED in ulid 3.x. Random generation goes through
+/// `ulid::Generator`, whose `generate` is fallible (monotonic overflow within
+/// the same millisecond) and takes `&mut self` — hence the mutex. Verify
+/// `Generator`'s exact signature against the installed source before writing
+/// this; do not copy ulid 1.x examples.
+pub struct SystemClock {
+    generator: std::sync::Mutex<ulid::Generator>,
+}
+
+impl Default for SystemClock {
+    fn default() -> Self {
+        Self { generator: std::sync::Mutex::new(ulid::Generator::new()) }
+    }
+}
+
+impl SystemClock {
+    fn next_ulid(&self) -> ulid::Ulid {
+        let mut g = self.generator.lock().expect("ulid generator poisoned");
+        // Monotonic overflow means >2^80 ids in one millisecond, which cannot
+        // happen here; fall back rather than panic in a library path.
+        g.generate().unwrap_or_else(|_| {
+            ulid::Ulid::from_parts(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .expect("clock before epoch")
+                    .as_millis() as u64,
+                0,
+            )
+        })
+    }
+}
 
 impl Clock for SystemClock {
     fn now_rfc3339(&self) -> String {
@@ -92,10 +122,10 @@ impl Clock for SystemClock {
         format_rfc3339_millis(d.as_secs() as i64, d.subsec_millis())
     }
     fn new_scan_id(&self) -> ScanId {
-        ScanId::from_ulid(ulid::Ulid::new())
+        ScanId::from_ulid(self.next_ulid())
     }
     fn new_event_id(&self) -> EventId {
-        EventId::from_ulid(ulid::Ulid::new())
+        EventId::from_ulid(self.next_ulid())
     }
 }
 
@@ -170,7 +200,7 @@ git commit -m "feat(types): injectable Clock so event logs are reproducible in t
 ```
 
 **Acceptance criteria:**
-- **AC-2.1** No source file in the workspace outside `crates/sonde-types/src/clock.rs` calls `SystemTime::now()` or `Ulid::new()`. Enforce with a CI grep.
+- **AC-2.1** No source file in the workspace outside `crates/sonde-types/src/clock.rs` calls `SystemTime::now()` or constructs a random ULID (`ulid::Generator`, or `Ulid::new()` should a future version reintroduce it). Enforce with a CI grep covering both `SystemTime::now` and `ulid::Generator`.
 - **AC-2.2** Two `FixedClock`s built with identical arguments yield identical timestamp and identifier sequences.
 - **AC-2.3** `SystemClock::now_rfc3339` emits exactly `YYYY-MM-DDTHH:MM:SS.mmmZ` (24 characters, UTC).
 
