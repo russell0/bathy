@@ -42,7 +42,7 @@ repository = "https://github.com/russell0/sonde"
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-schemars = "0.8"
+schemars = "1"
 thiserror = "2"
 blake3 = "1"
 ulid = "1"
@@ -386,16 +386,22 @@ impl<'de> Deserialize<'de> for Digest {
     }
 }
 
+// NOTE: this project uses schemars 1.x. The 0.8 builder API (`into_object()`,
+// `.string().pattern`, `schemars::gen::SchemaGenerator`, `schema_name() ->
+// String`) does NOT exist in 1.x. In 1.x a `Schema` wraps a JSON value and is
+// most clearly built with the `json_schema!` macro, and `schema_name` returns
+// `Cow<'static, str>`. Confirm the exact signatures against the version that
+// actually resolves before writing these impls — do not copy 0.8 examples.
 impl JsonSchema for Digest {
-    fn schema_name() -> String {
-        "Digest".to_owned()
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "Digest".into()
     }
-    fn json_schema(g: &mut schemars::gen::SchemaGenerator) -> schemars::schema::Schema {
-        let mut schema = <String as JsonSchema>::json_schema(g).into_object();
-        schema.string().pattern = Some("^blake3:[0-9a-f]{64}$".to_owned());
-        schema.metadata().description =
-            Some("BLAKE3 content digest of stored evidence bytes.".to_owned());
-        schema.into()
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "string",
+            "pattern": "^blake3:[0-9a-f]{64}$",
+            "description": "BLAKE3 content digest of stored evidence bytes.",
+        })
     }
 }
 
@@ -453,16 +459,15 @@ macro_rules! prefixed_id {
         }
 
         impl JsonSchema for $name {
-            fn schema_name() -> String {
-                stringify!($name).to_owned()
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                stringify!($name).into()
             }
-            fn json_schema(
-                g: &mut schemars::gen::SchemaGenerator,
-            ) -> schemars::schema::Schema {
-                let mut schema = <String as JsonSchema>::json_schema(g).into_object();
-                schema.string().pattern =
-                    Some(concat!("^", $prefix, "_[0-9A-HJKMNP-TV-Z]{26}$").to_owned());
-                schema.into()
+            fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                schemars::json_schema!({
+                    "type": "string",
+                    "pattern": concat!("^", $prefix, "_[0-9A-HJKMNP-TV-Z]{26}$"),
+                    "description": $doc,
+                })
             }
         }
     };
