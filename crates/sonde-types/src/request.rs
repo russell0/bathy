@@ -2,6 +2,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::ScopeId;
+use crate::nonempty::NonEmpty;
 
 /// What the caller is trying to learn. Objectives are a closed set so the
 /// planner can map each to a bounded strategy; free-text goals belong to the
@@ -70,9 +71,17 @@ pub enum PortSelection {
         preset: PortPreset,
     },
     /// Explicit ports and inclusive ranges, e.g. `["22", "80", "8000-8100"]`.
+    // `NonEmpty<String>`, not `Vec<String>` + `#[schemars(length(min = 1))]`:
+    // the schemars attribute alone is schema-only (see the equivalent note on
+    // `RawBudgets` above) and does not stop `{"explicit": []}` from
+    // deserializing -- an empty explicit-ports selection is self-contradictory
+    // and, per this task's design intent, an agent that submits one and gets
+    // no error has been misled. `NonEmpty` already enforces this at both
+    // deserialization (`nonempty.rs`'s custom `Deserialize` impl re-runs
+    // `TryFrom<Vec<T>>` on every parse) and schema generation, so it is reused
+    // here rather than hand-rolling a second `Raw*`/`TryFrom` shim.
     Explicit {
-        #[schemars(length(min = 1))]
-        explicit: Vec<String>,
+        explicit: NonEmpty<String>,
     },
 }
 
@@ -200,8 +209,12 @@ impl TryFrom<RawBudgets> for Budgets {
 #[serde(deny_unknown_fields)]
 pub struct ScanRequest {
     /// CIDRs, single addresses, or inclusive `a.b.c.d-e.f.g.h` ranges.
-    #[schemars(length(min = 1))]
-    pub targets: Vec<String>,
+    // `NonEmpty<String>`: see the note on `PortSelection::Explicit::explicit`
+    // above. An empty `targets` array is structurally valid JSON but silently
+    // produces a zero-unit plan; `#[schemars(length(min = 1))]` on a bare
+    // `Vec<String>` would only ever show up in the published schema, not stop
+    // the value from parsing.
+    pub targets: NonEmpty<String>,
     /// The manifest authorizing this scan. Without it there is no scan.
     pub authorization_scope_id: ScopeId,
     pub objective: Objective,
@@ -425,7 +438,7 @@ mod tests {
         assert_eq!(
             ps,
             PortSelection::Explicit {
-                explicit: vec!["22".to_string(), "80".to_string()]
+                explicit: NonEmpty::try_from(vec!["22".to_string(), "80".to_string()]).unwrap()
             }
         );
     }
@@ -456,17 +469,73 @@ mod tests {
         );
     }
 
+    // Fix round 1 (Important): `explicit: []` used to deserialize
+    // successfully despite the published schema declaring `minItems: 1` --
+    // `#[schemars(length(min = 1))]` on a bare `Vec<String>` is schema-only.
+    // Now that the field is `NonEmpty<String>`, an empty array must fail
+    // `NonEmpty`'s own `TryFrom<Vec<T>>` check during deserialization, not
+    // just fail to match the untagged enum's shape.
     #[test]
     fn port_selection_explicit_with_empty_array_is_rejected() {
-        // `explicit: []` fails the untagged match (neither variant's own
-        // deny_unknown_fields/shape rejects it directly -- `length(min=1)`
-        // is schema-only, so this is really exercising that an empty
-        // `explicit` array is still structurally valid JSON for the
-        // `Explicit` variant and therefore *does* parse; documented here so
-        // the schema-only nature of that constraint (see `targets` below)
-        // isn't mistaken for a runtime guarantee).
-        let ps: PortSelection = serde_json::from_str(r#"{"explicit": []}"#).unwrap();
-        assert_eq!(ps, PortSelection::Explicit { explicit: vec![] });
+        assert!(serde_json::from_str::<PortSelection>(r#"{"explicit": []}"#).is_err());
+    }
+
+    // Fix round 1 (Important): same divergence, for `ScanRequest::targets`.
+    #[test]
+    fn targets_empty_array_is_rejected() {
+        let empty_targets = EXAMPLE.replace(r#""targets": ["10.30.0.0/24"]"#, r#""targets": []"#);
+        assert!(serde_json::from_str::<ScanRequest>(&empty_targets).is_err());
+    }
+
+    // Fix round 1: "confirm the emitted schema still carries `minItems: 1`
+    // for both fields after the type change -- do not assume the derive
+    // carries it through `$ref`." `NonEmpty<T>`'s own `JsonSchema` derive is
+    // referenceable (unlike `Digest`/`ScopeId`'s hand-written impls), so
+    // `targets` and `explicit` both show up as `{"$ref": "#/$defs/NonEmpty"}`
+    // rather than an inline array schema -- confirmed by generating the raw
+    // schema and printing it before writing this assertion. Both tests below
+    // follow the `$ref` into `$defs` rather than looking for `minItems`
+    // directly on the field's own schema object, which would silently find
+    // nothing and could be mistaken for the field having no schema-level
+    // constraint at all.
+    #[test]
+    fn targets_schema_carries_min_items_one_through_ref() {
+        let schema = schemars::schema_for!(ScanRequest);
+        let value = serde_json::to_value(&schema).unwrap();
+        let ref_path = value["properties"]["targets"]["$ref"]
+            .as_str()
+            .expect("targets should be a $ref, not an inline schema")
+            .strip_prefix("#/$defs/")
+            .unwrap();
+        assert_eq!(
+            value["$defs"][ref_path]["minItems"].as_u64(),
+            Some(1),
+            "schema was {value:#}"
+        );
+        assert_eq!(value["$defs"][ref_path]["type"].as_str(), Some("array"));
+    }
+
+    #[test]
+    fn port_selection_explicit_schema_carries_min_items_one_through_ref() {
+        let schema = schemars::schema_for!(PortSelection);
+        let value = serde_json::to_value(&schema).unwrap();
+        // PortSelection is `anyOf: [Preset, Explicit]`; find the Explicit arm.
+        let explicit_arm = value["anyOf"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|arm| arm["properties"].get("explicit").is_some())
+            .expect("an anyOf arm with an `explicit` property");
+        let ref_path = explicit_arm["properties"]["explicit"]["$ref"]
+            .as_str()
+            .expect("explicit should be a $ref, not an inline schema")
+            .strip_prefix("#/$defs/")
+            .unwrap();
+        assert_eq!(
+            value["$defs"][ref_path]["minItems"].as_u64(),
+            Some(1),
+            "schema was {value:#}"
+        );
     }
 
     // --- Schema/runtime agreement (the dispatch's explicit ask): prove the
