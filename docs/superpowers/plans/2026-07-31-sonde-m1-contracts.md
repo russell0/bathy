@@ -1388,16 +1388,21 @@ use serde_json::Value;
 
 /// Every type that crosses a public boundary, keyed by the filename it is
 /// committed under in `schemas/`.
+/// Extended incrementally: Task 6 emits the two types that exist at that point,
+/// Task 7 adds `scope-manifest`, Task 8 adds `task-handle`. AC-1.22's
+/// four-schema requirement is a MILESTONE exit criterion, not Task 6's — do not
+/// stub types that do not exist yet.
 pub fn all() -> BTreeMap<&'static str, Value> {
     let mut m = BTreeMap::new();
     m.insert("scan-request", to_value(schema_for!(crate::request::ScanRequest)));
     m.insert("event", to_value(schema_for!(crate::event::Event)));
-    m.insert("task-handle", to_value(schema_for!(crate::task::TaskHandle)));
-    m.insert("scope-manifest", to_value(schema_for!(crate::scope_dto::ScopeManifestDto)));
+    // Task 7: m.insert("scope-manifest", to_value(schema_for!(crate::scope_dto::ScopeManifestDto)));
+    // Task 8: m.insert("task-handle", to_value(schema_for!(crate::task::TaskHandle)));
     m
 }
 
-fn to_value(s: schemars::schema::RootSchema) -> Value {
+// schemars 1.2.2 has no `RootSchema`; `schema_for!` yields `schemars::Schema`.
+fn to_value(s: schemars::Schema) -> Value {
     serde_json::to_value(s).expect("schema serializes")
 }
 ```
