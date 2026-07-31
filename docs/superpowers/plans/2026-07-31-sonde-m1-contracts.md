@@ -1603,6 +1603,10 @@ impl ScopeManifest {
         if raw.allowed_cidrs.is_empty() {
             return Err(ManifestError::NoAllowedCidrs);
         }
+        // An all-IPv6 allow set can never authorize anything in v0.1, which is
+        // behaviourally identical to an empty one — so it fails the same way
+        // rather than loading with a warning nobody reads. MIXED manifests warn
+        // and load: their IPv4 entries are genuinely meaningful.
         let parse = |v: &Vec<String>| -> Result<Vec<IpNet>, ManifestError> {
             v.iter()
                 .map(|c| c.parse::<IpNet>().map_err(|_| ManifestError::BadCidr(c.clone())))
@@ -1628,11 +1632,15 @@ impl ScopeManifest {
         self.ceiling
     }
 
-    /// RFC 3339 UTC strings with fixed width and millisecond precision sort
-    /// lexicographically in time order, so string comparison is correct here
-    /// and avoids pulling a date library into the policy path.
+    /// SECURITY: parse both instants; do NOT compare RFC 3339 strings
+    /// lexicographically. An earlier draft of this plan did, and it is wrong in
+    /// the DANGEROUS direction: `"2026-08-31T20:00:00-08:00" > "2026-09-01T00:00:00Z"`
+    /// is `false`, so a manifest four hours past expiry compares as still valid.
+    /// Verified empirically. Fails closed on unparseable input.
     pub fn is_expired(&self, now_rfc3339: &str) -> bool {
-        now_rfc3339 > self.not_after.as_str()
+        let Ok(now) = parse_rfc3339(now_rfc3339) else { return true };
+        let Ok(deadline) = parse_rfc3339(&self.not_after) else { return true };
+        now > deadline
     }
 
     pub fn allows(&self, ip: IpAddr) -> bool {
@@ -1659,13 +1667,23 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
                 || v4.is_unspecified()
                 || v4.octets()[0] == 0)
         }
-        IpAddr::V6(v6) => {
-            !(v6.is_loopback()
-                || v6.is_multicast()
-                || v6.is_unspecified()
-                // link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80)
-        }
+        // v0.1 SCOPE DECISION: IPv6 scanning is out of scope (see the overview's
+        // Gap Register), so refuse every IPv6 address unconditionally.
+        //
+        // This is not merely conservative — it is the only approach that
+        // converges. Three review rounds of prefix-by-prefix hardening each
+        // closed an enumerated set of IPv4-in-IPv6 embedding schemes and each
+        // was followed by a review finding one more: IPv4-compatible,
+        // IPv4-mapped, IPv4-translated, NAT64 well-known, NAT64 local-use,
+        // 6to4, Teredo, and ISATAP (which signals via interface identifier, not
+        // prefix, so no prefix list can catch it). A blanket refusal is immune
+        // to every scheme, enumerated or not.
+        //
+        // Keep the eight prefix guards in a parked `#[allow(dead_code)]`
+        // function with positive-match tests, as the documented starting point
+        // for v0.2 — but note in ITS doc comment that reconnecting requires
+        // re-running mutation testing against the live path.
+        IpAddr::V6(_) => false,
     }
 }
 ```
@@ -1688,8 +1706,8 @@ git commit -m "feat(scope): deny-by-default manifest with expiry and reserved-ra
 - **AC-1.24** An address matching both allow and deny sets is denied — deny always wins.
 - **AC-1.25** Loopback, multicast, broadcast, link-local, and unspecified addresses are refused even when the manifest allows `0.0.0.0/0`.
 - **AC-1.26** A manifest with an empty `allowed_cidrs` fails to load.
-- **AC-1.27** `is_expired` returns true for any instant after `not_after`.
-- **AC-1.28** IPv6 loopback, multicast, unspecified, and `fe80::/10` link-local are refused.
+- **AC-1.27** `is_expired` returns true for any instant after `not_after`, comparing parsed instants rather than RFC 3339 strings, and fails closed on unparseable input. Test a non-`Z` offset that shifts the calendar date — lexicographic comparison gets that case wrong in the unsafe direction.
+- **AC-1.28** Every IPv6 address is refused in v0.1, IPv6 scanning being out of scope — which satisfies the loopback/multicast/unspecified/`fe80::/10` requirement and additionally defeats all eight known IPv4-in-IPv6 embedding schemes. The parked prefix guards carry positive-match tests for all 12 disjuncts so they cannot rot before v0.2.\n- **AC-1.36** `load()` hard-fails when no usable (IPv4) allow entries remain, so a manifest that can never authorize anything is an error rather than a warning.
 
 ---
 
