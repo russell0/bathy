@@ -1,0 +1,12 @@
+/target
+/lab/.state
+*.sqlite
+*.sqlite-*
+
+# Local-only list of strings that must never be published. Consumed by
+# `cargo run -p xtask -- publish-check`. Ignored on purpose: a leak-detector
+# that hardcodes personal identifiers publishes them.
+.publish-deny
+
+# Scratch workspaces for plan execution (ledgers, briefs, review packages).
+.superpowers/

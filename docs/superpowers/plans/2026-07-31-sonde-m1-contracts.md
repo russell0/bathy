@@ -37,7 +37,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/OWNER/sonde"
+repository = "https://github.com/russell0/sonde"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

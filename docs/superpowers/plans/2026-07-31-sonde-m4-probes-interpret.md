@@ -315,7 +315,7 @@ Each follows the same shape. The HTTP probe, as the reference:
 ```rust
 pub struct HttpGetProbe;
 
-pub const USER_AGENT: &str = concat!("sonde/", env!("CARGO_PKG_VERSION"), " (+https://github.com/OWNER/sonde)");
+pub const USER_AGENT: &str = concat!("sonde/", env!("CARGO_PKG_VERSION"), " (+https://github.com/russell0/sonde)");
 
 #[async_trait::async_trait]
 impl Probe for HttpGetProbe {

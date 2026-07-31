@@ -388,7 +388,29 @@ fn publish_check() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 2. No secrets or personal identifiers.
-    for pattern in ["REDACTED", "REDACTED", "BEGIN RSA PRIVATE KEY", "BEGIN OPENSSH PRIVATE KEY"] {
+    //
+    // Generic patterns live here. Personal identifiers — the maintainer's own
+    // email addresses, account handles, session-cookie names seen in local
+    // research artifacts — go in `.publish-deny` , which is git-ignored so
+    // that the checker never becomes the leak it exists to prevent.
+    let mut patterns: Vec<String> = [
+        "BEGIN RSA PRIVATE KEY",
+        "BEGIN OPENSSH PRIVATE KEY",
+        "BEGIN EC PRIVATE KEY",
+        "AKIA",                 // AWS access key id prefix
+        "ghp_", "gho_", "github_pat_",
+        "xoxb-", "xoxp-",       // Slack
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Ok(local) = std::fs::read_to_string(".publish-deny") {
+        patterns.extend(
+            local.lines().map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#'))
+                 .map(str::to_owned),
+        );
+    }
+    for pattern in &patterns {
         if let Some(hit) = grep_tracked(&tracked, pattern)? {
             failures.push(format!("`{pattern}` appears in {hit}"));
         }
@@ -440,7 +462,7 @@ fn the_publish_gate_rejects_a_tracked_research_artifact() {
 
 #[test]
 fn the_publish_gate_rejects_a_leftover_placeholder_owner() {
-    let repo = fixture_repo_with_content("Cargo.toml", "repository = \"https://github.com/OWNER/sonde\"");
+    let repo = fixture_repo_with_content("Cargo.toml", "repository = \"https://github.com/russell0/sonde\"");
     assert!(publish_check_in(&repo).is_err());
 }
 
@@ -465,7 +487,7 @@ git commit -m "chore(xtask): publish-check gate for secrets, artifacts, licensin
 ```
 
 **Acceptance criteria:**
-- **AC-7.25** `xtask publish-check` fails when a research artifact, the owner's email, or a Google session token is tracked.
+- **AC-7.25** `xtask publish-check` fails when a research artifact is tracked, when any generic secret pattern (private keys, AWS/GitHub/Slack token prefixes) appears in tracked content, or when any pattern listed in the git-ignored `.publish-deny` file appears. Personal identifiers live only in `.publish-deny`, never in the checker's source — a leak-detector that hardcodes the thing it detects publishes it.
 - **AC-7.26** It fails on the forbidden phrase "deterministic results".
 - **AC-7.27** It fails when a named individual appears in `README.md` or `docs/`.
 - **AC-7.28** It fails on a leftover `OWNER` placeholder.
