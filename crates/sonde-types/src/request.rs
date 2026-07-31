@@ -491,13 +491,18 @@ mod tests {
     // for both fields after the type change -- do not assume the derive
     // carries it through `$ref`." `NonEmpty<T>`'s own `JsonSchema` derive is
     // referenceable (unlike `Digest`/`ScopeId`'s hand-written impls), so
-    // `targets` and `explicit` both show up as `{"$ref": "#/$defs/NonEmpty"}`
-    // rather than an inline array schema -- confirmed by generating the raw
-    // schema and printing it before writing this assertion. Both tests below
-    // follow the `$ref` into `$defs` rather than looking for `minItems`
-    // directly on the field's own schema object, which would silently find
-    // nothing and could be mistaken for the field having no schema-level
-    // constraint at all.
+    // `targets` and `explicit` both show up as a `$ref` into `$defs`
+    // (`{"$ref": "#/$defs/NonEmpty_of_string"}` as of Task 5a's
+    // `#[schemars(rename = "NonEmpty_of_{T}")]` fix -- see `nonempty.rs` --
+    // formerly just `#/$defs/NonEmpty`) rather than an inline array schema --
+    // confirmed by generating the raw schema and printing it before writing
+    // this assertion. Both tests below follow the `$ref` into `$defs` by
+    // reading its target path out of the schema itself, rather than
+    // hardcoding the `$defs` key, precisely so they don't care which name
+    // scheme is in effect -- and rather than looking for `minItems` directly
+    // on the field's own schema object, which would silently find nothing
+    // and could be mistaken for the field having no schema-level constraint
+    // at all.
     #[test]
     fn targets_schema_carries_min_items_one_through_ref() {
         let schema = schemars::schema_for!(ScanRequest);
