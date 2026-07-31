@@ -218,55 +218,89 @@ impl ScopeManifest {
 /// categories cause collateral traffic or self-scans and are refused
 /// outright.
 ///
-/// # IPv4-in-IPv6 embedding schemes
+/// # IPv4-in-IPv6 embedding and transition schemes
 ///
-/// IPv6 has *five* distinct, standardized ways to embed a 32-bit IPv4
-/// address inside a 128-bit IPv6 address, each with its own prefix:
+/// IPv6 has at least **seven** standardized prefixes that either embed a
+/// 32-bit IPv4 address in a fixed bit position or tunnel IPv4 reachability
+/// through a fixed, globally-known prefix. This count is a **floor, not a
+/// proof of completeness** -- it is what a systematic sweep of RFC 4291,
+/// RFC 6052/8215, RFC 2765/6145, RFC 3056, RFC 4380, and the IANA IPv6
+/// Special-Purpose Address Registry turned up as of this writing (see the
+/// task report for the full sweep, including every block considered and
+/// deliberately *not* added here, and why). Do not treat "seven" as a
+/// closed set the next time this function is touched.
 ///
 /// | Prefix | Scheme | RFC |
 /// |---|---|---|
 /// | `::/96` | IPv4-compatible (deprecated) | 4291 §2.5.5.1 |
 /// | `::ffff:0:0/96` | IPv4-mapped | 4291 §2.5.5.2 |
+/// | `::ffff:0:0:0/96` | IPv4-translated (SIIT) | 2765 §3.5, retained by 6145 |
 /// | `64:ff9b::/96` | NAT64 well-known prefix | 6052 |
 /// | `64:ff9b:1::/48` | NAT64 local-use prefix | 8215 |
 /// | `2002::/16` | 6to4 | 3056 |
+/// | `2001::/32` | Teredo (embeds an *obfuscated* IPv4 address/port) | 4380, updated by 8190 |
 ///
 /// A first version of this function guarded only the IPv4-mapped form via
-/// `Ipv6Addr::to_ipv4_mapped()`. A security review confirmed the other four
-/// were an open bypass: `::7f00:1`, `64:ff9b::7f00:1`, `64:ff9b::e000:1`,
-/// and `2002:7f00:1::1` all denote reserved IPv4 addresses (loopback,
-/// loopback, multicast, loopback respectively) yet none of them trip
+/// `Ipv6Addr::to_ipv4_mapped()`. A security review confirmed four more were
+/// an open bypass (`::7f00:1`, `64:ff9b::7f00:1`, `64:ff9b::e000:1`,
+/// `2002:7f00:1::1`); a second review, having explicitly warned that "five"
+/// was not a proof of completeness, found a sixth (`::ffff:0:127.0.0.1`,
+/// IPv4-translated) still open -- `to_ipv4_mapped()` returns `None` for it
+/// because it differs from the mapped form by exactly one segment offset
+/// (segment 4 holds `0xffff` instead of segment 5), and none of the other
+/// guards match it either. All of these denote reserved IPv4 addresses
+/// (loopback or multicast) yet none of them trip
 /// `Ipv6Addr::is_loopback`/`is_multicast`/`is_unspecified` or the
 /// `fe80::/10` mask below, because those all key off the *native IPv6* bit
-/// pattern and none of the five embedding prefixes' bit patterns match
-/// `::1`, `ff00::/8`, or `fe80::/10`. Left unguarded, a manifest that
-/// permissively allows an IPv6 range (the IPv6 analogue of the `0.0.0.0/0`
-/// case AC-1.25 already covers for IPv4) would let any of these slip past
-/// this backstop entirely -- the exact class of hole property 3 exists to
-/// close, and exactly the kind of false-allow that sends packets somewhere
-/// unauthorized.
+/// pattern and none of these prefixes' bit patterns match `::1`,
+/// `ff00::/8`, or `fe80::/10`. The seventh (Teredo) was added proactively
+/// during that same sweep, before a third review round could find it:
+/// Teredo obfuscates (bitwise-NOT, not a direct copy) its embedded IPv4
+/// address, so this guard does not attempt to decode it -- it refuses the
+/// whole `2001::/32` prefix regardless of what the low 96 bits contain,
+/// exactly like every other entry in this table. Left unguarded, a
+/// manifest that permissively allows an IPv6 range (the IPv6 analogue of
+/// the `0.0.0.0/0` case AC-1.25 already covers for IPv4) would let any of
+/// these slip past this backstop entirely -- the exact class of hole
+/// property 3 exists to close, and exactly the kind of false-allow that
+/// sends packets somewhere unauthorized.
 ///
-/// All five prefixes are refused **outright, as whole prefixes**, rather
+/// All seven prefixes are refused **outright, as whole prefixes**, rather
 /// than being unwrapped and re-evaluated as the IPv4 address they embed.
 /// This is a deliberate decision, not an oversight:
 ///
 /// - An operator who wants to authorize `10.30.0.0/24` writes that CIDR,
 ///   not `::ffff:10.30.0.0/120` or `2002:0a1e:0000::/120`; an address in
-///   any of these five prefixes reaching `allows()` at all is already
+///   any of these seven prefixes reaching `allows()` at all is already
 ///   anomalous input this codebase does not need to make meaningful.
 /// - Unwrapping is strictly more code on the safety boundary for no safety
 ///   benefit, and it does not scale: every future reserved-IPv4 rule (a new
 ///   martian range, a newly-reserved block) would have to be re-implemented
 ///   once per embedding scheme instead of once. Refusing the whole prefix
 ///   needs no such duplication -- these prefixes are not ordinary unicast
-///   scan targets under any circumstance, reserved or not.
+///   scan targets under any circumstance, reserved or not. Teredo's
+///   obfuscation makes this doubly true: there is no cheap way to "unwrap"
+///   an obfuscated embedded address at all.
 /// - Refusing outright is also the conservative reading of "when unsure,
 ///   refuse": it cannot be mistakenly authorized under any manifest, ever,
 ///   which unwrap-and-reevaluate cannot promise (it would still depend on
 ///   the allow/deny CIDR sets being IPv4-shaped and correctly interpreted).
 ///
-/// This is the same principle already applied to the IPv4-mapped form; the
-/// fix here is widening it to the other four schemes, not changing it.
+/// This is the same principle already applied to the IPv4-mapped form; each
+/// fix round has widened it to more schemes, never changed it.
+///
+/// # Known, structural limitation (not fixable by adding more guards here)
+///
+/// NAT64 (RFC 6052 §3.1) and SIIT (RFC 6145) both also support an
+/// operator-chosen "Network-Specific Prefix" out of the operator's own
+/// globally-routed address space, as an alternative to the fixed
+/// Well-Known Prefix / IPv4-translated format. An address using such a
+/// prefix is bit-for-bit indistinguishable from ordinary global unicast --
+/// there is no fixed mask that could ever catch it, structurally, without
+/// external configuration input this function does not have and a scope
+/// manifest format does not currently provide a place to declare. This is
+/// an accepted limitation of prefix-based detection, not an oversight
+/// equivalent to the ones fixed above.
 fn is_ordinary_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -298,6 +332,14 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
                 || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
                 // ::ffff:0:0/96 -- IPv4-mapped (RFC 4291 §2.5.5.2).
                 || v6.to_ipv4_mapped().is_some()
+                // ::ffff:0:0:0/96 -- IPv4-translated (SIIT, RFC 2765 §3.5,
+                // retained by RFC 6145). One segment offset from the mapped
+                // form above: 0xffff lives in segment 4, not segment 5.
+                // Segment indices verified against a real
+                // `"::ffff:0:127.0.0.1".parse::<Ipv6Addr>().segments()`
+                // probe, not derived by reasoning alone -- see the task
+                // report for the probe output.
+                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
                 // 64:ff9b::/96 -- NAT64 well-known prefix (RFC 6052).
                 || (s[0] == 0x0064
                     && s[1] == 0xff9b
@@ -308,7 +350,13 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
                 // 64:ff9b:1::/48 -- NAT64 local-use prefix (RFC 8215).
                 || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
                 // 2002::/16 -- 6to4 (RFC 3056).
-                || s[0] == 0x2002)
+                || s[0] == 0x2002
+                // 2001::/32 -- Teredo (RFC 4380, updated by RFC 8190).
+                // Added proactively (not from a reviewer-reported bypass):
+                // see the doc comment above for why this is refused as a
+                // whole prefix despite embedding an obfuscated, not raw,
+                // IPv4 address.
+                || (s[0] == 0x2001 && s[1] == 0))
         }
     }
 }
@@ -557,6 +605,77 @@ mod tests {
             m.allows(ip("2003::1")),
             "2003::1 is one step past 2002::/16 and must not be caught by \
              the 6to4 guard"
+        );
+    }
+
+    // --- Fix round 2 (CRITICAL): the sixth IPv4-in-IPv6 embedding scheme,
+    // found by a re-review after round 1 shipped -- IPv4-translated
+    // addresses, ::ffff:0:0:0/96 (RFC 2765 SIIT, retained by RFC 6145).
+    // Genuinely distinct from IPv4-mapped by a one-segment offset: 0xffff
+    // sits in segment 4 here, not segment 5, so `to_ipv4_mapped()` legitimately
+    // returns `None` for these addresses and none of the round-1 guards
+    // matched either. Segment layout confirmed via a real parse-and-inspect
+    // probe before writing the guard (see the task report for the raw
+    // output), per the reviewer's explicit instruction not to reason about
+    // the offset from memory alone. ---
+
+    #[test]
+    fn ipv4_translated_ipv6_addresses_are_refused_outright() {
+        let m = permissive_dual_stack_manifest();
+        // ::ffff:0:127.0.0.1 -- the reviewer's exact reproduction case.
+        // segments = [0, 0, 0, 0, 0xffff, 0, 0x7f00, 1] (confirmed by probe).
+        assert!(
+            !m.allows(ip("::ffff:0:127.0.0.1")),
+            "IPv4-translated loopback must be refused"
+        );
+        // ::ffff:0:0:0 -- the bare prefix address itself.
+        assert!(
+            !m.allows(ip("::ffff:0:0:0")),
+            "the IPv4-translated prefix address itself must be refused"
+        );
+        // Boundary: segment 5 set to 1 instead of 0 -- one value outside
+        // ::ffff:0:0:0/96 -- must not be caught by this guard. Confirmed by
+        // the same probe that `to_ipv4_mapped()` is still `None` for this
+        // address (segment 4 isn't where the mapped-form guard looks), and
+        // it doesn't match any other guard either (segment 0 isn't 0x64 or
+        // 0x2002, segments 0..=5 aren't all zero).
+        assert!(
+            m.allows(ip("::ffff:1:127.0.0.1")),
+            "an address one segment-value outside ::ffff:0:0:0/96 must not \
+             be caught by the IPv4-translated guard"
+        );
+    }
+
+    // --- Fix round 2: Teredo, added proactively during the round-2 sweep
+    // (not from a reported bypass) since it is an explicitly-named IPv6
+    // transition prefix (RFC 4380) that also embeds an IPv4 address, albeit
+    // obfuscated rather than in the clear. Refused as a whole prefix like
+    // everything else in this table -- this guard does not attempt to
+    // decode the obfuscated payload. ---
+
+    #[test]
+    fn teredo_addresses_are_refused_outright() {
+        let m = permissive_dual_stack_manifest();
+        // Any address in 2001::/32 is refused regardless of what its low 96
+        // bits (server address, flags, obfuscated port/client address)
+        // contain -- this simple in-prefix address is sufficient to prove
+        // the whole-prefix guard, without needing to construct a
+        // fully-obfuscation-valid Teredo address.
+        assert!(
+            !m.allows(ip("2001::1")),
+            "an address in the Teredo prefix 2001::/32 must be refused"
+        );
+        // Boundary: 2001:1::1 (IANA's own PCP-anycast address, segments[1]
+        // == 1 rather than Teredo's required 0) is one segment-value
+        // outside 2001::/32 and must not be caught by this guard. It is a
+        // real IANA special-purpose address in its own right (RFC 7723),
+        // deliberately not guarded here -- see the task report's sweep for
+        // why single-host anycast addresses like this one are out of scope
+        // for an IPv4-embedding fix.
+        assert!(
+            m.allows(ip("2001:1::1")),
+            "2001:1::1 is one segment-value outside 2001::/32 and must not \
+             be caught by the Teredo guard"
         );
     }
 
