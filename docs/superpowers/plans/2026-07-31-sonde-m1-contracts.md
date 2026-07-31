@@ -1554,6 +1554,8 @@ use ipnet::IpNet;
 use serde::Deserialize;
 use sonde_types::ids::ScopeId;
 use sonde_types::request::Budgets;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -1563,6 +1565,21 @@ pub enum ManifestError {
     NoAllowedCidrs,
     #[error("invalid CIDR `{0}`")]
     BadCidr(String),
+    /// `not_after` is not a parseable RFC 3339 instant. Rejected at load
+    /// time rather than accepted-then-mis-compared.
+    #[error("`not_after` is not a valid RFC 3339 timestamp: `{0}`")]
+    BadExpiry(String),
+    /// Every entry in `allowed_cidrs` is IPv6, which is unsupported in
+    /// v0.1: `allows()` refuses every IPv6 address unconditionally, so a
+    /// manifest like this can never authorize any address at all --
+    /// behaviorally identical to `allowed_cidrs: []`. A manifest with at
+    /// least one usable IPv4 entry alongside IPv6 ones is unaffected; that
+    /// case loads with a warning instead (see `load`).
+    #[error(
+        "every entry in `allowed_cidrs` is IPv6, which is unsupported in v0.1; \
+         a manifest must list at least one usable (IPv4) allowed CIDR"
+    )]
+    NoUsableAllowedCidrs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1578,8 +1595,10 @@ struct Raw {
     /// Reserved for v0.2 detached-signature verification. Accepted and stored
     /// but NOT verified in v0.1. Reserving the field now means adding
     /// verification later is not a breaking schema change; accepting it
-    /// silently would be dishonest, so `ScopeManifest::load` logs a warning
-    /// when it is present and `signature_verified()` always returns false.
+    /// silently would be dishonest, so `ScopeManifest::load` prints a warning
+    /// to stderr when it is present and `signature_verified()` always returns
+    /// `false`, regardless of whether a signature is present or what it
+    /// contains.
     #[serde(default)]
     signature: Option<String>,
 }
@@ -1591,10 +1610,13 @@ struct Raw {
 pub struct ScopeManifest {
     id: ScopeId,
     description: String,
-    not_after: String,
+    not_after: OffsetDateTime,
     allowed: Vec<IpNet>,
     denied: Vec<IpNet>,
     ceiling: Budgets,
+    /// Whether the loaded document carried a `signature` field at all --
+    /// never the signature's contents. See `signature_verified` below.
+    had_signature: bool,
 }
 
 impl ScopeManifest {
@@ -1603,22 +1625,70 @@ impl ScopeManifest {
         if raw.allowed_cidrs.is_empty() {
             return Err(ManifestError::NoAllowedCidrs);
         }
-        // An all-IPv6 allow set can never authorize anything in v0.1, which is
-        // behaviourally identical to an empty one — so it fails the same way
-        // rather than loading with a warning nobody reads. MIXED manifests warn
-        // and load: their IPv4 entries are genuinely meaningful.
         let parse = |v: &Vec<String>| -> Result<Vec<IpNet>, ManifestError> {
             v.iter()
                 .map(|c| c.parse::<IpNet>().map_err(|_| ManifestError::BadCidr(c.clone())))
                 .collect()
         };
+        let not_after = OffsetDateTime::parse(&raw.not_after, &Rfc3339)
+            .map_err(|_| ManifestError::BadExpiry(raw.not_after.clone()))?;
+        let allowed = parse(&raw.allowed_cidrs)?;
+        let denied = parse(&raw.denied_cidrs)?;
+
+        // An all-IPv6 allow set can never authorize anything under the v0.1
+        // blanket IPv6 refusal — behaviourally identical to an empty allow
+        // set, which the `is_empty()` check above already hard-fails on.
+        // `allowed` is non-empty here, so `all()` is not vacuously true.
+        // MIXED manifests (at least one IPv4 entry alongside IPv6 ones)
+        // still warn-and-load below, since their IPv4 entries remain
+        // genuinely meaningful.
+        if allowed.iter().all(|net| matches!(net, IpNet::V6(_))) {
+            return Err(ManifestError::NoUsableAllowedCidrs);
+        }
+
+        if raw.signature.is_some() {
+            // Loud on purpose: a signature field that looks like it should
+            // mean something but doesn't is more dangerous than no
+            // signature at all, because a human skimming the manifest may
+            // assume it was checked.
+            eprintln!(
+                "WARNING: scope manifest {} carries a `signature` field; \
+                 signatures are accepted and stored but NOT cryptographically \
+                 verified in this version.",
+                raw.id
+            );
+        }
+
+        // IPv6 scanning is out of scope for v0.1 (see `is_ordinary_unicast`
+        // below), so `allows()` refuses every IPv6 address no matter what
+        // this manifest says. Warn rather than fail: the manifest may also
+        // carry valid IPv4 CIDRs, and an operator drafting a manifest ahead
+        // of v0.2 should not be blocked from doing so.
+        let ipv6_allow_entries: Vec<&str> = raw
+            .allowed_cidrs
+            .iter()
+            .zip(allowed.iter())
+            .filter(|(_, net)| matches!(net, IpNet::V6(_)))
+            .map(|(s, _)| s.as_str())
+            .collect();
+        if !ipv6_allow_entries.is_empty() {
+            eprintln!(
+                "WARNING: scope manifest {} lists IPv6 CIDR(s) in \
+                 allowed_cidrs ({}); IPv6 scanning is unsupported in v0.1 \
+                 and these entries can never match.",
+                raw.id,
+                ipv6_allow_entries.join(", ")
+            );
+        }
+
         Ok(Self {
             id: raw.id,
             description: raw.description,
-            not_after: raw.not_after,
-            allowed: parse(&raw.allowed_cidrs)?,
-            denied: parse(&raw.denied_cidrs)?,
+            not_after,
+            allowed,
+            denied,
             ceiling: raw.budget_ceiling,
+            had_signature: raw.signature.is_some(),
         })
     }
 
@@ -1632,15 +1702,30 @@ impl ScopeManifest {
         self.ceiling
     }
 
+    /// Always `false` in v0.1: a `signature` field, if present, is stored
+    /// but never cryptographically checked.
+    pub fn signature_verified(&self) -> bool {
+        false
+    }
+
+    /// Whether the loaded document carried a `signature` field at all.
+    pub fn had_signature(&self) -> bool {
+        self.had_signature
+    }
+
     /// SECURITY: parse both instants; do NOT compare RFC 3339 strings
-    /// lexicographically. An earlier draft of this plan did, and it is wrong in
-    /// the DANGEROUS direction: `"2026-08-31T20:00:00-08:00" > "2026-09-01T00:00:00Z"`
-    /// is `false`, so a manifest four hours past expiry compares as still valid.
-    /// Verified empirically. Fails closed on unparseable input.
+    /// lexicographically. An earlier draft of this plan did, and it is wrong
+    /// in the DANGEROUS direction: `"2026-08-31T20:00:00-08:00" >
+    /// "2026-09-01T00:00:00Z"` is `false`, so a manifest four hours past
+    /// expiry compares as still valid. Verified empirically. `not_after` was
+    /// already validated at `load` time (as a real `OffsetDateTime`, above),
+    /// so only `now_rfc3339` can fail to parse here; if it does, this fails
+    /// closed -- treated as expired, never as still valid.
     pub fn is_expired(&self, now_rfc3339: &str) -> bool {
-        let Ok(now) = parse_rfc3339(now_rfc3339) else { return true };
-        let Ok(deadline) = parse_rfc3339(&self.not_after) else { return true };
-        now > deadline
+        match OffsetDateTime::parse(now_rfc3339, &Rfc3339) {
+            Ok(now) => now > self.not_after,
+            Err(_) => true,
+        }
     }
 
     pub fn allows(&self, ip: IpAddr) -> bool {
@@ -1665,7 +1750,11 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_link_local()
                 || v4.is_unspecified()
-                || v4.octets()[0] == 0)
+                || v4.octets()[0] == 0
+                // 240.0.0.0/4: IANA-reserved "martian" space.
+                // `Ipv4Addr::is_reserved()` is nightly-only at this MSRV,
+                // hence the hand-rolled range check.
+                || v4.octets()[0] >= 240)
         }
         // v0.1 SCOPE DECISION: IPv6 scanning is out of scope (see the overview's
         // Gap Register), so refuse every IPv6 address unconditionally.
@@ -1679,10 +1768,12 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
         // prefix, so no prefix list can catch it). A blanket refusal is immune
         // to every scheme, enumerated or not.
         //
-        // Keep the eight prefix guards in a parked `#[allow(dead_code)]`
-        // function with positive-match tests, as the documented starting point
-        // for v0.2 — but note in ITS doc comment that reconnecting requires
-        // re-running mutation testing against the live path.
+        // The eight prefix guards live on, parked behind
+        // `#[allow(dead_code)]` as `ipv6_is_ordinary_by_prefix_rules` (not
+        // shown here — see `manifest.rs`), with positive-match tests for
+        // all 12 disjuncts, as the documented starting point for v0.2.
+        // Reconnecting it requires re-running the mutation-testing
+        // discipline against the live path.
         IpAddr::V6(_) => false,
     }
 }
