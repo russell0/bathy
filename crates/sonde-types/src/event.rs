@@ -54,6 +54,48 @@ pub struct Observation {
     pub confidence: Confidence,
 }
 
+/// Stable, machine-readable reasons a scan request can be denied by policy.
+/// Wire values are exactly [`DenyReason::code`]'s four strings -- agents
+/// branch on them, so they are part of the public contract and must not be
+/// reworded without a version bump.
+// Proven to match code(), not just documented to match: see
+// `deny_reason_wire_values_match_code` below.
+//
+// C5: this type originated in `sonde-scope`, defined as free-standing
+// strings duplicated ad hoc wherever a `reason_code` was needed --
+// `EventBody::PolicyDenied` below used to be a bare
+// `{ reason_code: String, detail: String }`, and two of its fixtures
+// constructed it with `"out_of_scope"`, a string `DenyReason::code` can
+// never actually emit (it emits `target_out_of_scope`). Moved here, into
+// `sonde-types`, so `PolicyDenied.reason_code` can be typed as
+// `DenyReason` instead of an unconstrained `String`: `sonde-types` is the
+// lowest layer (nothing may be its dependency), and `sonde-scope` may
+// depend on `sonde-types`, so this is the only direction the move can go.
+// `sonde_scope::policy` re-exports this type rather than redefining it, so
+// existing call sites referencing `sonde_scope::DenyReason` or
+// `sonde_scope::policy::DenyReason` are unaffected.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DenyReason {
+    ScopeMismatch,
+    ScopeExpired,
+    TargetOutOfScope,
+    BudgetExceedsCeiling,
+}
+
+impl DenyReason {
+    /// Stable identifiers. Agents branch on these, so they are part of the
+    /// public contract and must not be reworded.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::ScopeMismatch => "scope_mismatch",
+            Self::ScopeExpired => "scope_expired",
+            Self::TargetOutOfScope => "target_out_of_scope",
+            Self::BudgetExceedsCeiling => "budget_exceeds_ceiling",
+        }
+    }
+}
+
 // `#[serde(deny_unknown_fields)]` lives on `EventBody` here, not on `Event`
 // (see below `Event`'s own doc comment) -- see that comment for why.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -99,7 +141,10 @@ pub enum EventBody {
     },
 
     #[serde(rename = "policy.denied")]
-    PolicyDenied { reason_code: String, detail: String },
+    PolicyDenied {
+        reason_code: DenyReason,
+        detail: String,
+    },
 
     #[serde(rename = "scan.completed")]
     ScanCompleted {
@@ -344,7 +389,7 @@ mod tests {
             (
                 "policy.denied",
                 EventBody::PolicyDenied {
-                    reason_code: "out_of_scope".to_string(),
+                    reason_code: DenyReason::TargetOutOfScope,
                     detail: "target not in authorization scope".to_string(),
                 },
             ),
@@ -446,7 +491,7 @@ mod tests {
                 packets_spent: 2000,
             },
             EventBody::PolicyDenied {
-                reason_code: "out_of_scope".to_string(),
+                reason_code: DenyReason::TargetOutOfScope,
                 detail: "target not in authorization scope".to_string(),
             },
             EventBody::ScanCompleted {
@@ -624,6 +669,68 @@ mod tests {
     #[test]
     fn the_fixture_used_by_the_rejection_tests_parses_on_its_own() {
         assert!(serde_json::from_str::<Event>(SERVICE_OBSERVED_EXAMPLE).is_ok());
+    }
+
+    // --- C5: deny codes were defined in `sonde-scope` (`DenyReason::code()`)
+    // but consumed as free text in `sonde-types`
+    // (`EventBody::PolicyDenied.reason_code: String`). The symptom was
+    // already in the tree: two fixtures above used to construct
+    // `EventBody::PolicyDenied { reason_code: "out_of_scope".to_string(),
+    // .. }`, a string `DenyReason::code()` can never emit (it emits
+    // `target_out_of_scope`) -- nothing caught that mismatch because the
+    // field was an unconstrained `String`. Now that it is typed as
+    // `DenyReason`, that particular mistake cannot even compile; the two
+    // tests below prove the wire values genuinely match `code()` (not just
+    // that the type compiles), and that an unrecognized reason code is
+    // rejected outright rather than silently accepted as free text. ---
+
+    #[test]
+    fn deny_reason_wire_values_match_code() {
+        for (reason, code) in [
+            (DenyReason::ScopeMismatch, "scope_mismatch"),
+            (DenyReason::ScopeExpired, "scope_expired"),
+            (DenyReason::TargetOutOfScope, "target_out_of_scope"),
+            (DenyReason::BudgetExceedsCeiling, "budget_exceeds_ceiling"),
+        ] {
+            assert_eq!(reason.code(), code);
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{code}\""),
+                "{reason:?} must serialize to exactly its code()"
+            );
+            let back: DenyReason = serde_json::from_str(&format!("\"{code}\"")).unwrap();
+            assert_eq!(back, reason, "{code} must deserialize back to {reason:?}");
+        }
+    }
+
+    #[test]
+    fn policy_denied_rejects_a_reason_code_that_is_not_a_real_deny_reason() {
+        // "out_of_scope" is exactly the wrong string the two fixtures above
+        // used to carry -- close to, but not, "target_out_of_scope". Before
+        // this fix (reason_code: String), this would have parsed
+        // successfully; now that it is typed as DenyReason, it must be
+        // rejected.
+        let json = r#"{
+            "event_type": "policy.denied",
+            "reason_code": "out_of_scope",
+            "detail": "target not in authorization scope"
+        }"#;
+        assert!(
+            serde_json::from_str::<EventBody>(json).is_err(),
+            "\"out_of_scope\" is not a value DenyReason::code() can produce \
+             and must be rejected"
+        );
+
+        // The real code, by contrast, must parse.
+        let good = json.replace("out_of_scope", "target_out_of_scope");
+        let body: EventBody = serde_json::from_str(&good).unwrap();
+        assert!(matches!(
+            body,
+            EventBody::PolicyDenied {
+                reason_code: DenyReason::TargetOutOfScope,
+                ..
+            }
+        ));
     }
 
     // --- Prove the schema carries the constraints the type does. ---

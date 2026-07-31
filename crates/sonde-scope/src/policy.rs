@@ -4,26 +4,13 @@ use sonde_types::request::ScanRequest;
 
 use crate::manifest::ScopeManifest;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DenyReason {
-    ScopeMismatch,
-    ScopeExpired,
-    TargetOutOfScope,
-    BudgetExceedsCeiling,
-}
-
-impl DenyReason {
-    /// Stable identifiers. Agents branch on these, so they are part of the
-    /// public contract and must not be reworded.
-    pub fn code(self) -> &'static str {
-        match self {
-            Self::ScopeMismatch => "scope_mismatch",
-            Self::ScopeExpired => "scope_expired",
-            Self::TargetOutOfScope => "target_out_of_scope",
-            Self::BudgetExceedsCeiling => "budget_exceeds_ceiling",
-        }
-    }
-}
+/// C5: `DenyReason` moved to `sonde-types` (see that type's own doc comment
+/// for why) -- re-exported here rather than redefined, so existing call
+/// sites that write `sonde_scope::policy::DenyReason` or
+/// `sonde_scope::DenyReason` (via `crate::lib`'s own re-export) keep
+/// working unchanged. `code()` moves with the type: inherent methods on a
+/// foreign type may only be defined in the crate that defines the type.
+pub use sonde_types::DenyReason;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyDecision {

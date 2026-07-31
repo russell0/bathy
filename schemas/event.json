@@ -7,6 +7,16 @@
       "minimum": 0.0,
       "type": "number"
     },
+    "DenyReason": {
+      "description": "Stable, machine-readable reasons a scan request can be denied by policy.\nWire values are exactly [`DenyReason::code`]'s four strings -- agents\nbranch on them, so they are part of the public contract and must not be\nreworded without a version bump.",
+      "enum": [
+        "scope_mismatch",
+        "scope_expired",
+        "target_out_of_scope",
+        "budget_exceeds_ceiling"
+      ],
+      "type": "string"
+    },
     "Digest": {
       "description": "BLAKE3 content digest of stored evidence bytes.",
       "pattern": "^blake3:[0-9a-f]{64}$",
@@ -273,7 +283,7 @@
           "type": "string"
         },
         "reason_code": {
-          "type": "string"
+          "$ref": "#/$defs/DenyReason"
         }
       },
       "required": [
