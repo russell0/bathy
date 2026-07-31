@@ -1,0 +1,201 @@
+{
+  "$defs": {
+    "Budgets": {
+      "additionalProperties": false,
+      "description": "Hard ceilings. The scheduler aborts the scan when any is exhausted; these\nare not advisory hints. Every field is mandatory: an unbounded scan is not\nan expressible request.",
+      "properties": {
+        "maximum_packets": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_packets_per_second": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_runtime_seconds": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maximum_packets",
+        "maximum_runtime_seconds",
+        "maximum_packets_per_second"
+      ],
+      "type": "object"
+    },
+    "EvidenceLevel": {
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Record only the derived observation. Smallest storage.",
+          "type": "string"
+        },
+        {
+          "const": "headers",
+          "description": "Record protocol banners and response headers. Default.",
+          "type": "string"
+        },
+        {
+          "const": "full",
+          "description": "Record full response bodies up to the per-response cap.",
+          "type": "string"
+        }
+      ]
+    },
+    "NonEmpty_of_string": {
+      "description": "A vector guaranteed to hold at least one element.\n\nUsed so that a `Finding` cannot be constructed without evidence. The\nguarantee lives in the type system rather than in a validation pass,\nbecause a validation pass can be forgotten.\n\n`NonEmpty<T>` is instantiated at more than one `T` in this crate (e.g.\n`NonEmpty<String>` in `request.rs`, `NonEmpty<Digest>` in `event.rs`), so\neach instantiation needs its own name in the generated JSON Schema's\n`$defs`. Without `#[schemars(rename = ...)]`, schemars_derive 1.2.2 names\nevery generic struct after its bare Rust identifier\n(`schemars_derive-1.2.2/src/lib.rs`'s `derive_json_schema`: `let name =\ncont.name();` is just the struct ident when no `rename` is set, with no\nreference to the type parameter) and disambiguates collisions by\n*declaration order* within a `SchemaGenerator` run, appending \"2\", \"3\",\netc. That makes `$defs` key names depend on unrelated field-ordering\ndecisions elsewhere in the crate -- reordering or adding a field renames\nthem, producing spurious diffs against the schemas committed under\n`schemas/` (checked by `xtask check-schemas`).\n\nThe fix uses the format-string form of `#[schemars(rename = \"...\")]`,\nwhich is schemars' own built-in mechanism for this: \"If set on a struct\nor enum with generic type parameters, then the given name may contain\nthem enclosed in curly braces (e.g. `{T}`) and they will be replaced with\nthe concrete type names when the schema is generated\"\n(`schemars_derive-1.2.2/attributes.md`, the `rename` section). This is\nalso exactly the pattern schemars uses for its own builtin generic\nimpls, e.g. `Vec<T>`'s `schema_name()` is\n`format!(\"Array_of_{}\", T::schema_name())`\n(`schemars-1.2.2/src/json_schema_impls/sequences.rs`) -- `_of_`, not\n`_for_`. Confirmed empirically with a throwaway probe crate against this\nworkspace's exact schemars 1.2.2: a struct holding `NonEmpty<String>` and\n`NonEmpty<u8>` emits `$defs` keys `NonEmpty_of_string` and\n`NonEmpty_of_uint8` regardless of the two fields' declaration order, each\nstill carrying its own `minItems: 1`.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "Objective": {
+      "description": "What the caller is trying to learn. Objectives are a closed set so the\nplanner can map each to a bounded strategy; free-text goals belong to the\nagent layer, which compiles them into one of these.",
+      "oneOf": [
+        {
+          "const": "host_inventory",
+          "description": "Which hosts are up.",
+          "type": "string"
+        },
+        {
+          "const": "inventory_exposed_services",
+          "description": "Which services are listening and what they are.",
+          "type": "string"
+        },
+        {
+          "const": "change_detection",
+          "description": "Re-observe a previous scan's endpoints to detect change.",
+          "type": "string"
+        },
+        {
+          "const": "confidence_refinement",
+          "description": "Re-probe only endpoints whose prior confidence was low.",
+          "type": "string"
+        }
+      ]
+    },
+    "PortPreset": {
+      "oneOf": [
+        {
+          "const": "top-100",
+          "description": "The 100 most commonly listening TCP ports, from our own dataset.",
+          "type": "string"
+        },
+        {
+          "const": "common-1000",
+          "description": "The 1000 most commonly listening TCP ports, from our own dataset.",
+          "type": "string"
+        },
+        {
+          "const": "all",
+          "description": "All 65535 TCP ports. Requires a budget large enough to cover them.",
+          "type": "string"
+        }
+      ]
+    },
+    "PortSelection": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "preset": {
+              "$ref": "#/$defs/PortPreset"
+            }
+          },
+          "required": [
+            "preset"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Explicit ports and inclusive ranges, e.g. `[\"22\", \"80\", \"8000-8100\"]`.",
+          "properties": {
+            "explicit": {
+              "$ref": "#/$defs/NonEmpty_of_string"
+            }
+          },
+          "required": [
+            "explicit"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ScopeId": {
+      "description": "Identifies an authorization scope manifest.",
+      "pattern": "^scope_[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    },
+    "ServiceDetection": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "intensity": {
+          "format": "uint8",
+          "maximum": 9,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "intensity"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "authorization_scope_id": {
+      "$ref": "#/$defs/ScopeId",
+      "description": "The manifest authorizing this scan. Without it there is no scan."
+    },
+    "budgets": {
+      "$ref": "#/$defs/Budgets"
+    },
+    "evidence_level": {
+      "$ref": "#/$defs/EvidenceLevel",
+      "default": "headers"
+    },
+    "idempotency_key": {
+      "description": "Repeating a call with the same key and an identical plan returns the\noriginal task instead of starting a second scan.",
+      "type": "string"
+    },
+    "objective": {
+      "$ref": "#/$defs/Objective"
+    },
+    "ports": {
+      "$ref": "#/$defs/PortSelection"
+    },
+    "service_detection": {
+      "$ref": "#/$defs/ServiceDetection",
+      "default": {
+        "enabled": true,
+        "intensity": 4
+      }
+    },
+    "targets": {
+      "$ref": "#/$defs/NonEmpty_of_string",
+      "description": "CIDRs, single addresses, or inclusive `a.b.c.d-e.f.g.h` ranges."
+    }
+  },
+  "required": [
+    "targets",
+    "authorization_scope_id",
+    "objective",
+    "ports",
+    "budgets",
+    "idempotency_key"
+  ],
+  "title": "ScanRequest",
+  "type": "object"
+}

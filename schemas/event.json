@@ -1,0 +1,362 @@
+{
+  "$defs": {
+    "Confidence": {
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched a rule in `sonde-interpret`.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "Endpoint": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "required": [
+        "transport",
+        "port"
+      ],
+      "type": "object"
+    },
+    "NonEmpty_of_Digest": {
+      "description": "A vector guaranteed to hold at least one element.\n\nUsed so that a `Finding` cannot be constructed without evidence. The\nguarantee lives in the type system rather than in a validation pass,\nbecause a validation pass can be forgotten.\n\n`NonEmpty<T>` is instantiated at more than one `T` in this crate (e.g.\n`NonEmpty<String>` in `request.rs`, `NonEmpty<Digest>` in `event.rs`), so\neach instantiation needs its own name in the generated JSON Schema's\n`$defs`. Without `#[schemars(rename = ...)]`, schemars_derive 1.2.2 names\nevery generic struct after its bare Rust identifier\n(`schemars_derive-1.2.2/src/lib.rs`'s `derive_json_schema`: `let name =\ncont.name();` is just the struct ident when no `rename` is set, with no\nreference to the type parameter) and disambiguates collisions by\n*declaration order* within a `SchemaGenerator` run, appending \"2\", \"3\",\netc. That makes `$defs` key names depend on unrelated field-ordering\ndecisions elsewhere in the crate -- reordering or adding a field renames\nthem, producing spurious diffs against the schemas committed under\n`schemas/` (checked by `xtask check-schemas`).\n\nThe fix uses the format-string form of `#[schemars(rename = \"...\")]`,\nwhich is schemars' own built-in mechanism for this: \"If set on a struct\nor enum with generic type parameters, then the given name may contain\nthem enclosed in curly braces (e.g. `{T}`) and they will be replaced with\nthe concrete type names when the schema is generated\"\n(`schemars_derive-1.2.2/attributes.md`, the `rename` section). This is\nalso exactly the pattern schemars uses for its own builtin generic\nimpls, e.g. `Vec<T>`'s `schema_name()` is\n`format!(\"Array_of_{}\", T::schema_name())`\n(`schemars-1.2.2/src/json_schema_impls/sequences.rs`) -- `_of_`, not\n`_for_`. Confirmed empirically with a throwaway probe crate against this\nworkspace's exact schemars 1.2.2: a struct holding `NonEmpty<String>` and\n`NonEmpty<u8>` emits `$defs` keys `NonEmpty_of_string` and\n`NonEmpty_of_uint8` regardless of the two fields' declaration order, each\nstill carrying its own `minItems: 1`.",
+      "items": {
+        "$ref": "#/$defs/Digest"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "description": "What a probe concluded about one endpoint. Every field beyond `service` is\noptional because partial identification is normal and honest.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "product": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "service",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "PortState": {
+      "description": "The observed reachability of one endpoint.\n\n`Filtered` and `Closed` are distinct on purpose: a closed port is positive\nevidence that a host is up, a filtered port is evidence of a middlebox.",
+      "oneOf": [
+        {
+          "enum": [
+            "open",
+            "closed",
+            "filtered"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "Probed, but the response was contradictory across retries.",
+          "type": "string"
+        }
+      ]
+    },
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-9A-HJKMNP-TV-Z]{26}$",
+      "type": "string"
+    },
+    "Target": {
+      "additionalProperties": false,
+      "properties": {
+        "ip": {
+          "format": "ip",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ip"
+      ],
+      "type": "object"
+    },
+    "Transport": {
+      "enum": [
+        "tcp",
+        "udp"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "One immutable entry in a scan's append-only log.\n\n`sequence` is gap-free and monotonic per scan; resumption replays from the\nlast persisted sequence, so a gap means data loss and is a hard error.\n\nDeliberately **not** `#[serde(deny_unknown_fields)]` on this struct, even\nthough every other wire type in this crate carries that attribute.\nCombining `#[serde(deny_unknown_fields)]` on a container with\n`#[serde(flatten)]` on one of its fields is a known sharp edge in serde:\nflatten forces the derived `Deserialize` impl to buffer the document\nthrough a generic content map to figure out which keys belong to the\nflattened field, and `deny_unknown_fields` on that *same* container runs\nits \"is this key one of my own fields\" check against that buffering step\n-- which doesn't know about the flattened type's fields at all. The\npractical effect, confirmed empirically with a throwaway probe crate\nagainst this workspace's exact serde version: it does not merely fail to\nreject unknown fields, it rejects *every* input, including fully valid\nones, with `unknown field `event_type``. `deny_unknown_fields` and\n`flatten` cannot both live here.\n\nThe guarantee is not weakened, only relocated: `#[serde(deny_unknown_fields)]`\nis on `EventBody` (below) instead. Every field of a wire document that\nisn't one of `Event`'s own four direct fields (`scan_id`, `sequence`,\n`timestamp`, `engine_version`) is, by construction of `#[serde(flatten)]`,\nexactly the set of fields handed to `EventBody`'s deserializer -- so\n`EventBody`'s `deny_unknown_fields` rejects anything that isn't the\n`event_type` discriminator or one of the matched variant's own fields,\nwhich is the same \"no unrecognized field anywhere in the document\"\nguarantee `Event`'s own `deny_unknown_fields` would have provided, had it\nbeen usable. Confirmed with the same probe crate: an unrelated top-level\nfield (not part of `Event`'s direct fields, not part of any `EventBody`\nvariant) is still rejected. What's lost is only where the guarantee is\nenforced, not whether it is enforced. See `event::tests::\nunknown_top_level_field_is_rejected_via_event_body` and `event::tests::\nunknown_field_inside_a_variant_is_rejected` below for the two concrete\ncases this covers.",
+  "oneOf": [
+    {
+      "properties": {
+        "estimated_probes": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "estimated_targets": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "event_type": {
+          "const": "scan.started",
+          "type": "string"
+        },
+        "plan_hash": {
+          "$ref": "#/$defs/Digest"
+        }
+      },
+      "required": [
+        "event_type",
+        "plan_hash",
+        "estimated_targets",
+        "estimated_probes"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "event_type": {
+          "const": "host.discovered",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/NonEmpty_of_Digest"
+        },
+        "method": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/Target"
+        }
+      },
+      "required": [
+        "event_type",
+        "target",
+        "method",
+        "evidence_refs"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "event_type": {
+          "const": "port.state",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/NonEmpty_of_Digest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "state": {
+          "$ref": "#/$defs/PortState"
+        },
+        "target": {
+          "$ref": "#/$defs/Target"
+        }
+      },
+      "required": [
+        "event_type",
+        "target",
+        "endpoint",
+        "state"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint"
+        },
+        "event_type": {
+          "const": "service.observed",
+          "type": "string"
+        },
+        "evidence_refs": {
+          "$ref": "#/$defs/NonEmpty_of_Digest"
+        },
+        "observation": {
+          "$ref": "#/$defs/Observation"
+        },
+        "probe_id": {
+          "type": "string"
+        },
+        "target": {
+          "$ref": "#/$defs/Target"
+        }
+      },
+      "required": [
+        "event_type",
+        "target",
+        "endpoint",
+        "observation",
+        "evidence_refs",
+        "probe_id"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "event_type": {
+          "const": "scan.progress",
+          "type": "string"
+        },
+        "packets_spent": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "probes_sent": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "probes_total": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_type",
+        "probes_sent",
+        "probes_total",
+        "packets_spent"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "event_type": {
+          "const": "policy.denied",
+          "type": "string"
+        },
+        "reason_code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type",
+        "reason_code",
+        "detail"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "event_type": {
+          "const": "scan.completed",
+          "type": "string"
+        },
+        "findings": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "packets_spent": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "probes_sent": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "event_type",
+        "probes_sent",
+        "packets_spent",
+        "findings"
+      ],
+      "type": "object"
+    },
+    {
+      "properties": {
+        "detail": {
+          "type": "string"
+        },
+        "event_type": {
+          "const": "scan.failed",
+          "type": "string"
+        },
+        "reason_code": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "event_type",
+        "reason_code",
+        "detail"
+      ],
+      "type": "object"
+    }
+  ],
+  "properties": {
+    "engine_version": {
+      "type": "string"
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    },
+    "sequence": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "timestamp": {
+      "description": "RFC 3339 UTC with milliseconds. Supplied by an injected `Clock`.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "scan_id",
+    "sequence",
+    "timestamp",
+    "engine_version"
+  ],
+  "title": "Event",
+  "type": "object"
+}

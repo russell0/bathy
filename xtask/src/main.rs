@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::Path;
 
 /// Crates are listed lowest-level first. A crate may only depend on crates
 /// that appear strictly earlier in this list.
@@ -31,8 +32,10 @@ const FORBIDDEN_SUBSTRINGS: &[&str] = &[
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     match std::env::args().nth(1).as_deref() {
         Some("check-deps") => check_deps(),
+        Some("emit-schemas") => emit_schemas(true),
+        Some("check-schemas") => emit_schemas(false),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
-        None => Err("usage: xtask <check-deps>".into()),
+        None => Err("usage: xtask <check-deps|emit-schemas|check-schemas>".into()),
     }
 }
 
@@ -136,6 +139,66 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+/// The published contract: `schemas/*.json` are committed, and this is the
+/// gate that stops a type change from silently altering what agents were
+/// promised (AC-1.22).
+///
+/// `write == true` ("emit-schemas") regenerates every file under `dir` from
+/// `sonde_types::schema::all()`, unconditionally. `write == false`
+/// ("check-schemas") instead compares what's on disk against what
+/// regeneration would produce and fails — naming every drifted file — if
+/// they differ. A missing file is treated as drift too (surfaced as an `Err`
+/// naming the path, same as any other read failure), not silently skipped,
+/// so a schema that was never committed at all is still caught.
+fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let schemas = sonde_types::schema::all();
+    let drift = diff_or_write(&schemas, Path::new("schemas"), write)?;
+    if drift.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "schema drift in: {}. Run `cargo run -p xtask -- emit-schemas` and commit.",
+            drift.join(", ")
+        )
+        .into())
+    }
+}
+
+/// The pure-ish core of [`emit_schemas`]: given the schema set and a target
+/// directory, either writes every schema (returning no drift) or reports
+/// which files, if any, differ from what writing would produce. Separated
+/// from `emit_schemas` (which always points at `sonde_types::schema::all()`
+/// and the real `schemas/` directory) so the drift-detection logic itself is
+/// testable against a synthetic schema set and a scratch directory, without
+/// mutating this repository's committed schemas — mirroring `find_violations`
+/// above, which is `check_deps`'s own I/O-free rule-checking core.
+fn diff_or_write(
+    schemas: &BTreeMap<&'static str, serde_json::Value>,
+    dir: &Path,
+    write: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut drift = Vec::new();
+    for (name, schema) in schemas {
+        let path = dir.join(format!("{name}.json"));
+        let rendered = format!("{}\n", serde_json::to_string_pretty(schema)?);
+        if write {
+            std::fs::create_dir_all(dir)?;
+            std::fs::write(&path, rendered)?;
+        } else {
+            let on_disk = std::fs::read_to_string(&path).map_err(|e| {
+                format!(
+                    "{}: {e} (run `cargo run -p xtask -- emit-schemas`)",
+                    path.display()
+                )
+            })?;
+            if on_disk != rendered {
+                drift.push(path.display().to_string());
+            }
+        }
+    }
+    Ok(drift)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,5 +288,112 @@ mod tests {
     fn empty_workspace_has_no_violations() {
         let violations = find_violations(&[]);
         assert!(violations.is_empty());
+    }
+
+    // --- diff_or_write: the drift-detection core behind AC-1.22, exercised
+    // against a synthetic schema set and a scratch directory rather than the
+    // real `schemas/` this repository commits. Each test cleans up its own
+    // directory at the end so scratch state never leaks between tests. ---
+
+    fn scratch_dir(label: &str) -> std::path::PathBuf {
+        // Unique per test *and* per call within a test, so parallel test
+        // threads (cargo test's default) never collide on the same path.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "xtask-diff-or-write-test-{label}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn one_schema() -> BTreeMap<&'static str, serde_json::Value> {
+        let mut m = BTreeMap::new();
+        m.insert("thing", serde_json::json!({"type": "object"}));
+        m
+    }
+
+    #[test]
+    fn write_true_creates_the_directory_and_file() {
+        let dir = scratch_dir("write-creates");
+        let drift = diff_or_write(&one_schema(), &dir, true).unwrap();
+        assert!(drift.is_empty(), "write mode should report no drift");
+        let on_disk = std::fs::read_to_string(dir.join("thing.json")).unwrap();
+        assert_eq!(on_disk, "{\n  \"type\": \"object\"\n}\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_false_reports_no_drift_immediately_after_write() {
+        let dir = scratch_dir("check-matches");
+        diff_or_write(&one_schema(), &dir, true).unwrap();
+        let drift = diff_or_write(&one_schema(), &dir, false).unwrap();
+        assert!(drift.is_empty(), "expected no drift, got {drift:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_false_names_the_file_when_on_disk_content_differs() {
+        // Proves the "one byte edited" case: write the real schema, hand-edit
+        // the file on disk, then confirm check mode names it.
+        let dir = scratch_dir("check-byte-edit");
+        diff_or_write(&one_schema(), &dir, true).unwrap();
+        let path = dir.join("thing.json");
+        let mut edited = std::fs::read_to_string(&path).unwrap();
+        edited.push_str("   "); // trailing bytes: still "one byte changed" in spirit
+        std::fs::write(&path, edited).unwrap();
+
+        let drift = diff_or_write(&one_schema(), &dir, false).unwrap();
+        assert_eq!(
+            drift.len(),
+            1,
+            "expected exactly one drifted file: {drift:?}"
+        );
+        assert!(
+            drift[0].ends_with("thing.json"),
+            "drift entry should name the file, got {drift:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_false_fails_when_a_type_gains_a_field_and_regeneration_never_ran() {
+        // The case the check exists for: the schema *source* (what
+        // `sonde_types::schema::all()` would now produce) has changed --
+        // simulated here by handing `diff_or_write` a schema set with an
+        // extra property -- but nobody re-ran `emit-schemas`, so the
+        // committed file is still the old shape. This must be reported as
+        // drift even though no one touched the file on disk at all.
+        let dir = scratch_dir("check-added-field");
+        diff_or_write(&one_schema(), &dir, true).unwrap();
+
+        let mut changed = BTreeMap::new();
+        changed.insert(
+            "thing",
+            serde_json::json!({"type": "object", "properties": {"new_field": {"type": "string"}}}),
+        );
+        let drift = diff_or_write(&changed, &dir, false).unwrap();
+        assert_eq!(
+            drift.len(),
+            1,
+            "a type gaining a field without regeneration must be reported as drift: {drift:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn check_false_errors_naming_the_path_when_the_file_is_missing_entirely() {
+        let dir = scratch_dir("check-missing");
+        let err = diff_or_write(&one_schema(), &dir, false).unwrap_err();
+        assert!(
+            err.to_string().contains("thing.json"),
+            "error should name the missing file: {err}"
+        );
+        assert!(
+            err.to_string().contains("emit-schemas"),
+            "error should point at the remediation command: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
