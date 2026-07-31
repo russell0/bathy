@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 pub mod confidence;
+pub mod event;
 pub mod ids;
 pub mod nonempty;
 pub mod request;
 
 pub use confidence::{Confidence, ConfidenceError};
+pub use event::{Endpoint, Event, EventBody, Observation, PortState, Target, Transport};
 pub use ids::{Digest, EventId, IdError, ScanId, ScopeId};
 pub use nonempty::{EmptyError, NonEmpty};
 pub use request::{
