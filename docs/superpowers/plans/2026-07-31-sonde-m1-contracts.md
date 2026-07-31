@@ -1707,7 +1707,8 @@ git commit -m "feat(scope): deny-by-default manifest with expiry and reserved-ra
 - **AC-1.25** Loopback, multicast, broadcast, link-local, and unspecified addresses are refused even when the manifest allows `0.0.0.0/0`.
 - **AC-1.26** A manifest with an empty `allowed_cidrs` fails to load.
 - **AC-1.27** `is_expired` returns true for any instant after `not_after`, comparing parsed instants rather than RFC 3339 strings, and fails closed on unparseable input. Test a non-`Z` offset that shifts the calendar date — lexicographic comparison gets that case wrong in the unsafe direction.
-- **AC-1.28** Every IPv6 address is refused in v0.1, IPv6 scanning being out of scope — which satisfies the loopback/multicast/unspecified/`fe80::/10` requirement and additionally defeats all eight known IPv4-in-IPv6 embedding schemes. The parked prefix guards carry positive-match tests for all 12 disjuncts so they cannot rot before v0.2.\n- **AC-1.36** `load()` hard-fails when no usable (IPv4) allow entries remain, so a manifest that can never authorize anything is an error rather than a warning.
+- **AC-1.28** Every IPv6 address is refused in v0.1, IPv6 scanning being out of scope — which satisfies the loopback/multicast/unspecified/`fe80::/10` requirement and additionally defeats all eight known IPv4-in-IPv6 embedding schemes. The parked prefix guards carry positive-match tests for all 12 disjuncts so they cannot rot before v0.2.
+- **AC-1.36** `load()` hard-fails when no usable (IPv4) allow entries remain, so a manifest that can never authorize anything is an error rather than a warning.
 
 ---
 
@@ -2082,6 +2083,6 @@ M1 is complete when all of the following hold:
 - [ ] `cargo clippy --workspace --all-targets -- -D warnings` is clean.
 - [ ] `cargo run -p xtask -- check-deps` and `check-schemas` both exit 0.
 - [ ] `schemas/scan-request.json`, `event.json`, `task-handle.json`, `scope-manifest.json` are committed.
-- [ ] AC-1.1 through AC-1.34 are each demonstrated by a named passing test.
+- [ ] AC-1.1 through AC-1.36 are each demonstrated by a named passing test.
 - [ ] No crate outside `sonde-packetd` contains `unsafe`.
 - [ ] `sonde-types` has zero internal dependencies and no `tokio` in its dependency tree.
