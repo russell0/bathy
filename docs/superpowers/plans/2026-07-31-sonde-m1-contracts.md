@@ -838,14 +838,22 @@ pub enum EvidenceLevel {
     Full,
 }
 
+/// NOTE: `rename_all = "kebab-case"` alone is NOT sufficient here. Serde's
+/// kebab-case does not insert a hyphen before a trailing digit run, so
+/// `Common1000` renders as `"common1000"`, which fails to parse the canonical
+/// `"common-1000"`. Verified against serde 1.0.229. The explicit renames below
+/// are load-bearing — do not remove them believing `rename_all` covers it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub enum PortPreset {
     /// The 100 most commonly listening TCP ports, from our own dataset.
+    #[serde(rename = "top-100")]
     Top100,
     /// The 1000 most commonly listening TCP ports, from our own dataset.
+    #[serde(rename = "common-1000")]
     Common1000,
     /// All 65535 TCP ports. Requires a budget large enough to cover them.
+    #[serde(rename = "all")]
     All,
 }
 
@@ -856,10 +864,12 @@ pub enum PortSelection {
         preset: PortPreset,
     },
     /// Explicit ports and inclusive ranges, e.g. `["22", "80", "8000-8100"]`.
-    Explicit {
-        #[schemars(length(min = 1))]
-        explicit: Vec<String>,
-    },
+    ///
+    /// `NonEmpty`, not `Vec` + `schemars(length)`. The schemars attribute
+    /// constrains only the *generated schema*; it does not validate at
+    /// deserialization, so `{"explicit": []}` would parse while the published
+    /// schema declared it invalid. `NonEmpty` enforces both paths.
+    Explicit { explicit: NonEmpty<String> },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -895,8 +905,9 @@ pub struct Budgets {
 #[serde(deny_unknown_fields)]
 pub struct ScanRequest {
     /// CIDRs, single addresses, or inclusive `a.b.c.d-e.f.g.h` ranges.
-    #[schemars(length(min = 1))]
-    pub targets: Vec<String>,
+    /// `NonEmpty` for the same reason as `PortSelection::Explicit` — an empty
+    /// target list must be unrepresentable, not merely schema-discouraged.
+    pub targets: NonEmpty<String>,
     /// The manifest authorizing this scan. Without it there is no scan.
     pub authorization_scope_id: ScopeId,
     pub objective: Objective,
