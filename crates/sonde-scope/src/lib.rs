@@ -6,6 +6,10 @@
 //! itself -- every other crate that ends up putting a packet on the wire
 //! goes through this gate first.
 
+pub mod budget;
 pub mod manifest;
+pub mod policy;
 
+pub use budget::{BudgetExhausted, BudgetLedger};
 pub use manifest::{ManifestError, ScopeManifest};
+pub use policy::{DenyReason, PolicyDecision, evaluate};
