@@ -39,6 +39,11 @@ pub enum IdError {
     WrongAlgorithm,
     #[error("expected 64 hex characters, found {0}")]
     BadDigestLength(usize),
+    /// Also returned for otherwise-valid hex that isn't lowercase (e.g.
+    /// `A`-`F`): this type deliberately accepts only what its published
+    /// JSON Schema pattern allows, so "wrong case" and "not hex at all"
+    /// share this variant rather than splitting into a `NonLowercaseHex`
+    /// case a caller would have no different remediation for.
     #[error("invalid hex in digest")]
     BadHex,
     #[error("expected identifier prefix `{expected}_`")]
@@ -53,6 +58,19 @@ impl FromStr for Digest {
         let hex = s.strip_prefix("blake3:").ok_or(IdError::WrongAlgorithm)?;
         if hex.len() != 64 {
             return Err(IdError::BadDigestLength(hex.len()));
+        }
+        // Deliberately strict: only lowercase hex digits are accepted, to
+        // match this type's published JSON Schema pattern exactly
+        // (`^blake3:[0-9a-f]{64}$`). `u8::from_str_radix(_, 16)` below is
+        // case-insensitive on its own and would otherwise accept
+        // uppercase/mixed-case hex, which the schema forbids -- a document
+        // that fails schema validation must not be accepted by this type.
+        // Do not relax this by swapping in `is_ascii_hexdigit()`.
+        if !hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(IdError::BadHex);
         }
         let mut out = [0u8; 32];
         for (i, byte) in out.iter_mut().enumerate() {
@@ -198,7 +216,20 @@ mod tests {
     #[test]
     fn digest_rejects_wrong_algorithm() {
         let bad = format!("sha256:{}", "a".repeat(64));
-        assert!(bad.parse::<Digest>().is_err());
+        assert_eq!(bad.parse::<Digest>().unwrap_err(), IdError::WrongAlgorithm);
+    }
+
+    #[test]
+    fn digest_rejects_missing_algorithm_prefix() {
+        // A bare 64-hex string with no prefix at all must still be
+        // rejected. This is exactly the case that goes unnoticed if the
+        // `strip_prefix("blake3:").ok_or(...)` check is ever removed or
+        // weakened to a fallback (see `digest_rejects_wrong_algorithm`'s
+        // history: that test alone did not catch such a regression,
+        // because a 71-character `sha256:`-prefixed string happens to
+        // fail the length check instead once the prefix check is gone).
+        let bad = "a".repeat(64);
+        assert_eq!(bad.parse::<Digest>().unwrap_err(), IdError::WrongAlgorithm);
     }
 
     #[test]
@@ -228,6 +259,56 @@ mod tests {
     fn digest_rejects_invalid_hex() {
         let bad = format!("blake3:{}", "z".repeat(64));
         assert_eq!(bad.parse::<Digest>(), Err(IdError::BadHex));
+    }
+
+    // --- Strictness: the Rust type must accept exactly what the
+    // published JSON Schema pattern `^blake3:[0-9a-f]{64}$` allows, no
+    // more. `u8::from_str_radix(_, 16)` is case-insensitive by itself, so
+    // this is deliberately over-and-above what parsing alone would give.
+
+    #[test]
+    fn digest_accepts_lowercase_hex_via_from_str() {
+        // Belt-and-suspenders alongside `digest_roundtrips_through_string`:
+        // spells out that a hand-written (not just self-rendered)
+        // lowercase-hex string parses successfully.
+        let hex = "0f".repeat(32);
+        assert!(format!("blake3:{hex}").parse::<Digest>().is_ok());
+    }
+
+    #[test]
+    fn digest_rejects_uppercase_hex_via_from_str() {
+        let bad = format!("blake3:{}", "A".repeat(64));
+        assert_eq!(bad.parse::<Digest>(), Err(IdError::BadHex));
+    }
+
+    #[test]
+    fn digest_rejects_mixed_case_hex_via_from_str() {
+        let mut hex = "a".repeat(63);
+        hex.push('F');
+        let bad = format!("blake3:{hex}");
+        assert_eq!(bad.parse::<Digest>(), Err(IdError::BadHex));
+    }
+
+    #[test]
+    fn digest_accepts_lowercase_hex_via_deserialize() {
+        let hex = "0f".repeat(32);
+        let json = format!("\"blake3:{hex}\"");
+        let d: Digest = serde_json::from_str(&json).unwrap();
+        assert_eq!(d.to_string(), format!("blake3:{hex}"));
+    }
+
+    #[test]
+    fn digest_rejects_uppercase_hex_via_deserialize() {
+        let json = format!("\"blake3:{}\"", "A".repeat(64));
+        assert!(serde_json::from_str::<Digest>(&json).is_err());
+    }
+
+    #[test]
+    fn digest_rejects_mixed_case_hex_via_deserialize() {
+        let mut hex = "a".repeat(63);
+        hex.push('F');
+        let json = format!("\"blake3:{hex}\"");
+        assert!(serde_json::from_str::<Digest>(&json).is_err());
     }
 
     #[test]
