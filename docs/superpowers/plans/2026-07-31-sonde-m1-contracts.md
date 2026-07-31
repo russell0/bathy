@@ -52,10 +52,16 @@ proptest = "1"
 
 `rust-toolchain.toml`:
 ```toml
+# Develop on stable. 1.85 is the MSRV, declared as `rust-version` in the
+# workspace manifest and verified by a dedicated CI job — pinning the
+# toolchain to the MSRV itself would force every contributor to download an
+# old compiler and would hide warnings that newer compilers catch.
 [toolchain]
-channel = "1.85"
+channel = "stable"
 components = ["rustfmt", "clippy"]
 ```
+
+Verified locally: rustc 1.97.1 satisfies the 1.85 floor and compiles edition 2024.
 
 - [ ] **Step 2: Add both license files**
 
@@ -166,7 +172,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
@@ -187,6 +193,16 @@ jobs:
           # Bracket expression matches the phrase without this line containing it.
           ! grep -rniIE "deterministic[ ]results" . --exclude-dir=target --exclude-dir=.git \
             | grep -v '\[phrase-rule\]'
+  # The MSRV is a promise to downstream consumers, so it gets its own job.
+  # Without this, MSRV rots silently the first time someone uses a newer API.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
+      - run: cargo check --workspace --all-targets
+
   deny:
     runs-on: ubuntu-latest
     steps:
@@ -220,6 +236,7 @@ git commit -m "chore: workspace scaffold, dual license, CI, dependency-boundary 
 - **AC-1.3** Both `LICENSE-APACHE` and `LICENSE-MIT` exist and every crate manifest declares `license = "Apache-2.0 OR MIT"` via `workspace = true`.
 - **AC-1.4** CI fails the build if `unsafe ` appears in any crate other than `sonde-packetd`.
 - **AC-1.5** CI fails the build if the unscoped determinism phrase appears on any line not carrying the `[phrase-rule]` marker. Prove both directions: a seeded unmarked occurrence fails the build, and the rule's own marked statements do not. `[phrase-rule]`
+- **AC-1.35** A dedicated CI job compiles the workspace on Rust 1.85 with `rust-toolchain.toml` removed, so the declared MSRV is verified rather than assumed. Development itself happens on stable. (Numbered out of positional order: added after the toolchain was installed and the exact-version pin proved wrong.)
 
 ---
 
