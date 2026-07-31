@@ -510,7 +510,7 @@ prefixed_id!(EventId, "evt", "Identifies one immutable event.");
 prefixed_id!(ScopeId, "scope", "Identifies an authorization scope manifest.");
 ```
 
-Note: identifiers are *constructed* only in `sonde-store` (M2), which owns the clock and the ULID generator. `from_ulid` exists so pure crates and tests can build them without a clock.
+Note: identifiers are *constructed* only through a `Clock` implementation. `Clock` is created in **M2 Task 1** and lives in `sonde-types` — not in `sonde-store`, which sits above `sonde-evidence` in the layer order and would make `EventLog::append` an upward dependency. `from_ulid` exists so pure crates and tests can build identifiers without a clock.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
