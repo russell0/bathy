@@ -21,6 +21,19 @@ pub enum ManifestError {
     /// expiry nobody can evaluate correctly.
     #[error("`not_after` is not a valid RFC 3339 timestamp: `{0}`")]
     BadExpiry(String),
+    /// Every entry in `allowed_cidrs` is IPv6, which is unsupported in
+    /// v0.1 (see `is_ordinary_unicast`'s doc comment): `allows()` refuses
+    /// every IPv6 address unconditionally, so a manifest like this can
+    /// never authorize any address at all -- behaviorally identical to
+    /// `allowed_cidrs: []`, which [`NoAllowedCidrs`](Self::NoAllowedCidrs)
+    /// already hard-fails on. A manifest with at least one usable IPv4
+    /// entry alongside IPv6 ones is not affected by this variant; that
+    /// case loads with a warning instead (see `load`).
+    #[error(
+        "every entry in `allowed_cidrs` is IPv6, which is unsupported in v0.1; \
+         a manifest must list at least one usable (IPv4) allowed CIDR"
+    )]
+    NoUsableAllowedCidrs,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +107,24 @@ impl ScopeManifest {
             .map_err(|_| ManifestError::BadExpiry(raw.not_after.clone()))?;
         let allowed = parse(&raw.allowed_cidrs)?;
         let denied = parse(&raw.denied_cidrs)?;
+
+        // Fix round 4 (Finding C): an allow set that is entirely IPv6 can
+        // never authorize anything under the v0.1 blanket IPv6 refusal --
+        // behaviorally identical to an empty allow set, which the
+        // `raw.allowed_cidrs.is_empty()` check above already hard-fails
+        // on. Treating one as an error and the other as a mere warning
+        // would be exactly the "authorized something, got no error"
+        // inconsistency this project keeps ruling against (see the
+        // signature and mixed-manifest warnings below, which exist for
+        // the same reason). Hard-fail here too, but only when there is NO
+        // usable entry left -- `allowed` is non-empty at this point
+        // (`raw.allowed_cidrs.is_empty()` already returned above), so
+        // `all()` is not vacuously true. A MIXED manifest (at least one
+        // IPv4 entry alongside IPv6 ones) still warns-and-loads below,
+        // since its IPv4 entries remain genuinely meaningful.
+        if allowed.iter().all(|net| matches!(net, IpNet::V6(_))) {
+            return Err(ManifestError::NoUsableAllowedCidrs);
+        }
 
         if raw.signature.is_some() {
             // Loud on purpose: a signature field that looks like it should
@@ -331,6 +362,45 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
 /// it in v0.1; do not remove that attribute by deleting the function
 /// instead -- the research stays, it just is not live.
 ///
+/// # Before reconnecting this in v0.2, read this
+///
+/// This function is unreachable in v0.1. Its 12 disjuncts (4 baseline
+/// reserved-range checks -- loopback, multicast, unspecified, `fe80::/10`
+/// -- plus the 8 embedding/transition prefixes in the table below) are
+/// each covered by a **positive-match test** calling this function
+/// directly (added in fix round 4, Finding A; see e.g.
+/// `isatap_prefix_guard_is_precise` and the boundary-assertion rewrites in
+/// the round-1/round-2 tests for the pattern every one of them follows).
+/// That coverage proves each guard catches at least the one address it was
+/// written for, and that the boundary-adjacent address just outside each
+/// prefix is not caught -- i.e. neither too narrow nor too broad, *as
+/// exercised by these specific test addresses*.
+///
+/// It does **not** prove this function is safe to reconnect as-is. Before
+/// wiring `is_ordinary_unicast`'s `IpAddr::V6` arm to call this function
+/// again: re-run the full mutation-testing discipline used throughout
+/// fix rounds 1-4 against the *reconnected* live path (`allows()`, not
+/// this function in isolation) -- delete or invert each guard in turn,
+/// confirm the right test fails, revert -- and re-run the systematic RFC
+/// and IANA-registry sweep from fix round 2/3, since new embedding or
+/// transition schemes can be standardized between now and whenever v0.2
+/// ships. Do not treat "the parked tests still pass" as sufficient
+/// evidence the guards are complete; it never was, even in v0.1 -- see
+/// the "floor, not a proof of completeness" language throughout this
+/// function's own history in `task-7-report.md`.
+///
+/// One nuance the mutation testing behind this itself surfaced: `is_loopback()`
+/// and `is_unspecified()` cannot be individually falsified by deleting them
+/// alone, because their only possible trigger addresses (`::1` and `::`
+/// respectively) are *both* also inside the `::/96` IPv4-compatible guard's
+/// bit pattern (segments 0..=5 all zero is satisfied by both). Their
+/// positive-match tests still pass -- the addresses are still correctly
+/// refused -- but that refusal is only demonstrably attributable to
+/// `::/96` for those two specific addresses, not to `is_loopback`/
+/// `is_unspecified` individually. This is not a test gap to fix; it is a
+/// real, inherent overlap between two of the twelve disjuncts, kept
+/// documented here rather than silently discovered again later.
+///
 /// # Eight standardized IPv4-in-IPv6 embedding and transition prefixes
 ///
 /// | Prefix | Scheme | RFC |
@@ -512,7 +582,13 @@ mod tests {
     // AC-1.28. ---
 
     fn permissive_ipv6_manifest() -> ScopeManifest {
-        let permissive = MANIFEST.replace(r#"["10.30.0.0/24"]"#, r#"["::/0"]"#);
+        // Fix round 4 (Finding C): an all-IPv6 allow set now hard-fails to
+        // load (`ManifestError::NoUsableAllowedCidrs`), so this fixture
+        // must keep at least one IPv4 entry to stay loadable -- it is a
+        // MIXED manifest. Every test using this helper only ever probes
+        // IPv6 addresses, so the IPv4 entry being present and unused is
+        // not a behavior change for any of them.
+        let permissive = MANIFEST.replace(r#"["10.30.0.0/24"]"#, r#"["10.30.0.0/24", "::/0"]"#);
         ScopeManifest::load(&permissive).unwrap()
     }
 
@@ -534,6 +610,40 @@ mod tests {
         assert!(!m.allows(ip("ff02::1")), "multicast");
         assert!(!m.allows(ip("::")), "unspecified");
         assert!(!m.allows(ip("fe80::1")), "link-local");
+    }
+
+    // Fix round 4 (Finding A): the assertions above only prove `m.allows()`
+    // refuses these addresses, which under the v0.1 blanket policy is true
+    // regardless of whether the individual parked checks below are even
+    // correct -- a mutation audit confirmed exactly that: deleting
+    // `is_loopback()`, `is_multicast()`, or `is_unspecified()` from
+    // `ipv6_is_ordinary_by_prefix_rules` left every existing test passing.
+    // These are the positive-match tests that were missing: each calls the
+    // parked function directly and asserts it actually catches the address
+    // its corresponding baseline check exists for, independent of the
+    // blanket policy.
+    #[test]
+    fn parked_baseline_reserved_checks_have_positive_match_coverage() {
+        // Mutation-tested individually: deleting `is_multicast()` alone
+        // makes this assertion fail (see the task report). Deleting
+        // `is_loopback()` or `is_unspecified()` alone does NOT make their
+        // assertions fail -- `::1` and `::` are both also inside the
+        // `::/96` guard's bit pattern (segments 0..=5 all zero), so that
+        // guard alone still catches them. This is a real, inherent overlap
+        // between disjuncts, not a gap in these assertions; see the note
+        // on `ipv6_is_ordinary_by_prefix_rules`'s doc comment.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("::1")),
+            "is_loopback() must catch ::1"
+        );
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("ff02::1")),
+            "is_multicast() must catch ff02::1"
+        );
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("::")),
+            "is_unspecified() must catch ::"
+        );
     }
 
     // The dispatch's explicit ask: prove the `(segments()[0] & 0xffc0) ==
@@ -566,6 +676,19 @@ mod tests {
             ipv6_is_ordinary_by_prefix_rules(ipv6("fec0::")),
             "fec0:: is one step past fe80::/10 and must not be caught by the mask"
         );
+        // Fix round 4 (Finding A): positive-match coverage for the fe80
+        // mask itself, calling the parked function directly rather than
+        // `m.allows()` -- the two "must be refused" assertions above only
+        // prove the blanket policy refuses these, not that the mask would
+        // catch them if reconnected without it.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("fe80::")),
+            "the fe80::/10 mask must catch fe80::"
+        );
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff")),
+            "the fe80::/10 mask must catch febf:ffff:..."
+        );
     }
 
     // --- IPv4-mapped IPv6 addresses: the decision documented on
@@ -595,6 +718,12 @@ mod tests {
             "v4-mapped address inside the ordinary allow range must still be \
              refused: mapped addresses are refused outright, not evaluated \
              as their embedded IPv4 address"
+        );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("::ffff:127.0.0.1")),
+            "the ::ffff:0:0/96 IPv4-mapped guard must catch ::ffff:127.0.0.1"
         );
         // Sanity check the fixture actually is dual-stack-permissive for
         // IPv4, so the assertions above are proving the mapped-address
@@ -639,6 +768,13 @@ mod tests {
             !m.allows(ip("::7f00:1")),
             "IPv4-compatible loopback (::127.0.0.1) must be refused"
         );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly -- proves the ::/96 guard itself
+        // catches this address, not just that the blanket policy does.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("::7f00:1")),
+            "the ::/96 IPv4-compatible guard must catch ::7f00:1"
+        );
         // Boundary: one bit outside ::/96 (segment 5, the last of the top
         // 96 bits, set instead of zero) must NOT be caught by this rule.
         assert!(
@@ -663,6 +799,13 @@ mod tests {
             !m.allows(ip("64:ff9b::e000:1")),
             "NAT64-embedded multicast must be refused"
         );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("64:ff9b::7f00:1")),
+            "the 64:ff9b::/96 NAT64 well-known-prefix guard must catch \
+             64:ff9b::7f00:1"
+        );
         // Boundary: one bit outside 64:ff9b::/96 must not be caught.
         assert!(
             ipv6_is_ordinary_by_prefix_rules(ip6_addr([0x0064, 0xff9b, 0, 0, 0, 1, 0x7f00, 1])),
@@ -677,6 +820,13 @@ mod tests {
         assert!(
             !m.allows(ip("64:ff9b:1::7f00:1")),
             "NAT64 local-use-prefix-embedded loopback must be refused"
+        );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("64:ff9b:1::7f00:1")),
+            "the 64:ff9b:1::/48 NAT64 local-use-prefix guard must catch \
+             64:ff9b:1::7f00:1"
         );
         // Boundary: segment 2 one past the /48 (0x0001 -> 0x0002) must not
         // be caught by this rule. It also must not be caught by the
@@ -698,6 +848,12 @@ mod tests {
         assert!(
             !m.allows(ip("2002:7f00:1::1")),
             "6to4-embedded loopback must be refused"
+        );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("2002:7f00:1::1")),
+            "the 2002::/16 6to4 guard must catch 2002:7f00:1::1"
         );
         // Boundary given directly in the fix instructions: 2003::1 (one
         // step past 2002::/16) must not be caught by the 6to4 guard.
@@ -733,6 +889,13 @@ mod tests {
             !m.allows(ip("::ffff:0:0:0")),
             "the IPv4-translated prefix address itself must be refused"
         );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("::ffff:0:127.0.0.1")),
+            "the ::ffff:0:0:0/96 IPv4-translated guard must catch \
+             ::ffff:0:127.0.0.1"
+        );
         // Boundary: segment 5 set to 1 instead of 0 -- one value outside
         // ::ffff:0:0:0/96 -- must not be caught by this guard. Confirmed by
         // the same probe that `to_ipv4_mapped()` is still `None` for this
@@ -764,6 +927,12 @@ mod tests {
         assert!(
             !m.allows(ip("2001::1")),
             "an address in the Teredo prefix 2001::/32 must be refused"
+        );
+        // Fix round 4 (Finding A): positive-match coverage against the
+        // parked function directly.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("2001::1")),
+            "the 2001::/32 Teredo guard must catch 2001::1"
         );
         // Boundary: 2001:1::1 (IANA's own PCP-anycast address, segments[1]
         // == 1 rather than Teredo's required 0) is one segment-value
@@ -884,14 +1053,18 @@ mod tests {
 
     #[test]
     fn manifest_with_ipv6_allowed_cidr_still_loads_successfully() {
-        // Fix round 3: an IPv6 entry in `allowed_cidrs` must warn, not
-        // fail to load -- the manifest may also carry valid IPv4 CIDRs,
-        // and an operator drafting a manifest ahead of v0.2 (when IPv6
-        // scanning lands) should not be blocked from doing so. The warning
-        // text itself is manually verified (see the task report), same as
-        // the signature warning above it in `load` -- this test proves the
-        // load-time behavior (succeeds; IPv4 entries stay usable; the IPv6
-        // entry can never match anything), not the warning's wording.
+        // Fix round 3/4: this is the MIXED case (at least one usable IPv4
+        // entry alongside IPv6 ones) -- warn, not fail, to load. The IPv4
+        // entries remain genuinely meaningful, and an operator drafting a
+        // manifest ahead of v0.2 (when IPv6 scanning lands) should not be
+        // blocked from doing so. Contrast with
+        // `manifest_with_only_ipv6_allowed_cidrs_hard_fails_to_load` below
+        // (Fix round 4, Finding C): an ALL-IPv6 allow set has no usable
+        // entry left and does hard-fail. The warning text itself is
+        // manually verified (see the task report), same as the signature
+        // warning above it in `load` -- this test proves the load-time
+        // behavior (succeeds; IPv4 entries stay usable; the IPv6 entry can
+        // never match anything), not the warning's wording.
         let with_ipv6 = MANIFEST.replace(r#"["10.30.0.0/24"]"#, r#"["10.30.0.0/24", "::/0"]"#);
         let m = ScopeManifest::load(&with_ipv6).unwrap();
         assert!(m.allows(ip("10.30.0.42")), "the IPv4 entry stays usable");
@@ -899,6 +1072,37 @@ mod tests {
             !m.allows(ip("2001:db8::1")),
             "the IPv6 entry can never match anything, per the v0.1 blanket \
              refusal"
+        );
+    }
+
+    // --- Fix round 4 (Finding C): the other two allow-set compositions,
+    // named explicitly alongside the mixed case above so all three
+    // (all-IPv4, mixed, all-IPv6) have a dedicated test each. ---
+
+    #[test]
+    fn manifest_with_only_ipv4_allowed_cidrs_loads_cleanly() {
+        // The ordinary case every other test in this file already
+        // exercises via the bare `MANIFEST` fixture; named explicitly here
+        // as the all-IPv4 baseline for the three-way contrast with the
+        // mixed and all-IPv6 cases.
+        let m = ScopeManifest::load(MANIFEST).unwrap();
+        assert!(m.allows(ip("10.30.0.42")));
+    }
+
+    #[test]
+    fn manifest_with_only_ipv6_allowed_cidrs_hard_fails_to_load() {
+        // An allow set that is entirely IPv6 has no usable entry at all --
+        // behaviorally identical to `allowed_cidrs: []`
+        // (`manifest_with_no_allowed_cidrs_is_rejected` above), which
+        // already hard-fails via `ManifestError::NoAllowedCidrs`. Treating
+        // one as an error and the other as a mere warning would be
+        // inconsistent and would repeat the "authorized something, got no
+        // error" failure this project rules against elsewhere.
+        let all_ipv6 = MANIFEST.replace(r#"["10.30.0.0/24"]"#, r#"["::/0"]"#);
+        let err = ScopeManifest::load(&all_ipv6).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::NoUsableAllowedCidrs),
+            "got {err:?}"
         );
     }
 
