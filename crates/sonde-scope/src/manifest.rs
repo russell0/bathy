@@ -92,6 +92,8 @@ impl ScopeManifest {
         };
         let not_after = OffsetDateTime::parse(&raw.not_after, &Rfc3339)
             .map_err(|_| ManifestError::BadExpiry(raw.not_after.clone()))?;
+        let allowed = parse(&raw.allowed_cidrs)?;
+        let denied = parse(&raw.denied_cidrs)?;
 
         if raw.signature.is_some() {
             // Loud on purpose: a signature field that looks like it should
@@ -110,12 +112,42 @@ impl ScopeManifest {
             );
         }
 
+        // Fix round 3: IPv6 scanning is out of scope for v0.1 (see
+        // `is_ordinary_unicast`'s doc comment and the Gap Register in
+        // docs/superpowers/plans/2026-07-31-sonde-v0.1-overview.md), so
+        // `allows()` refuses every IPv6 address no matter what this
+        // manifest says -- an IPv6 entry in `allowed_cidrs` can never
+        // match anything. Warn rather than fail: the manifest may also
+        // carry perfectly valid IPv4 CIDRs, and an operator drafting a
+        // manifest ahead of v0.2 should not be blocked from doing so.
+        // Staying silent would repeat the exact failure mode the loud
+        // signature warning above exists to avoid -- an agent that thinks
+        // it authorized something and gets no error, when in fact the
+        // entry can never take effect.
+        let ipv6_allow_entries: Vec<&str> = raw
+            .allowed_cidrs
+            .iter()
+            .zip(allowed.iter())
+            .filter(|(_, net)| matches!(net, IpNet::V6(_)))
+            .map(|(s, _)| s.as_str())
+            .collect();
+        if !ipv6_allow_entries.is_empty() {
+            eprintln!(
+                "WARNING: scope manifest {} lists IPv6 CIDR(s) in \
+                 allowed_cidrs ({}); IPv6 scanning is unsupported in v0.1 \
+                 and every IPv6 address is refused regardless of this \
+                 manifest -- these entries can never match.",
+                raw.id,
+                ipv6_allow_entries.join(", ")
+            );
+        }
+
         Ok(Self {
             id: raw.id,
             description: raw.description,
             not_after,
-            allowed: parse(&raw.allowed_cidrs)?,
-            denied: parse(&raw.denied_cidrs)?,
+            allowed,
+            denied,
             ceiling: raw.budget_ceiling,
             had_signature: raw.signature.is_some(),
         })
@@ -218,89 +250,41 @@ impl ScopeManifest {
 /// categories cause collateral traffic or self-scans and are refused
 /// outright.
 ///
-/// # IPv4-in-IPv6 embedding and transition schemes
+/// # The IPv6 arm: a v0.1 scope decision, not a reserved-range check
 ///
-/// IPv6 has at least **seven** standardized prefixes that either embed a
-/// 32-bit IPv4 address in a fixed bit position or tunnel IPv4 reachability
-/// through a fixed, globally-known prefix. This count is a **floor, not a
-/// proof of completeness** -- it is what a systematic sweep of RFC 4291,
-/// RFC 6052/8215, RFC 2765/6145, RFC 3056, RFC 4380, and the IANA IPv6
-/// Special-Purpose Address Registry turned up as of this writing (see the
-/// task report for the full sweep, including every block considered and
-/// deliberately *not* added here, and why). Do not treat "seven" as a
-/// closed set the next time this function is touched.
+/// Three fix rounds enumerated IPv4-in-IPv6 embedding and transition
+/// prefixes: four in round 1, a fifth (IPv4-mapped) already present, a
+/// sixth (IPv4-translated) and a seventh (Teredo, added proactively) in
+/// round 2, and an eighth (ISATAP) found by round 2's own re-review despite
+/// an explicit warning that the count was "a floor, not a proof of
+/// completeness". Three rounds, three closed enumerations, three
+/// subsequent findings -- that is a signal about the *approach*, not about
+/// any round's thoroughness (see the task report's fix-round-3 section for
+/// the controller's reasoning in full).
 ///
-/// | Prefix | Scheme | RFC |
-/// |---|---|---|
-/// | `::/96` | IPv4-compatible (deprecated) | 4291 §2.5.5.1 |
-/// | `::ffff:0:0/96` | IPv4-mapped | 4291 §2.5.5.2 |
-/// | `::ffff:0:0:0/96` | IPv4-translated (SIIT) | 2765 §3.5, retained by 6145 |
-/// | `64:ff9b::/96` | NAT64 well-known prefix | 6052 |
-/// | `64:ff9b:1::/48` | NAT64 local-use prefix | 8215 |
-/// | `2002::/16` | 6to4 | 3056 |
-/// | `2001::/32` | Teredo (embeds an *obfuscated* IPv4 address/port) | 4380, updated by 8190 |
+/// The actual fix follows from a scope decision made independently of this
+/// bug hunt: **`docs/superpowers/plans/2026-07-31-sonde-v0.1-overview.md`'s
+/// Gap Register states IPv6 scanning is out of scope for v0.1.** This
+/// crate had been hardening a code path the product does not ship. Given
+/// that, the IPv6 arm below refuses **every IPv6 address unconditionally**,
+/// as its first and only action -- not a narrower reserved-range check, a
+/// blanket refusal. This is immune to every embedding or transition scheme,
+/// enumerated below or not, which is exactly the property three rounds of
+/// enumerate-and-patch could not achieve. It also satisfies AC-1.28 more
+/// strongly than literally required (loopback/multicast/unspecified/
+/// `fe80::/10` refused): every IPv6 address is refused, reserved or not.
 ///
-/// A first version of this function guarded only the IPv4-mapped form via
-/// `Ipv6Addr::to_ipv4_mapped()`. A security review confirmed four more were
-/// an open bypass (`::7f00:1`, `64:ff9b::7f00:1`, `64:ff9b::e000:1`,
-/// `2002:7f00:1::1`); a second review, having explicitly warned that "five"
-/// was not a proof of completeness, found a sixth (`::ffff:0:127.0.0.1`,
-/// IPv4-translated) still open -- `to_ipv4_mapped()` returns `None` for it
-/// because it differs from the mapped form by exactly one segment offset
-/// (segment 4 holds `0xffff` instead of segment 5), and none of the other
-/// guards match it either. All of these denote reserved IPv4 addresses
-/// (loopback or multicast) yet none of them trip
-/// `Ipv6Addr::is_loopback`/`is_multicast`/`is_unspecified` or the
-/// `fe80::/10` mask below, because those all key off the *native IPv6* bit
-/// pattern and none of these prefixes' bit patterns match `::1`,
-/// `ff00::/8`, or `fe80::/10`. The seventh (Teredo) was added proactively
-/// during that same sweep, before a third review round could find it:
-/// Teredo obfuscates (bitwise-NOT, not a direct copy) its embedded IPv4
-/// address, so this guard does not attempt to decode it -- it refuses the
-/// whole `2001::/32` prefix regardless of what the low 96 bits contain,
-/// exactly like every other entry in this table. Left unguarded, a
-/// manifest that permissively allows an IPv6 range (the IPv6 analogue of
-/// the `0.0.0.0/0` case AC-1.25 already covers for IPv4) would let any of
-/// these slip past this backstop entirely -- the exact class of hole
-/// property 3 exists to close, and exactly the kind of false-allow that
-/// sends packets somewhere unauthorized.
-///
-/// All seven prefixes are refused **outright, as whole prefixes**, rather
-/// than being unwrapped and re-evaluated as the IPv4 address they embed.
-/// This is a deliberate decision, not an oversight:
-///
-/// - An operator who wants to authorize `10.30.0.0/24` writes that CIDR,
-///   not `::ffff:10.30.0.0/120` or `2002:0a1e:0000::/120`; an address in
-///   any of these seven prefixes reaching `allows()` at all is already
-///   anomalous input this codebase does not need to make meaningful.
-/// - Unwrapping is strictly more code on the safety boundary for no safety
-///   benefit, and it does not scale: every future reserved-IPv4 rule (a new
-///   martian range, a newly-reserved block) would have to be re-implemented
-///   once per embedding scheme instead of once. Refusing the whole prefix
-///   needs no such duplication -- these prefixes are not ordinary unicast
-///   scan targets under any circumstance, reserved or not. Teredo's
-///   obfuscation makes this doubly true: there is no cheap way to "unwrap"
-///   an obfuscated embedded address at all.
-/// - Refusing outright is also the conservative reading of "when unsure,
-///   refuse": it cannot be mistakenly authorized under any manifest, ever,
-///   which unwrap-and-reevaluate cannot promise (it would still depend on
-///   the allow/deny CIDR sets being IPv4-shaped and correctly interpreted).
-///
-/// This is the same principle already applied to the IPv4-mapped form; each
-/// fix round has widened it to more schemes, never changed it.
-///
-/// # Known, structural limitation (not fixable by adding more guards here)
-///
-/// NAT64 (RFC 6052 §3.1) and SIIT (RFC 6145) both also support an
-/// operator-chosen "Network-Specific Prefix" out of the operator's own
-/// globally-routed address space, as an alternative to the fixed
-/// Well-Known Prefix / IPv4-translated format. An address using such a
-/// prefix is bit-for-bit indistinguishable from ordinary global unicast --
-/// there is no fixed mask that could ever catch it, structurally, without
-/// external configuration input this function does not have and a scope
-/// manifest format does not currently provide a place to declare. This is
-/// an accepted limitation of prefix-based detection, not an oversight
-/// equivalent to the ones fixed above.
+/// [`ipv6_is_ordinary_by_prefix_rules`] below holds the full prefix-guard
+/// logic developed across all three rounds, including the eighth (ISATAP)
+/// guard added this round. It is **not called from this function in
+/// v0.1** -- it is parked, `#[allow(dead_code)]`, unreachable in the live
+/// path, and exists solely as the documented starting point for v0.2 when
+/// IPv6 scanning ships (at which point the `IpAddr::V6` arm below should
+/// call it instead of returning `false`). See that function's own doc
+/// comment for the full prefix table, the RFCs swept, what was
+/// deliberately excluded and why, and the mechanisms (NAT64/SIIT
+/// Network-Specific Prefix, 6rd) that remain structurally unguardable by
+/// any fixed mask.
 fn is_ordinary_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -320,45 +304,125 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
                 // hand-rolled range check.
                 || v4.octets()[0] >= 240)
         }
-        IpAddr::V6(v6) => {
-            let s = v6.segments();
-            !(v6.is_loopback()
-                || v6.is_multicast()
-                || v6.is_unspecified()
-                // link-local fe80::/10
-                || (s[0] & 0xffc0) == 0xfe80
-                // ::/96 -- IPv4-compatible (deprecated, RFC 4291 §2.5.5.1):
-                // top 96 bits (segments 0..=5) all zero, low 32 bits free.
-                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
-                // ::ffff:0:0/96 -- IPv4-mapped (RFC 4291 §2.5.5.2).
-                || v6.to_ipv4_mapped().is_some()
-                // ::ffff:0:0:0/96 -- IPv4-translated (SIIT, RFC 2765 §3.5,
-                // retained by RFC 6145). One segment offset from the mapped
-                // form above: 0xffff lives in segment 4, not segment 5.
-                // Segment indices verified against a real
-                // `"::ffff:0:127.0.0.1".parse::<Ipv6Addr>().segments()`
-                // probe, not derived by reasoning alone -- see the task
-                // report for the probe output.
-                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
-                // 64:ff9b::/96 -- NAT64 well-known prefix (RFC 6052).
-                || (s[0] == 0x0064
-                    && s[1] == 0xff9b
-                    && s[2] == 0
-                    && s[3] == 0
-                    && s[4] == 0
-                    && s[5] == 0)
-                // 64:ff9b:1::/48 -- NAT64 local-use prefix (RFC 8215).
-                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
-                // 2002::/16 -- 6to4 (RFC 3056).
-                || s[0] == 0x2002
-                // 2001::/32 -- Teredo (RFC 4380, updated by RFC 8190).
-                // Added proactively (not from a reviewer-reported bypass):
-                // see the doc comment above for why this is refused as a
-                // whole prefix despite embedding an obfuscated, not raw,
-                // IPv4 address.
-                || (s[0] == 0x2001 && s[1] == 0))
+        IpAddr::V6(_) => {
+            // v0.1 SCOPE DECISION -- see this function's doc comment above.
+            // IPv6 scanning is not supported in this release, so no IPv6
+            // address of any kind is ever a valid scan target. This
+            // unconditional `false` is the only thing standing between an
+            // IPv6 embedding/transition bypass and the outside world right
+            // now -- see the task report's fix-round-3 mutation evidence,
+            // which proves by direct experiment that `ipv6_is_ordinary_by_
+            // prefix_rules` below provides zero protection on its own: with
+            // this `false` mutated away, both an ordinary IPv6 address and
+            // an ISATAP-embedded-loopback address become reachable again,
+            // with nothing else catching either.
+            false
         }
     }
+}
+
+/// The full IPv6 reserved-range and IPv4-embedding/transition-prefix guard
+/// logic developed across fix rounds 0 through 3. **Not called by
+/// [`is_ordinary_unicast`] in v0.1** -- see that function's doc comment for
+/// why. Kept intact, not deleted, as the documented starting point for
+/// v0.2: when IPv6 scanning ships, `is_ordinary_unicast`'s `IpAddr::V6` arm
+/// should call this function instead of returning `false` unconditionally.
+/// `#[allow(dead_code)]` because nothing outside this module's tests calls
+/// it in v0.1; do not remove that attribute by deleting the function
+/// instead -- the research stays, it just is not live.
+///
+/// # Eight standardized IPv4-in-IPv6 embedding and transition prefixes
+///
+/// | Prefix | Scheme | RFC |
+/// |---|---|---|
+/// | `::/96` | IPv4-compatible (deprecated) | 4291 §2.5.5.1 |
+/// | `::ffff:0:0/96` | IPv4-mapped | 4291 §2.5.5.2 |
+/// | `::ffff:0:0:0/96` | IPv4-translated (SIIT) | 2765 §3.5, retained by 6145 |
+/// | `64:ff9b::/96` | NAT64 well-known prefix | 6052 |
+/// | `64:ff9b:1::/48` | NAT64 local-use prefix | 8215 |
+/// | `2002::/16` | 6to4 | 3056 |
+/// | `2001::/32` | Teredo (embeds an *obfuscated* IPv4 address/port) | 4380, updated by 8190 |
+/// | interface ID `0000:5EFE:*` or `0200:5EFE:*`, any prefix | ISATAP | 5214 §6.1 |
+///
+/// This count (eight) is still **a floor, not a proof of completeness** --
+/// each of the first seven was found by a systematic sweep of RFC 4291,
+/// RFC 6052/8215, RFC 2765/6145, RFC 3056, RFC 4380, and the IANA IPv6
+/// Special-Purpose Address Registry (see the task report for the full
+/// 25-row registry table and every excluded block's reasoning), and that
+/// same sweep's own re-review still found an eighth (ISATAP) it had missed
+/// -- and had actively mis-reasoned about, see below. Whatever number is
+/// written here next is not guaranteed to be the last one either; that is
+/// the entire reason this logic is parked behind a blanket refusal rather
+/// than trusted as the live defense.
+///
+/// ISATAP is structurally different from the other seven: it has no fixed
+/// global *prefix* at all. The embedded IPv4 address instead sits in the
+/// low 32 bits of the interface identifier (segments 6-7), immediately
+/// preceded by a fixed 32-bit marker at segments 4-5 (`0000:5EFE` for a
+/// publicly-routable embedded address, `0200:5EFE` -- the "locally
+/// administered" bit set -- for a private/martian one), riding on *any*
+/// unicast prefix the deploying site chooses for segments 0-3. The guard
+/// below is therefore independent of segments 0-3, unlike every other
+/// guard in this function, which all key off fixed high-order bits. A
+/// prior sweep (fix round 2) excluded ISATAP with the reasoning "not an
+/// IANA-reserved bit pattern, just a convention" -- that reasoning was
+/// factually wrong and is not repeated here: `00-00-5E` is IANA's own
+/// registered OUI (Organizationally Unique Identifier), assigned
+/// specifically for this use by RFC 5214 itself. It is guardable, and is
+/// guarded, by the differently-shaped (suffix-anchored, not prefix-
+/// anchored) check below. Segment positions verified against a real
+/// `"2001:db8::5efe:7f00:1".parse::<Ipv6Addr>().segments()` probe before
+/// writing the guard, not derived by reasoning alone -- see the task
+/// report for the probe output.
+///
+/// # Known, structural limitations (not fixable by adding more guards here)
+///
+/// - **NAT64/SIIT "Network-Specific Prefix"** (RFC 6052 §3.1, and the
+///   corresponding option in RFC 6145): an operator may choose *any* of
+///   their own globally-routed prefixes as a translation prefix instead of
+///   the fixed Well-Known Prefix or the fixed IPv4-translated format. Such
+///   an address is bit-for-bit indistinguishable from ordinary global
+///   unicast -- no fixed mask could ever catch it without external
+///   configuration input this function does not have and a scope manifest
+///   does not currently provide a place to declare.
+/// - **6rd** (IPv6 Rapid Deployment, RFC 5969): the 6to4-like mechanism an
+///   ISP runs using its *own* chosen IPv6 prefix (the "6rd domain prefix")
+///   instead of 6to4's fixed `2002::/16`. Same class of limitation as NAT64
+///   NSP, for the same reason: no fixed signature exists to match against,
+///   by design of the mechanism itself. Named explicitly here (a prior
+///   sweep round omitted it despite being asked to check for it) so its
+///   absence from the table above reads as a documented, deliberate
+///   exclusion rather than a gap nobody looked for.
+#[allow(dead_code)]
+fn ipv6_is_ordinary_by_prefix_rules(v6: std::net::Ipv6Addr) -> bool {
+    let s = v6.segments();
+    !(v6.is_loopback()
+        || v6.is_multicast()
+        || v6.is_unspecified()
+        // link-local fe80::/10
+        || (s[0] & 0xffc0) == 0xfe80
+        // ::/96 -- IPv4-compatible (deprecated, RFC 4291 §2.5.5.1): top 96
+        // bits (segments 0..=5) all zero, low 32 bits free.
+        || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+        // ::ffff:0:0/96 -- IPv4-mapped (RFC 4291 §2.5.5.2).
+        || v6.to_ipv4_mapped().is_some()
+        // ::ffff:0:0:0/96 -- IPv4-translated (SIIT, RFC 2765 §3.5, retained
+        // by RFC 6145). One segment offset from the mapped form above:
+        // 0xffff lives in segment 4, not segment 5.
+        || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
+        // 64:ff9b::/96 -- NAT64 well-known prefix (RFC 6052).
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+        // 64:ff9b:1::/48 -- NAT64 local-use prefix (RFC 8215).
+        || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
+        // 2002::/16 -- 6to4 (RFC 3056).
+        || s[0] == 0x2002
+        // 2001::/32 -- Teredo (RFC 4380, updated by RFC 8190). Refuses the
+        // whole prefix without attempting to decode the obfuscated payload.
+        || (s[0] == 0x2001 && s[1] == 0)
+        // ISATAP (RFC 5214 §6.1): fixed marker at segments 4-5, independent
+        // of segments 0-3. See this function's doc comment above.
+        || (s[4] == 0 && s[5] == 0x5efe)
+        || (s[4] == 0x0200 && s[5] == 0x5efe))
 }
 
 #[cfg(test)]
@@ -380,6 +444,19 @@ mod tests {
     }"#;
 
     fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    /// Parses directly to `Ipv6Addr` (not `IpAddr`), for calling the parked
+    /// [`ipv6_is_ordinary_by_prefix_rules`] directly -- used wherever a
+    /// pre-fix-round-3 test asserted a boundary address was still *allowed*
+    /// through the public `allows()` API. Under the v0.1 blanket IPv6
+    /// refusal, `allows()` refuses every IPv6 address regardless of prefix,
+    /// so those assertions no longer hold through the public API; the
+    /// mask-precision claim they were proving is still real and still
+    /// tested, just against the parked function directly. See the
+    /// "Fix round 3" comment block below.
+    fn ipv6(s: &str) -> std::net::Ipv6Addr {
         s.parse().unwrap()
     }
 
@@ -441,15 +518,22 @@ mod tests {
 
     #[test]
     fn ipv6_reserved_ranges_are_never_allowed_even_if_listed() {
+        // Fix round 3: all four assertions below still pass, now via the
+        // v0.1 blanket IPv6 refusal (see `is_ordinary_unicast`'s doc
+        // comment) rather than the individual is_loopback/is_multicast/
+        // is_unspecified/fe80-mask checks each was originally written to
+        // prove -- those checks still exist, parked and unreachable, in
+        // `ipv6_is_ordinary_by_prefix_rules`. The fifth original assertion
+        // here ("ordinary v6 unicast still allowed") no longer holds under
+        // the blanket policy; it was moved to its own dedicated test below,
+        // `ordinary_global_unicast_ipv6_is_refused_because_ipv6_scanning_is_out_of_scope_for_v0_1`,
+        // which states the v0.1 reasoning explicitly rather than silently
+        // dropping the coverage.
         let m = permissive_ipv6_manifest();
         assert!(!m.allows(ip("::1")), "loopback");
         assert!(!m.allows(ip("ff02::1")), "multicast");
         assert!(!m.allows(ip("::")), "unspecified");
         assert!(!m.allows(ip("fe80::1")), "link-local");
-        assert!(
-            m.allows(ip("2001:db8::1")),
-            "ordinary v6 unicast still allowed"
-        );
     }
 
     // The dispatch's explicit ask: prove the `(segments()[0] & 0xffc0) ==
@@ -472,8 +556,14 @@ mod tests {
             !m.allows(ip("febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff")),
             "febf:ffff:... is the last address in fe80::/10"
         );
+        // Fix round 3: under the v0.1 blanket IPv6 refusal, `m.allows()`
+        // refuses fec0:: too (like every IPv6 address), so this boundary
+        // can no longer be proven through the public API. The
+        // mask-precision claim itself is still real and still worth
+        // proving -- tested directly against the parked v0.2 guard
+        // function instead.
         assert!(
-            m.allows(ip("fec0::")),
+            ipv6_is_ordinary_by_prefix_rules(ipv6("fec0::")),
             "fec0:: is one step past fe80::/10 and must not be caught by the mask"
         );
     }
@@ -506,14 +596,18 @@ mod tests {
              refused: mapped addresses are refused outright, not evaluated \
              as their embedded IPv4 address"
         );
-        // Sanity check the fixture actually is dual-stack-permissive, so
-        // the assertions above are proving the mapped-address guard and not
-        // just an accidentally-too-narrow manifest.
+        // Sanity check the fixture actually is dual-stack-permissive for
+        // IPv4, so the assertions above are proving the mapped-address
+        // guard and not just an accidentally-too-narrow manifest.
         assert!(m.allows(ip("10.30.0.42")), "plain v4 unicast still allowed");
-        assert!(
-            m.allows(ip("2001:db8::1")),
-            "plain v6 unicast still allowed"
-        );
+        // Fix round 3: the fixture's "::/0" allow entry can no longer make
+        // any IPv6 address allowed -- the v0.1 blanket refusal (see
+        // `is_ordinary_unicast`) refuses every IPv6 address regardless of
+        // the manifest. The original "plain v6 unicast still allowed"
+        // assertion here was removed rather than inverted in place, since
+        // its removal is itself the interesting fact: see the dedicated
+        // test `ordinary_global_unicast_ipv6_is_refused_because_ipv6_scanning_is_out_of_scope_for_v0_1`
+        // below for where that coverage now lives, stated explicitly.
     }
 
     // --- Fix round 1 (CRITICAL): the other four IPv4-in-IPv6 embedding
@@ -524,9 +618,17 @@ mod tests {
     // the table in `is_ordinary_unicast`'s doc comment for the RFC behind
     // each prefix. ---
 
-    fn ip6(segments: [u16; 8]) -> IpAddr {
-        IpAddr::V6(std::net::Ipv6Addr::from(segments))
+    fn ip6_addr(segments: [u16; 8]) -> std::net::Ipv6Addr {
+        std::net::Ipv6Addr::from(segments)
     }
+
+    // Fix round 3: every "boundary must still be allowed" assertion in the
+    // four tests below was rewritten to call `ipv6_is_ordinary_by_prefix_
+    // rules` directly instead of `m.allows()`, for the same reason given on
+    // `fe80_slash_10_boundary_is_exact` above -- the v0.1 blanket IPv6
+    // refusal means `m.allows()` refuses every boundary address too, for a
+    // reason unrelated to prefix-mask precision. Each "must be refused"
+    // assertion is untouched and still goes through the real `m.allows()`.
 
     #[test]
     fn ipv4_compatible_ipv6_addresses_are_refused_outright() {
@@ -539,10 +641,8 @@ mod tests {
         );
         // Boundary: one bit outside ::/96 (segment 5, the last of the top
         // 96 bits, set instead of zero) must NOT be caught by this rule.
-        // Not loopback/multicast/link-local/mapped/NAT64/6to4 either, so it
-        // must be an ordinary, allowed address.
         assert!(
-            m.allows(ip6([0, 0, 0, 0, 0, 1, 0x7f00, 1])),
+            ipv6_is_ordinary_by_prefix_rules(ip6_addr([0, 0, 0, 0, 0, 1, 0x7f00, 1])),
             "an address one bit outside ::/96 must not be caught by the \
              IPv4-compatible guard"
         );
@@ -565,7 +665,7 @@ mod tests {
         );
         // Boundary: one bit outside 64:ff9b::/96 must not be caught.
         assert!(
-            m.allows(ip6([0x0064, 0xff9b, 0, 0, 0, 1, 0x7f00, 1])),
+            ipv6_is_ordinary_by_prefix_rules(ip6_addr([0x0064, 0xff9b, 0, 0, 0, 1, 0x7f00, 1])),
             "an address one bit outside 64:ff9b::/96 must not be caught by \
              the NAT64 well-known-prefix guard"
         );
@@ -583,7 +683,7 @@ mod tests {
         // well-known-prefix rule above, since that one requires segment 2
         // to be exactly zero.
         assert!(
-            m.allows(ip("64:ff9b:2::1")),
+            ipv6_is_ordinary_by_prefix_rules(ipv6("64:ff9b:2::1")),
             "an address one step past 64:ff9b:1::/48 must not be caught by \
              the NAT64 local-use-prefix guard"
         );
@@ -600,9 +700,9 @@ mod tests {
             "6to4-embedded loopback must be refused"
         );
         // Boundary given directly in the fix instructions: 2003::1 (one
-        // step past 2002::/16) must still be allowed.
+        // step past 2002::/16) must not be caught by the 6to4 guard.
         assert!(
-            m.allows(ip("2003::1")),
+            ipv6_is_ordinary_by_prefix_rules(ipv6("2003::1")),
             "2003::1 is one step past 2002::/16 and must not be caught by \
              the 6to4 guard"
         );
@@ -640,7 +740,7 @@ mod tests {
         // it doesn't match any other guard either (segment 0 isn't 0x64 or
         // 0x2002, segments 0..=5 aren't all zero).
         assert!(
-            m.allows(ip("::ffff:1:127.0.0.1")),
+            ipv6_is_ordinary_by_prefix_rules(ipv6("::ffff:1:127.0.0.1")),
             "an address one segment-value outside ::ffff:0:0:0/96 must not \
              be caught by the IPv4-translated guard"
         );
@@ -673,9 +773,132 @@ mod tests {
         // why single-host anycast addresses like this one are out of scope
         // for an IPv4-embedding fix.
         assert!(
-            m.allows(ip("2001:1::1")),
+            ipv6_is_ordinary_by_prefix_rules(ipv6("2001:1::1")),
             "2001:1::1 is one segment-value outside 2001::/32 and must not \
              be caught by the Teredo guard"
+        );
+    }
+
+    // --- Fix round 3 (CRITICAL, ISATAP): the eighth IPv4-in-IPv6 embedding
+    // scheme, found by the round-2 re-review. Signals via a fixed 32-bit
+    // marker in the *interface identifier* (segments 4-5), not a network
+    // prefix -- so it rides on any unicast prefix a site chooses, unlike
+    // every other guard above. `00-00-5E` is IANA's own registered OUI,
+    // reserved for exactly this use by RFC 5214 -- a prior sweep round
+    // wrongly called this "not IANA-reserved, just a convention" and
+    // excluded it on that basis; that reasoning was factually wrong, not
+    // just incomplete, and is corrected in `ipv6_is_ordinary_by_prefix_
+    // rules`'s own doc comment. Segment positions verified against a real
+    // `"2001:db8::5efe:7f00:1".parse::<Ipv6Addr>().segments()` probe before
+    // writing the guard -- see the task report for the probe output. ---
+
+    #[test]
+    fn isatap_prefix_guard_is_precise() {
+        // Tests the parked guard directly, not through `m.allows()`: in
+        // v0.1 every IPv6 address is refused regardless of this guard (see
+        // the "Fix round 3" tests below), so precision has to be proven
+        // against the guard function itself, same as every other boundary
+        // test rewritten this round.
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("2001:db8::5efe:7f00:1")),
+            "ISATAP-embedded loopback (0000:5EFE marker) must be caught"
+        );
+        assert!(
+            !ipv6_is_ordinary_by_prefix_rules(ipv6("2001:db8::200:5efe:7f00:1")),
+            "ISATAP-embedded loopback (0200:5EFE marker) must be caught"
+        );
+        // Boundary: segment 4 one value away from either recognized marker
+        // (0x0001, matching neither 0x0000 nor 0x0200) must not be caught.
+        assert!(
+            ipv6_is_ordinary_by_prefix_rules(ip6_addr([
+                0x2001, 0x0db8, 0, 0, 1, 0x5efe, 0x7f00, 1
+            ])),
+            "an address whose segment 4 matches neither ISATAP marker must \
+             not be caught by the ISATAP guard"
+        );
+        // Boundary: segment 5 one value away from the marker (0x5eff,
+        // matching neither), with segment 4 == 0, must not be caught.
+        assert!(
+            ipv6_is_ordinary_by_prefix_rules(ip6_addr([
+                0x2001, 0x0db8, 0, 0, 0, 0x5eff, 0x7f00, 1
+            ])),
+            "an address whose segment 5 is one past the ISATAP marker must \
+             not be caught by the ISATAP guard"
+        );
+    }
+
+    // --- Fix round 3 (CONTROLLER DECISION): IPv6 scanning is out of scope
+    // for v0.1 (docs/superpowers/plans/2026-07-31-sonde-v0.1-overview.md's
+    // Gap Register). `is_ordinary_unicast`'s IPv6 arm now refuses every
+    // IPv6 address unconditionally, as its first and only action --
+    // immune to every embedding/transition scheme, enumerated above or
+    // not. Every IPv6-refusal test in this file (added across rounds 0-3)
+    // still passes -- they all still assert `false` -- but now for this
+    // single, broader reason rather than for the individual prefix guard
+    // each was originally written to prove; see the comments added to
+    // those tests above. The two tests below are the ones that actually
+    // prove the blanket policy itself, rather than incidentally passing
+    // because of it. ---
+
+    #[test]
+    fn ordinary_global_unicast_ipv6_is_refused_because_ipv6_scanning_is_out_of_scope_for_v0_1() {
+        let m = permissive_ipv6_manifest(); // allows ::/0
+        // 2606:4700:4700::1111 is a real, non-reserved, globally-routed
+        // address (Cloudflare's public DNS) -- not loopback, not
+        // multicast, not link-local, and not within any of the eight
+        // IPv4-embedding/transition prefixes above (confirmed by the same
+        // probe used to verify the ISATAP segment layout: segments =
+        // [0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111], matching none of
+        // them). If IPv6 scanning were supported, this is exactly the kind
+        // of address a manifest should be able to authorize. It is refused
+        // anyway: this is the v0.1 scope decision documented on
+        // `is_ordinary_unicast`, not a bug and not evidence that some
+        // reserved-range check misfired.
+        assert!(
+            !m.allows(ip("2606:4700:4700::1111")),
+            "ordinary IPv6 unicast must be refused in v0.1 -- IPv6 scanning \
+             is out of scope for this release, not because this address is \
+             reserved"
+        );
+    }
+
+    #[test]
+    fn isatap_addresses_are_refused_by_the_v0_1_blanket_policy() {
+        let m = permissive_ipv6_manifest();
+        // Both markers, embedding raw (unobfuscated) 127.0.0.1, on the
+        // documentation prefix standing in for "any site-chosen prefix" --
+        // ISATAP does not use a fixed global prefix. Refused here by the
+        // v0.1 blanket policy; the mutation evidence in the task report
+        // proves the parked ISATAP-specific guard alone provides no
+        // protection right now (removing the blanket refusal makes these
+        // addresses allowed again, with nothing else catching them).
+        assert!(
+            !m.allows(ip("2001:db8::5efe:7f00:1")),
+            "ISATAP-embedded loopback (0000:5EFE marker) must be refused"
+        );
+        assert!(
+            !m.allows(ip("2001:db8::200:5efe:7f00:1")),
+            "ISATAP-embedded loopback (0200:5EFE marker) must be refused"
+        );
+    }
+
+    #[test]
+    fn manifest_with_ipv6_allowed_cidr_still_loads_successfully() {
+        // Fix round 3: an IPv6 entry in `allowed_cidrs` must warn, not
+        // fail to load -- the manifest may also carry valid IPv4 CIDRs,
+        // and an operator drafting a manifest ahead of v0.2 (when IPv6
+        // scanning lands) should not be blocked from doing so. The warning
+        // text itself is manually verified (see the task report), same as
+        // the signature warning above it in `load` -- this test proves the
+        // load-time behavior (succeeds; IPv4 entries stay usable; the IPv6
+        // entry can never match anything), not the warning's wording.
+        let with_ipv6 = MANIFEST.replace(r#"["10.30.0.0/24"]"#, r#"["10.30.0.0/24", "::/0"]"#);
+        let m = ScopeManifest::load(&with_ipv6).unwrap();
+        assert!(m.allows(ip("10.30.0.42")), "the IPv4 entry stays usable");
+        assert!(
+            !m.allows(ip("2001:db8::1")),
+            "the IPv6 entry can never match anything, per the v0.1 blanket \
+             refusal"
         );
     }
 
