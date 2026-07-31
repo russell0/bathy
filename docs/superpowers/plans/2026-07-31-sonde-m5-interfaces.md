@@ -265,7 +265,7 @@ fn json_output_is_line_delimited_and_parseable_for_every_command() {
 fn human_output_never_claims_deterministic_results() {
     let out = sonde(&["--help"]).success();
     let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
-    assert!(!text.contains("deterministic results"));
+    assert!(!text.contains("deterministic results")); // [phrase-rule]
 }
 ```
 

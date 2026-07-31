@@ -416,9 +416,14 @@ fn publish_check() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 3. No forbidden determinism claim.
-    if let Some(hit) = grep_tracked(&tracked, "deterministic results")? {
-        failures.push(format!("forbidden claim \"deterministic results\" in {hit}"));
+    // 3. No forbidden determinism claim. Lines carrying the `[phrase-rule]`
+    //    marker state or enforce the rule itself and are exempt — see the
+    //    overview's sentinel convention. Without this, the checker flags its
+    //    own source.
+    // Pattern is assembled so this source line does not itself contain the phrase.
+    let phrase = concat!("deterministic", " ", "results");
+    if let Some(hit) = grep_tracked_excluding_marked(&tracked, phrase)? {
+        failures.push(format!("unscoped determinism claim in {hit}"));
     }
 
     // 4. No named individual in a comparative context.
@@ -488,7 +493,7 @@ git commit -m "chore(xtask): publish-check gate for secrets, artifacts, licensin
 
 **Acceptance criteria:**
 - **AC-7.25** `xtask publish-check` fails when a research artifact is tracked, when any generic secret pattern (private keys, AWS/GitHub/Slack token prefixes) appears in tracked content, or when any pattern listed in the git-ignored `.publish-deny` file appears. Personal identifiers live only in `.publish-deny`, never in the checker's source — a leak-detector that hardcodes the thing it detects publishes it.
-- **AC-7.26** It fails on the forbidden phrase "deterministic results".
+- **AC-7.26** It fails on the unscoped determinism phrase when unmarked, and passes over lines carrying the `[phrase-rule]` marker. Both directions tested. `[phrase-rule]`
 - **AC-7.27** It fails when a named individual appears in `README.md` or `docs/`.
 - **AC-7.28** It fails on a leftover `OWNER` placeholder.
 - **AC-7.29** It fails on an unpinned lab image, a failing `cargo deny check`, a failing test suite, or a missing license or `SECURITY.md`.

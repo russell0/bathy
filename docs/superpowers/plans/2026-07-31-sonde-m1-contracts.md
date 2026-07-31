@@ -178,8 +178,15 @@ jobs:
         run: |
           ! grep -rn --include='*.rs' 'unsafe ' crates/ \
             | grep -v '^crates/sonde-packetd/'
+      # Lines that legitimately name the phrase — this rule, its tests, its
+      # enforcement — carry the [phrase-rule] marker and are excluded. Without
+      # that exclusion this step fails on its own source. See the overview's
+      # sentinel convention.
       - name: forbidden determinism claim
-        run: '! grep -rniI "deterministic results" . --exclude-dir=target'
+        run: |
+          # Bracket expression matches the phrase without this line containing it.
+          ! grep -rniIE "deterministic[ ]results" . --exclude-dir=target --exclude-dir=.git \
+            | grep -v '\[phrase-rule\]'
   deny:
     runs-on: ubuntu-latest
     steps:
@@ -212,7 +219,7 @@ git commit -m "chore: workspace scaffold, dual license, CI, dependency-boundary 
 - **AC-1.2** `check-deps` exits non-zero if any workspace crate depends on a package whose name contains any `FORBIDDEN_SUBSTRINGS` entry.
 - **AC-1.3** Both `LICENSE-APACHE` and `LICENSE-MIT` exist and every crate manifest declares `license = "Apache-2.0 OR MIT"` via `workspace = true`.
 - **AC-1.4** CI fails the build if `unsafe ` appears in any crate other than `sonde-packetd`.
-- **AC-1.5** CI fails the build if the string "deterministic results" appears anywhere in the repo.
+- **AC-1.5** CI fails the build if the unscoped determinism phrase appears on any line not carrying the `[phrase-rule]` marker. Prove both directions: a seeded unmarked occurrence fails the build, and the rule's own marked statements do not. `[phrase-rule]`
 
 ---
 
