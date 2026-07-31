@@ -218,32 +218,55 @@ impl ScopeManifest {
 /// categories cause collateral traffic or self-scans and are refused
 /// outright.
 ///
-/// # IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`)
+/// # IPv4-in-IPv6 embedding schemes
 ///
-/// Refused outright, before any of the native IPv6 checks below run, rather
-/// than being unwrapped and evaluated as the IPv4 address they denote. This
-/// is a deliberate decision, not an oversight:
+/// IPv6 has *five* distinct, standardized ways to embed a 32-bit IPv4
+/// address inside a 128-bit IPv6 address, each with its own prefix:
 ///
-/// - `Ipv6Addr::is_loopback`, `is_multicast`, `is_unspecified`, and the
-///   `fe80::/10` mask below all key off the *IPv6* bit pattern. None of them
-///   recognize `::ffff:127.0.0.1` as loopback, `::ffff:224.0.0.1` as
-///   multicast, or `::ffff:169.254.1.1` as link-local, because in raw IPv6
-///   terms none of those bit patterns match `::1`, `ff00::/8`, or
-///   `fe80::/10`. Left unhandled, a manifest that permissively allows an
-///   IPv6 range (the IPv6 analogue of the `0.0.0.0/0` case AC-1.25 already
-///   covers for IPv4) would let a v4-mapped reserved address slip past this
-///   backstop entirely -- the exact class of hole property 3 exists to
-///   close.
-/// - Unwrapping and re-evaluating as IPv4 was the alternative considered.
-///   It was rejected as strictly more code on the safety boundary for no
-///   safety benefit: an operator who wants to authorize `10.30.0.0/24`
-///   writes that CIDR, not `::ffff:10.30.0.0/120`; a v4-mapped address
-///   reaching `allows()` at all is already anomalous input this codebase
-///   does not need to make meaningful. Refusing it outright is the
-///   conservative reading of "when unsure, refuse" -- it cannot be
-///   mistakenly authorized under any manifest, ever, which unwrap-and-
-///   reevaluate cannot promise (it would still depend on the allow/deny
-///   CIDR sets being IPv4-shaped and correct).
+/// | Prefix | Scheme | RFC |
+/// |---|---|---|
+/// | `::/96` | IPv4-compatible (deprecated) | 4291 §2.5.5.1 |
+/// | `::ffff:0:0/96` | IPv4-mapped | 4291 §2.5.5.2 |
+/// | `64:ff9b::/96` | NAT64 well-known prefix | 6052 |
+/// | `64:ff9b:1::/48` | NAT64 local-use prefix | 8215 |
+/// | `2002::/16` | 6to4 | 3056 |
+///
+/// A first version of this function guarded only the IPv4-mapped form via
+/// `Ipv6Addr::to_ipv4_mapped()`. A security review confirmed the other four
+/// were an open bypass: `::7f00:1`, `64:ff9b::7f00:1`, `64:ff9b::e000:1`,
+/// and `2002:7f00:1::1` all denote reserved IPv4 addresses (loopback,
+/// loopback, multicast, loopback respectively) yet none of them trip
+/// `Ipv6Addr::is_loopback`/`is_multicast`/`is_unspecified` or the
+/// `fe80::/10` mask below, because those all key off the *native IPv6* bit
+/// pattern and none of the five embedding prefixes' bit patterns match
+/// `::1`, `ff00::/8`, or `fe80::/10`. Left unguarded, a manifest that
+/// permissively allows an IPv6 range (the IPv6 analogue of the `0.0.0.0/0`
+/// case AC-1.25 already covers for IPv4) would let any of these slip past
+/// this backstop entirely -- the exact class of hole property 3 exists to
+/// close, and exactly the kind of false-allow that sends packets somewhere
+/// unauthorized.
+///
+/// All five prefixes are refused **outright, as whole prefixes**, rather
+/// than being unwrapped and re-evaluated as the IPv4 address they embed.
+/// This is a deliberate decision, not an oversight:
+///
+/// - An operator who wants to authorize `10.30.0.0/24` writes that CIDR,
+///   not `::ffff:10.30.0.0/120` or `2002:0a1e:0000::/120`; an address in
+///   any of these five prefixes reaching `allows()` at all is already
+///   anomalous input this codebase does not need to make meaningful.
+/// - Unwrapping is strictly more code on the safety boundary for no safety
+///   benefit, and it does not scale: every future reserved-IPv4 rule (a new
+///   martian range, a newly-reserved block) would have to be re-implemented
+///   once per embedding scheme instead of once. Refusing the whole prefix
+///   needs no such duplication -- these prefixes are not ordinary unicast
+///   scan targets under any circumstance, reserved or not.
+/// - Refusing outright is also the conservative reading of "when unsure,
+///   refuse": it cannot be mistakenly authorized under any manifest, ever,
+///   which unwrap-and-reevaluate cannot promise (it would still depend on
+///   the allow/deny CIDR sets being IPv4-shaped and correctly interpreted).
+///
+/// This is the same principle already applied to the IPv4-mapped form; the
+/// fix here is widening it to the other four schemes, not changing it.
 fn is_ordinary_unicast(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
@@ -252,17 +275,40 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
                 || v4.is_broadcast()
                 || v4.is_link_local()
                 || v4.is_unspecified()
-                || v4.octets()[0] == 0)
+                || v4.octets()[0] == 0
+                // 240.0.0.0/4: IANA-reserved "martian" space (includes the
+                // 255.255.255.255 limited-broadcast address already caught
+                // above by `is_broadcast`; both checks are kept because they
+                // document different intents -- `is_broadcast` documents
+                // "this is *the* broadcast address", this documents "this
+                // whole /4 is reserved". `Ipv4Addr::is_reserved()` exists in
+                // std but is nightly-only as of this MSRV, hence the
+                // hand-rolled range check.
+                || v4.octets()[0] >= 240)
         }
         IpAddr::V6(v6) => {
-            if v6.to_ipv4_mapped().is_some() {
-                return false;
-            }
+            let s = v6.segments();
             !(v6.is_loopback()
                 || v6.is_multicast()
                 || v6.is_unspecified()
                 // link-local fe80::/10
-                || (v6.segments()[0] & 0xffc0) == 0xfe80)
+                || (s[0] & 0xffc0) == 0xfe80
+                // ::/96 -- IPv4-compatible (deprecated, RFC 4291 §2.5.5.1):
+                // top 96 bits (segments 0..=5) all zero, low 32 bits free.
+                || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
+                // ::ffff:0:0/96 -- IPv4-mapped (RFC 4291 §2.5.5.2).
+                || v6.to_ipv4_mapped().is_some()
+                // 64:ff9b::/96 -- NAT64 well-known prefix (RFC 6052).
+                || (s[0] == 0x0064
+                    && s[1] == 0xff9b
+                    && s[2] == 0
+                    && s[3] == 0
+                    && s[4] == 0
+                    && s[5] == 0)
+                // 64:ff9b:1::/48 -- NAT64 local-use prefix (RFC 8215).
+                || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
+                // 2002::/16 -- 6to4 (RFC 3056).
+                || s[0] == 0x2002)
         }
     }
 }
@@ -419,6 +465,125 @@ mod tests {
         assert!(
             m.allows(ip("2001:db8::1")),
             "plain v6 unicast still allowed"
+        );
+    }
+
+    // --- Fix round 1 (CRITICAL): the other four IPv4-in-IPv6 embedding
+    // schemes. The reviewer's direct probe against a `::/0`-allowing
+    // manifest confirmed `allows()` returned `true` for every row below --
+    // a false allow, the dangerous direction. Each is a reserved IPv4
+    // address (loopback or multicast) wearing a different IPv6 dress; see
+    // the table in `is_ordinary_unicast`'s doc comment for the RFC behind
+    // each prefix. ---
+
+    fn ip6(segments: [u16; 8]) -> IpAddr {
+        IpAddr::V6(std::net::Ipv6Addr::from(segments))
+    }
+
+    #[test]
+    fn ipv4_compatible_ipv6_addresses_are_refused_outright() {
+        let m = permissive_dual_stack_manifest();
+        // ::7f00:1 == ::127.0.0.1, the IPv4-compatible form of loopback.
+        // Reviewer's reproduction case.
+        assert!(
+            !m.allows(ip("::7f00:1")),
+            "IPv4-compatible loopback (::127.0.0.1) must be refused"
+        );
+        // Boundary: one bit outside ::/96 (segment 5, the last of the top
+        // 96 bits, set instead of zero) must NOT be caught by this rule.
+        // Not loopback/multicast/link-local/mapped/NAT64/6to4 either, so it
+        // must be an ordinary, allowed address.
+        assert!(
+            m.allows(ip6([0, 0, 0, 0, 0, 1, 0x7f00, 1])),
+            "an address one bit outside ::/96 must not be caught by the \
+             IPv4-compatible guard"
+        );
+    }
+
+    #[test]
+    fn nat64_well_known_prefix_addresses_are_refused_outright() {
+        let m = permissive_dual_stack_manifest();
+        // 64:ff9b::7f00:1 == NAT64-embedded 127.0.0.1. Reviewer's
+        // reproduction case.
+        assert!(
+            !m.allows(ip("64:ff9b::7f00:1")),
+            "NAT64-embedded loopback must be refused"
+        );
+        // 64:ff9b::e000:1 == NAT64-embedded 224.0.0.1 (multicast).
+        // Reviewer's reproduction case.
+        assert!(
+            !m.allows(ip("64:ff9b::e000:1")),
+            "NAT64-embedded multicast must be refused"
+        );
+        // Boundary: one bit outside 64:ff9b::/96 must not be caught.
+        assert!(
+            m.allows(ip6([0x0064, 0xff9b, 0, 0, 0, 1, 0x7f00, 1])),
+            "an address one bit outside 64:ff9b::/96 must not be caught by \
+             the NAT64 well-known-prefix guard"
+        );
+    }
+
+    #[test]
+    fn nat64_local_use_prefix_addresses_are_refused_outright() {
+        let m = permissive_dual_stack_manifest();
+        assert!(
+            !m.allows(ip("64:ff9b:1::7f00:1")),
+            "NAT64 local-use-prefix-embedded loopback must be refused"
+        );
+        // Boundary: segment 2 one past the /48 (0x0001 -> 0x0002) must not
+        // be caught by this rule. It also must not be caught by the
+        // well-known-prefix rule above, since that one requires segment 2
+        // to be exactly zero.
+        assert!(
+            m.allows(ip("64:ff9b:2::1")),
+            "an address one step past 64:ff9b:1::/48 must not be caught by \
+             the NAT64 local-use-prefix guard"
+        );
+    }
+
+    #[test]
+    fn six_to_four_addresses_are_refused_outright() {
+        let m = permissive_dual_stack_manifest();
+        // 2002:7f00:1::1 == 6to4-embedded 127.0.0.1 (the 6to4 address for
+        // 127.0.0.1 encodes the IPv4 address in segments 1-2). Reviewer's
+        // reproduction case.
+        assert!(
+            !m.allows(ip("2002:7f00:1::1")),
+            "6to4-embedded loopback must be refused"
+        );
+        // Boundary given directly in the fix instructions: 2003::1 (one
+        // step past 2002::/16) must still be allowed.
+        assert!(
+            m.allows(ip("2003::1")),
+            "2003::1 is one step past 2002::/16 and must not be caught by \
+             the 6to4 guard"
+        );
+    }
+
+    // --- Fix round 1 (Important): 240.0.0.0/4 IANA-reserved martian space
+    // was allowed. `Ipv4Addr::is_reserved()` is nightly-only at this MSRV,
+    // hence the hand-rolled `octets()[0] >= 240` range check. ---
+
+    #[test]
+    fn ipv4_reserved_martian_space_is_refused() {
+        let permissive = MANIFEST.replace(r#"["10.30.0.0/24"]"#, r#"["0.0.0.0/0"]"#);
+        let m = ScopeManifest::load(&permissive).unwrap();
+        assert!(!m.allows(ip("240.0.0.1")), "240.0.0.0/4 must be refused");
+        assert!(
+            !m.allows(ip("255.0.0.1")),
+            "255.0.0.0/8 (inside 240.0.0.0/4) must be refused"
+        );
+        // Already refused for a different reason (is_multicast, not the new
+        // >= 240 check) -- confirm it's unaffected and still refused.
+        assert!(
+            !m.allows(ip("239.255.255.255")),
+            "the top of multicast space must still be refused"
+        );
+        // Ordinary unicast just below the new threshold: must remain
+        // allowed.
+        assert!(
+            m.allows(ip("223.1.2.3")),
+            "223.1.2.3 is ordinary unicast and must remain allowed"
         );
     }
 
