@@ -166,6 +166,15 @@ pub struct Event {
     pub scan_id: ScanId,
     pub sequence: u64,
     /// RFC 3339 UTC with milliseconds. Supplied by an injected `Clock`.
+    // C3: the Global Constraint ("All timestamps are RFC 3339 UTC with
+    // milliseconds") had zero enforcement anywhere in M1, unlike every
+    // other invariant in this crate, which is pinned in both the type and
+    // the published schema. `#[schemars(extend("format" = "date-time"))]`
+    // below makes the published contract at least honest about the
+    // intended shape. Deliberately NOT runtime-parsed here: `Clock` (which
+    // actually produces this value) is created in M2 Task 1, and that is
+    // the right place to validate it.
+    #[schemars(extend("format" = "date-time"))]
     pub timestamp: String,
     pub engine_version: String,
     #[serde(flatten)]
@@ -735,5 +744,28 @@ mod tests {
         for arm in value["oneOf"].as_array().unwrap() {
             assert!(arm.get("additionalProperties").is_none(), "arm was {arm:#}");
         }
+    }
+
+    // --- C3: the Global Constraint promises RFC 3339 UTC with milliseconds
+    // for every timestamp; the published schema must actually say so.
+    // Proven concretely, the same way as every other pinned invariant in
+    // this crate (e.g. `digest_json_schema_has_expected_pattern` in
+    // `ids.rs`): generate the schema and assert the exact `format` value is
+    // present, not just that the attribute was written somewhere. ---
+
+    #[test]
+    fn event_timestamp_schema_declares_date_time_format() {
+        let schema = schemars::schema_for!(Event);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            value["properties"]["timestamp"]["format"].as_str(),
+            Some("date-time"),
+            "schema was {value:#}"
+        );
+        assert_eq!(
+            value["properties"]["timestamp"]["type"].as_str(),
+            Some("string"),
+            "schema was {value:#}"
+        );
     }
 }

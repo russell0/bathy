@@ -68,6 +68,7 @@
     },
     "not_after": {
       "description": "RFC 3339 instant after which the manifest is no longer valid.",
+      "format": "date-time",
       "type": "string"
     },
     "signature": {

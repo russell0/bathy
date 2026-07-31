@@ -348,6 +348,7 @@
     },
     "timestamp": {
       "description": "RFC 3339 UTC with milliseconds. Supplied by an injected `Clock`.",
+      "format": "date-time",
       "type": "string"
     }
   },

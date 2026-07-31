@@ -40,6 +40,13 @@ pub struct ScopeManifestDto {
     pub id: ScopeId,
     pub description: String,
     /// RFC 3339 instant after which the manifest is no longer valid.
+    // C3: pinned in the published schema via `format: "date-time"` below so
+    // the contract is at least honest, mirroring every other invariant in
+    // this crate. `sonde_scope::manifest::ScopeManifest::load` (the sole
+    // runtime authority) already parses and validates this at load time --
+    // see `ManifestError::BadExpiry`; this DTO is schema/documentation
+    // only and adds no new runtime parsing.
+    #[schemars(extend("format" = "date-time"))]
     pub not_after: String,
     /// CIDR strings, e.g. `"10.30.0.0/24"`. Parsed and validated by
     /// `sonde-scope` at load time, not by this type.
@@ -161,5 +168,26 @@ mod tests {
         // required -- otherwise the schema would be stricter than the type.
         assert!(!required.contains(&"denied_cidrs"));
         assert!(!required.contains(&"signature"));
+    }
+
+    // --- C3: the Global Constraint promises RFC 3339 UTC with milliseconds
+    // for every timestamp; the published schema must actually say so. See
+    // `event::tests::event_timestamp_schema_declares_date_time_format` for
+    // the same proof on `Event.timestamp`. ---
+
+    #[test]
+    fn not_after_schema_declares_date_time_format() {
+        let schema = schemars::schema_for!(ScopeManifestDto);
+        let value = serde_json::to_value(&schema).unwrap();
+        assert_eq!(
+            value["properties"]["not_after"]["format"].as_str(),
+            Some("date-time"),
+            "schema was {value:#}"
+        );
+        assert_eq!(
+            value["properties"]["not_after"]["type"].as_str(),
+            Some("string"),
+            "schema was {value:#}"
+        );
     }
 }
