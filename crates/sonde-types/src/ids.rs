@@ -152,6 +152,20 @@ macro_rules! prefixed_id {
                 let rest = s
                     .strip_prefix(concat!($prefix, "_"))
                     .ok_or(IdError::WrongPrefix { expected: $prefix })?;
+                // Deliberately strict, mirroring `Digest::from_str` above
+                // (see its comment for the same shape of bug): the
+                // published JSON Schema pattern for this type is
+                // uppercase-only Crockford base32
+                // (`^..._[0-9A-HJKMNP-TV-Z]{26}$`), but `ulid::Ulid::
+                // from_string` is case-insensitive on its own -- it folds
+                // lowercase onto the same lookup table as uppercase, so
+                // e.g. `scan_01arz3ndektsv4rrffq69g5fav` parses
+                // successfully today even though it fails schema
+                // validation. A document that fails schema validation
+                // must not be accepted by this type.
+                if rest.bytes().any(|b| b.is_ascii_lowercase()) {
+                    return Err(IdError::BadUlid);
+                }
                 Ok(Self(
                     ulid::Ulid::from_string(rest).map_err(|_| IdError::BadUlid)?,
                 ))
@@ -344,6 +358,73 @@ mod tests {
             "scan_not-a-ulid".parse::<ScanId>(),
             Err(IdError::BadUlid)
         ));
+    }
+
+    // --- C1: the published pattern for `ScanId`/`EventId`/`ScopeId` is
+    // uppercase-only Crockford (`^..._[0-9A-HJKMNP-TV-Z]{26}$`), and this
+    // type must accept exactly what it publishes -- the same rule already
+    // enforced for `Digest` above (`digest_rejects_uppercase_hex_via_*`,
+    // `digest_rejects_mixed_case_hex_via_*`), now applied to the
+    // `prefixed_id!` macro too. One generic helper, monomorphized over all
+    // three types, so the three don't silently drift out of sync with each
+    // other the way the macro itself did with `Digest`.
+
+    fn assert_rejects_non_uppercase_ulid<T>(prefix: &str, valid_uppercase_body: &str)
+    where
+        T: FromStr<Err = IdError> + for<'de> Deserialize<'de> + std::fmt::Debug,
+    {
+        // Positive control: the unmodified uppercase id must still parse,
+        // via both FromStr and Deserialize -- otherwise the rejections
+        // below would trivially "pass" for the wrong reason (nothing of
+        // this shape ever parses).
+        let ok = format!("{prefix}_{valid_uppercase_body}");
+        assert!(ok.parse::<T>().is_ok(), "{ok} via FromStr");
+        assert!(
+            serde_json::from_str::<T>(&format!("\"{ok}\"")).is_ok(),
+            "{ok} via Deserialize"
+        );
+
+        let lower = format!("{prefix}_{}", valid_uppercase_body.to_lowercase());
+        assert_eq!(
+            lower.parse::<T>().unwrap_err(),
+            IdError::BadUlid,
+            "{lower} via FromStr"
+        );
+        assert!(
+            serde_json::from_str::<T>(&format!("\"{lower}\"")).is_err(),
+            "{lower} via Deserialize"
+        );
+
+        let mut mixed = valid_uppercase_body.to_string();
+        // Flip exactly one letter to lowercase -- e.g. the ULID's last
+        // character -- so this is genuinely "mixed", not "all lowercase".
+        let last = mixed.pop().unwrap();
+        mixed.push(last.to_ascii_lowercase());
+        let mixed = format!("{prefix}_{mixed}");
+        assert_eq!(
+            mixed.parse::<T>().unwrap_err(),
+            IdError::BadUlid,
+            "{mixed} via FromStr"
+        );
+        assert!(
+            serde_json::from_str::<T>(&format!("\"{mixed}\"")).is_err(),
+            "{mixed} via Deserialize"
+        );
+    }
+
+    #[test]
+    fn scan_id_rejects_non_uppercase_ulid() {
+        assert_rejects_non_uppercase_ulid::<ScanId>("scan", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
+
+    #[test]
+    fn event_id_rejects_non_uppercase_ulid() {
+        assert_rejects_non_uppercase_ulid::<EventId>("evt", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
+    }
+
+    #[test]
+    fn scope_id_rejects_non_uppercase_ulid() {
+        assert_rejects_non_uppercase_ulid::<ScopeId>("scope", "01ARZ3NDEKTSV4RRFFQ69G5FAV");
     }
 
     #[test]
