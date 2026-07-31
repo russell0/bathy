@@ -15,7 +15,13 @@ jobs:
       - run: cargo run -p xtask -- check-schemas
       - name: no unsafe outside packetd
         run: |
-          ! grep -rn --include='*.rs' 'unsafe ' crates/ \
+          # Matches `unsafe` followed by a space, `{`, `(`, or end-of-line, so
+          # `unsafe fn`, `unsafe{`, `unsafe(no_mangle)`, and a bare trailing
+          # `unsafe` are all caught, not just the space-delimited form. Scans
+          # both crates/ and xtask/ — the binding constraint is "no crate
+          # outside sonde-packetd", not "no crate under crates/ outside
+          # sonde-packetd".
+          ! grep -rnE --include='*.rs' 'unsafe([ {(]|$)' crates/ xtask/ \
             | grep -v '^crates/sonde-packetd/'
       # Lines that legitimately name the phrase — this rule, its tests, its
       # enforcement — carry the [phrase-rule] marker and are excluded. Without

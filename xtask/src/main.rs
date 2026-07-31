@@ -17,7 +17,7 @@ const LAYERS: &[&str] = &[
     "sonde-cli",
 ];
 
-/// No crate at or below this layer may depend on anything resembling a
+/// No workspace crate — ranked or not — may depend on anything resembling a
 /// model/inference client. Enforces "no LLM on the packet path".
 const FORBIDDEN_SUBSTRINGS: &[&str] = &[
     "openai",
@@ -51,21 +51,28 @@ struct PackageInfo {
 /// Pure rule check: given a workspace's packages, return every
 /// dependency-boundary or forbidden-substring violation as a human-readable
 /// message. No I/O — this is what AC-1.1 and AC-1.2 test directly.
+///
+/// The two checks are gated independently: the layer-order check only
+/// applies when the *depending* package itself has a rank (an unranked
+/// package, like `xtask`, isn't part of the layer order and so can't violate
+/// it). The forbidden-substring check has no such gate — AC-1.2 requires it
+/// for "any workspace crate", ranked or not, so it runs over every
+/// dependency of every package regardless of whether the depender is ranked.
 fn find_violations(packages: &[PackageInfo]) -> Vec<String> {
     let rank: BTreeMap<&str, usize> = LAYERS.iter().enumerate().map(|(i, n)| (*n, i)).collect();
     let mut violations = Vec::new();
 
     for pkg in packages {
-        let Some(&own_rank) = rank.get(pkg.name.as_str()) else {
-            continue;
-        };
+        let own_rank = rank.get(pkg.name.as_str()).copied();
         for dep_name in &pkg.dependencies {
-            if let Some(&dep_rank) = rank.get(dep_name.as_str()) {
-                if dep_rank >= own_rank {
-                    violations.push(format!(
-                        "{} depends on {dep_name}, which is not strictly lower in the layer order",
-                        pkg.name
-                    ));
+            if let Some(own_rank) = own_rank {
+                if let Some(&dep_rank) = rank.get(dep_name.as_str()) {
+                    if dep_rank >= own_rank {
+                        violations.push(format!(
+                            "{} depends on {dep_name}, which is not strictly lower in the layer order",
+                            pkg.name
+                        ));
+                    }
                 }
             }
             let lowered = dep_name.to_ascii_lowercase();
@@ -180,6 +187,21 @@ mod tests {
     fn forbidden_substring_dependency_is_detected() {
         // AC-1.2
         let packages = vec![pkg("sonde-probe", &["async-openai"])];
+        let violations = find_violations(&packages);
+        assert_eq!(
+            violations.len(),
+            1,
+            "expected exactly one violation: {violations:?}"
+        );
+        assert!(violations[0].contains("looks like an inference client"));
+    }
+
+    #[test]
+    fn forbidden_substring_dependency_is_detected_for_unranked_depender() {
+        // AC-1.2 says "any workspace crate", not "any ranked crate". xtask
+        // itself is a real workspace member but has no entry in LAYERS, so
+        // it must not get a free pass on the forbidden-substring rule.
+        let packages = vec![pkg("xtask", &["async-openai"])];
         let violations = find_violations(&packages);
         assert_eq!(
             violations.len(),
