@@ -2031,8 +2031,20 @@ proptest::proptest! {
         let ip = std::net::IpAddr::from([octets[0], octets[1], octets[2], octets[3]]);
         let m = manifest(); // allows 10.30.0.0/24, denies 10.30.0.1/32
         let d = evaluate(&m, &request(), &[ip], "2026-08-15T00:00:00.000Z");
+        // NOTE: do NOT exclude .0 and .255 here. `IpNet::contains` does not
+        // special-case network/broadcast addresses, and `allows()` genuinely
+        // approves 10.30.0.0 and 10.30.0.255. (Target *expansion* in M3 Task 1
+        // excludes them; scope *authorization* does not.) An earlier draft of
+        // this formula excluded them and would have asserted denial for
+        // addresses that are actually allowed.
+        //
+        // The oracle must be literal arithmetic over the fixture's CIDR text,
+        // never a call to `allows()` or `evaluate()` — a prior review found a
+        // test in manifest.rs that compared `allows()` against the function it
+        // calls internally, so mutations moved both sides and it could never
+        // fail.
         let should_allow = octets[0] == 10 && octets[1] == 30 && octets[2] == 0
-            && octets[3] != 1 && octets[3] != 0 && octets[3] != 255;
+            && octets[3] != 1;
         if !should_allow {
             proptest::prop_assert!(
                 matches!(d, PolicyDecision::Denied { .. }),
