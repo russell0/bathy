@@ -283,8 +283,32 @@ mod tests {
 
     #[test]
     fn digest_rejects_wrong_algorithm() {
+        // Assert the SPECIFIC variant. An earlier version of this test used
+        // `.is_err()` with a 71-character input, which passed even with the
+        // algorithm check deleted — the input fell through to the length check
+        // and failed there for an unrelated reason. Mutation testing caught it.
         let bad = format!("sha256:{}", "a".repeat(64));
-        assert!(bad.parse::<Digest>().is_err());
+        assert_eq!(bad.parse::<Digest>().unwrap_err(), IdError::WrongAlgorithm);
+    }
+
+    #[test]
+    fn digest_rejects_missing_algorithm_prefix() {
+        // The hole the weak test above masked: correct length, correct hex,
+        // no prefix at all.
+        let bare = "a".repeat(64);
+        assert_eq!(bare.parse::<Digest>().unwrap_err(), IdError::WrongAlgorithm);
+    }
+
+    #[test]
+    fn digest_rejects_uppercase_hex_so_the_type_matches_its_published_schema() {
+        // The schema this type publishes is `^blake3:[0-9a-f]{64}$`. If the
+        // type accepted uppercase, a document that fails schema validation
+        // would still deserialize — schema and implementation must agree.
+        let upper = format!("blake3:{}", "A".repeat(64));
+        assert!(upper.parse::<Digest>().is_err());
+        assert!(serde_json::from_str::<Digest>(&format!("\"{upper}\"")).is_err());
+        let lower = format!("blake3:{}", "a".repeat(64));
+        assert!(lower.parse::<Digest>().is_ok());
     }
 
     #[test]
@@ -363,6 +387,14 @@ impl FromStr for Digest {
         let hex = s.strip_prefix("blake3:").ok_or(IdError::WrongAlgorithm)?;
         if hex.len() != 64 {
             return Err(IdError::BadDigestLength(hex.len()));
+        }
+        // Lowercase ONLY, deliberately. `u8::from_str_radix(_, 16)` below is
+        // case-insensitive, but the JSON Schema this type publishes is
+        // `^blake3:[0-9a-f]{64}$`. Without this check the type would accept
+        // documents its own schema rejects. Do not "simplify" this to
+        // `is_ascii_hexdigit()` — that reintroduces the divergence.
+        if !hex.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+            return Err(IdError::BadHex);
         }
         let mut out = [0u8; 32];
         for (i, byte) in out.iter_mut().enumerate() {
@@ -493,7 +525,7 @@ git commit -m "feat(types): prefixed ULID identifiers and BLAKE3 digest type"
 ```
 
 **Acceptance criteria:**
-- **AC-1.6** `Digest` serializes to and parses from exactly `blake3:<64 lowercase hex>`, and rejects any other algorithm prefix.
+- **AC-1.6** `Digest` serializes to and parses from exactly `blake3:<64 lowercase hex>`. It rejects a wrong algorithm prefix, a missing prefix, and non-lowercase hex — the last because the type must accept exactly what its published schema advertises. Assert specific `IdError` variants, not `is_err()`: a length-mismatched test input passes even with the algorithm check deleted.
 - **AC-1.7** Each of `ScanId`, `EventId`, `ScopeId` rejects a string carrying a different type's prefix.
 - **AC-1.8** Each identifier and `Digest` exposes a JSON Schema with a `pattern` constraining its format.
 
