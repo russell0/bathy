@@ -122,10 +122,15 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
 
     for pkg in meta["packages"].as_array().ok_or("no packages")? {
         let name = pkg["name"].as_str().ok_or("unnamed package")?;
-        let Some(&own_rank) = rank.get(name) else { continue };
+        // A package's own rank gates only the LAYER check. The
+        // forbidden-substring check applies to EVERY workspace package,
+        // ranked or not — `xtask` is a real member and is deliberately not in
+        // LAYERS, so gating both checks on rank would let it depend on an
+        // inference client undetected.
+        let own_rank = rank.get(name).copied();
         for dep in pkg["dependencies"].as_array().ok_or("no dependencies")? {
             let dep_name = dep["name"].as_str().ok_or("unnamed dep")?;
-            if let Some(&dep_rank) = rank.get(dep_name) {
+            if let (Some(own_rank), Some(&dep_rank)) = (own_rank, rank.get(dep_name)) {
                 if dep_rank >= own_rank {
                     violations.push(format!(
                         "{name} depends on {dep_name}, which is not strictly lower in the layer order"
@@ -180,9 +185,12 @@ jobs:
       - run: cargo test --workspace
       - run: cargo run -p xtask -- check-deps
       - run: cargo run -p xtask -- check-schemas
+      # `unsafe ` with a trailing space misses `unsafe{`, and scanning only
+      # crates/ misses xtask/. Match unsafe followed by space, brace, paren,
+      # or end-of-line, across every Rust source outside sonde-packetd.
       - name: no unsafe outside packetd
         run: |
-          ! grep -rn --include='*.rs' 'unsafe ' crates/ \
+          ! grep -rnE --include='*.rs' 'unsafe([ {(]|$)' crates/ xtask/ \
             | grep -v '^crates/sonde-packetd/'
       # Lines that legitimately name the phrase — this rule, its tests, its
       # enforcement — carry the [phrase-rule] marker and are excluded. Without
@@ -232,9 +240,9 @@ git commit -m "chore: workspace scaffold, dual license, CI, dependency-boundary 
 
 **Acceptance criteria:**
 - **AC-1.1** `cargo run -p xtask -- check-deps` exits non-zero when a crate depends on one at or above its own layer. Prove with a temporary violating dependency in a test, then revert.
-- **AC-1.2** `check-deps` exits non-zero if any workspace crate depends on a package whose name contains any `FORBIDDEN_SUBSTRINGS` entry.
+- **AC-1.2** `check-deps` exits non-zero if any workspace package depends on a package whose name contains any `FORBIDDEN_SUBSTRINGS` entry — **including packages not listed in `LAYERS`**, such as `xtask`. Prove with a test whose depender is unranked; gating this check on the depender's rank is the natural mistake and it leaves a real hole.
 - **AC-1.3** Both `LICENSE-APACHE` and `LICENSE-MIT` exist and every crate manifest declares `license = "Apache-2.0 OR MIT"` via `workspace = true`.
-- **AC-1.4** CI fails the build if `unsafe ` appears in any crate other than `sonde-packetd`.
+- **AC-1.4** CI fails the build if `unsafe` appears in any Rust source outside `sonde-packetd`, matching `unsafe` followed by a space, `{`, `(`, or end-of-line, and scanning `xtask/` as well as `crates/`. Verify both directions by seeding `unsafe{}` (no space, under `xtask/`) and confirming a non-zero exit, then removing it and confirming zero.
 - **AC-1.5** CI fails the build if the unscoped determinism phrase appears on any line not carrying the `[phrase-rule]` marker. Prove both directions: a seeded unmarked occurrence fails the build, and the rule's own marked statements do not. `[phrase-rule]`
 - **AC-1.35** A dedicated CI job compiles the workspace on Rust 1.85 with `rust-toolchain.toml` removed, so the declared MSRV is verified rather than assumed. Development itself happens on stable. (Numbered out of positional order: added after the toolchain was installed and the exact-version pin proved wrong.)
 
