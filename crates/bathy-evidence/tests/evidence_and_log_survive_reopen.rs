@@ -22,7 +22,7 @@ fn evidence_and_its_referencing_event_survive_close_and_reopen() {
     let evidence_dir = dir.path().join("evidence");
     let events_dir = dir.path().join("events");
     let scan_id: ScanId = "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
-    let clock = FixedClock::new("2026-08-01T15:04:31.182Z", 7);
+    let clock = FixedClock::new("2026-08-01T15:04:31.182Z", 7).unwrap();
     let response_bytes = b"HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n";
 
     let digest = {

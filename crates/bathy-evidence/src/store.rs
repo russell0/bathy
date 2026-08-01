@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -23,8 +24,18 @@ pub enum EvidenceError {
 /// Evidence is always written *before* the event that references it, so an
 /// `evidence_refs` entry can never dangle. Because the key is the hash,
 /// writes are idempotent and identical responses across hosts cost one copy.
+///
+/// C1: "written before" is a durability claim, not just a program-order
+/// claim -- `store.rs`'s own module doc and `put`'s doc below promise that
+/// once `put` returns `Ok`, the digest is durably retrievable, and M4
+/// depends on that ordering surviving a crash, not merely a bug. `durable`
+/// (set by [`Self::open`] vs [`Self::open_without_durability_barrier`])
+/// controls whether `put` actually pays for that guarantee with an
+/// `fsync`, per the finding's requirement that any opt-out be explicit in
+/// a named constructor, never a silent default.
 pub struct EvidenceStore {
     root: PathBuf,
+    durable: bool,
 }
 
 /// Where the bytes for `digest` live under `root`, if they exist.
@@ -76,14 +87,62 @@ fn tmp_path(parent: &Path) -> PathBuf {
     parent.join(format!(".tmp-{}-{seq}", std::process::id()))
 }
 
+/// Fsyncs a directory's own metadata (the entry pointing at a just-renamed
+/// file), so the rename in [`EvidenceStore::put`] is itself durable, not
+/// only the bytes underneath it.
+///
+/// Unix guarantees a directory can be opened read-only and `fsync`'d this
+/// way (POSIX `open(2)`/`fsync(2)`; every mainstream Unix filesystem this
+/// project targets -- ext4, APFS, XFS -- honors it). Windows has no
+/// equivalent: `CreateFile` on a directory requires
+/// `FILE_FLAG_BACKUP_SEMANTICS`, which `std::fs::File::open` does not set,
+/// so attempting this on Windows would simply fail with "access denied" on
+/// every call, and NTFS's own metadata journaling makes the hazard this
+/// guards against far less likely there in the first place. Rather than
+/// have every `put` on Windows pay for a syscall that only ever errors,
+/// this degrades explicitly to a documented no-op on non-Unix platforms --
+/// callers on Windows get the data-durability half of C1 (the temp file's
+/// own `sync_all`) but not the directory-entry half.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 impl EvidenceStore {
+    /// The default, durable constructor: `put` fsyncs the temp file before
+    /// renaming it into place and fsyncs the containing directory after the
+    /// rename (see [`fsync_dir`]), so a crash immediately after `put`
+    /// returns `Ok` can never lose or corrupt the bytes it just wrote. See
+    /// [`Self::open_without_durability_barrier`] for the explicit opt-out.
     pub fn open(root: &Path) -> Result<Self, EvidenceError> {
+        Self::open_with_durability(root, true)
+    }
+
+    /// C1: the explicit, named opt-out. `put` on a store built this way
+    /// skips both fsyncs -- cheaper, but a crash between `put` returning
+    /// `Ok` and the OS actually flushing those pages can lose the blob
+    /// while any event that already cited its digest survives, producing
+    /// exactly the dangling `evidence_refs` entry `store.rs`'s module doc
+    /// says can never happen. There is no way to reach this behavior except
+    /// by naming it: [`Self::open`] (the type most callers should use) is
+    /// always durable.
+    pub fn open_without_durability_barrier(root: &Path) -> Result<Self, EvidenceError> {
+        Self::open_with_durability(root, false)
+    }
+
+    fn open_with_durability(root: &Path, durable: bool) -> Result<Self, EvidenceError> {
         fs::create_dir_all(root.join("blobs")).map_err(|source| EvidenceError::Io {
             path: root.to_owned(),
             source,
         })?;
         Ok(Self {
             root: root.to_owned(),
+            durable,
         })
     }
 
@@ -113,14 +172,53 @@ impl EvidenceStore {
         // The temp name is process- and call-unique (see `tmp_path`), so
         // concurrent writers never share one.
         let tmp = tmp_path(parent);
-        fs::write(&tmp, bytes).map_err(|source| EvidenceError::Io {
-            path: tmp.clone(),
-            source,
-        })?;
+        // C1: `fs::write` alone (the previous shape here) opens, writes, and
+        // closes the file with no way to fsync it first -- closing a file
+        // does not imply the kernel has flushed its data to durable
+        // storage. Go through a `File` handle instead, specifically so
+        // `sync_all` can run on it before the file is renamed into place.
+        {
+            let mut f = File::create(&tmp).map_err(|source| EvidenceError::Io {
+                path: tmp.clone(),
+                source,
+            })?;
+            f.write_all(bytes).map_err(|source| EvidenceError::Io {
+                path: tmp.clone(),
+                source,
+            })?;
+            if self.durable {
+                // Flushes both data and metadata (`sync_all`, not
+                // `sync_data`): a freshly-created temp file's metadata
+                // (e.g. its allocated extents) may not exist durably yet
+                // either, and the subsequent `rename` depends on the file
+                // actually existing on disk under this name.
+                f.sync_all().map_err(|source| EvidenceError::Io {
+                    path: tmp.clone(),
+                    source,
+                })?;
+            }
+            // `f` drops here, closing the descriptor before rename -- not
+            // load-bearing for correctness (POSIX rename doesn't care
+            // whether the source is still open), but avoids holding an fd
+            // open a moment longer than necessary.
+        }
         fs::rename(&tmp, &path).map_err(|source| EvidenceError::Io {
             path: path.clone(),
             source,
         })?;
+        if self.durable {
+            // The rename itself is only durable once the directory entry
+            // change is flushed -- fsyncing the file's data says nothing
+            // about the directory that now points to it under its final
+            // name. Without this, a crash right after `rename` can leave
+            // the *old* name (or no name at all) pointing at the bytes once
+            // the filesystem's journal replays, even though the data itself
+            // is safely on disk.
+            fsync_dir(parent).map_err(|source| EvidenceError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
         Ok(digest)
     }
 
@@ -553,5 +651,80 @@ mod tests {
             2,
             "exactly the two distinct blobs, neither lost nor duplicated"
         );
+    }
+
+    // --- C1: the durability barrier. A crash can't be simulated in-process,
+    // so what's checked here is everything that IS observable from user
+    // space: the default is durable, the opt-out is explicit and named (not
+    // a flag that could default the wrong way), both still round-trip bytes
+    // correctly, and `fsync_dir` itself succeeds against a real directory
+    // and fails cleanly against a path that isn't one. The actual claim --
+    // that `sync_all`/`fsync_dir` genuinely reach the OS, not just that the
+    // code compiles -- is established differently: the fix wave report
+    // measures wall-clock throughput with these calls present vs. removed,
+    // which is the one thing that IS observable about an fsync from user
+    // space. ---
+
+    #[test]
+    fn open_is_durable_by_default_and_still_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = EvidenceStore::open(dir.path()).unwrap();
+        assert!(s.durable, "EvidenceStore::open must default to durable");
+        let digest = s.put(b"durable by default").unwrap();
+        assert_eq!(s.get(&digest).unwrap(), b"durable by default");
+    }
+
+    #[test]
+    fn the_durability_opt_out_is_explicit_and_still_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = EvidenceStore::open_without_durability_barrier(dir.path()).unwrap();
+        assert!(
+            !s.durable,
+            "the explicit opt-out constructor must actually disable the barrier"
+        );
+        let digest = s.put(b"no fsync here").unwrap();
+        assert_eq!(
+            s.get(&digest).unwrap(),
+            b"no fsync here",
+            "skipping the fsync must not affect correctness under normal \
+             (non-crash) operation"
+        );
+        // Dedup, healing, and atomicity are all orthogonal to durability --
+        // spot-check dedup still holds under the opt-out too.
+        let again = s.put(b"no fsync here").unwrap();
+        assert_eq!(digest, again);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_dir_succeeds_against_a_real_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(fsync_dir(dir.path()).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fsync_dir_fails_cleanly_against_a_path_that_does_not_exist() {
+        // `File::open` doesn't distinguish "directory" from "regular file"
+        // by itself -- opening either one read-only succeeds on Unix, so
+        // `fsync_dir` is not, and does not claim to be, a type check.
+        // What it must still do is propagate a real I/O failure cleanly
+        // rather than panicking or silently reporting success.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(
+            fsync_dir(&missing).is_err(),
+            "fsync_dir must report an error for a path that cannot be opened"
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn fsync_dir_is_a_documented_no_op_off_unix() {
+        // See `fsync_dir`'s doc comment: there is no portable directory-fsync
+        // primitive on Windows via `std::fs::File::open`, so this degrades
+        // explicitly rather than erroring on every `put`.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(fsync_dir(dir.path()).is_ok());
     }
 }

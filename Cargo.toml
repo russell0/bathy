@@ -21,6 +21,15 @@ proptest = "1"
 time = { version = "0.3", features = ["parsing"] }
 tempfile = "3.27"
 walkdir = "2.5"
+# C5: advisory whole-file locking for `EventLog::open`'s writer-exclusion
+# guarantee. Pure Rust (no libc), so it doesn't conflict with `#[forbid(unsafe_code)]`
+# in `bathy-evidence`; `sync` is the only feature enabled -- no async runtime
+# is pulled in. `File::try_lock`/`lock`/`unlock` were only stabilized in std
+# as of Rust 1.89, above this workspace's declared MSRV floor for the crates
+# that need this (`bathy-evidence` stays at 1.85 -- see the MSRV tiering
+# comment on `bathy-store`'s `Cargo.toml`), so std's own API isn't an option
+# here.
+fs4 = { version = "1", default-features = false, features = ["sync"] }
 # `fallible_uint`: this store's schema uses `u64` throughout (packet/probe
 # counts, unit indices); without this feature rusqlite 0.40.1 does not
 # implement `ToSql`/`FromSql` for `u64` at all (verified against the
