@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod canonical;
+pub mod clock;
 pub mod confidence;
 pub mod event;
 pub mod ids;
@@ -11,6 +12,7 @@ pub mod scope_dto;
 pub mod task;
 
 pub use canonical::{CanonicalError, canonical_json, plan_digest};
+pub use clock::{Clock, FixedClock, SystemClock};
 pub use confidence::{Confidence, ConfidenceError};
 pub use event::{
     DenyReason, Endpoint, Event, EventBody, Observation, PortState, Target, Transport,

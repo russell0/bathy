@@ -13,6 +13,16 @@ jobs:
       - run: cargo test --workspace
       - run: cargo run -p xtask -- check-deps
       - run: cargo run -p xtask -- check-schemas
+      - name: no direct time/id generation outside Clock (AC-2.1)
+        run: |
+          # `Clock` (crates/bathy-types/src/clock.rs) is the only place
+          # permitted to call `SystemTime::now()` or construct a random ULID
+          # (`ulid::Generator`, or `Ulid::new()` should a future `ulid`
+          # version reintroduce it). Injecting both through `Clock` is what
+          # makes an event log byte-comparable between a recorded run and a
+          # replayed one; any other call site breaks that guarantee.
+          ! grep -rnE --include='*.rs' 'SystemTime::now\(\)|ulid::Generator|Ulid::new\(' crates/ xtask/ \
+            | grep -v '^crates/bathy-types/src/clock\.rs:'
       - name: no unsafe outside packetd
         run: |
           # Matches `unsafe` followed by a space, `{`, `(`, or end-of-line, so

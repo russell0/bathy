@@ -126,9 +126,56 @@ macro_rules! prefixed_id {
 
         impl $name {
             pub const PREFIX: &'static str = $prefix;
+
+            /// Builds an id straight from a `Ulid`, with no validation --
+            /// unlike `FromStr` above, which rejects any first Crockford
+            /// character above `7` (see C2). That looks like the same hole
+            /// reopened: could a caller hand this a `Ulid` whose canonical
+            /// string this type's own `FromStr` would then reject?
+            ///
+            /// No -- and the reason is structural, not incidental. `Ulid`
+            /// wraps a `u128` (`ulid::Ulid(pub u128)`). Its `Display` impl
+            /// (`ulid-3.0.0/src/base32.rs::encode_to_array`) walks the value
+            /// 5 bits at a time for 26 characters, most-significant group
+            /// first: `buffer[0] = (value >> 125) & 0x1f` is the first
+            /// character. 26 * 5 = 130 bits requested from a value that only
+            /// *has* 128, so that top group can supply at most
+            /// 128 - 25*5 = 3 real bits (positions 125-127); the two bit
+            /// positions above that (128, 129) don't exist in a `u128`, so
+            /// there is nothing there to ever set. Consequently, for *every*
+            /// possible `u128` value -- not just ones reachable through
+            /// `Generator::generate()` or `Ulid::from_parts`, but literally
+            /// `Ulid(u128::MAX)` -- `value >> 125 < 2^3 = 8`, so the first
+            /// character always lands in `0..=7`. Encoding is total onto the
+            /// range `FromStr` accepts; there is no bit pattern that can ever
+            /// violate it. The `debug_assert!` below pins that as an
+            /// executable invariant (checked on every debug-mode call, so a
+            /// future change to `ulid`'s encoding would be caught
+            /// immediately rather than drifting quietly), and
+            /// `from_ulid_round_trips_for_every_reachable_first_character`
+            /// and the `Clock`-level tests in `clock.rs` pin it with
+            /// concrete extreme values.
+            ///
+            /// This is option (b) from the M2 Task 1 dispatch, not (a)
+            /// (`try_from_ulid`): a fallible constructor would be a
+            /// vocabulary lie here, forcing every caller (including
+            /// `Clock::new_scan_id`, which must be infallible) to handle an
+            /// error case that provably cannot occur.
             pub fn from_ulid(u: ulid::Ulid) -> Self {
+                debug_assert!(
+                    u.to_string()
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|b| (b'0'..=b'7').contains(b)),
+                    "ulid::Ulid's Display must always start with a canonical \
+                     (0-7) Crockford character -- see the comment on \
+                     `from_ulid` above; if this fires, the upstream `ulid` \
+                     encoding changed and this reasoning must be redone \
+                     before release"
+                );
                 Self(u)
             }
+
             pub fn as_ulid(&self) -> ulid::Ulid {
                 self.0
             }
@@ -640,5 +687,60 @@ mod tests {
             Err(IdError::BadUlid)
         );
         assert!("scan_71ARZ3NDEKTSV4RRFFQ69G5FAV".parse::<ScanId>().is_ok());
+    }
+
+    // --- M2 Task 1: `from_ulid` takes a `Ulid` with no validation, unlike
+    // `FromStr` above. These pin the bit-level proof on `from_ulid`'s doc
+    // comment that this can never actually produce a string `FromStr` would
+    // reject: encoding a `u128` onto 26 Crockford characters structurally
+    // cannot set the first character above `7`, for *any* `u128` whatsoever.
+    // ---
+
+    #[test]
+    fn from_ulid_round_trips_for_every_reachable_first_character() {
+        // The largest possible 128-bit value: `Ulid`'s field is public
+        // (`pub struct Ulid(pub u128)`), so this bypasses `from_parts` and
+        // `Generator` entirely and constructs the single most adversarial
+        // bit pattern directly -- every bit set, not just the ones those
+        // constructors happen to reach.
+        let max = ScanId::from_ulid(ulid::Ulid(u128::MAX));
+        let s = max.to_string();
+        assert!(s.starts_with("scan_7"), "got {s}");
+        assert_eq!(s.parse::<ScanId>().unwrap(), max, "must round-trip: {s}");
+
+        // The nil ulid: every bit zero.
+        let nil = ScanId::from_ulid(ulid::Ulid(0));
+        let s = nil.to_string();
+        assert!(s.starts_with("scan_0"), "got {s}");
+        assert_eq!(s.parse::<ScanId>().unwrap(), nil, "must round-trip: {s}");
+
+        // Every value reachable via `from_parts` with a maxed-out 48-bit
+        // timestamp and maxed-out 80-bit random component -- the largest
+        // value the *documented* constructor path can produce, distinct
+        // from the raw-tuple case above.
+        let from_parts_max = ScanId::from_ulid(ulid::Ulid::from_parts(u64::MAX, u128::MAX));
+        let s = from_parts_max.to_string();
+        assert!(s.starts_with("scan_7"), "got {s}");
+        assert_eq!(
+            s.parse::<ScanId>().unwrap(),
+            from_parts_max,
+            "must round-trip: {s}"
+        );
+
+        // Sweep every one of the 8 canonical first-character values
+        // directly, by shifting a 3-bit pattern into the timestamp's top
+        // bits, confirming each is reachable and round-trips.
+        for top3 in 0u64..=7 {
+            let timestamp_ms = top3 << 45; // bits 45-47 are the top 3 of 48
+            let u = ulid::Ulid::from_parts(timestamp_ms, 0);
+            let id = ScanId::from_ulid(u);
+            let s = id.to_string();
+            assert_eq!(
+                &s[5..6],
+                top3.to_string(),
+                "top3={top3} should encode to first char {top3}, got {s}"
+            );
+            assert_eq!(s.parse::<ScanId>().unwrap(), id, "must round-trip: {s}");
+        }
     }
 }
