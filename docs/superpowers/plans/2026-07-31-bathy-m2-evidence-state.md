@@ -327,18 +327,31 @@ impl EvidenceStore {
         Ok(Self { root: root.to_owned() })
     }
 
+    /// NO `path.exists()` short-circuit. An early return on presence reports
+    /// success without verifying content, so calling `put` with correct bytes
+    /// over a corrupted blob returns `Ok` while the next `get` still fails
+    /// `Corrupt` — and M4 treats `put`'s `Ok` as "this digest is now durably
+    /// retrievable". Always write-then-rename instead: idempotent for identical
+    /// content (same bytes, same digest, same path), self-healing for corrupt
+    /// content, and it removes a branch rather than adding a special case.
+    /// Do NOT "optimize" this back into an exists-check.
     pub fn put(&self, bytes: &[u8]) -> Result<Digest, EvidenceError> {
         let digest = Digest::of_bytes(bytes);
         let path = blob_path(&self.root, &digest);
-        if path.exists() {
-            return Ok(digest); // content-addressed: already have exactly these bytes
-        }
         let parent = path.parent().expect("blob path has a parent");
         fs::create_dir_all(parent)
             .map_err(|source| EvidenceError::Io { path: parent.to_owned(), source })?;
         // Write to a temp name then rename, so a crash never leaves a partial
         // blob visible under a digest that does not describe it.
-        let tmp = parent.join(format!(".tmp-{}", std::process::id()));
+        //
+        // The name MUST include a per-call sequence, not just the pid: two
+        // threads in one process writing distinct blobs whose digests share a
+        // fan-out directory otherwise collide on the same temp path, and one
+        // thread's rename fails ENOENT after the other renames it away.
+        // Reproduced 5/5 with a pid-only name.
+        static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = parent.join(format!(".tmp-{}-{seq}", std::process::id()));
         fs::write(&tmp, bytes)
             .map_err(|source| EvidenceError::Io { path: tmp.clone(), source })?;
         fs::rename(&tmp, &path)
@@ -388,11 +401,12 @@ git commit -m "feat(evidence): content-addressed store with read-time digest ver
 ```
 
 **Acceptance criteria:**
-- **AC-2.4** Storing identical bytes twice yields one digest and exactly one on-disk object.
+- **AC-2.4** Storing identical bytes twice yields one digest and exactly one on-disk object. Prove by counting files on disk (excluding `.tmp-` names), not by comparing return values — a return-value check passes even when storage duplicates.
 - **AC-2.5** `get` recomputes the digest of the bytes it read and returns `Corrupt` when they disagree. Tampering with a blob is detected, not served.
 - **AC-2.6** `get` of an unstored digest returns `NotFound`, never panics.
 - **AC-2.7** `put_capped` truncates at the cap and reports truncation, so `evidence_level: full` cannot be turned into unbounded disk use by a hostile response.
-- **AC-2.8** Blob writes are atomic (temp file plus rename); a partial write is never visible under a valid digest.
+- **AC-2.8** Blob writes are atomic (temp file plus rename); a partial write is never visible under a valid digest. The temp name carries a per-call sequence as well as the pid, so concurrent writers in one process cannot collide.
+- **AC-2.9** `put` heals a corrupted blob: given bytes whose digest matches an existing but corrupt object, a subsequent `get` returns the correct bytes. `contains` is documented as a presence probe, not a verification.
 
 ---
 
