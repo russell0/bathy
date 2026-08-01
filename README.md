@@ -4,9 +4,35 @@ An agent-native network discovery engine: turns authorized network questions int
 bounded scan plans, executes them, and returns structured, evidence-backed findings
 over MCP.
 
-> **Status: pre-implementation.** This repository currently contains implementation
-> plans only — no working code. Nothing here scans anything yet. See
+> **Status: Milestone 1 of 7 complete. Nothing here scans anything yet.**
+>
+> What exists: the contract layer (`sonde-types`) and the authorization engine
+> (`sonde-scope`), with 194 tests, four published JSON Schemas, and CI enforcing
+> the project's layering and clean-room rules. **No code in this repository sends
+> a packet.** The scanning engine lands in Milestone 3.
+>
+> Plans for all seven milestones — 185 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
+
+## What works today
+
+| Crate | Delivers |
+|---|---|
+| `sonde-types` | Every type crossing a public boundary: `ScanRequest`, the immutable `Event` model, `Digest`, prefixed ULID identifiers, `NonEmpty`, `Confidence`, `TaskHandle`, canonical JSON and `plan_digest`. Zero internal dependencies, no async runtime. |
+| `sonde-scope` | Deny-by-default authorization: scope manifests with expiry, policy evaluation with stable machine-readable deny codes, and a hard budget ledger. |
+| `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
+
+Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
+changes without regenerating them — they are the published contract, not a
+by-product.
+
+### Verified properties, not just tested ones
+
+Reviews on this branch mutation-test their findings: a check is deleted, and the
+suite must fail. Several defects were caught that way and would not have been
+caught by reading, including a test that passed with the code it named removed,
+eight distinct IPv4-in-IPv6 embedding schemes that bypassed the authorization
+boundary, and an expiry comparison that reported an expired manifest as valid.
 
 ## Authorized use
 
@@ -57,6 +83,15 @@ and rate budgets, a CLI, a Rust library, and an MCP server.
 
 Out of scope for v0.1: OS fingerprinting, UDP breadth, traceroute, evasion modes,
 IPv6 scanning, and Windows support.
+
+**IPv6 is refused outright**, not merely unimplemented. `ScopeManifest::allows()`
+returns false for every IPv6 address in v0.1. That decision came out of review:
+three rounds of prefix-by-prefix hardening each closed an enumerated set of
+IPv4-in-IPv6 embedding schemes and each was followed by a review finding one
+more — eight in total, the last (ISATAP) signalling through the interface
+identifier rather than a prefix, which no prefix list can catch. A blanket
+refusal is immune to every scheme, enumerated or not. The eight guards remain in
+the source, parked and tested, as the starting point for v0.2.
 
 ## Clean room
 
