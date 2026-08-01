@@ -6,7 +6,7 @@
 
 **Architecture:** Evidence is written before the event that references it, so a dangling `EvidenceRef` is impossible. The event log is the only source of truth for what was observed; SQLite holds only mutable task state and the resumption cursor, and can be rebuilt from the log. Time and identifier generation are injected via a `Clock` trait so every test is deterministic.
 
-**Tech Stack:** rusqlite (bundled), serde_json, ulid, blake3, tempfile, tokio (for the async append path only).
+**Tech Stack:** rusqlite (bundled), serde_json (a NORMAL dependency of `bathy-evidence` — the event log serializes through it, not just tests), ulid, blake3, tempfile, walkdir (dev), tokio (for the async append path only).
 
 **Read first:** `2026-07-31-bathy-v0.1-overview.md` Global Constraints, and M1 Tasks 2 and 5 for `Digest`, `ScanId`, and `Event`.
 
@@ -406,7 +406,7 @@ git commit -m "feat(evidence): content-addressed store with read-time digest ver
 - **AC-2.6** `get` of an unstored digest returns `NotFound`, never panics.
 - **AC-2.7** `put_capped` truncates at the cap and reports truncation, so `evidence_level: full` cannot be turned into unbounded disk use by a hostile response.
 - **AC-2.8** Blob writes are atomic (temp file plus rename); a partial write is never visible under a valid digest. The temp name carries a per-call sequence as well as the pid, so concurrent writers in one process cannot collide.
-- **AC-2.9** `put` heals a corrupted blob: given bytes whose digest matches an existing but corrupt object, a subsequent `get` returns the correct bytes. `contains` is documented as a presence probe, not a verification.
+- **AC-2.21** `put` heals a corrupted blob: given bytes whose digest matches an existing but corrupt object, a subsequent `get` returns the correct bytes. `contains` is documented as a presence probe, not a verification.
 
 ---
 
@@ -603,6 +603,17 @@ impl EventLog {
         Ok(event)
     }
 
+    /// Seeks; does NOT rescan. `open` already walks the file to validate
+    /// sequences, so it builds a byte-offset index in the same pass and
+    /// `append` extends it by one entry. Re-scanning the whole file per call
+    /// would make this O(n) per page and contradict the "cheap streaming
+    /// primitive" claim M5's `scan.events` paging is built on. At 8 bytes per
+    /// event the index costs ~7.6 MiB at the 1,000,000-packet budget ceiling.
+    ///
+    /// Build the index while STREAMING (BufReader plus a running byte
+    /// position). Do not read the whole file into one buffer to do it — that
+    /// trades an O(n) scan for an O(n) allocation, ~240-330 MiB at that same
+    /// ceiling, and gains nothing.
     pub fn read_from(&self, after_sequence: u64) -> Result<Vec<Event>, LogError> {
         let f = File::open(&self.path)
             .map_err(|source| LogError::Io { path: self.path.clone(), source })?;
@@ -639,7 +650,7 @@ git commit -m "feat(evidence): gap-free append-only JSONL event log"
 
 **Acceptance criteria:**
 - **AC-2.9** Sequences begin at 1, increase by exactly 1, and continue correctly across a close and reopen.
-- **AC-2.10** A sequence gap in an existing log is an error on open, not a silently accepted state.
+- **AC-2.10** A sequence gap in an existing log is an error on open, not a silently accepted state. Test all three corruption shapes, not only a missing tail: a gap in the MIDDLE, a DUPLICATE sequence, and OUT-OF-ORDER sequences. One unified check should catch all three; prove it by mutation.
 - **AC-2.11** A truncated trailing record causes `open` to fail with `Malformed` naming the line number.
 - **AC-2.12** `read_from(n)` returns exactly the events with `sequence > n`, in order. This is the primitive `scan.events` streaming is built on.
 - **AC-2.13** Each event occupies exactly one line and the file always ends with a newline.
