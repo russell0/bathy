@@ -5,7 +5,16 @@ members = ["crates/*", "xtask"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+# 1.88, not the lowest number that happens to build: the patched `time`
+# release that fixes RUSTSEC-2026-0009 (stack exhaustion via RFC 2822
+# parsing, see the `time` entry below) declares `rust-version = 1.88`.
+# Cargo's resolver is MSRV-aware over the workspace floor, so anything
+# lower pins `time` back to the vulnerable 0.3.45. This floor previously
+# read 1.85 for no reason other than matching edition 2024's own minimum --
+# an arbitrary number with no consumer requiring it, which is exactly what
+# let it block a security patch. Don't lower this without checking whether
+# `time` (or whatever replaces it as the reason) still needs 1.88.
+rust-version = "1.88"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/russell0/bathy"
 
@@ -26,7 +35,7 @@ walkdir = "2.5"
 # in `bathy-evidence`; `sync` is the only feature enabled -- no async runtime
 # is pulled in. `File::try_lock`/`lock`/`unlock` were only stabilized in std
 # as of Rust 1.89, above this workspace's declared MSRV floor for the crates
-# that need this (`bathy-evidence` stays at 1.85 -- see the MSRV tiering
+# that need this (`bathy-evidence` stays at 1.88 -- see the MSRV tiering
 # comment on `bathy-store`'s `Cargo.toml`), so std's own API isn't an option
 # here.
 fs4 = { version = "1", default-features = false, features = ["sync"] }
@@ -43,11 +52,11 @@ fs4 = { version = "1", default-features = false, features = ["sync"] }
 # MSRV, tiered rather than a workspace-wide conflict: `bundled`'s
 # `libsqlite3-sys` 0.38.1 build script needs a rustc with `cfg_select!`
 # (stable at 1.97.1, present but unstable-gated from 1.90; simply absent at
-# this workspace's declared floor of 1.85). Rather than raise the whole
+# this workspace's declared floor of 1.88). Rather than raise the whole
 # workspace's MSRV for one dependency only `bathy-store` uses, `bathy-store`
 # declares its own literal, higher `rust-version` -- see the comment on it
 # in `crates/bathy-store/Cargo.toml` for the exact floor and how it was
 # measured. CI verifies both floors with two separate jobs
-# (`.github/workflows/ci.yml`): `msrv` at `1.85` over the four crates that
+# (`.github/workflows/ci.yml`): `msrv` at `1.88` over the four crates that
 # still need only that, and `msrv-bathy-store` at `1.95` for this one.
 rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }

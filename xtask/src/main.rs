@@ -70,15 +70,14 @@ fn find_violations(packages: &[PackageInfo]) -> Vec<String> {
     for pkg in packages {
         let own_rank = rank.get(pkg.name.as_str()).copied();
         for dep_name in &pkg.dependencies {
-            if let Some(own_rank) = own_rank {
-                if let Some(&dep_rank) = rank.get(dep_name.as_str()) {
-                    if dep_rank >= own_rank {
-                        violations.push(format!(
-                            "{} depends on {dep_name}, which is not strictly lower in the layer order",
-                            pkg.name
-                        ));
-                    }
-                }
+            if let Some(own_rank) = own_rank
+                && let Some(&dep_rank) = rank.get(dep_name.as_str())
+                && dep_rank >= own_rank
+            {
+                violations.push(format!(
+                    "{} depends on {dep_name}, which is not strictly lower in the layer order",
+                    pkg.name
+                ));
             }
             let lowered = dep_name.to_ascii_lowercase();
             if FORBIDDEN_SUBSTRINGS.iter().any(|f| lowered.contains(f)) {

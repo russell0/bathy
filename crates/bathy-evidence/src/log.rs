@@ -182,7 +182,7 @@ impl EventLog {
         // std's method (shadowing the trait method) instead of `fs4`'s --
         // which behave equivalently at runtime, but return a *different*
         // `TryLockError` type than the `fs4::TryLockError` matched below,
-        // and this crate's MSRV floor (1.85) is below 1.89, so relying on
+        // and this crate's MSRV floor (1.88) is below 1.89, so relying on
         // std's version at all here would not even compile there.
         fs4::FileExt::try_lock(&file).map_err(|e| match e {
             fs4::TryLockError::WouldBlock => LogError::Locked { path: path.clone() },
