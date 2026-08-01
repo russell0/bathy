@@ -2,7 +2,24 @@
 name = "bathy-store"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
+# MSRV tiering: this crate, alone in the workspace, needs a rustc newer than
+# the workspace floor (`1.85`, see `rust-version.workspace = true` on every
+# other member). `rusqlite`'s `bundled` feature (see the comment on
+# `rusqlite` in the workspace `Cargo.toml`) pulls in `libsqlite3-sys`
+# 0.38.1, whose build script invokes the `cfg_select!` macro -- unstable
+# before 1.90, stable at 1.97.1, and simply absent at 1.85
+# (`rustup run 1.85.0 cargo check -p bathy-store` fails with "cannot find
+# macro `cfg_select`"). Empirically, `1.95` is the exact floor: 1.85, 1.90,
+# 1.91, 1.93, and 1.94 all fail; 1.95 succeeds. `libsqlite3-sys` itself
+# declares no `rust-version` at all, so this number is only trustworthy
+# because CI's dedicated `msrv-bathy-store` job (`.github/workflows/ci.yml`)
+# actually builds this crate at literal Rust 1.95, rather than being taken
+# on faith the way the workspace-wide `1.85` claim used to be for this
+# crate. `resolver = "3"` (workspace `Cargo.toml`) is MSRV-aware over the
+# workspace's declared *minimum*, not per-crate, so this override does not
+# unlock any newer dependency versions for this crate -- it only documents
+# and verifies the floor this crate has always actually needed.
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 

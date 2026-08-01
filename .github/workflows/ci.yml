@@ -52,13 +52,30 @@ jobs:
             | grep -v '\[phrase-rule\]'
   # The MSRV is a promise to downstream consumers, so it gets its own job.
   # Without this, MSRV rots silently the first time someone uses a newer API.
+  #
+  # Tiered in two jobs, not one over `--workspace`: `bathy-store` (via
+  # `rusqlite`'s `bundled` feature) needs a newer rustc than the rest of the
+  # workspace -- see the MSRV comment on `bathy-store`'s `Cargo.toml` for the
+  # exact floor and how `1.95` was measured. A single `--workspace` job
+  # pinned to `1.85` would simply fail on `bathy-store` forever; splitting
+  # it is what lets CI stay green while still actually verifying both
+  # floors, rather than one of them being asserted in a comment and never
+  # built.
   msrv:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
-      - run: cargo check --workspace --all-targets
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p xtask --all-targets
+
+  msrv-bathy-store:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95
+      - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
+      - run: cargo check -p bathy-store --all-targets
 
   deny:
     runs-on: ubuntu-latest

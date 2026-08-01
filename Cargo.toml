@@ -40,23 +40,14 @@ fs4 = { version = "1", default-features = false, features = ["sync"] }
 # library is required on a contributor machine or in CI -- deliberate, so
 # `cargo test` stays reproducible without an OS package manager step.
 #
-# KNOWN MSRV CONFLICT, verified concretely (not assumed): with `bundled`
-# enabled, `libsqlite3-sys` 0.38.1's build script (the only version on
-# crates.io satisfying rusqlite 0.40.1's `^0.38.1` requirement) invokes the
-# `cfg_select!` macro, which this workspace's declared `rust-version = "1.85"`
-# does not have -- confirmed by running `rustup run 1.85.0 cargo check
-# --workspace --all-targets`, which fails with "cannot find macro
-# `cfg_select`". `cfg_select!` is unstable-gated as of 1.90.0 and fully
-# stable by 1.97.1, i.e. it needs a rustc well above 1.85. This is an
-# upstream `libsqlite3-sys` implementation detail, not something a code
-# change in this workspace can fix; dropping `bundled` would restore MSRV
-# compliance but reintroduce the system-SQLite dependency this feature
-# exists to avoid (and CI's `test` job would then need a new
-# `apt-get install libsqlite3-dev` step, since ubuntu-latest does not ship
-# one). Left as `bundled` deliberately -- see crates/bathy-store's task
-# report for the full tradeoff -- so CI's dedicated `msrv` job (pinned to
-# literal Rust 1.85) is expected to fail on this dependency alone until
-# either libsqlite3-sys changes its bundled build script or the workspace's
-# MSRV floor is revisited; that is a project-wide decision this task does
-# not make unilaterally.
+# MSRV, tiered rather than a workspace-wide conflict: `bundled`'s
+# `libsqlite3-sys` 0.38.1 build script needs a rustc with `cfg_select!`
+# (stable at 1.97.1, present but unstable-gated from 1.90; simply absent at
+# this workspace's declared floor of 1.85). Rather than raise the whole
+# workspace's MSRV for one dependency only `bathy-store` uses, `bathy-store`
+# declares its own literal, higher `rust-version` -- see the comment on it
+# in `crates/bathy-store/Cargo.toml` for the exact floor and how it was
+# measured. CI verifies both floors with two separate jobs
+# (`.github/workflows/ci.yml`): `msrv` at `1.85` over the four crates that
+# still need only that, and `msrv-bathy-store` at `1.95` for this one.
 rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }

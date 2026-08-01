@@ -1,7 +1,10 @@
-# Develop on stable. 1.85 is the MSRV, declared as `rust-version` in the
-# workspace manifest and verified by a dedicated CI job — pinning the
-# toolchain to the MSRV itself would force every contributor to download an
-# old compiler and would hide warnings that newer compilers catch.
+# Develop on stable. 1.85 is the MSRV for most of the workspace, declared as
+# `rust-version` in the workspace manifest; `bathy-store` alone needs a
+# higher floor (1.95 -- see the MSRV comment on its own `Cargo.toml`). Both
+# floors are verified by dedicated CI jobs (`msrv`, `msrv-bathy-store`) --
+# pinning this toolchain file to either MSRV itself would force every
+# contributor to download an old compiler and would hide warnings that
+# newer compilers catch.
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
