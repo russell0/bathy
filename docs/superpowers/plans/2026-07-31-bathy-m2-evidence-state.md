@@ -50,7 +50,8 @@ mod tests {
 
     #[test]
     fn system_clock_emits_rfc3339_utc_with_milliseconds() {
-        let s = SystemClock.now_rfc3339();
+        // SystemClock owns a Generator field, so it is not a unit struct.
+        let s = SystemClock::default().now_rfc3339();
         assert!(s.ends_with('Z'), "got {s}");
         assert_eq!(s.len(), 24, "expected YYYY-MM-DDTHH:MM:SS.mmmZ, got {s}");
         assert_eq!(&s[4..5], "-");
