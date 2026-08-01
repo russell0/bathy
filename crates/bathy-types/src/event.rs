@@ -218,7 +218,12 @@ pub struct Event {
     // below makes the published contract at least honest about the
     // intended shape. Deliberately NOT runtime-parsed here: `Clock` (which
     // actually produces this value) is created in M2 Task 1, and that is
-    // the right place to validate it.
+    // the right place to validate it -- now discharged by
+    // `FixedClock::new`, which is fallible specifically so a value that
+    // does not have this shape (e.g. `"banana"`) can never be stored as a
+    // clock's `now` in the first place, let alone reach this field. See
+    // `bathy_types::clock`'s `validate_rfc3339_millis` and the
+    // `fixed_clock_rejects_banana` test.
     #[schemars(extend("format" = "date-time"))]
     pub timestamp: String,
     pub engine_version: String,
