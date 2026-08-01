@@ -50,6 +50,7 @@ dependencies = [
 name = "bathy-store"
 version = "0.1.0"
 dependencies = [
+ "bathy-evidence",
  "bathy-types",
  "rusqlite",
  "serde_json",

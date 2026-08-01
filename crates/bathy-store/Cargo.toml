@@ -14,3 +14,10 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# C2: `bathy-evidence` is strictly below `bathy-store` in xtask's LAYERS
+# (see `lib.rs`'s module doc), so this is a legal direction for a dependency
+# to point -- used only in `tests/` to prove one shared `Arc<dyn Clock>`
+# drives both an `EventLog` (bathy-evidence) and a `TaskStore` (this crate)
+# without their identifiers ever colliding, which is the actual requirement
+# behind the `Clock for Arc<T>` fix in `bathy-types`.
+bathy-evidence = { path = "../bathy-evidence" }

@@ -31,21 +31,42 @@
 //!
 //! # The `foreign_keys` pragma trap
 //!
-//! `PRAGMA foreign_keys = ON;` is per-*connection* in SQLite, defaults OFF,
-//! and carries no persisted state in the database file (unlike
-//! `journal_mode`, which is a property of the file itself once set). A
-//! connection that never (re-)issues it will silently ignore `ON DELETE
-//! CASCADE` -- the delete succeeds, the child rows just never go away.
-//! [`TaskStore::open`] re-runs the *entire* `schema.sql`, pragmas included,
-//! on every call, not only when the database file is first created, so this
-//! is reasserted on every connection this type ever hands out. See
-//! `foreign_keys_is_reasserted_on_every_reopen_not_only_the_first_open` and
-//! `cascade_delete_does_nothing_when_foreign_keys_is_off_the_pragma_trap`
-//! below, which prove both halves of that claim concretely rather than
-//! assuming them from the pragma being present in `schema.sql` at all.
+//! `PRAGMA foreign_keys = ON;` is per-*connection* in SQLite, defaults OFF
+//! on a stock/system build, and carries no persisted state in the database
+//! file (unlike `journal_mode`, which is a property of the file itself once
+//! set). A connection that never (re-)issues it will silently ignore `ON
+//! DELETE CASCADE` -- the delete succeeds, the child rows just never go
+//! away. [`TaskStore::open`] re-runs the *entire* `schema.sql`, pragmas
+//! included, on every call, not only when the database file is first
+//! created, so this is reasserted on every connection this type ever hands
+//! out.
+//!
+//! T1 (whole-branch review): this crate's actual dependency -- `bundled`
+//! `libsqlite3-sys` -- is compiled with `-DSQLITE_DEFAULT_FOREIGN_KEYS=1`,
+//! so a brand new connection already reports `foreign_keys = 1` before
+//! `schema.sql` ever runs against it (see
+//! `this_projects_bundled_sqlite_defaults_foreign_keys_on_correcting_the_dispatchs_stated_fact`).
+//! That means every test that only ever opens *fresh* connections through
+//! `TaskStore::open` -- which was every test in this cluster before T1 --
+//! cannot tell "`schema.sql`'s pragma reasserted this" apart from "the
+//! compiled-in default was already on and nothing needed to reassert
+//! anything." Concretely: deleting `PRAGMA foreign_keys = ON;` from
+//! `schema.sql` left all five of those tests green. The previous version of
+//! this doc comment claimed they "prove both halves of that claim
+//! concretely rather than assuming them" -- backwards; they proved only the
+//! compile flag. `schema_sql_reasserts_foreign_keys_on_even_when_the_connection_had_it_off`
+//! is the one test that actually depends on `schema.sql`'s own pragma: it
+//! forces a single connection's `foreign_keys` OFF *first*, runs
+//! `schema.sql` against that exact connection, and only then checks the
+//! pragma -- it can pass only if executing `schema.sql` genuinely flipped
+//! it back to ON, independent of whatever a fresh connection's compiled-in
+//! default happens to be. `cascade_delete_does_nothing_when_foreign_keys_is_explicitly_off_the_pragma_trap`
+//! remains valuable as a demonstration of the underlying mechanism (a
+//! cascade delete silently doing nothing with the pragma off), but tests
+//! that mechanism in the abstract, not this crate's own reassertion of it.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
@@ -57,6 +78,28 @@ const SCHEMA_SQL: &str = include_str!("schema.sql");
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
+    /// Smaller item m1 (whole-branch review): the only `#[from]` in this
+    /// crate's three error enums, so every `?` on a `rusqlite` call
+    /// widens this type's public error surface with whatever
+    /// `rusqlite::Error` variant the underlying call happened to produce,
+    /// and -- unlike [`Self::Io`] and `bathy-evidence`'s `EvidenceError`/
+    /// `LogError` `Io` variants -- with no added path or key context.
+    /// Deliberately kept this way rather than wrapped, for two reasons
+    /// specific to this crate (not a general claim that `#[from]` is
+    /// always fine): (1) a `TaskStore` operates on exactly one
+    /// `state.sqlite` file for its whole lifetime, fixed at
+    /// [`TaskStore::open`] -- unlike `EvidenceStore`, which touches a
+    /// different blob path on every call and where "which path"
+    /// genuinely disambiguates one failure from another, there is only
+    /// ever one path here, already known to whatever caller is holding
+    /// this `TaskStore`; and (2) `rusqlite::Error`'s own `Display`
+    /// already carries the SQLite extended error code and, for most
+    /// variants, the failing statement or column -- context a bare
+    /// `path` field would not add much to. `StoreError::NotFound` and
+    /// `IdempotencyConflict` already exist as dedicated variants for the
+    /// two cases in this crate where the caller genuinely needs
+    /// structured context (which scan, which key) rather than an opaque
+    /// error string.
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("store io at {path}: {source}")]
@@ -143,7 +186,7 @@ pub struct ListFilter {
 /// across threads (`Mutex<T>` is `Sync` whenever `T: Send`).
 pub struct TaskStore {
     conn: Mutex<Connection>,
-    clock: Box<dyn Clock>,
+    clock: Arc<dyn Clock>,
 }
 
 impl TaskStore {
@@ -154,7 +197,23 @@ impl TaskStore {
     /// INDEX` statements are idempotent via `IF NOT EXISTS`, but
     /// `PRAGMA foreign_keys = ON` is not persisted anywhere and must be
     /// reissued on every connection -- see the module doc comment.
-    pub fn open(dir: &Path, clock: Box<dyn Clock>) -> Result<Self, StoreError> {
+    ///
+    /// `clock` is `Arc<dyn Clock>`, not `Box<dyn Clock>` (C2): a `Box` can
+    /// only ever be owned by this one `TaskStore`, so a caller that also
+    /// needs a `Clock` elsewhere -- most concretely, the SAME scan's
+    /// `bathy_evidence::EventLog`, whose `append` takes `&dyn Clock` per
+    /// call -- would be forced to construct a second, independent clock.
+    /// Two independent `SystemClock`s means two independent instances of
+    /// `ulid`'s `Generator` type (no shared monotonicity guarantee across a scan);
+    /// two `FixedClock`s built with the same seed produce byte-identical id
+    /// sequences, which is exactly what forced this module's own
+    /// cross-connection race test to use disjoint seeds as a workaround
+    /// (see `two_independent_connections_racing_on_the_same_key_still_yield_exactly_one_scan`
+    /// below). `Arc` lets one clock instance be shared: `TaskStore` holds a
+    /// clone for its own lifetime, and `&*shared`/`shared.as_ref()` still
+    /// gives an `EventLog` caller the `&dyn Clock` it needs from the exact
+    /// same instance.
+    pub fn open(dir: &Path, clock: Arc<dyn Clock>) -> Result<Self, StoreError> {
         std::fs::create_dir_all(dir).map_err(|source| StoreError::Io {
             path: dir.to_owned(),
             source,
@@ -286,6 +345,42 @@ impl TaskStore {
         let changed = conn.execute(
             "UPDATE scans SET status = ?1, updated_at = ?2 WHERE scan_id = ?3",
             params![status_to_db(status), now, scan_id.to_string()],
+        )?;
+        if changed == 0 {
+            return Err(StoreError::NotFound(scan_id));
+        }
+        Ok(())
+    }
+
+    /// C4: the resumption cursor's writer. `scans.last_sequence` and
+    /// `scans.packets_spent` are `NOT NULL DEFAULT 0`, are SELECTed by
+    /// [`Self::get`]/[`Self::list`], and `log.rs`'s and this crate's own
+    /// module docs describe `last_sequence` as the value `scan.resume`
+    /// replays from -- but before this method existed, nothing in this
+    /// crate ever wrote either column, so they stayed permanently `0` and a
+    /// resume would silently replay an entire scan from the start (`0` is
+    /// indistinguishable from "a fresh scan legitimately hasn't progressed
+    /// yet").
+    ///
+    /// Both values are taken as absolute counters set by the caller (whoever
+    /// is driving the scan and reading `EventLog::last_sequence`/tracking
+    /// packet spend), not incremented here -- this method has no way to
+    /// know whether a given call represents new progress or a resume
+    /// re-recording state already on disk, so it always writes exactly what
+    /// it is given, the same way `set_status` always writes exactly the
+    /// status it is given.
+    pub fn record_progress(
+        &self,
+        scan_id: ScanId,
+        last_sequence: u64,
+        packets_spent: u64,
+    ) -> Result<(), StoreError> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let now = self.clock.now_rfc3339();
+        let changed = conn.execute(
+            "UPDATE scans SET last_sequence = ?1, packets_spent = ?2, updated_at = ?3 \
+             WHERE scan_id = ?4",
+            params![last_sequence, packets_spent, now, scan_id.to_string()],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(scan_id));
@@ -430,12 +525,12 @@ mod tests {
     use bathy_types::clock::FixedClock;
 
     fn clock() -> FixedClock {
-        FixedClock::new("2026-08-01T15:04:31.182Z", 7)
+        FixedClock::new("2026-08-01T15:04:31.182Z", 7).unwrap()
     }
 
     fn store() -> (tempfile::TempDir, TaskStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
         (dir, store)
     }
 
@@ -510,12 +605,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
-            let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
             let out = store.start_or_reuse(&req("key-a", hash_a())).unwrap();
             id = out.scan_id();
             store.mark_units_done(id, &[0, 1, 2, 5]).unwrap();
         }
-        let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
         let done = store.completed_units(id).unwrap();
         assert_eq!(done, vec![0, 1, 2, 5]);
         assert_eq!(store.next_pending_unit(id, 8).unwrap(), Some(3));
@@ -562,7 +657,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
-            let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
             id = store
                 .start_or_reuse(&req("key-a", hash_a()))
                 .unwrap()
@@ -570,7 +665,7 @@ mod tests {
             store.set_status(id, TaskStatus::Running).unwrap();
             store.set_status(id, TaskStatus::Cancelled).unwrap();
         }
-        let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
         assert_eq!(
             store.get(id).unwrap().unwrap().status,
             TaskStatus::Cancelled,
@@ -583,13 +678,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
-            let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
             id = store
                 .start_or_reuse(&req("key-a", hash_a()))
                 .unwrap()
                 .scan_id();
         }
-        let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
 
         let reused = store.start_or_reuse(&req("key-a", hash_a())).unwrap();
         assert!(
@@ -718,7 +813,7 @@ mod tests {
     #[test]
     fn the_unique_index_is_load_bearing_not_decorative() {
         let dir = tempfile::tempdir().unwrap();
-        let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
         let conn = store.conn.lock().unwrap();
         try_insert_raw_scan(&conn, "scan_a", "dup-key", &hash_a().to_string()).unwrap();
         let err = try_insert_raw_scan(&conn, "scan_b", "dup-key", &hash_b().to_string())
@@ -857,12 +952,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store_a = TaskStore::open(
             dir.path(),
-            Box::new(FixedClock::new("2026-08-01T15:04:31.182Z", 7)),
+            Arc::new(FixedClock::new("2026-08-01T15:04:31.182Z", 7).unwrap()),
         )
         .unwrap();
         let store_b = TaskStore::open(
             dir.path(),
-            Box::new(FixedClock::new("2026-08-01T15:04:31.182Z", 8)),
+            Arc::new(FixedClock::new("2026-08-01T15:04:31.182Z", 8).unwrap()),
         )
         .unwrap();
 
@@ -969,6 +1064,117 @@ mod tests {
         assert!(store.get(bogus).unwrap().is_none());
     }
 
+    // --- C4: `last_sequence`/`packets_spent` have a real writer now. Every
+    // test below goes through `record_progress` and `get` only -- the
+    // public API a resume path would actually use -- never a raw SQL
+    // UPDATE, so these prove the same thing a resuming caller would
+    // observe. ---
+
+    #[test]
+    fn record_progress_defaults_to_zero_before_it_is_ever_called() {
+        let (_d, store) = store();
+        let id = store
+            .start_or_reuse(&req("key-a", hash_a()))
+            .unwrap()
+            .scan_id();
+        let record = store.get(id).unwrap().unwrap();
+        assert_eq!(record.last_sequence, 0);
+        assert_eq!(record.packets_spent, 0);
+    }
+
+    #[test]
+    fn record_progress_is_visible_immediately_via_get() {
+        let (_d, store) = store();
+        let id = store
+            .start_or_reuse(&req("key-a", hash_a()))
+            .unwrap()
+            .scan_id();
+        store.record_progress(id, 42, 1_000).unwrap();
+        let record = store.get(id).unwrap().unwrap();
+        assert_eq!(record.last_sequence, 42);
+        assert_eq!(record.packets_spent, 1_000);
+    }
+
+    #[test]
+    fn record_progress_survives_closing_and_reopening_the_store() {
+        // AC-shape mirrors `status_survives_closing_and_reopening_the_store`
+        // above: the resume path's whole reason to exist is a value that
+        // outlives the process that wrote it, so a live-connection check
+        // alone would not prove the actual claim.
+        let dir = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
+            id = store
+                .start_or_reuse(&req("key-a", hash_a()))
+                .unwrap()
+                .scan_id();
+            store.record_progress(id, 17, 250).unwrap();
+        }
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
+        let record = store.get(id).unwrap().unwrap();
+        assert_eq!(
+            record.last_sequence, 17,
+            "last_sequence must survive a real close and reopen"
+        );
+        assert_eq!(
+            record.packets_spent, 250,
+            "packets_spent must survive a real close and reopen"
+        );
+    }
+
+    #[test]
+    fn record_progress_overwrites_the_previous_value_not_accumulates() {
+        // `record_progress` takes an absolute cursor, not a delta: a caller
+        // resuming from `EventLog::last_sequence()` always has the true
+        // current value in hand and must be able to write it directly.
+        let (_d, store) = store();
+        let id = store
+            .start_or_reuse(&req("key-a", hash_a()))
+            .unwrap()
+            .scan_id();
+        store.record_progress(id, 5, 50).unwrap();
+        store.record_progress(id, 9, 90).unwrap();
+        let record = store.get(id).unwrap().unwrap();
+        assert_eq!(record.last_sequence, 9);
+        assert_eq!(record.packets_spent, 90);
+    }
+
+    #[test]
+    fn record_progress_resume_path_reads_back_exactly_what_was_written() {
+        // The concrete scenario C4 names: a resumed scan reads
+        // `last_sequence` back to know where to continue replaying from.
+        let dir = tempfile::tempdir().unwrap();
+        let id;
+        {
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
+            id = store
+                .start_or_reuse(&req("key-a", hash_a()))
+                .unwrap()
+                .scan_id();
+            store.record_progress(id, 3, 30).unwrap();
+            store.record_progress(id, 8, 80).unwrap();
+        }
+        // Simulates the resume path: reopen the store as a fresh process
+        // would, then read the cursor back before doing anything else.
+        let resumed = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
+        let resume_from = resumed.get(id).unwrap().unwrap().last_sequence;
+        assert_eq!(
+            resume_from, 8,
+            "resume must read back the last value actually written, not 0"
+        );
+    }
+
+    #[test]
+    fn record_progress_on_an_unknown_scan_is_not_found() {
+        let (_d, store) = store();
+        let bogus = clock().new_scan_id();
+        assert!(matches!(
+            store.record_progress(bogus, 1, 1),
+            Err(StoreError::NotFound(_))
+        ));
+    }
+
     // --- Pragma verification: WAL and foreign_keys are actually applied on
     // every connection, not just asserted to be in schema.sql. ---
 
@@ -996,7 +1202,7 @@ mod tests {
     fn foreign_keys_is_reasserted_on_every_reopen_not_only_the_first_open() {
         let dir = tempfile::tempdir().unwrap();
         {
-            let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
             let conn = store.conn.lock().unwrap();
             let fk: i64 = conn
                 .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
@@ -1009,7 +1215,7 @@ mod tests {
         // A brand new `Connection` under the hood. Absent `TaskStore::open`
         // re-running `PRAGMA foreign_keys = ON` on every call (not only when
         // the file is first created), this would default back to OFF.
-        let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
         let conn = store.conn.lock().unwrap();
         let fk: i64 = conn
             .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
@@ -1069,7 +1275,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
-            let store = TaskStore::open(dir.path(), Box::new(clock())).unwrap();
+            let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
             id = store
                 .start_or_reuse(&req("key-a", hash_a()))
                 .unwrap()
@@ -1103,6 +1309,46 @@ mod tests {
             "with foreign_keys off, ON DELETE CASCADE silently does nothing -- \
              exactly the trap TaskStore::open's unconditional pragma reassertion \
              exists to prevent"
+        );
+    }
+
+    // --- T1: the honest test. Everything above this point that mentions
+    // `foreign_keys` opens a fresh connection through `TaskStore::open` (or,
+    // for the "bare" test, `Connection::open` with no schema at all) --
+    // which this build's bundled SQLite already reports `foreign_keys = 1`
+    // for before `schema.sql` ever runs, per
+    // `SQLITE_DEFAULT_FOREIGN_KEYS=1`. None of those tests can distinguish
+    // "schema.sql's pragma did this" from "it was already this way." This
+    // one forces a single connection's `foreign_keys` OFF first, then runs
+    // `schema.sql` against that SAME connection, so it can only pass if
+    // `schema.sql`'s own `PRAGMA foreign_keys = ON;` genuinely ran and took
+    // effect.
+
+    #[test]
+    fn schema_sql_reasserts_foreign_keys_on_even_when_the_connection_had_it_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = Connection::open(dir.path().join("state.sqlite")).unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            fk, 0,
+            "setup: this connection's foreign_keys must genuinely start off, \
+             not merely be assumed off"
+        );
+
+        conn.execute_batch(SCHEMA_SQL).unwrap();
+
+        let fk: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            fk, 1,
+            "running schema.sql against a connection that had foreign_keys \
+             OFF must turn it back ON -- unlike the tests above, this holds \
+             regardless of what a brand new connection's compiled-in \
+             default happens to be"
         );
     }
 
