@@ -1,0 +1,16 @@
+[package]
+name = "bathy-evidence"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bathy-types = { path = "../bathy-types" }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+walkdir = { workspace = true }
+proptest = { workspace = true }
