@@ -64,6 +64,11 @@ pub fn blob_path(root: &Path, digest: &Digest) -> PathBuf {
 /// every call to `tmp_path`, from any thread, pick a distinct name, which is
 /// all atomicity via rename requires: the temp name need not be
 /// predictable or content-derived, only unique to the writer.
+///
+/// This still assumes distinct OS processes get distinct pids, which does
+/// not hold if two separate containers each see themselves as pid 1 while
+/// sharing one bind-mounted store directory. That is not a deployment shape
+/// this project targets, so it is out of scope here rather than fixed.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 fn tmp_path(parent: &Path) -> PathBuf {
@@ -85,18 +90,28 @@ impl EvidenceStore {
     pub fn put(&self, bytes: &[u8]) -> Result<Digest, EvidenceError> {
         let digest = Digest::of_bytes(bytes);
         let path = blob_path(&self.root, &digest);
-        if path.exists() {
-            return Ok(digest); // content-addressed: already have exactly these bytes
-        }
         let parent = path.parent().expect("blob path has a parent");
         fs::create_dir_all(parent).map_err(|source| EvidenceError::Io {
             path: parent.to_owned(),
             source,
         })?;
-        // Write to a temp name then rename, so a crash never leaves a partial
-        // blob visible under a digest that does not describe it. The temp
-        // name is process- and call-unique (see `tmp_path`), so concurrent
-        // writers never share one.
+        // Deliberately no `exists()` short-circuit: always write-then-rename,
+        // even when a blob already appears to sit at `path`. `rename` onto an
+        // existing file atomically replaces it (POSIX and Windows both
+        // guarantee this), so for identical content this is a no-op in
+        // substance -- same bytes hash to the same digest, so the
+        // replacement writes back exactly what was already there -- while
+        // also being self-healing if the existing blob was ever corrupted on
+        // disk. An `exists()` short-circuit would trust that stale file
+        // without checking it and return `Ok` for a digest `get` would then
+        // refuse to serve, which is a correctness bug, not just a missed
+        // optimization: M4's ordering rule treats `put`'s `Ok` as meaning the
+        // digest is now durably retrievable. See
+        // `put_heals_a_previously_corrupted_blob` and
+        // `put_of_identical_bytes_still_deduplicates_without_the_exists_short_circuit`.
+        //
+        // The temp name is process- and call-unique (see `tmp_path`), so
+        // concurrent writers never share one.
         let tmp = tmp_path(parent);
         fs::write(&tmp, bytes).map_err(|source| EvidenceError::Io {
             path: tmp.clone(),
@@ -115,6 +130,14 @@ impl EvidenceStore {
         Ok((self.put(slice)?, truncated))
     }
 
+    /// Reports whether a blob is present at `digest`'s canonical path --
+    /// **not** whether its bytes are intact. This is a cheap presence probe
+    /// (one `Path::exists` syscall); it deliberately does not read or
+    /// re-hash the blob, which would mean paying `get`'s full cost just to
+    /// throw the bytes away. A corrupted blob therefore still reports
+    /// `true` here. Callers that need a retrievability guarantee -- "these
+    /// bytes are actually there and match their digest" -- must call
+    /// [`Self::get`], the only method on this store that verifies on read.
     pub fn contains(&self, digest: &Digest) -> bool {
         blob_path(&self.root, digest).exists()
     }
@@ -183,7 +206,15 @@ mod tests {
     fn get_of_an_unknown_digest_is_an_error_not_a_panic() {
         let (_d, s) = store();
         let unknown = bathy_types::ids::Digest::of_bytes(b"never stored");
-        assert!(s.get(&unknown).is_err());
+        // Pins the specific variant, not just `is_err()`: a bare `is_err()`
+        // would still pass if `get` mistakenly reported `Corrupt` or `Io`
+        // for a digest that was simply never stored, matching how the
+        // tamper tests already pin `Corrupt` rather than accepting any
+        // error.
+        assert!(
+            matches!(s.get(&unknown), Err(EvidenceError::NotFound(_))),
+            "an unstored digest must report NotFound specifically"
+        );
     }
 
     #[test]
@@ -227,6 +258,65 @@ mod tests {
         assert!(
             matches!(s.get(&digest), Err(EvidenceError::Corrupt { .. })),
             "tampering must surface as Corrupt, not any other error"
+        );
+    }
+
+    // --- Review fix: `put` must not trust a stale `exists()` check ---
+    //
+    // The original brief's `put` short-circuited on `path.exists()` and
+    // returned `Ok(digest)` without ever reading or verifying the file
+    // already there. If that file had been corrupted on disk (bit rot,
+    // tampering, a prior interrupted write from a different bug), `put`
+    // still reported success for bytes it never actually wrote, and the
+    // very next `get` for that digest would then fail with `Corrupt` --
+    // silently breaking M4's ordering rule, which treats `put`'s `Ok` as
+    // meaning the digest is now durably retrievable. `put` now always
+    // writes-then-renames, which is self-healing (a `put` of the correct
+    // bytes overwrites bad data with good) without regressing dedup (the
+    // final path is still fully determined by content, so repeated puts of
+    // identical bytes still converge on one file, they just each pay a
+    // rename to get there instead of skipping it).
+
+    #[test]
+    fn put_heals_a_previously_corrupted_blob() {
+        let (dir, s) = store();
+        let digest = s.put(b"authentic").unwrap();
+        let path = blob_path(dir.path(), &digest);
+        // Corrupt it on disk, exactly as the tamper tests do above.
+        fs::write(&path, b"tampered").unwrap();
+        assert!(
+            matches!(s.get(&digest), Err(EvidenceError::Corrupt { .. })),
+            "setup: the blob must actually be corrupt before healing is exercised"
+        );
+
+        // Re-`put`-ting the correct bytes must heal the store.
+        let healed = s.put(b"authentic").unwrap();
+        assert_eq!(healed, digest);
+        assert_eq!(
+            s.get(&digest).unwrap(),
+            b"authentic",
+            "put() of the correct bytes must heal a previously corrupted blob"
+        );
+    }
+
+    #[test]
+    fn put_of_identical_bytes_still_deduplicates_without_the_exists_short_circuit() {
+        // Guards the regression the fix above could plausibly introduce:
+        // "always write-then-rename" must not silently become "always
+        // create a new object". `blob_path` is a pure function of content,
+        // so repeated puts of the same bytes must still land at the one
+        // deterministic path -- this must keep holding even though `put`
+        // no longer skips the write when that path already exists.
+        let (dir, s) = store();
+        let a = s.put(b"same-again").unwrap();
+        let b = s.put(b"same-again").unwrap();
+        let c = s.put(b"same-again").unwrap();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+        assert_eq!(
+            walkdir_count_files(dir.path()),
+            1,
+            "repeated puts of identical bytes must still yield exactly one on-disk object"
         );
     }
 
