@@ -6,9 +6,46 @@
 
 **Architecture:** Evidence is written before the event that references it, so a dangling `EvidenceRef` is impossible. The event log is the only source of truth for what was observed; SQLite holds only mutable task state and the resumption cursor, and can be rebuilt from the log. Time and identifier generation are injected via a `Clock` trait so every test is deterministic.
 
-**Tech Stack:** rusqlite (bundled), serde_json (a NORMAL dependency of `bathy-evidence` — the event log serializes through it, not just tests), ulid, blake3, tempfile, walkdir (dev), tokio (for the async append path only).
+**Tech Stack:** rusqlite 0.40 (bundled), serde_json (a NORMAL dependency of `bathy-evidence` — the event log serializes through it, not just tests), ulid 3.x, blake3, time (RFC 3339 parsing), fs4 (advisory locking), tempfile + walkdir (dev). **No tokio** — M2 is entirely synchronous and the exit criteria require it stay that way.
 
 **Read first:** `2026-07-31-bathy-v0.1-overview.md` Global Constraints, and M1 Tasks 2 and 5 for `Digest`, `ScanId`, and `Event`.
+
+## Durability contract — decided, and binding on M3
+
+`File::flush()` on a `std::fs::File` is a **no-op**; there is no userspace buffer.
+An implementation that calls it and claims durability is claiming nothing. Both
+halves of this milestone therefore need real barriers:
+
+- `EvidenceStore::put`: `sync_all()` the temp file **before** rename, then fsync
+  the parent directory **after**. Keep this per-put — evidence is written once
+  per *service observation*, which is far rarer than a port probe, so the ~41x
+  cost lands on an infrequent operation.
+- `EventLog::append`: `sync_data()`, not `flush()`.
+
+**Measured cost of a per-event fsync on the append path: ~5.28 ms/op, ~2281x
+the non-durable path.** At the 1,000,000-packet budget ceiling with one
+`port.state` event per probed unit that is **~88 minutes of pure fsync latency
+serialized into a single scan** — two to three orders of magnitude above the
+network I/O it is meant to be recording. Per-event fsync is not viable at M3
+scale, and the realistic failure mode is an M3 engineer discovering this and
+reaching for the durability opt-out globally, silently reinstating the hazard.
+
+**M3 must therefore implement group commit before wiring a scan driver to
+`append`.** The design, decided here so it is not rediscovered under pressure:
+
+1. Buffer appends and `sync_data()` on a bounded trigger — whichever of *N*
+   events or *T* milliseconds comes first. Both are configurable; both have
+   defaults.
+2. Terminal events (`scan.completed`, `scan.failed`, `policy.denied`) force an
+   immediate sync regardless of the trigger.
+3. The crash contract is explicit and published: **a crash loses at most the
+   last N events or T milliseconds of events, never a partially-written record.**
+4. **The evidence-before-event ordering survives batching**, and this is why the
+   asymmetry is correct rather than sloppy: evidence syncs per put, the log
+   batches, so *evidence durability always leads event durability*. A crash can
+   therefore leave an orphaned blob — harmless — but never a dangling
+   `evidence_refs` entry, which is the failure the guarantee exists to prevent.
+   Never invert this by batching evidence while syncing events.
 
 ---
 
@@ -72,7 +109,7 @@ Expected: FAIL — `Clock` not found.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bathy_types::ids::{EventId, ScanId};
+use crate::ids::{EventId, ScanId};  // this file IS bathy-types/src/clock.rs
 
 /// All time and identifier generation flows through this trait.
 ///
@@ -105,15 +142,11 @@ impl SystemClock {
         let mut g = self.generator.lock().expect("ulid generator poisoned");
         // Monotonic overflow means >2^80 ids in one millisecond, which cannot
         // happen here; fall back rather than panic in a library path.
-        g.generate().unwrap_or_else(|_| {
-            ulid::Ulid::from_parts(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .expect("clock before epoch")
-                    .as_millis() as u64,
-                0,
-            )
-        })
+        // Use the crate's own overflow path. Hand-rolling from_parts(now, 0)
+        // desyncs the generator's monotonic `previous` state AND emits
+        // IDENTICAL ulids if it fires twice in one millisecond — a collision,
+        // not merely an odd-looking id.
+        g.generate().unwrap_or_else(|o| o.commit_overflow_random())
     }
 }
 
@@ -542,7 +575,12 @@ impl EventLog {
         Ok(Self { path, scan_id, file, last_sequence })
     }
 
-    fn scan_existing(path: &Path) -> Result<u64, LogError> {
+    /// Streams the file once, validating sequences AND recording the byte
+    /// offset of every record in the same pass. Returns (last_sequence, offsets).
+    /// Do NOT fs::read the whole file to do this — that trades an O(n) scan for
+    /// an O(n) allocation (~240-330 MiB at the 1M-event ceiling) on the RESUME
+    /// path, i.e. right after a crash when memory is already scarce.
+    fn scan_existing(path: &Path) -> Result<(u64, Vec<u64>), LogError> {
         if !path.exists() {
             return Ok(0);
         }
@@ -615,7 +653,18 @@ impl EventLog {
     /// trades an O(n) scan for an O(n) allocation, ~240-330 MiB at that same
     /// ceiling, and gains nothing.
     pub fn read_from(&self, after_sequence: u64) -> Result<Vec<Event>, LogError> {
-        let f = File::open(&self.path)
+        // SEEK, do not rescan. `self.offsets[n]` is the byte offset of the
+        // record with sequence n+1, built during `open`'s validation pass and
+        // extended by one entry per `append`. Rescanning from byte 0 makes this
+        // O(n) per page and contradicts the streaming primitive M5's
+        // `scan.events` paging is built on. Index cost is 8 bytes/event
+        // (~7.6 MiB at the 1M-event ceiling).
+        if after_sequence >= self.last_sequence {
+            return Ok(Vec::new());
+        }
+        let mut f = File::open(&self.path)
+            .map_err(|source| LogError::Io { path: self.path.clone(), source })?;
+        f.seek(SeekFrom::Start(self.offsets[after_sequence as usize]))
             .map_err(|source| LogError::Io { path: self.path.clone(), source })?;
         let mut out = Vec::new();
         for (i, line) in BufReader::new(f).lines().enumerate() {
@@ -628,13 +677,10 @@ impl EventLog {
                 line: i + 1,
                 detail: e.to_string(),
             })?;
-            if event.sequence > after_sequence {
-                out.push(event);
-            }
+            out.push(event);
         }
         Ok(out)
     }
-}
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -664,7 +710,7 @@ git commit -m "feat(evidence): gap-free append-only JSONL event log"
 
 **Interfaces:**
 - Consumes: `Clock`, `ScanId`, `Digest`, `TaskStatus`, `Budgets`, `ScopeId`.
-- Produces: `TaskStore::open(&Path) -> Result<Self>`, `start_or_reuse(&StartRequest) -> Result<StartOutcome>`, `get(ScanId)`, `set_status(ScanId, TaskStatus)`, `list(filter)`.
+- Produces: `TaskStore::open(&Path, Arc<dyn Clock>) -> Result<Self>`, `start_or_reuse(&StartRequest) -> Result<StartOutcome>`, `get(ScanId)`, `set_status(ScanId, TaskStatus)`, `list(filter)`.
 
 - [ ] **Step 1: Write the schema**
 
@@ -805,7 +851,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use bathy_types::ids::{Digest, ScanId, ScopeId};
 use bathy_types::task::TaskStatus;
 
-use crate::clock::Clock;
+use bathy_types::clock::Clock;  // NOT crate::clock — Clock lives in bathy-types
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -969,7 +1015,7 @@ git commit -m "feat(store): SQLite task state with database-enforced idempotency
 ## Milestone Exit Criteria
 
 - [ ] `cargo test --workspace` green; clippy clean.
-- [ ] AC-2.1 through AC-2.20 each demonstrated by a named passing test.
+- [ ] AC-2.1 through AC-2.21 each demonstrated by a named passing test.
 - [ ] A CI grep proves no `SystemTime::now()` or `Ulid::new()` outside `crates/bathy-types/src/clock.rs`.
 - [ ] `cargo run -p xtask -- check-deps` passes, confirming `bathy-evidence` does not depend on `bathy-store`.
 - [ ] An integration test writes evidence, appends an event referencing its digest, closes everything, reopens, and reads both back intact.
