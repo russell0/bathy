@@ -1,7 +1,7 @@
 {
   "$defs": {
     "Confidence": {
-      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched a rule in `sonde-interpret`.",
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched a rule in `bathy-interpret`.",
       "format": "double",
       "maximum": 1.0,
       "minimum": 0.0,

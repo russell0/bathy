@@ -1,4 +1,4 @@
-# sonde M6 — Privileged SYN Scanning (`packetd`) — Implementation Plan
+# bathy M6 — Privileged SYN Scanning (`packetd`) — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -17,7 +17,7 @@
 ### Task 1: The IPC protocol
 
 **Files:**
-- Create: `crates/sonde-packetd/Cargo.toml`, `crates/sonde-packetd/src/protocol.rs`
+- Create: `crates/bathy-packetd/Cargo.toml`, `crates/bathy-packetd/src/protocol.rs`
 
 **Interfaces:**
 - Produces: `Request::{ Init { allowed_cidrs, denied_cidrs, packets_per_second, max_packets }, Probe { id, target, port }, Shutdown }`, `Response::{ Ready { dropped_capabilities: bool }, Result { id, state }, Refused { id, reason }, Fatal { detail } }`, all line-delimited JSON.
@@ -70,7 +70,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail** — `cargo test -p sonde-packetd protocol`.
+- [ ] **Step 2: Run tests to verify they fail** — `cargo test -p bathy-packetd protocol`.
 
 - [ ] **Step 3: Implement the protocol**
 
@@ -84,7 +84,7 @@ Line-delimited JSON over stdin/stdout. Hard rules encoded in `Session`:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-packetd
+git add crates/bathy-packetd
 git commit -m "feat(packetd): fail-closed line protocol with immutable session scope"
 ```
 
@@ -99,7 +99,7 @@ git commit -m "feat(packetd): fail-closed line protocol with immutable session s
 ### Task 2: Capability acquisition and immediate drop
 
 **Files:**
-- Create: `crates/sonde-packetd/src/privilege.rs`, `crates/sonde-packetd/src/main.rs`
+- Create: `crates/bathy-packetd/src/privilege.rs`, `crates/bathy-packetd/src/main.rs`
 
 **Interfaces:**
 - Produces: `fn acquire_raw_sockets() -> Result<RawSockets, PrivilegeError>`, `fn drop_all_capabilities() -> Result<(), PrivilegeError>`, `fn capabilities_are_dropped() -> bool`.
@@ -131,7 +131,7 @@ fn running_without_privilege_fails_cleanly_with_actionable_guidance() {
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("CAP_NET_RAW"));
-        assert!(stderr.contains("sonde will fall back to connect scanning"));
+        assert!(stderr.contains("bathy will fall back to connect scanning"));
     }
 }
 
@@ -171,8 +171,8 @@ fn main() -> std::process::ExitCode {
             eprintln!(
                 "packetd: cannot open raw sockets ({e}).\n\
                  Grant CAP_NET_RAW with:\n  \
-                 sudo setcap cap_net_raw+ep $(which sonde-packetd)\n\
-                 Without it, sonde will fall back to connect scanning, which is \
+                 sudo setcap cap_net_raw+ep $(which bathy-packetd)\n\
+                 Without it, bathy will fall back to connect scanning, which is \
                  slower but needs no privilege."
             );
             return std::process::ExitCode::from(69);
@@ -198,7 +198,7 @@ The ordering is the entire security argument for this design: sockets are a capa
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-packetd
+git add crates/bathy-packetd
 git commit -m "feat(packetd): acquire sockets then drop capabilities before reading input"
 ```
 
@@ -206,14 +206,14 @@ git commit -m "feat(packetd): acquire sockets then drop capabilities before read
 - **AC-6.5** Raw sockets are opened, then all capabilities dropped, and only then is any input read. Verified by the binary's own `--self-check` report.
 - **AC-6.6** Running without `CAP_NET_RAW` fails with a message naming the capability, the exact `setcap` command, and the connect-scan fallback.
 - **AC-6.7** Every `unsafe` block in the crate is preceded by a `SAFETY:` comment, asserted by a test that walks the source.
-- **AC-6.8** No crate outside `sonde-packetd` contains `unsafe`, asserted in CI.
+- **AC-6.8** No crate outside `bathy-packetd` contains `unsafe`, asserted in CI.
 
 ---
 
 ### Task 3: SYN probing with independent scope enforcement
 
 **Files:**
-- Create: `crates/sonde-packetd/src/syn.rs`
+- Create: `crates/bathy-packetd/src/syn.rs`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -274,7 +274,7 @@ fn an_open_port_receives_a_rst_so_no_half_open_connection_is_left_behind() {
 
 ```rust
 /// Scope is checked here a second time, against the immutable session
-/// allowlist, using logic that shares no code with `sonde-scope`.
+/// allowlist, using logic that shares no code with `bathy-scope`.
 ///
 /// This duplication is deliberate. `packetd` is the only component that can
 /// emit an arbitrary packet, so it must not delegate the question of whether
@@ -293,12 +293,12 @@ Behavior:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-packetd
+git add crates/bathy-packetd
 git commit -m "feat(packetd): SYN probing with independent scope check and RST teardown"
 ```
 
 **Acceptance criteria:**
-- **AC-6.9** `packetd` enforces the session allowlist and denylist itself, with logic independent of `sonde-scope`. A refused target emits zero packets.
+- **AC-6.9** `packetd` enforces the session allowlist and denylist itself, with logic independent of `bathy-scope`. A refused target emits zero packets.
 - **AC-6.10** Reserved ranges are refused even when the session allowlist is `0.0.0.0/0`.
 - **AC-6.11** The session packet ceiling is enforced inside `packetd`, independently of the engine's ledger.
 - **AC-6.12** SYN-ACK, RST, ICMP unreachable, and silence map to `Open`, `Closed`, `Filtered`, `Filtered`.
@@ -309,8 +309,8 @@ git commit -m "feat(packetd): SYN probing with independent scope check and RST t
 ### Task 4: Engine integration, fallback, and cross-validation
 
 **Files:**
-- Modify: `crates/sonde-engine/src/scheduler.rs`
-- Create: `crates/sonde-engine/tests/syn_vs_connect.rs`
+- Modify: `crates/bathy-engine/src/scheduler.rs`
+- Create: `crates/bathy-engine/tests/syn_vs_connect.rs`
 
 - [ ] **Step 1: Write the failing test**
 
@@ -367,7 +367,7 @@ async fn packetd_dying_mid_scan_fails_the_scan_rather_than_silently_degrading() 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-engine crates/sonde-packetd
+git add crates/bathy-engine crates/bathy-packetd
 git commit -m "feat(engine): packetd integration with connect fallback and cross-validation"
 ```
 
@@ -382,8 +382,8 @@ git commit -m "feat(engine): packetd integration with connect fallback and cross
 ### Task 5: ICMP echo host discovery
 
 **Files:**
-- Create: `crates/sonde-packetd/src/icmp.rs`
-- Modify: `crates/sonde-engine/src/discovery.rs`
+- Create: `crates/bathy-packetd/src/icmp.rs`
+- Modify: `crates/bathy-engine/src/discovery.rs`
 
 The source design document specifies "ICMP/TCP host discovery". M3 delivered the TCP half, which is all that is possible unprivileged. The ICMP half lands here because it requires the same raw-socket capability as SYN scanning.
 
@@ -441,14 +441,14 @@ async fn combined_discovery_prefers_icmp_then_falls_back_to_tcp() {
 
 Send an ICMP echo request with a session-local identifier and a per-probe sequence number, and classify: echo reply → `Up`, destination unreachable → `Down`, silence past the deadline → `Unknown`. Route the probe through the *same* `check_session_scope` and the same session budget as SYN probes — one enforcement path, not two.
 
-In `sonde-engine`, `discover_host_combined` tries ICMP first when `packetd` is available and falls back to the M3 TCP method on `Unknown`. Record whichever method produced the answer on the `host.discovered` event.
+In `bathy-engine`, `discover_host_combined` tries ICMP first when `packetd` is available and falls back to the M3 TCP method on `Unknown`. Record whichever method produced the answer on the `host.discovered` event.
 
 - [ ] **Step 4: Run tests to verify they pass** — expected 5 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-packetd crates/sonde-engine
+git add crates/bathy-packetd crates/bathy-engine
 git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budget path"
 ```
 
@@ -463,6 +463,6 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 
 - [ ] `cargo test --workspace` green; privileged CI job green including the cross-validation test.
 - [ ] AC-6.1 through AC-6.20 each demonstrated by a named passing test.
-- [ ] `sonde-packetd` is under 800 lines of non-test Rust. If it is larger, move logic out of the privileged process.
+- [ ] `bathy-packetd` is under 800 lines of non-test Rust. If it is larger, move logic out of the privileged process.
 - [ ] Every `unsafe` block has a `SAFETY:` comment; no other crate has any.
 - [ ] `docs/design-paper.md` contains a section explaining the two-layer scope enforcement and why the duplication is intentional.

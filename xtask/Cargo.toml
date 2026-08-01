@@ -12,4 +12,4 @@ serde_json = { workspace = true }
 # is allowed to depend on it for schema emission/drift-checking; check-deps'
 # forbidden-substring rule still applies to it like any other workspace
 # member.
-sonde-types = { path = "../crates/sonde-types" }
+bathy-types = { path = "../crates/bathy-types" }

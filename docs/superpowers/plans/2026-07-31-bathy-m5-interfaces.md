@@ -1,10 +1,10 @@
-# sonde M5 — Query, Diff, CLI & MCP Server — Implementation Plan
+# bathy M5 — Query, Diff, CLI & MCP Server — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship the agent-facing product — differential scanning, a human CLI, and an MCP server exposing exactly eleven typed tools that let an agent complete an authorized inventory workflow without ever constructing a command string or parsing XML.
 
-**Architecture:** `sonde-query` folds event logs into a queryable endpoint state and diffs two folds. The CLI and the MCP server are both thin adapters over the same engine API — neither contains scanning logic, and anything the MCP server can do the CLI can do, so the tool surface is testable without an MCP client.
+**Architecture:** `bathy-query` folds event logs into a queryable endpoint state and diffs two folds. The CLI and the MCP server are both thin adapters over the same engine API — neither contains scanning logic, and anything the MCP server can do the CLI can do, so the tool surface is testable without an MCP client.
 
 **Tech Stack:** rmcp (official Rust MCP SDK), clap (derive), tokio, serde_json.
 
@@ -17,7 +17,7 @@
 ### Task 1: Folding event logs into endpoint state
 
 **Files:**
-- Create: `crates/sonde-query/Cargo.toml`, `crates/sonde-query/src/lib.rs`, `crates/sonde-query/src/fold.rs`
+- Create: `crates/bathy-query/Cargo.toml`, `crates/bathy-query/src/lib.rs`, `crates/bathy-query/src/fold.rs`
 
 **Interfaces:**
 - Consumes: `Event`, `EventBody`.
@@ -83,7 +83,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail** — `cargo test -p sonde-query fold`.
+- [ ] **Step 2: Run tests to verify they fail** — `cargo test -p bathy-query fold`.
 
 - [ ] **Step 3: Implement the fold**
 
@@ -94,7 +94,7 @@ Sort events by `sequence` before folding — never trust caller ordering. For ea
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-query
+git add crates/bathy-query
 git commit -m "feat(query): sequence-ordered fold of event logs into endpoint state"
 ```
 
@@ -108,7 +108,7 @@ git commit -m "feat(query): sequence-ordered fold of event logs into endpoint st
 ### Task 2: Differential scanning
 
 **Files:**
-- Create: `crates/sonde-query/src/diff.rs`
+- Create: `crates/bathy-query/src/diff.rs`
 
 **Interfaces:**
 - Produces: `diff(&ScanFold, &ScanFold) -> ScanDiff`, `ScanDiff { changes: Vec<Change>, unchanged: u64 }`, `Change { target, endpoint, kind: ChangeKind, before, after }`, `ChangeKind::{EndpointAppeared, EndpointDisappeared, StateChanged, ProductChanged, VersionChanged, ConfidenceOnly}`.
@@ -204,7 +204,7 @@ Classification order, first match wins: absent-then-present → `EndpointAppeare
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-query
+git add crates/bathy-query
 git commit -m "feat(query): differential scanning with confidence noise separated from real change"
 ```
 
@@ -219,17 +219,17 @@ git commit -m "feat(query): differential scanning with confidence noise separate
 ### Task 3: The CLI
 
 **Files:**
-- Create: `crates/sonde-cli/Cargo.toml`, `crates/sonde-cli/src/main.rs`, `crates/sonde-cli/src/commands/*.rs`
+- Create: `crates/bathy-cli/Cargo.toml`, `crates/bathy-cli/src/main.rs`, `crates/bathy-cli/src/commands/*.rs`
 
 **Interfaces:**
-- Produces: the `sonde` binary with subcommands `scope validate`, `scan preview`, `scan start`, `scan status`, `scan events`, `scan cancel`, `scan resume`, `result query`, `result diff`, `evidence get`, `explain`, `serve mcp`.
+- Produces: the `bathy` binary with subcommands `scope validate`, `scan preview`, `scan start`, `scan status`, `scan events`, `scan cancel`, `scan resume`, `result query`, `result diff`, `evidence get`, `explain`, `serve mcp`.
 
 - [ ] **Step 1: Write the failing CLI test**
 
 ```rust
 #[test]
 fn preview_prints_a_plan_hash_and_estimates_without_sending_a_packet() {
-    let out = sonde(&["scan", "preview", "--scope", scope_file(), "--targets", "10.30.0.0/30",
+    let out = bathy(&["scan", "preview", "--scope", scope_file(), "--targets", "10.30.0.0/30",
                       "--ports", "22,80", "--json"]).success();
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert!(v["plan_hash"].as_str().unwrap().starts_with("blake3:"));
@@ -240,7 +240,7 @@ fn preview_prints_a_plan_hash_and_estimates_without_sending_a_packet() {
 
 #[test]
 fn preview_of_an_out_of_scope_target_is_denied_with_a_reason_code_and_exit_2() {
-    let out = sonde(&["scan", "preview", "--scope", scope_file(), "--targets", "8.8.8.8",
+    let out = bathy(&["scan", "preview", "--scope", scope_file(), "--targets", "8.8.8.8",
                       "--ports", "80", "--json"]).code(2);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["policy_decision"], "denied");
@@ -249,13 +249,13 @@ fn preview_of_an_out_of_scope_target_is_denied_with_a_reason_code_and_exit_2() {
 
 #[test]
 fn a_scan_without_a_scope_argument_is_refused_before_anything_else() {
-    let out = sonde(&["scan", "start", "--targets", "10.30.0.1", "--ports", "80"]).failure();
+    let out = bathy(&["scan", "start", "--targets", "10.30.0.1", "--ports", "80"]).failure();
     assert!(String::from_utf8_lossy(&out.stderr).contains("--scope"));
 }
 
 #[test]
 fn json_output_is_line_delimited_and_parseable_for_every_command() {
-    let out = sonde(&["scan", "events", "--scan", &completed_scan_id(), "--json"]).success();
+    let out = bathy(&["scan", "events", "--scan", &completed_scan_id(), "--json"]).success();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         serde_json::from_str::<serde_json::Value>(line).expect("every line is one JSON object");
     }
@@ -263,7 +263,7 @@ fn json_output_is_line_delimited_and_parseable_for_every_command() {
 
 #[test]
 fn human_output_never_claims_deterministic_results() {
-    let out = sonde(&["--help"]).success();
+    let out = bathy(&["--help"]).success();
     let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
     assert!(!text.contains("deterministic results")); // [phrase-rule]
 }
@@ -285,8 +285,8 @@ Use `clap` derive. Rules:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-cli
-git commit -m "feat(cli): sonde binary with mandatory scope and documented exit codes"
+git add crates/bathy-cli
+git commit -m "feat(cli): bathy binary with mandatory scope and documented exit codes"
 ```
 
 **Acceptance criteria:**
@@ -301,7 +301,7 @@ git commit -m "feat(cli): sonde binary with mandatory scope and documented exit 
 ### Task 4: The MCP server
 
 **Files:**
-- Create: `crates/sonde-mcp/Cargo.toml`, `crates/sonde-mcp/src/lib.rs`, `crates/sonde-mcp/src/tools/*.rs`
+- Create: `crates/bathy-mcp/Cargo.toml`, `crates/bathy-mcp/src/lib.rs`, `crates/bathy-mcp/src/tools/*.rs`
 - Create: `docs/protocol-notes.md`
 
 **Interfaces:**
@@ -426,7 +426,7 @@ async fn cancel_and_resume_round_trip_through_the_tool_surface() {
 
 - [ ] **Step 4: Implement the tool surface**
 
-Every tool's input and output type lives in `sonde-types` and derives `JsonSchema`; the server publishes those schemas rather than hand-written ones, so `xtask check-schemas` covers the MCP surface too.
+Every tool's input and output type lives in `bathy-types` and derives `JsonSchema`; the server publishes those schemas rather than hand-written ones, so `xtask check-schemas` covers the MCP surface too.
 
 Tool contracts:
 
@@ -451,14 +451,14 @@ Tool contracts:
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/sonde-mcp docs/protocol-notes.md
+git add crates/bathy-mcp docs/protocol-notes.md
 git commit -m "feat(mcp): eleven typed tools with task handles and human approval gate"
 ```
 
 **Acceptance criteria:**
 - **AC-5.13** Exactly eleven tools are advertised, with exactly the designed names.
 - **AC-5.14** No tool's input schema contains a field named `command`, `args`, `flags`, `argv`, or `raw`. An agent cannot construct a command line through this surface. Asserted by a test over every published schema.
-- **AC-5.15** Every tool publishes an object-typed JSON Schema derived from a Rust type in `sonde-types`, covered by `xtask check-schemas`.
+- **AC-5.15** Every tool publishes an object-typed JSON Schema derived from a Rust type in `bathy-types`, covered by `xtask check-schemas`.
 - **AC-5.16** `scan.start` returns a `TaskHandle` in under two seconds regardless of scan size.
 - **AC-5.17** A policy-denied `scan.start` creates no task record and emits no packet.
 - **AC-5.18** Repeating `scan.start` with the same key and plan returns the same `task_id`.
@@ -473,7 +473,7 @@ git commit -m "feat(mcp): eleven typed tools with task handles and human approva
 ### Task 5: The ten-call workflow demonstration
 
 **Files:**
-- Create: `crates/sonde-mcp/tests/workflow.rs`
+- Create: `crates/bathy-mcp/tests/workflow.rs`
 - Create: `docs/examples/agent-inventory-workflow.md`
 
 This is the project's headline claim made executable: an agent completes an authorized inventory with a handful of typed calls and zero string construction.
@@ -550,7 +550,7 @@ async fn the_workflow_involves_no_string_parsing_anywhere() {
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/sonde-mcp/tests docs/examples
+git add crates/bathy-mcp/tests docs/examples
 git commit -m "test(mcp): the ten-call authorized inventory workflow, as an executable claim"
 ```
 
@@ -565,6 +565,6 @@ git commit -m "test(mcp): the ten-call authorized inventory workflow, as an exec
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` and `check-schemas` clean.
 - [ ] AC-5.1 through AC-5.26 each demonstrated by a named passing test.
-- [ ] `sonde serve mcp` connects to a real MCP client and lists eleven tools.
+- [ ] `bathy serve mcp` connects to a real MCP client and lists eleven tools.
 - [ ] `docs/protocol-notes.md` exists and names the verified spec revision.
 - [ ] **This milestone ships the agent-facing product.** Tag `v0.1.0-beta.1`.

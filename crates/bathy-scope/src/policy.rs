@@ -1,16 +1,16 @@
 use std::net::IpAddr;
 
-use sonde_types::request::ScanRequest;
+use bathy_types::request::ScanRequest;
 
 use crate::manifest::ScopeManifest;
 
-/// C5: `DenyReason` moved to `sonde-types` (see that type's own doc comment
+/// C5: `DenyReason` moved to `bathy-types` (see that type's own doc comment
 /// for why) -- re-exported here rather than redefined, so existing call
-/// sites that write `sonde_scope::policy::DenyReason` or
-/// `sonde_scope::DenyReason` (via `crate::lib`'s own re-export) keep
+/// sites that write `bathy_scope::policy::DenyReason` or
+/// `bathy_scope::DenyReason` (via `crate::lib`'s own re-export) keep
 /// working unchanged. `code()` moves with the type: inherent methods on a
 /// foreign type may only be defined in the crate that defines the type.
-pub use sonde_types::DenyReason;
+pub use bathy_types::DenyReason;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PolicyDecision {

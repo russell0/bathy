@@ -1,10 +1,10 @@
-# sonde M4 — Probe Framework & Replayable Interpretation — Implementation Plan
+# bathy M4 — Probe Framework & Replayable Interpretation — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Identify what is listening, and make every identification explainable and replayable. Probes capture raw bytes; a **pure** interpretation layer turns those bytes into observations with calibrated confidence. Re-running interpretation over stored evidence must reproduce the findings exactly, without a network.
 
-**Architecture:** The split between `sonde-probe` (does I/O, produces bytes) and `sonde-interpret` (no I/O, consumes bytes) is the central design decision of this milestone. It gives us regression tests that replay a corpus of captured responses, an honest answer to "why do you believe this is PostgreSQL", and a fuzzing surface that needs no sockets.
+**Architecture:** The split between `bathy-probe` (does I/O, produces bytes) and `bathy-interpret` (no I/O, consumes bytes) is the central design decision of this milestone. It gives us regression tests that replay a corpus of captured responses, an honest answer to "why do you believe this is PostgreSQL", and a fuzzing surface that needs no sockets.
 
 **Tech Stack:** tokio, rustls (raw handshake inspection), hickory-proto (DNS message encoding only), regex (interpretation rules), insta (snapshot tests).
 
@@ -17,8 +17,8 @@
 ### Task 1: Probe capture types and framework
 
 **Files:**
-- Create: `crates/sonde-probe/Cargo.toml`, `crates/sonde-probe/src/lib.rs`, `crates/sonde-probe/src/framework.rs`
-- Create: `crates/sonde-types/src/capture.rs`
+- Create: `crates/bathy-probe/Cargo.toml`, `crates/bathy-probe/src/lib.rs`, `crates/bathy-probe/src/framework.rs`
+- Create: `crates/bathy-types/src/capture.rs`
 
 **Interfaces:**
 - Produces: `ProbeCapture { probe_id, transport, port, request: Option<Vec<u8>>, response: Vec<u8>, elapsed_micros, truncated }`, `trait Probe { fn id(&self) -> &'static str; fn kind(&self) -> ProbeKind; fn affinity(&self, port: u16) -> u8; async fn execute(&self, io: &mut ProbeIo) -> Result<ProbeCapture, ProbeError>; }`, `ProbeKind::{ListenFirst, SendFirst}`, `select_probes(port: u16, intensity: u8, registry: &ProbeRegistry) -> Vec<&dyn Probe>`.
@@ -78,7 +78,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-probe framework` — expected FAIL.
+Run: `cargo test -p bathy-probe framework` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -205,12 +205,12 @@ pub fn select_probes<'a>(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-probe framework` — expected 4 passed.
+Run: `cargo test -p bathy-probe framework` — expected 4 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-probe crates/sonde-types
+git add crates/bathy-probe crates/bathy-types
 git commit -m "feat(probe): bounded probe framework with versioned ids and intensity budget"
 ```
 
@@ -225,7 +225,7 @@ git commit -m "feat(probe): bounded probe framework with versioned ids and inten
 ### Task 2: Protocol probes
 
 **Files:**
-- Create: `crates/sonde-probe/src/probes/{http,tls,ssh,dns,smtp,postgres,mysql,redis}.rs`
+- Create: `crates/bathy-probe/src/probes/{http,tls,ssh,dns,smtp,postgres,mysql,redis}.rs`
 
 **Interfaces:**
 - Produces: eight `Probe` implementations with ids `http-get-v1`, `tls-v1`, `ssh-banner-v1`, `dns-version-bind-v1`, `smtp-banner-v1`, `postgres-startup-v1`, `mysql-greeting-v1`, `redis-ping-v1`.
@@ -259,7 +259,7 @@ mod tests {
         let cap = run_probe(&HttpGetProbe, port).await.unwrap();
         let req = String::from_utf8(cap.request.unwrap()).unwrap();
         assert!(
-            req.contains("User-Agent: sonde/"),
+            req.contains("User-Agent: bathy/"),
             "scanners must be identifiable to the operators they contact"
         );
     }
@@ -306,7 +306,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-probe probes` — expected FAIL.
+Run: `cargo test -p bathy-probe probes` — expected FAIL.
 
 - [ ] **Step 3: Write the probe implementations**
 
@@ -315,7 +315,7 @@ Each follows the same shape. The HTTP probe, as the reference:
 ```rust
 pub struct HttpGetProbe;
 
-pub const USER_AGENT: &str = concat!("sonde/", env!("CARGO_PKG_VERSION"), " (+https://github.com/russell0/sonde)");
+pub const USER_AGENT: &str = concat!("bathy/", env!("CARGO_PKG_VERSION"), " (+https://github.com/russell0/bathy)");
 
 #[async_trait::async_trait]
 impl Probe for HttpGetProbe {
@@ -362,7 +362,7 @@ Remaining probes, with their exact wire behavior:
 |---|---|---|---|---|
 | TLS | `tls-v1` | SendFirst | A TLS 1.3 ClientHello with SNI omitted and no ALPN; captures the raw ServerHello and certificate bytes | 443, 8443, 993, 995 |
 | SSH | `ssh-banner-v1` | ListenFirst | nothing | 22, 2222 |
-| SMTP | `smtp-banner-v1` | ListenFirst | after reading the `220` greeting, sends `EHLO sonde.invalid\r\n` and captures the capability list | 25, 465, 587 |
+| SMTP | `smtp-banner-v1` | ListenFirst | after reading the `220` greeting, sends `EHLO bathy.invalid\r\n` and captures the capability list | 25, 465, 587 |
 | DNS | `dns-version-bind-v1` | SendFirst | a TXT/CHAOS query for `version.bind` over TCP with a fixed transaction id of `0x5344` | 53 |
 | Postgres | `postgres-startup-v1` | SendFirst | an SSLRequest packet (`00 00 00 08 04 D2 16 2F`) and captures the single-byte `S`/`N` reply | 5432 |
 | MySQL | `mysql-greeting-v1` | ListenFirst | nothing; captures the initial handshake packet | 3306 |
@@ -372,17 +372,17 @@ Use a **fixed** DNS transaction id rather than a random one so captures are byte
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-probe probes` — expected 7 passed.
+Run: `cargo test -p bathy-probe probes` — expected 7 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-probe
+git add crates/bathy-probe
 git commit -m "feat(probe): eight clean-room protocol probes with identifying user agent"
 ```
 
 **Acceptance criteria:**
-- **AC-4.5** The HTTP probe sends `User-Agent: sonde/<version> (+<url>)`. sonde traffic is identifiable to the operators receiving it; there is no anonymous or evasive mode in v0.1.
+- **AC-4.5** The HTTP probe sends `User-Agent: bathy/<version> (+<url>)`. bathy traffic is identifiable to the operators receiving it; there is no anonymous or evasive mode in v0.1.
 - **AC-4.6** Listen-first probes (SSH, MySQL) send nothing before reading; `capture.request` is `None`.
 - **AC-4.7** Every probe stops at `DEFAULT_READ_CAP` against a peer that floods, and sets `truncated`.
 - **AC-4.8** Every probe against a silent or immediately closed socket returns an error or an empty capture, never hangs past the deadline.
@@ -393,13 +393,13 @@ git commit -m "feat(probe): eight clean-room protocol probes with identifying us
 ### Task 3: The pure interpretation layer
 
 **Files:**
-- Create: `crates/sonde-interpret/Cargo.toml`, `crates/sonde-interpret/src/lib.rs`, `crates/sonde-interpret/src/rules.rs`, `crates/sonde-interpret/src/interpret.rs`
+- Create: `crates/bathy-interpret/Cargo.toml`, `crates/bathy-interpret/src/lib.rs`, `crates/bathy-interpret/src/rules.rs`, `crates/bathy-interpret/src/interpret.rs`
 
 **Interfaces:**
 - Consumes: `ProbeCapture`, `Observation`, `Confidence`.
 - Produces: `interpret(&ProbeCapture) -> Vec<Interpretation>`, `Interpretation { observation: Observation, rule_id: &'static str, matched_span: Range<usize>, rationale: String }`, `explain(rule_id) -> Option<&RuleDoc>`.
 
-> `sonde-interpret` may depend **only** on `sonde-types` and `regex`. No tokio, no filesystem, no clock, no randomness. `cargo tree -p sonde-interpret` is checked in CI.
+> `bathy-interpret` may depend **only** on `bathy-types` and `regex`. No tokio, no filesystem, no clock, no randomness. `cargo tree -p bathy-interpret` is checked in CI.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -500,15 +500,15 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-interpret` — expected FAIL.
+Run: `cargo test -p bathy-interpret` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
 ```rust
 use std::ops::Range;
 
-use sonde_types::confidence::Confidence;
-use sonde_types::event::Observation;
+use bathy_types::confidence::Confidence;
+use bathy_types::event::Observation;
 
 /// The confidence ladder. Every rule declares which rung it sits on, so
 /// scores across protocols mean the same thing and are auditable in one table
@@ -561,7 +561,7 @@ pub struct Interpretation {
 ///
 /// PURE. No I/O, no clock, no randomness, no allocation-order dependence.
 /// Given identical bytes this returns an identical vector forever, which is
-/// what lets `sonde` answer "why do you believe this" from stored evidence
+/// what lets `bathy` answer "why do you believe this" from stored evidence
 /// and what lets the replay corpus in M7 act as a real regression suite.
 ///
 /// Returns an empty vector when nothing matches. Guessing is a bug.
@@ -637,22 +637,22 @@ Compile every regex once via `std::sync::LazyLock` rather than per call.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-interpret` — expected 10 passed.
+Run: `cargo test -p bathy-interpret` — expected 10 passed.
 
 - [ ] **Step 5: Verify the purity constraint**
 
-Run: `cargo tree -p sonde-interpret --edges normal`
-Expected: only `sonde-types`, `regex`, and their transitive dependencies. No `tokio`, no `std::fs` usage. Add this as a CI assertion.
+Run: `cargo tree -p bathy-interpret --edges normal`
+Expected: only `bathy-types`, `regex`, and their transitive dependencies. No `tokio`, no `std::fs` usage. Add this as a CI assertion.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/sonde-interpret
+git add crates/bathy-interpret
 git commit -m "feat(interpret): pure rule engine with confidence ladder and cited provenance"
 ```
 
 **Acceptance criteria:**
-- **AC-4.10** `interpret` is pure: `sonde-interpret`'s dependency tree contains no async runtime, no filesystem access, and no clock. Asserted in CI.
+- **AC-4.10** `interpret` is pure: `bathy-interpret`'s dependency tree contains no async runtime, no filesystem access, and no clock. Asserted in CI.
 - **AC-4.11** Confidence comes from a single declared ladder; product+version outranks product-only outranks protocol-only. No magic numbers in match arms.
 - **AC-4.12** Every `Interpretation` carries a `rule_id`, a `matched_span` indexing real bytes of the response, and a rationale. `explain(rule_id)` returns documentation for every rule that can fire.
 - **AC-4.13** Unrecognized input yields an empty vector. Interpretation never guesses a service.
@@ -665,7 +665,7 @@ git commit -m "feat(interpret): pure rule engine with confidence ladder and cite
 ### Task 4: Evidence replay harness
 
 **Files:**
-- Create: `crates/sonde-interpret/tests/replay.rs`
+- Create: `crates/bathy-interpret/tests/replay.rs`
 - Create: `testdata/captures/*.json` (committed corpus)
 
 **Interfaces:**
@@ -728,13 +728,13 @@ At least 16 captures, at least two per probe: one that matches a rule with a ver
 
 - [ ] **Step 3: Run and accept the snapshots**
 
-Run: `cargo test -p sonde-interpret --test replay`, then `cargo insta review`.
+Run: `cargo test -p bathy-interpret --test replay`, then `cargo insta review`.
 Expected: 16+ snapshots accepted; a second run is green with no diffs.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/sonde-interpret testdata/captures
+git add crates/bathy-interpret testdata/captures
 git commit -m "test(interpret): recorded-capture replay corpus with snapshot assertions"
 ```
 
@@ -748,7 +748,7 @@ git commit -m "test(interpret): recorded-capture replay corpus with snapshot ass
 ### Task 5: Wiring probes into the scheduler
 
 **Files:**
-- Modify: `crates/sonde-engine/src/scheduler.rs`
+- Modify: `crates/bathy-engine/src/scheduler.rs`
 
 - [ ] **Step 1: Write the failing integration test**
 
@@ -821,7 +821,7 @@ Note that `evidence_level: none` means we cannot satisfy the `NonEmpty<Digest>` 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-engine
+git add crates/bathy-engine
 git commit -m "feat(engine): service identification with evidence stored before reference"
 ```
 
@@ -838,6 +838,6 @@ git commit -m "feat(engine): service identification with evidence stored before 
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` clean.
 - [ ] AC-4.1 through AC-4.24 each demonstrated by a named passing test.
-- [ ] `cargo tree -p sonde-interpret` shows no async runtime and no I/O crates.
-- [ ] The replay corpus passes with the network interface down (`unshare -rn cargo test -p sonde-interpret` on Linux), proving interpretation needs no network.
+- [ ] `cargo tree -p bathy-interpret` shows no async runtime and no I/O crates.
+- [ ] The replay corpus passes with the network interface down (`unshare -rn cargo test -p bathy-interpret` on Linux), proving interpretation needs no network.
 - [ ] An end-to-end run against a local nginx reports `http` / `nginx` / a version, and `evidence.get` on the cited digest returns the exact response bytes that justified it.

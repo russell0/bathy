@@ -6,18 +6,18 @@ use std::path::Path;
 /// Crates are listed lowest-level first. A crate may only depend on crates
 /// that appear strictly earlier in this list.
 const LAYERS: &[&str] = &[
-    "sonde-types",
-    "sonde-scope",
-    "sonde-evidence",
-    "sonde-store",
-    "sonde-plan",
-    "sonde-interpret",
-    "sonde-probe",
-    "sonde-engine",
-    "sonde-packetd",
-    "sonde-query",
-    "sonde-mcp",
-    "sonde-cli",
+    "bathy-types",
+    "bathy-scope",
+    "bathy-evidence",
+    "bathy-store",
+    "bathy-plan",
+    "bathy-interpret",
+    "bathy-probe",
+    "bathy-engine",
+    "bathy-packetd",
+    "bathy-query",
+    "bathy-mcp",
+    "bathy-cli",
 ];
 
 /// No workspace crate — ranked or not — may depend on anything resembling a
@@ -146,14 +146,14 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
 /// promised (AC-1.22).
 ///
 /// `write == true` ("emit-schemas") regenerates every file under `dir` from
-/// `sonde_types::schema::all()`, unconditionally. `write == false`
+/// `bathy_types::schema::all()`, unconditionally. `write == false`
 /// ("check-schemas") instead compares what's on disk against what
 /// regeneration would produce and fails — naming every drifted file — if
 /// they differ. A missing file is treated as drift too (surfaced as an `Err`
 /// naming the path, same as any other read failure), not silently skipped,
 /// so a schema that was never committed at all is still caught.
 fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let schemas = sonde_types::schema::all();
+    let schemas = bathy_types::schema::all();
     let drift = diff_or_write(&schemas, Path::new("schemas"), write)?;
     if drift.is_empty() {
         Ok(())
@@ -169,7 +169,7 @@ fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
 /// The pure-ish core of [`emit_schemas`]: given the schema set and a target
 /// directory, either writes every schema (returning no drift) or reports
 /// which files, if any, differ from what writing would produce. Separated
-/// from `emit_schemas` (which always points at `sonde_types::schema::all()`
+/// from `emit_schemas` (which always points at `bathy_types::schema::all()`
 /// and the real `schemas/` directory) so the drift-detection logic itself is
 /// testable against a synthetic schema set and a scratch directory, without
 /// mutating this repository's committed schemas — mirroring `find_violations`
@@ -214,22 +214,22 @@ mod tests {
 
     #[test]
     fn layer_violation_is_detected() {
-        // AC-1.1: sonde-types (layer 0) depending on sonde-scope (layer 1)
+        // AC-1.1: bathy-types (layer 0) depending on bathy-scope (layer 1)
         // depends on something at or above its own layer.
-        let packages = vec![pkg("sonde-types", &["sonde-scope"])];
+        let packages = vec![pkg("bathy-types", &["bathy-scope"])];
         let violations = find_violations(&packages);
         assert_eq!(
             violations.len(),
             1,
             "expected exactly one violation: {violations:?}"
         );
-        assert!(violations[0].contains("sonde-types depends on sonde-scope"));
+        assert!(violations[0].contains("bathy-types depends on bathy-scope"));
     }
 
     #[test]
     fn same_layer_dependency_is_a_violation() {
         // A crate depending on a peer at its own rank is >= its own layer.
-        let packages = vec![pkg("sonde-probe", &["sonde-probe"])];
+        let packages = vec![pkg("bathy-probe", &["bathy-probe"])];
         let violations = find_violations(&packages);
         assert_eq!(
             violations.len(),
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn strictly_lower_layer_dependency_is_fine() {
-        let packages = vec![pkg("sonde-scope", &["sonde-types"])];
+        let packages = vec![pkg("bathy-scope", &["bathy-types"])];
         let violations = find_violations(&packages);
         assert!(
             violations.is_empty(),
@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn forbidden_substring_dependency_is_detected() {
         // AC-1.2
-        let packages = vec![pkg("sonde-probe", &["async-openai"])];
+        let packages = vec![pkg("bathy-probe", &["async-openai"])];
         let violations = find_violations(&packages);
         assert_eq!(
             violations.len(),
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn ordinary_dependency_is_not_flagged() {
-        let packages = vec![pkg("sonde-probe", &["serde"])];
+        let packages = vec![pkg("bathy-probe", &["serde"])];
         let violations = find_violations(&packages);
         assert!(
             violations.is_empty(),
@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn check_false_fails_when_a_type_gains_a_field_and_regeneration_never_ran() {
         // The case the check exists for: the schema *source* (what
-        // `sonde_types::schema::all()` would now produce) has changed --
+        // `bathy_types::schema::all()` would now produce) has changed --
         // simulated here by handing `diff_or_write` a schema set with an
         // extra property -- but nobody re-ran `emit-schemas`, so the
         // committed file is still the old shape. This must be reported as

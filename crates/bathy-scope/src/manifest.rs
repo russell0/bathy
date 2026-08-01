@@ -1,9 +1,9 @@
 use std::net::IpAddr;
 
+use bathy_types::ids::ScopeId;
+use bathy_types::request::Budgets;
 use ipnet::IpNet;
 use serde::Deserialize;
-use sonde_types::ids::ScopeId;
-use sonde_types::request::Budgets;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -130,7 +130,7 @@ impl ScopeManifest {
             // Loud on purpose: a signature field that looks like it should
             // mean something but doesn't is more dangerous than no
             // signature at all, because a human skimming the manifest may
-            // assume it was checked. `sonde-scope` has no logging
+            // assume it was checked. `bathy-scope` has no logging
             // framework dependency (nor should the deny-by-default policy
             // path acquire one just for this), so this goes straight to
             // stderr rather than being silently swallowed.
@@ -145,7 +145,7 @@ impl ScopeManifest {
 
         // Fix round 3: IPv6 scanning is out of scope for v0.1 (see
         // `is_ordinary_unicast`'s doc comment and the Gap Register in
-        // docs/superpowers/plans/2026-07-31-sonde-v0.1-overview.md), so
+        // docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md), so
         // `allows()` refuses every IPv6 address no matter what this
         // manifest says -- an IPv6 entry in `allowed_cidrs` can never
         // match anything. Warn rather than fail: the manifest may also
@@ -294,7 +294,7 @@ impl ScopeManifest {
 /// the controller's reasoning in full).
 ///
 /// The actual fix follows from a scope decision made independently of this
-/// bug hunt: **`docs/superpowers/plans/2026-07-31-sonde-v0.1-overview.md`'s
+/// bug hunt: **`docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md`'s
 /// Gap Register states IPv6 scanning is out of scope for v0.1.** This
 /// crate had been hardening a code path the product does not ship. Given
 /// that, the IPv6 arm below refuses **every IPv6 address unconditionally**,
@@ -997,7 +997,7 @@ mod tests {
     }
 
     // --- Fix round 3 (CONTROLLER DECISION): IPv6 scanning is out of scope
-    // for v0.1 (docs/superpowers/plans/2026-07-31-sonde-v0.1-overview.md's
+    // for v0.1 (docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md's
     // Gap Register). `is_ordinary_unicast`'s IPv6 arm now refuses every
     // IPv6 address unconditionally, as its first and only action --
     // immune to every embedding/transition scheme, enumerated above or
@@ -1281,7 +1281,7 @@ mod tests {
     // never. Deleting the deny-set check at `allows`'s own `if self.denied
     // ...` (above) would not have been reliably caught by this test at all.
     // `allows_octets_strategy` below is weighted the same way, and for the
-    // same reason, as `sonde_scope::policy`'s `octets_strategy` (see that
+    // same reason, as `bathy_scope::policy`'s `octets_strategy` (see that
     // function's doc comment for the full mutation-testing rationale): the
     // denied host and the subnet's `.0`/`.255` boundary addresses each get
     // their own `Just(..)` arm, sampled on roughly 1 in 5 cases, rather than

@@ -1,4 +1,4 @@
-use sonde_types::request::Budgets;
+use bathy_types::request::Budgets;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("packet budget exhausted: {spent}/{ceiling} already spent, {requested} more requested")]

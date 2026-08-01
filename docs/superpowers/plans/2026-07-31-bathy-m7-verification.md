@@ -1,4 +1,4 @@
-# sonde M7 — Integration Lab, Fuzzing, Benchmarks & Publication — Implementation Plan
+# bathy M7 — Integration Lab, Fuzzing, Benchmarks & Publication — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -22,7 +22,7 @@
 Every image is pinned by digest, never by tag. A tag that moves turns a green suite red for reasons unrelated to our code, and — worse — silently changes the banners our interpretation rules are tested against.
 
 ```yaml
-name: sonde-lab
+name: bathy-lab
 networks:
   labnet:
     ipam:
@@ -209,7 +209,7 @@ fuzz_target!(|data: &[u8]| {
             probe_id, port: 80, request: None,
             response: data.to_vec(), elapsed_micros: 0, truncated: false,
         };
-        let out = sonde_interpret::interpret(&capture);
+        let out = bathy_interpret::interpret(&capture);
         // Any produced span must index real bytes — a bad span would panic a
         // consumer that slices with it.
         for i in &out {
@@ -253,7 +253,7 @@ git commit -m "test(fuzz): libFuzzer targets for every untrusted-input parser"
 
 - [ ] **Step 1: Write the comparison harness**
 
-`bench/compare.sh` runs sonde, Nmap, Masscan, and RustScan against the identical lab subnet and port set, recording wall-clock time, packets emitted (from `/proc/net/snmp` deltas), and — the part that matters — **accuracy against the ground truth**.
+`bench/compare.sh` runs bathy, Nmap, Masscan, and RustScan against the identical lab subnet and port set, recording wall-clock time, packets emitted (from `/proc/net/snmp` deltas), and — the part that matters — **accuracy against the ground truth**.
 
 Rules that make the comparison honest, and that must be stated in `docs/benchmarks.md`:
 - Same target set, same port set, same timeout, same rate limit, on the same machine, in the same run.
@@ -269,7 +269,7 @@ Benchmark the parts we control: `interpret` throughput over the replay corpus, `
 
 - [ ] **Step 3: Run and write `docs/benchmarks.md`**
 
-Publish the real numbers from a real run, including the categories where sonde loses.
+Publish the real numbers from a real run, including the categories where bathy loses.
 
 - [ ] **Step 4: Commit**
 
@@ -282,7 +282,7 @@ git commit -m "bench: reproducible cross-scanner comparison with accuracy report
 - **AC-7.11** The comparison runs all four scanners against the identical lab, ports, timeout, and rate, on one machine in one run.
 - **AC-7.12** Accuracy against ground truth is reported for every scanner, next to its timing.
 - **AC-7.13** Every tool's version and full command line appears in the published output.
-- **AC-7.14** `docs/benchmarks.md` reports at least one category where sonde loses, including service-identification breadth.
+- **AC-7.14** `docs/benchmarks.md` reports at least one category where bathy loses, including service-identification breadth.
 - **AC-7.15** Criterion benchmarks cover `interpret`, `canonical_json`, plan construction, and log append.
 
 ---
@@ -297,12 +297,12 @@ git commit -m "bench: reproducible cross-scanner comparison with accuracy report
 Required structure: what it is in two sentences; the authorized-use statement, above the fold; a 60-second quickstart that includes writing a scope manifest, because there is no way to scan without one; the eleven MCP tools; an honest limitations section.
 
 The limitations section is not optional and must state plainly:
-- Service-identification coverage is a fraction of Nmap's. Nmap has 28 years of community fingerprint contributions; sonde v0.1 has eight protocols.
+- Service-identification coverage is a fraction of Nmap's. Nmap has 28 years of community fingerprint contributions; bathy v0.1 has eight protocols.
 - No OS detection, no UDP breadth, no traceroute, no IPv6 scanning, no Windows support in v0.1.
 - Port presets are IANA-derived heuristics, not prevalence measurements.
 - Observations are not reproducible; planning and interpretation are. Explain the distinction.
 
-Positioning rules, binding: the README compares sonde to *tools*, never to *people*. No named individual appears in it. No claim that another project is bad, badly run, or obsolete. The argument is "here is an interface designed for a different consumer, here are the measurements" — and that argument is strictly stronger than any adjective.
+Positioning rules, binding: the README compares bathy to *tools*, never to *people*. No named individual appears in it. No claim that another project is bad, badly run, or obsolete. The argument is "here is an interface designed for a different consumer, here are the measurements" — and that argument is strictly stronger than any adjective.
 
 - [ ] **Step 2: Write the design paper**
 
@@ -314,7 +314,7 @@ Linux is supported. macOS is best-effort (BPF device permissions differ). Window
 
 - [ ] **Step 4: Write `docs/threat-model.md`**
 
-What sonde defends against (hostile responses from scanned endpoints, a confused or adversarial calling agent, an over-broad scope manifest), what it does not (a compromised host running `packetd`, a malicious operator with legitimate scope), and why the LLM is kept off the packet path.
+What bathy defends against (hostile responses from scanned endpoints, a confused or adversarial calling agent, an over-broad scope manifest), what it does not (a compromised host running `packetd`, a malicious operator with legitimate scope), and why the LLM is kept off the packet path.
 
 - [ ] **Step 5: Commit**
 
@@ -340,7 +340,7 @@ git commit -m "docs: README, design paper, platform support, and threat model"
 
 - [ ] **Step 1: Write `SECURITY.md`**
 
-Must contain: a disclosure contact and expected response time; a statement that sonde is intended for scanning networks the operator is authorized to scan; a description of the safety mechanisms (mandatory scope manifests, expiry, hard budgets, identifying User-Agent, no evasion features); and an explicit statement that detection-evasion and anonymization are **non-goals** and that feature requests for them will be declined.
+Must contain: a disclosure contact and expected response time; a statement that bathy is intended for scanning networks the operator is authorized to scan; a description of the safety mechanisms (mandatory scope manifests, expiry, hard budgets, identifying User-Agent, no evasion features); and an explicit statement that detection-evasion and anonymization are **non-goals** and that feature requests for them will be declined.
 
 - [ ] **Step 2: Write `CONTRIBUTING.md`**
 
@@ -467,7 +467,7 @@ fn the_publish_gate_rejects_a_tracked_research_artifact() {
 
 #[test]
 fn the_publish_gate_rejects_a_leftover_placeholder_owner() {
-    let repo = fixture_repo_with_content("Cargo.toml", "repository = \"https://github.com/russell0/sonde\"");
+    let repo = fixture_repo_with_content("Cargo.toml", "repository = \"https://github.com/russell0/bathy\"");
     assert!(publish_check_in(&repo).is_err());
 }
 
@@ -482,7 +482,7 @@ fn the_publish_gate_rejects_an_unpinned_lab_image() {
 
 - [ ] **Step 4: Confirm the name is available**
 
-Before the first publish, verify `sonde` is free on crates.io, as a GitHub org or repo name, and as a domain. There is a plausible existing `sonde` crate in the DTrace/USDT space. If it is taken, rename now — the fallback order is `fathom` → `assay` → `reckon`, and the rename is a workspace-wide search-and-replace plus a `Cargo.toml` sweep. Renaming after publish breaks every existing link and install.
+Before the first publish, verify `bathy` is free on crates.io, as a GitHub org or repo name, and as a domain. There is a plausible existing `bathy` crate in the DTrace/USDT space. If it is taken, rename now — the fallback order is `fathom` → `assay` → `reckon`, and the rename is a workspace-wide search-and-replace plus a `Cargo.toml` sweep. Renaming after publish breaks every existing link and install.
 
 - [ ] **Step 5: Commit**
 
@@ -507,6 +507,6 @@ git commit -m "chore(xtask): publish-check gate for secrets, artifacts, licensin
 - [ ] `cargo test --workspace` green; `lab/run.sh test` green; fuzz targets clean for 120s each.
 - [ ] AC-7.1 through AC-7.31 each demonstrated by a named passing test or a recorded verification.
 - [ ] `cargo run -p xtask -- publish-check` exits 0.
-- [ ] `docs/benchmarks.md` published with real numbers, including at least one category sonde loses.
+- [ ] `docs/benchmarks.md` published with real numbers, including at least one category bathy loses.
 - [ ] README, SECURITY.md, CONTRIBUTING.md, design paper, platform support, and threat model all present.
 - [ ] **Ready to publish.** Tag `v0.1.0`.

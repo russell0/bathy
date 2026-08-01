@@ -21,6 +21,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "bathy-scope"
+version = "0.1.0"
+dependencies = [
+ "bathy-types",
+ "ipnet",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "time",
+]
+
+[[package]]
+name = "bathy-types"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "schemars",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "ulid",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -539,31 +564,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "sonde-scope"
-version = "0.1.0"
-dependencies = [
- "ipnet",
- "proptest",
- "serde",
- "serde_json",
- "sonde-types",
- "thiserror",
- "time",
-]
-
-[[package]]
-name = "sonde-types"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "schemars",
- "serde",
- "serde_json",
- "thiserror",
- "ulid",
-]
-
-[[package]]
 name = "syn"
 version = "2.0.119"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -768,8 +768,8 @@ checksum = "f17a85883d4e6d00e8a97c586de764dabcc06133f7f1d55dce5cdc070ad7fe59"
 name = "xtask"
 version = "0.1.0"
 dependencies = [
+ "bathy-types",
  "serde_json",
- "sonde-types",
 ]
 
 [[package]]

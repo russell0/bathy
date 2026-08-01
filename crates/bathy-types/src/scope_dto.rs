@@ -5,18 +5,18 @@ use crate::ids::ScopeId;
 use crate::nonempty::NonEmpty;
 use crate::request::Budgets;
 
-/// Wire/schema mirror of `sonde_scope::manifest::ScopeManifest`'s on-disk
+/// Wire/schema mirror of `bathy_scope::manifest::ScopeManifest`'s on-disk
 /// JSON form.
 ///
-/// Lives here, not in `sonde-scope`, purely so `sonde_types::schema::all()`
-/// can publish `scope-manifest.json` without `sonde-types` -- a
+/// Lives here, not in `bathy-scope`, purely so `bathy_types::schema::all()`
+/// can publish `scope-manifest.json` without `bathy-types` -- a
 /// zero-internal-dependency, pure contract crate -- taking on `ipnet`'s
 /// CIDR-parsing behavior as a dependency. Accordingly, `allowed_cidrs` and
 /// `denied_cidrs` are plain strings here, not `ipnet::IpNet`: this type
 /// describes the wire *shape*, it does not validate that each string is a
 /// syntactically valid CIDR (that validation, and the reserved-range and
 /// deny-beats-allow policy `ScopeManifestDto` deliberately says nothing
-/// about, live in `sonde_scope::manifest::ScopeManifest::load`, which is the
+/// about, live in `bathy_scope::manifest::ScopeManifest::load`, which is the
 /// only code path that may ever decide whether a packet is authorized).
 ///
 /// `allowed_cidrs` still uses `NonEmpty<String>` rather than `Vec<String>`,
@@ -24,14 +24,14 @@ use crate::request::Budgets;
 /// `PortSelection::Explicit::explicit` do (see `request.rs`): a
 /// `#[schemars(length(min = 1))]` attribute alone only shows up in the
 /// *published* schema, it does not stop `{"allowed_cidrs": []}` from
-/// deserializing through this type. `sonde_scope::manifest::Raw` (a
+/// deserializing through this type. `bathy_scope::manifest::Raw` (a
 /// separate, unrelated deserialization target) enforces the same "at least
 /// one allowed CIDR" rule independently via its own explicit empty check,
 /// since `ScopeManifest::load` does not deserialize through this DTO at
 /// all -- keep both in sync by hand if the rule ever changes.
 ///
 /// This type is a schema/documentation artifact, not part of any runtime
-/// authorization path. `sonde_scope::manifest::ScopeManifest` is the sole
+/// authorization path. `bathy_scope::manifest::ScopeManifest` is the sole
 /// authority on what a manifest means; this mirror must be kept in sync
 /// with it by hand.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -42,14 +42,14 @@ pub struct ScopeManifestDto {
     /// RFC 3339 instant after which the manifest is no longer valid.
     // C3: pinned in the published schema via `format: "date-time"` below so
     // the contract is at least honest, mirroring every other invariant in
-    // this crate. `sonde_scope::manifest::ScopeManifest::load` (the sole
+    // this crate. `bathy_scope::manifest::ScopeManifest::load` (the sole
     // runtime authority) already parses and validates this at load time --
     // see `ManifestError::BadExpiry`; this DTO is schema/documentation
     // only and adds no new runtime parsing.
     #[schemars(extend("format" = "date-time"))]
     pub not_after: String,
     /// CIDR strings, e.g. `"10.30.0.0/24"`. Parsed and validated by
-    /// `sonde-scope` at load time, not by this type.
+    /// `bathy-scope` at load time, not by this type.
     pub allowed_cidrs: NonEmpty<String>,
     /// CIDR strings. Deny always beats allow, regardless of specificity.
     #[serde(default)]
@@ -57,7 +57,7 @@ pub struct ScopeManifestDto {
     pub budget_ceiling: Budgets,
     /// Reserved for v0.2 detached-signature verification; accepted on the
     /// wire but NOT cryptographically verified by this version. See
-    /// `sonde_scope::manifest::ScopeManifest::signature_verified`.
+    /// `bathy_scope::manifest::ScopeManifest::signature_verified`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }

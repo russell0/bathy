@@ -1,4 +1,4 @@
-# sonde M2 — Evidence Store & Scan State — Implementation Plan
+# bathy M2 — Evidence Store & Scan State — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -8,20 +8,20 @@
 
 **Tech Stack:** rusqlite (bundled), serde_json, ulid, blake3, tempfile, tokio (for the async append path only).
 
-**Read first:** `2026-07-31-sonde-v0.1-overview.md` Global Constraints, and M1 Tasks 2 and 5 for `Digest`, `ScanId`, and `Event`.
+**Read first:** `2026-07-31-bathy-v0.1-overview.md` Global Constraints, and M1 Tasks 2 and 5 for `Digest`, `ScanId`, and `Event`.
 
 ---
 
 ### Task 1: Injectable clock and identifier source
 
 **Files:**
-- Create: `crates/sonde-types/src/clock.rs`
-- Create: `crates/sonde-store/Cargo.toml`, `crates/sonde-store/src/lib.rs`
+- Create: `crates/bathy-types/src/clock.rs`
+- Create: `crates/bathy-store/Cargo.toml`, `crates/bathy-store/src/lib.rs`
 
-> **Layering note.** `Clock` lives in `sonde-types`, not `sonde-store`. `sonde-evidence` needs it for `EventLog::append` and sits *below* `sonde-store` in the layer order, so putting `Clock` in `sonde-store` would make `xtask check-deps` fail. The trait is pure — no I/O, no internal dependencies — so `sonde-types` is its correct home.
+> **Layering note.** `Clock` lives in `bathy-types`, not `bathy-store`. `bathy-evidence` needs it for `EventLog::append` and sits *below* `bathy-store` in the layer order, so putting `Clock` in `bathy-store` would make `xtask check-deps` fail. The trait is pure — no I/O, no internal dependencies — so `bathy-types` is its correct home.
 
 **Interfaces:**
-- Consumes: `ScanId`, `EventId` from `sonde-types`.
+- Consumes: `ScanId`, `EventId` from `bathy-types`.
 - Produces: `trait Clock { fn now_rfc3339(&self) -> String; fn new_scan_id(&self) -> ScanId; fn new_event_id(&self) -> EventId; }`, `SystemClock`, `FixedClock::new(&str, seed: u64)`.
 
 - [ ] **Step 1: Write the failing test**
@@ -62,7 +62,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p sonde-types clock`
+Run: `cargo test -p bathy-types clock`
 Expected: FAIL — `Clock` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -71,7 +71,7 @@ Expected: FAIL — `Clock` not found.
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sonde_types::ids::{EventId, ScanId};
+use bathy_types::ids::{EventId, ScanId};
 
 /// All time and identifier generation flows through this trait.
 ///
@@ -190,17 +190,17 @@ Note: the "reproducible" test draws IDs from two *separate* `FixedClock` instanc
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-types clock` — expected 3 passed.
+Run: `cargo test -p bathy-types clock` — expected 3 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-types crates/sonde-store
+git add crates/bathy-types crates/bathy-store
 git commit -m "feat(types): injectable Clock so event logs are reproducible in tests"
 ```
 
 **Acceptance criteria:**
-- **AC-2.1** No source file in the workspace outside `crates/sonde-types/src/clock.rs` calls `SystemTime::now()` or constructs a random ULID (`ulid::Generator`, or `Ulid::new()` should a future version reintroduce it). Enforce with a CI grep covering both `SystemTime::now` and `ulid::Generator`.
+- **AC-2.1** No source file in the workspace outside `crates/bathy-types/src/clock.rs` calls `SystemTime::now()` or constructs a random ULID (`ulid::Generator`, or `Ulid::new()` should a future version reintroduce it). Enforce with a CI grep covering both `SystemTime::now` and `ulid::Generator`.
 - **AC-2.2** Two `FixedClock`s built with identical arguments yield identical timestamp and identifier sequences.
 - **AC-2.3** `SystemClock::now_rfc3339` emits exactly `YYYY-MM-DDTHH:MM:SS.mmmZ` (24 characters, UTC).
 
@@ -209,7 +209,7 @@ git commit -m "feat(types): injectable Clock so event logs are reproducible in t
 ### Task 2: Content-addressed evidence store
 
 **Files:**
-- Create: `crates/sonde-evidence/Cargo.toml`, `crates/sonde-evidence/src/lib.rs`, `crates/sonde-evidence/src/store.rs`
+- Create: `crates/bathy-evidence/Cargo.toml`, `crates/bathy-evidence/src/lib.rs`, `crates/bathy-evidence/src/store.rs`
 
 **Interfaces:**
 - Consumes: `Digest`.
@@ -248,7 +248,7 @@ mod tests {
     #[test]
     fn get_of_an_unknown_digest_is_an_error_not_a_panic() {
         let (_d, s) = store();
-        let unknown = sonde_types::ids::Digest::of_bytes(b"never stored");
+        let unknown = bathy_types::ids::Digest::of_bytes(b"never stored");
         assert!(s.get(&unknown).is_err());
     }
 
@@ -282,7 +282,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-evidence store`
+Run: `cargo test -p bathy-evidence store`
 Expected: FAIL — `EvidenceStore` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -291,7 +291,7 @@ Expected: FAIL — `EvidenceStore` not found.
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sonde_types::ids::Digest;
+use bathy_types::ids::Digest;
 
 #[derive(Debug, thiserror::Error)]
 pub enum EvidenceError {
@@ -377,12 +377,12 @@ Add a `walkdir_count_files` helper in the test module using `walkdir` as a dev-d
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-evidence store` — expected 6 passed.
+Run: `cargo test -p bathy-evidence store` — expected 6 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-evidence
+git add crates/bathy-evidence
 git commit -m "feat(evidence): content-addressed store with read-time digest verification"
 ```
 
@@ -398,7 +398,7 @@ git commit -m "feat(evidence): content-addressed store with read-time digest ver
 ### Task 3: Append-only event log
 
 **Files:**
-- Create: `crates/sonde-evidence/src/log.rs`
+- Create: `crates/bathy-evidence/src/log.rs`
 
 **Interfaces:**
 - Consumes: `Event`, `ScanId`, `EvidenceStore`.
@@ -476,7 +476,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-evidence log`
+Run: `cargo test -p bathy-evidence log`
 Expected: FAIL — `EventLog` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -486,9 +486,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 
-use sonde_types::clock::Clock;
-use sonde_types::event::{Event, EventBody};
-use sonde_types::ids::ScanId;
+use bathy_types::clock::Clock;
+use bathy_types::event::{Event, EventBody};
+use bathy_types::ids::ScanId;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogError {
@@ -613,12 +613,12 @@ impl EventLog {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-evidence log` — expected 5 passed.
+Run: `cargo test -p bathy-evidence log` — expected 5 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-evidence
+git add crates/bathy-evidence
 git commit -m "feat(evidence): gap-free append-only JSONL event log"
 ```
 
@@ -634,7 +634,7 @@ git commit -m "feat(evidence): gap-free append-only JSONL event log"
 ### Task 4: SQLite task store with idempotency
 
 **Files:**
-- Create: `crates/sonde-store/src/schema.sql`, `crates/sonde-store/src/tasks.rs`
+- Create: `crates/bathy-store/src/schema.sql`, `crates/bathy-store/src/tasks.rs`
 
 **Interfaces:**
 - Consumes: `Clock`, `ScanId`, `Digest`, `TaskStatus`, `Budgets`, `ScopeId`.
@@ -642,7 +642,7 @@ git commit -m "feat(evidence): gap-free append-only JSONL event log"
 
 - [ ] **Step 1: Write the schema**
 
-`crates/sonde-store/src/schema.sql`:
+`crates/bathy-store/src/schema.sql`:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
@@ -765,7 +765,7 @@ mod tests {
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-store tasks`
+Run: `cargo test -p bathy-store tasks`
 Expected: FAIL — `TaskStore` not found.
 
 - [ ] **Step 4: Write the implementation**
@@ -776,8 +776,8 @@ Key structures and the idempotency rule:
 use std::path::Path;
 
 use rusqlite::{Connection, OptionalExtension, params};
-use sonde_types::ids::{Digest, ScanId, ScopeId};
-use sonde_types::task::TaskStatus;
+use bathy_types::ids::{Digest, ScanId, ScopeId};
+use bathy_types::task::TaskStatus;
 
 use crate::clock::Clock;
 
@@ -920,12 +920,12 @@ Implement `open` (create dir, open `state.sqlite`, execute `schema.sql` via `exe
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-store tasks` — expected 7 passed.
+Run: `cargo test -p bathy-store tasks` — expected 7 passed.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/sonde-store
+git add crates/bathy-store
 git commit -m "feat(store): SQLite task state with database-enforced idempotency and resume cursor"
 ```
 
@@ -944,7 +944,7 @@ git commit -m "feat(store): SQLite task state with database-enforced idempotency
 
 - [ ] `cargo test --workspace` green; clippy clean.
 - [ ] AC-2.1 through AC-2.20 each demonstrated by a named passing test.
-- [ ] A CI grep proves no `SystemTime::now()` or `Ulid::new()` outside `crates/sonde-types/src/clock.rs`.
-- [ ] `cargo run -p xtask -- check-deps` passes, confirming `sonde-evidence` does not depend on `sonde-store`.
+- [ ] A CI grep proves no `SystemTime::now()` or `Ulid::new()` outside `crates/bathy-types/src/clock.rs`.
+- [ ] `cargo run -p xtask -- check-deps` passes, confirming `bathy-evidence` does not depend on `bathy-store`.
 - [ ] An integration test writes evidence, appends an event referencing its digest, closes everything, reopens, and reads both back intact.
-- [ ] `sonde-evidence` and `sonde-store` are both usable without `tokio` in a synchronous test.
+- [ ] `bathy-evidence` and `bathy-store` are both usable without `tokio` in a synchronous test.

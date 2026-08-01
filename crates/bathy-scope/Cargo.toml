@@ -1,5 +1,5 @@
 [package]
-name = "sonde-types"
+name = "bathy-scope"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,9 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bathy-types = { path = "../bathy-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
-schemars = { workspace = true }
 thiserror = { workspace = true }
-blake3 = { workspace = true }
-ulid = { workspace = true }
+ipnet = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

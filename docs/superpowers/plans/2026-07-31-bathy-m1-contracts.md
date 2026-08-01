@@ -1,14 +1,14 @@
-# sonde M1 — Contracts, Scope & Policy — Implementation Plan
+# bathy M1 — Contracts, Scope & Policy — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Establish the Rust workspace and the complete contract layer — every type an agent can see, its JSON Schema, and a deny-by-default scope/policy/budget engine that can accept or refuse a target with a machine-readable reason.
 
-**Architecture:** `sonde-types` is a pure, I/O-free crate holding every type that crosses a public boundary; `schemars` derives JSON Schema from those types and the schemas are committed to `schemas/` so CI can detect drift. `sonde-scope` layers policy on top: an unexpired manifest defines allow/deny CIDR sets and budget ceilings, and every scan decision passes through it before a single packet exists.
+**Architecture:** `bathy-types` is a pure, I/O-free crate holding every type that crosses a public boundary; `schemars` derives JSON Schema from those types and the schemas are committed to `schemas/` so CI can detect drift. `bathy-scope` layers policy on top: an unexpired manifest defines allow/deny CIDR sets and budget ceilings, and every scan decision passes through it before a single packet exists.
 
 **Tech Stack:** Rust 1.85 (edition 2024), serde, schemars, ulid, blake3, ipnet, thiserror, proptest.
 
-**Read first:** `2026-07-31-sonde-v0.1-overview.md` — its Global Constraints section applies to every task here.
+**Read first:** `2026-07-31-bathy-v0.1-overview.md` — its Global Constraints section applies to every task here.
 
 ---
 
@@ -37,7 +37,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
-repository = "https://github.com/russell0/sonde"
+repository = "https://github.com/russell0/bathy"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -84,18 +84,18 @@ use std::collections::BTreeMap;
 /// Crates are listed lowest-level first. A crate may only depend on crates
 /// that appear strictly earlier in this list.
 const LAYERS: &[&str] = &[
-    "sonde-types",
-    "sonde-scope",
-    "sonde-evidence",
-    "sonde-store",
-    "sonde-plan",
-    "sonde-interpret",
-    "sonde-probe",
-    "sonde-engine",
-    "sonde-packetd",
-    "sonde-query",
-    "sonde-mcp",
-    "sonde-cli",
+    "bathy-types",
+    "bathy-scope",
+    "bathy-evidence",
+    "bathy-store",
+    "bathy-plan",
+    "bathy-interpret",
+    "bathy-probe",
+    "bathy-engine",
+    "bathy-packetd",
+    "bathy-query",
+    "bathy-mcp",
+    "bathy-cli",
 ];
 
 /// No crate at or below this layer may depend on anything resembling a
@@ -187,11 +187,11 @@ jobs:
       - run: cargo run -p xtask -- check-schemas
       # `unsafe ` with a trailing space misses `unsafe{`, and scanning only
       # crates/ misses xtask/. Match unsafe followed by space, brace, paren,
-      # or end-of-line, across every Rust source outside sonde-packetd.
+      # or end-of-line, across every Rust source outside bathy-packetd.
       - name: no unsafe outside packetd
         run: |
           ! grep -rnE --include='*.rs' 'unsafe([ {(]|$)' crates/ xtask/ \
-            | grep -v '^crates/sonde-packetd/'
+            | grep -v '^crates/bathy-packetd/'
       # Lines that legitimately name the phrase — this rule, its tests, its
       # enforcement — carry the [phrase-rule] marker and are excluded. Without
       # that exclusion this step fails on its own source. See the overview's
@@ -242,7 +242,7 @@ git commit -m "chore: workspace scaffold, dual license, CI, dependency-boundary 
 - **AC-1.1** `cargo run -p xtask -- check-deps` exits non-zero when a crate depends on one at or above its own layer. Prove with a temporary violating dependency in a test, then revert.
 - **AC-1.2** `check-deps` exits non-zero if any workspace package depends on a package whose name contains any `FORBIDDEN_SUBSTRINGS` entry — **including packages not listed in `LAYERS`**, such as `xtask`. Prove with a test whose depender is unranked; gating this check on the depender's rank is the natural mistake and it leaves a real hole.
 - **AC-1.3** Both `LICENSE-APACHE` and `LICENSE-MIT` exist and every crate manifest declares `license = "Apache-2.0 OR MIT"` via `workspace = true`.
-- **AC-1.4** CI fails the build if `unsafe` appears in any Rust source outside `sonde-packetd`, matching `unsafe` followed by a space, `{`, `(`, or end-of-line, and scanning `xtask/` as well as `crates/`. Verify both directions by seeding `unsafe{}` (no space, under `xtask/`) and confirming a non-zero exit, then removing it and confirming zero.
+- **AC-1.4** CI fails the build if `unsafe` appears in any Rust source outside `bathy-packetd`, matching `unsafe` followed by a space, `{`, `(`, or end-of-line, and scanning `xtask/` as well as `crates/`. Verify both directions by seeding `unsafe{}` (no space, under `xtask/`) and confirming a non-zero exit, then removing it and confirming zero.
 - **AC-1.5** CI fails the build if the unscoped determinism phrase appears on any line not carrying the `[phrase-rule]` marker. Prove both directions: a seeded unmarked occurrence fails the build, and the rule's own marked statements do not. `[phrase-rule]`
 - **AC-1.35** A dedicated CI job compiles the workspace on Rust 1.85 with `rust-toolchain.toml` removed, so the declared MSRV is verified rather than assumed. Development itself happens on stable. (Numbered out of positional order: added after the toolchain was installed and the exact-version pin proved wrong.)
 
@@ -251,7 +251,7 @@ git commit -m "chore: workspace scaffold, dual license, CI, dependency-boundary 
 ### Task 2: Identifier and digest types
 
 **Files:**
-- Create: `crates/sonde-types/Cargo.toml`, `crates/sonde-types/src/lib.rs`, `crates/sonde-types/src/ids.rs`
+- Create: `crates/bathy-types/Cargo.toml`, `crates/bathy-types/src/lib.rs`, `crates/bathy-types/src/ids.rs`
 - Test: inline `#[cfg(test)]` in `ids.rs`
 
 **Interfaces:**
@@ -260,7 +260,7 @@ git commit -m "chore: workspace scaffold, dual license, CI, dependency-boundary 
 
 - [ ] **Step 1: Write the failing test**
 
-`crates/sonde-types/src/ids.rs`:
+`crates/bathy-types/src/ids.rs`:
 ```rust
 #[cfg(test)]
 mod tests {
@@ -326,7 +326,7 @@ mod tests {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cargo test -p sonde-types ids`
+Run: `cargo test -p bathy-types ids`
 Expected: FAIL — `cannot find type Digest in this scope`.
 
 - [ ] **Step 3: Write the implementation**
@@ -510,17 +510,17 @@ prefixed_id!(EventId, "evt", "Identifies one immutable event.");
 prefixed_id!(ScopeId, "scope", "Identifies an authorization scope manifest.");
 ```
 
-Note: identifiers are *constructed* only through a `Clock` implementation. `Clock` is created in **M2 Task 1** and lives in `sonde-types` — not in `sonde-store`, which sits above `sonde-evidence` in the layer order and would make `EventLog::append` an upward dependency. `from_ulid` exists so pure crates and tests can build identifiers without a clock.
+Note: identifiers are *constructed* only through a `Clock` implementation. `Clock` is created in **M2 Task 1** and lives in `bathy-types` — not in `bathy-store`, which sits above `bathy-evidence` in the layer order and would make `EventLog::append` an upward dependency. `from_ulid` exists so pure crates and tests can build identifiers without a clock.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-types ids`
+Run: `cargo test -p bathy-types ids`
 Expected: 5 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-types
+git add crates/bathy-types
 git commit -m "feat(types): prefixed ULID identifiers and BLAKE3 digest type"
 ```
 
@@ -534,7 +534,7 @@ git commit -m "feat(types): prefixed ULID identifiers and BLAKE3 digest type"
 ### Task 3: Non-empty evidence vector and confidence
 
 **Files:**
-- Create: `crates/sonde-types/src/nonempty.rs`, `crates/sonde-types/src/confidence.rs`
+- Create: `crates/bathy-types/src/nonempty.rs`, `crates/bathy-types/src/confidence.rs`
 
 **Interfaces:**
 - Consumes: nothing.
@@ -542,7 +542,7 @@ git commit -m "feat(types): prefixed ULID identifiers and BLAKE3 digest type"
 
 - [ ] **Step 1: Write the failing test**
 
-`crates/sonde-types/src/nonempty.rs`:
+`crates/bathy-types/src/nonempty.rs`:
 ```rust
 #[cfg(test)]
 mod tests {
@@ -569,7 +569,7 @@ mod tests {
 }
 ```
 
-`crates/sonde-types/src/confidence.rs`:
+`crates/bathy-types/src/confidence.rs`:
 ```rust
 #[cfg(test)]
 mod tests {
@@ -599,7 +599,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-types nonempty confidence`
+Run: `cargo test -p bathy-types nonempty confidence`
 Expected: FAIL — types not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -682,7 +682,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// A probability in the closed interval [0.0, 1.0].
 ///
 /// Confidence is reported, never inferred by a model at runtime: it comes from
-/// how specifically a probe's response matched a rule in `sonde-interpret`.
+/// how specifically a probe's response matched a rule in `bathy-interpret`.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]
@@ -715,13 +715,13 @@ impl<'de> Deserialize<'de> for Confidence {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-types`
+Run: `cargo test -p bathy-types`
 Expected: all passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-types
+git add crates/bathy-types
 git commit -m "feat(types): NonEmpty and Confidence with parse-time validation"
 ```
 
@@ -734,7 +734,7 @@ git commit -m "feat(types): NonEmpty and Confidence with parse-time validation"
 ### Task 4: Scan request, budgets, and port selection
 
 **Files:**
-- Create: `crates/sonde-types/src/request.rs`
+- Create: `crates/bathy-types/src/request.rs`
 
 **Interfaces:**
 - Consumes: `Digest`, `ScopeId` from Task 2.
@@ -807,7 +807,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-types request`
+Run: `cargo test -p bathy-types request`
 Expected: FAIL — `ScanRequest` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -966,13 +966,13 @@ then annotate `Budgets` with `#[serde(try_from = "RawBudgets")]`. Apply the iden
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-types request`
+Run: `cargo test -p bathy-types request`
 Expected: 5 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-types
+git add crates/bathy-types
 git commit -m "feat(types): ScanRequest with mandatory budgets and closed objective set"
 ```
 
@@ -988,7 +988,7 @@ git commit -m "feat(types): ScanRequest with mandatory budgets and closed object
 ### Task 5: Events, observations, and findings
 
 **Files:**
-- Create: `crates/sonde-types/src/event.rs`
+- Create: `crates/bathy-types/src/event.rs`
 
 **Interfaces:**
 - Consumes: `ScanId`, `Digest`, `Confidence`, `NonEmpty`.
@@ -1066,7 +1066,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-types event`
+Run: `cargo test -p bathy-types event`
 Expected: FAIL — `Event` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -1222,13 +1222,13 @@ pub struct Event {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-types event`
+Run: `cargo test -p bathy-types event`
 Expected: 3 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-types
+git add crates/bathy-types
 git commit -m "feat(types): immutable event model with mandatory evidence on findings"
 ```
 
@@ -1243,13 +1243,13 @@ git commit -m "feat(types): immutable event model with mandatory evidence on fin
 ### Task 6: Canonical JSON, schema export, and drift detection
 
 **Files:**
-- Create: `crates/sonde-types/src/canonical.rs`, `crates/sonde-types/src/schema.rs`
+- Create: `crates/bathy-types/src/canonical.rs`, `crates/bathy-types/src/schema.rs`
 - Modify: `xtask/src/main.rs` (add `check-schemas` and `emit-schemas`)
 - Create: `schemas/` (generated, committed)
 
 **Interfaces:**
 - Consumes: every type above.
-- Produces: `canonical_json(&serde_json::Value) -> Result<String, CanonicalError>`, `plan_digest(&serde_json::Value) -> Result<Digest, CanonicalError>`, `sonde_types::schema::all() -> BTreeMap<&'static str, serde_json::Value>`.
+- Produces: `canonical_json(&serde_json::Value) -> Result<String, CanonicalError>`, `plan_digest(&serde_json::Value) -> Result<Digest, CanonicalError>`, `bathy_types::schema::all() -> BTreeMap<&'static str, serde_json::Value>`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1301,7 +1301,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-types canonical`
+Run: `cargo test -p bathy-types canonical`
 Expected: FAIL — `canonical_json` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -1411,7 +1411,7 @@ Add to `xtask/src/main.rs`:
 ```rust
 fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     let mut drift = Vec::new();
-    for (name, schema) in sonde_types::schema::all() {
+    for (name, schema) in bathy_types::schema::all() {
         let path = format!("schemas/{name}.json");
         let rendered = format!("{}\n", serde_json::to_string_pretty(&schema)?);
         if write {
@@ -1440,14 +1440,14 @@ Wire `"emit-schemas" => emit_schemas(true)` and `"check-schemas" => emit_schemas
 
 - [ ] **Step 4: Run tests and generate the schemas**
 
-Run: `cargo test -p sonde-types canonical` — expected 5 passed.
+Run: `cargo test -p bathy-types canonical` — expected 5 passed.
 Run: `cargo run -p xtask -- emit-schemas` then `cargo run -p xtask -- check-schemas` — expected exit 0.
 Run: manually edit one byte of `schemas/event.json`, re-run `check-schemas` — expected non-zero exit naming the drifted file. Revert.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-types schemas xtask
+git add crates/bathy-types schemas xtask
 git commit -m "feat(types): canonical JSON profile, plan digest, committed schemas with drift check"
 ```
 
@@ -1462,8 +1462,8 @@ git commit -m "feat(types): canonical JSON profile, plan digest, committed schem
 ### Task 7: Scope manifest
 
 **Files:**
-- Create: `crates/sonde-scope/Cargo.toml`, `crates/sonde-scope/src/lib.rs`, `crates/sonde-scope/src/manifest.rs`
-- Create: `crates/sonde-types/src/scope_dto.rs` (wire form, so `sonde-types` can publish its schema)
+- Create: `crates/bathy-scope/Cargo.toml`, `crates/bathy-scope/src/lib.rs`, `crates/bathy-scope/src/manifest.rs`
+- Create: `crates/bathy-types/src/scope_dto.rs` (wire form, so `bathy-types` can publish its schema)
 
 **Interfaces:**
 - Consumes: `ScopeId`.
@@ -1542,7 +1542,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-scope manifest`
+Run: `cargo test -p bathy-scope manifest`
 Expected: FAIL — `ScopeManifest` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -1552,8 +1552,8 @@ use std::net::IpAddr;
 
 use ipnet::IpNet;
 use serde::Deserialize;
-use sonde_types::ids::ScopeId;
-use sonde_types::request::Budgets;
+use bathy_types::ids::ScopeId;
+use bathy_types::request::Budgets;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
@@ -1779,17 +1779,17 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
 }
 ```
 
-Also add a `ScopeManifestDto` mirror in `sonde-types/src/scope_dto.rs` deriving `JsonSchema` over the same fields, so `schema::all()` can publish it without `sonde-types` depending on `ipnet` parsing behavior.
+Also add a `ScopeManifestDto` mirror in `bathy-types/src/scope_dto.rs` deriving `JsonSchema` over the same fields, so `schema::all()` can publish it without `bathy-types` depending on `ipnet` parsing behavior.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-scope manifest`
+Run: `cargo test -p bathy-scope manifest`
 Expected: 6 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-scope crates/sonde-types
+git add crates/bathy-scope crates/bathy-types
 git commit -m "feat(scope): deny-by-default manifest with expiry and reserved-range refusal"
 ```
 
@@ -1806,8 +1806,8 @@ git commit -m "feat(scope): deny-by-default manifest with expiry and reserved-ra
 ### Task 8: Policy decision and budget accounting
 
 **Files:**
-- Create: `crates/sonde-scope/src/policy.rs`, `crates/sonde-scope/src/budget.rs`
-- Create: `crates/sonde-types/src/task.rs`
+- Create: `crates/bathy-scope/src/policy.rs`, `crates/bathy-scope/src/budget.rs`
+- Create: `crates/bathy-types/src/task.rs`
 
 **Interfaces:**
 - Consumes: `ScopeManifest`, `ScanRequest`, `Budgets`.
@@ -1917,7 +1917,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-scope policy budget`
+Run: `cargo test -p bathy-scope policy budget`
 Expected: FAIL — `evaluate` and `BudgetLedger` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -1926,7 +1926,7 @@ Expected: FAIL — `evaluate` and `BudgetLedger` not found.
 ```rust
 use std::net::IpAddr;
 
-use sonde_types::request::ScanRequest;
+use bathy_types::request::ScanRequest;
 
 use crate::manifest::ScopeManifest;
 
@@ -2016,7 +2016,7 @@ pub fn evaluate(
 
 `budget.rs`:
 ```rust
-use sonde_types::request::Budgets;
+use bathy_types::request::Budgets;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 #[error("packet budget exhausted: {spent}/{ceiling} already spent, {requested} more requested")]
@@ -2066,7 +2066,7 @@ impl BudgetLedger {
 }
 ```
 
-`crates/sonde-types/src/task.rs`:
+`crates/bathy-types/src/task.rs`:
 ```rust
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -2107,7 +2107,7 @@ pub struct TaskHandle {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-scope`
+Run: `cargo test -p bathy-scope`
 Expected: 16 passed across manifest, policy, and budget.
 
 - [ ] **Step 5: Add a property test for the scope invariant**
@@ -2147,12 +2147,12 @@ proptest::proptest! {
 }
 ```
 
-Run: `cargo test -p sonde-scope no_target_outside` — expected PASS over 256 cases.
+Run: `cargo test -p bathy-scope no_target_outside` — expected PASS over 256 cases.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/sonde-scope crates/sonde-types
+git add crates/bathy-scope crates/bathy-types
 git commit -m "feat(scope): policy evaluation with stable deny codes and hard budget ledger"
 ```
 
@@ -2175,5 +2175,5 @@ M1 is complete when all of the following hold:
 - [ ] `cargo run -p xtask -- check-deps` and `check-schemas` both exit 0.
 - [ ] `schemas/scan-request.json`, `event.json`, `task-handle.json`, `scope-manifest.json` are committed.
 - [ ] AC-1.1 through AC-1.36 are each demonstrated by a named passing test.
-- [ ] No crate outside `sonde-packetd` contains `unsafe`.
-- [ ] `sonde-types` has zero internal dependencies and no `tokio` in its dependency tree.
+- [ ] No crate outside `bathy-packetd` contains `unsafe`.
+- [ ] `bathy-types` has zero internal dependencies and no `tokio` in its dependency tree.

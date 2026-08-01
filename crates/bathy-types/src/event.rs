@@ -61,19 +61,19 @@ pub struct Observation {
 // Proven to match code(), not just documented to match: see
 // `deny_reason_wire_values_match_code` below.
 //
-// C5: this type originated in `sonde-scope`, defined as free-standing
+// C5: this type originated in `bathy-scope`, defined as free-standing
 // strings duplicated ad hoc wherever a `reason_code` was needed --
 // `EventBody::PolicyDenied` below used to be a bare
 // `{ reason_code: String, detail: String }`, and two of its fixtures
 // constructed it with `"out_of_scope"`, a string `DenyReason::code` can
 // never actually emit (it emits `target_out_of_scope`). Moved here, into
-// `sonde-types`, so `PolicyDenied.reason_code` can be typed as
-// `DenyReason` instead of an unconstrained `String`: `sonde-types` is the
-// lowest layer (nothing may be its dependency), and `sonde-scope` may
-// depend on `sonde-types`, so this is the only direction the move can go.
-// `sonde_scope::policy` re-exports this type rather than redefining it, so
-// existing call sites referencing `sonde_scope::DenyReason` or
-// `sonde_scope::policy::DenyReason` are unaffected.
+// `bathy-types`, so `PolicyDenied.reason_code` can be typed as
+// `DenyReason` instead of an unconstrained `String`: `bathy-types` is the
+// lowest layer (nothing may be its dependency), and `bathy-scope` may
+// depend on `bathy-types`, so this is the only direction the move can go.
+// `bathy_scope::policy` re-exports this type rather than redefining it, so
+// existing call sites referencing `bathy_scope::DenyReason` or
+// `bathy_scope::policy::DenyReason` are unaffected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DenyReason {
@@ -671,8 +671,8 @@ mod tests {
         assert!(serde_json::from_str::<Event>(SERVICE_OBSERVED_EXAMPLE).is_ok());
     }
 
-    // --- C5: deny codes were defined in `sonde-scope` (`DenyReason::code()`)
-    // but consumed as free text in `sonde-types`
+    // --- C5: deny codes were defined in `bathy-scope` (`DenyReason::code()`)
+    // but consumed as free text in `bathy-types`
     // (`EventBody::PolicyDenied.reason_code: String`). The symptom was
     // already in the tree: two fixtures above used to construct
     // `EventBody::PolicyDenied { reason_code: "out_of_scope".to_string(),

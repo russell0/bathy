@@ -1,4 +1,4 @@
-# sonde M3 — Deterministic Planner & Scanning Engine — Implementation Plan
+# bathy M3 — Deterministic Planner & Scanning Engine — Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -15,7 +15,7 @@
 ### Task 1: Target expansion
 
 **Files:**
-- Create: `crates/sonde-plan/Cargo.toml`, `crates/sonde-plan/src/lib.rs`, `crates/sonde-plan/src/targets.rs`
+- Create: `crates/bathy-plan/Cargo.toml`, `crates/bathy-plan/src/lib.rs`, `crates/bathy-plan/src/targets.rs`
 
 **Interfaces:**
 - Consumes: nothing internal.
@@ -87,7 +87,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-plan targets`
+Run: `cargo test -p bathy-plan targets`
 Expected: FAIL — `expand_targets` not found.
 
 - [ ] **Step 3: Write the implementation**
@@ -200,12 +200,12 @@ fn count_of(spec: &str) -> Result<u128, TargetError> {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-plan targets` — expected 8 passed.
+Run: `cargo test -p bathy-plan targets` — expected 8 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-plan
+git add crates/bathy-plan
 git commit -m "feat(plan): order-independent target expansion with pre-allocation size check"
 ```
 
@@ -221,7 +221,7 @@ git commit -m "feat(plan): order-independent target expansion with pre-allocatio
 ### Task 2: Port sets and the clean-room port dataset
 
 **Files:**
-- Create: `crates/sonde-plan/src/ports.rs`
+- Create: `crates/bathy-plan/src/ports.rs`
 - Create: `data/ports/top-100.txt`, `data/ports/common-1000.txt`
 - Create: `data/ports/README.md`
 - Modify: `xtask/src/main.rs` (add `gen-ports`)
@@ -230,7 +230,7 @@ git commit -m "feat(plan): order-independent target expansion with pre-allocatio
 - Consumes: `PortSelection`, `PortPreset`.
 - Produces: `resolve_ports(&PortSelection) -> Result<Vec<u16>, PortError>`.
 
-> **Clean-room note — read before starting.** Nmap's `nmap-services` frequency data must not be consulted, opened, or referenced. Our port rankings are derived only from the IANA *Service Name and Transport Protocol Port Number Registry*, which is published for unrestricted use. IANA records assignments, not observed prevalence, so our v0.1 ranking is a documented heuristic, not a measurement. `data/ports/README.md` must say so plainly. Replacing this with a ranking from our own measurement is v0.2 work and is the single largest gap between sonde and a mature scanner — do not let the README imply otherwise.
+> **Clean-room note — read before starting.** Nmap's `nmap-services` frequency data must not be consulted, opened, or referenced. Our port rankings are derived only from the IANA *Service Name and Transport Protocol Port Number Registry*, which is published for unrestricted use. IANA records assignments, not observed prevalence, so our v0.1 ranking is a documented heuristic, not a measurement. `data/ports/README.md` must say so plainly. Replacing this with a ranking from our own measurement is v0.2 work and is the single largest gap between bathy and a mature scanner — do not let the README imply otherwise.
 
 - [ ] **Step 1: Write `data/ports/README.md`**
 
@@ -266,7 +266,7 @@ measurement study and is tracked as issue #1 for v0.2.
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sonde_types::request::{PortPreset, PortSelection};
+    use bathy_types::request::{PortPreset, PortSelection};
 
     #[test]
     fn presets_have_their_advertised_sizes() {
@@ -319,12 +319,12 @@ mod tests {
 
 - [ ] **Step 3: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-plan ports` — expected FAIL.
+Run: `cargo test -p bathy-plan ports` — expected FAIL.
 
 - [ ] **Step 4: Write the implementation**
 
 ```rust
-use sonde_types::request::{PortPreset, PortSelection};
+use bathy_types::request::{PortPreset, PortSelection};
 
 const TOP_100: &str = include_str!("../../../data/ports/top-100.txt");
 const COMMON_1000: &str = include_str!("../../../data/ports/common-1000.txt");
@@ -396,12 +396,12 @@ Generate the two datasets with `xtask gen-ports` following the documented heuris
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-plan ports` — expected 6 passed.
+Run: `cargo test -p bathy-plan ports` — expected 6 passed.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/sonde-plan data/ports xtask
+git add crates/bathy-plan data/ports xtask
 git commit -m "feat(plan): clean-room IANA-derived port datasets and port resolution"
 ```
 
@@ -416,7 +416,7 @@ git commit -m "feat(plan): clean-room IANA-derived port datasets and port resolu
 ### Task 3: The plan and its hash
 
 **Files:**
-- Create: `crates/sonde-plan/src/plan.rs`
+- Create: `crates/bathy-plan/src/plan.rs`
 
 **Interfaces:**
 - Consumes: `expand_targets`, `resolve_ports`, `canonical_json`, `plan_digest`.
@@ -498,7 +498,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-plan plan` — expected FAIL.
+Run: `cargo test -p bathy-plan plan` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -506,10 +506,10 @@ Run: `cargo test -p sonde-plan plan` — expected FAIL.
 use std::net::IpAddr;
 
 use serde_json::json;
-use sonde_types::canonical::plan_digest;
-use sonde_types::event::{Endpoint, Transport};
-use sonde_types::ids::Digest;
-use sonde_types::request::ScanRequest;
+use bathy_types::canonical::plan_digest;
+use bathy_types::event::{Endpoint, Transport};
+use bathy_types::ids::Digest;
+use bathy_types::request::ScanRequest;
 
 use crate::ports::resolve_ports;
 use crate::targets::expand_targets;
@@ -594,7 +594,7 @@ impl ScanPlan {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-plan plan` — expected 7 passed.
+Run: `cargo test -p bathy-plan plan` — expected 7 passed.
 
 - [ ] **Step 5: Add a property test for plan stability**
 
@@ -619,7 +619,7 @@ proptest::proptest! {
 - [ ] **Step 6: Commit**
 
 ```bash
-git add crates/sonde-plan
+git add crates/bathy-plan
 git commit -m "feat(plan): deterministic port-major plan with stable plan_hash"
 ```
 
@@ -636,7 +636,7 @@ git commit -m "feat(plan): deterministic port-major plan with stable plan_hash"
 ### Task 4: Rate limiter and budget-governed emission
 
 **Files:**
-- Create: `crates/sonde-engine/Cargo.toml`, `crates/sonde-engine/src/lib.rs`, `crates/sonde-engine/src/rate.rs`
+- Create: `crates/bathy-engine/Cargo.toml`, `crates/bathy-engine/src/lib.rs`, `crates/bathy-engine/src/rate.rs`
 
 **Interfaces:**
 - Consumes: `BudgetLedger`.
@@ -682,7 +682,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-engine rate` — expected FAIL.
+Run: `cargo test -p bathy-engine rate` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -746,12 +746,12 @@ impl RateLimiter {
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-engine rate` — expected 3 passed.
+Run: `cargo test -p bathy-engine rate` — expected 3 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-engine
+git add crates/bathy-engine
 git commit -m "feat(engine): token-bucket rate limiter with oversized-request progress"
 ```
 
@@ -764,7 +764,7 @@ git commit -m "feat(engine): token-bucket rate limiter with oversized-request pr
 ### Task 5: TCP connect scanning
 
 **Files:**
-- Create: `crates/sonde-engine/src/connect.rs`
+- Create: `crates/bathy-engine/src/connect.rs`
 
 **Interfaces:**
 - Consumes: `Endpoint`, `PortState`.
@@ -826,7 +826,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-engine connect` — expected FAIL.
+Run: `cargo test -p bathy-engine connect` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -877,12 +877,12 @@ pub async fn probe_connect(target: IpAddr, port: u16, budget: Duration) -> Conne
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-engine connect` — expected 4 passed.
+Run: `cargo test -p bathy-engine connect` — expected 4 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-engine
+git add crates/bathy-engine
 git commit -m "feat(engine): unprivileged TCP connect probing with filtered/closed distinction"
 ```
 
@@ -896,7 +896,7 @@ git commit -m "feat(engine): unprivileged TCP connect probing with filtered/clos
 ### Task 6: Host discovery
 
 **Files:**
-- Create: `crates/sonde-engine/src/discovery.rs`
+- Create: `crates/bathy-engine/src/discovery.rs`
 
 **Interfaces:**
 - Consumes: `probe_connect`, `RateLimiter`.
@@ -957,7 +957,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-engine discovery` — expected FAIL.
+Run: `cargo test -p bathy-engine discovery` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1021,12 +1021,12 @@ pub async fn discover_host(
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-engine discovery` — expected 4 passed.
+Run: `cargo test -p bathy-engine discovery` — expected 4 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-engine
+git add crates/bathy-engine
 git commit -m "feat(engine): TCP host discovery treating refusal as liveness evidence"
 ```
 
@@ -1040,7 +1040,7 @@ git commit -m "feat(engine): TCP host discovery treating refusal as liveness evi
 ### Task 7: The scheduler — cancellation, budgets, resumption
 
 **Files:**
-- Create: `crates/sonde-engine/src/scheduler.rs`
+- Create: `crates/bathy-engine/src/scheduler.rs`
 
 **Interfaces:**
 - Consumes: everything above, `EventLog`, `TaskStore`, `BudgetLedger`, `PolicyDecision`.
@@ -1130,7 +1130,7 @@ mod tests {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cargo test -p sonde-engine scheduler` — expected FAIL.
+Run: `cargo test -p bathy-engine scheduler` — expected FAIL.
 
 - [ ] **Step 3: Write the implementation**
 
@@ -1141,8 +1141,8 @@ use tokio::sync::Semaphore;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use sonde_scope::budget::BudgetLedger;
-use sonde_types::event::{Endpoint, EventBody, PortState, Target};
+use bathy_scope::budget::BudgetLedger;
+use bathy_types::event::{Endpoint, EventBody, PortState, Target};
 
 use crate::connect::{ConnectOutcome, probe_connect};
 use crate::rate::RateLimiter;
@@ -1264,12 +1264,12 @@ Mapping: `Open → PortState::Open`, `Closed → Closed`, `Filtered → Filtered
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `cargo test -p sonde-engine scheduler` — expected 6 passed.
+Run: `cargo test -p bathy-engine scheduler` — expected 6 passed.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/sonde-engine
+git add crates/bathy-engine
 git commit -m "feat(engine): budget-governed scheduler with cancellation and resumption"
 ```
 

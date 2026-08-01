@@ -43,11 +43,11 @@
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
-  "description": "Wire/schema mirror of `sonde_scope::manifest::ScopeManifest`'s on-disk\nJSON form.\n\nLives here, not in `sonde-scope`, purely so `sonde_types::schema::all()`\ncan publish `scope-manifest.json` without `sonde-types` -- a\nzero-internal-dependency, pure contract crate -- taking on `ipnet`'s\nCIDR-parsing behavior as a dependency. Accordingly, `allowed_cidrs` and\n`denied_cidrs` are plain strings here, not `ipnet::IpNet`: this type\ndescribes the wire *shape*, it does not validate that each string is a\nsyntactically valid CIDR (that validation, and the reserved-range and\ndeny-beats-allow policy `ScopeManifestDto` deliberately says nothing\nabout, live in `sonde_scope::manifest::ScopeManifest::load`, which is the\nonly code path that may ever decide whether a packet is authorized).\n\n`allowed_cidrs` still uses `NonEmpty<String>` rather than `Vec<String>`,\nfor the same reason `ScanRequest::targets` and\n`PortSelection::Explicit::explicit` do (see `request.rs`): a\n`#[schemars(length(min = 1))]` attribute alone only shows up in the\n*published* schema, it does not stop `{\"allowed_cidrs\": []}` from\ndeserializing through this type. `sonde_scope::manifest::Raw` (a\nseparate, unrelated deserialization target) enforces the same \"at least\none allowed CIDR\" rule independently via its own explicit empty check,\nsince `ScopeManifest::load` does not deserialize through this DTO at\nall -- keep both in sync by hand if the rule ever changes.\n\nThis type is a schema/documentation artifact, not part of any runtime\nauthorization path. `sonde_scope::manifest::ScopeManifest` is the sole\nauthority on what a manifest means; this mirror must be kept in sync\nwith it by hand.",
+  "description": "Wire/schema mirror of `bathy_scope::manifest::ScopeManifest`'s on-disk\nJSON form.\n\nLives here, not in `bathy-scope`, purely so `bathy_types::schema::all()`\ncan publish `scope-manifest.json` without `bathy-types` -- a\nzero-internal-dependency, pure contract crate -- taking on `ipnet`'s\nCIDR-parsing behavior as a dependency. Accordingly, `allowed_cidrs` and\n`denied_cidrs` are plain strings here, not `ipnet::IpNet`: this type\ndescribes the wire *shape*, it does not validate that each string is a\nsyntactically valid CIDR (that validation, and the reserved-range and\ndeny-beats-allow policy `ScopeManifestDto` deliberately says nothing\nabout, live in `bathy_scope::manifest::ScopeManifest::load`, which is the\nonly code path that may ever decide whether a packet is authorized).\n\n`allowed_cidrs` still uses `NonEmpty<String>` rather than `Vec<String>`,\nfor the same reason `ScanRequest::targets` and\n`PortSelection::Explicit::explicit` do (see `request.rs`): a\n`#[schemars(length(min = 1))]` attribute alone only shows up in the\n*published* schema, it does not stop `{\"allowed_cidrs\": []}` from\ndeserializing through this type. `bathy_scope::manifest::Raw` (a\nseparate, unrelated deserialization target) enforces the same \"at least\none allowed CIDR\" rule independently via its own explicit empty check,\nsince `ScopeManifest::load` does not deserialize through this DTO at\nall -- keep both in sync by hand if the rule ever changes.\n\nThis type is a schema/documentation artifact, not part of any runtime\nauthorization path. `bathy_scope::manifest::ScopeManifest` is the sole\nauthority on what a manifest means; this mirror must be kept in sync\nwith it by hand.",
   "properties": {
     "allowed_cidrs": {
       "$ref": "#/$defs/NonEmpty_of_string",
-      "description": "CIDR strings, e.g. `\"10.30.0.0/24\"`. Parsed and validated by\n`sonde-scope` at load time, not by this type."
+      "description": "CIDR strings, e.g. `\"10.30.0.0/24\"`. Parsed and validated by\n`bathy-scope` at load time, not by this type."
     },
     "budget_ceiling": {
       "$ref": "#/$defs/Budgets"
@@ -72,7 +72,7 @@
       "type": "string"
     },
     "signature": {
-      "description": "Reserved for v0.2 detached-signature verification; accepted on the\nwire but NOT cryptographically verified by this version. See\n`sonde_scope::manifest::ScopeManifest::signature_verified`.",
+      "description": "Reserved for v0.2 detached-signature verification; accepted on the\nwire but NOT cryptographically verified by this version. See\n`bathy_scope::manifest::ScopeManifest::signature_verified`.",
       "type": [
         "string",
         "null"

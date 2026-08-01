@@ -4,7 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// A probability in the closed interval [0.0, 1.0].
 ///
 /// Confidence is reported, never inferred by a model at runtime: it comes from
-/// how specifically a probe's response matched a rule in `sonde-interpret`.
+/// how specifically a probe's response matched a rule in `bathy-interpret`.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]

@@ -1,4 +1,4 @@
-# sonde
+# bathy
 
 An agent-native network discovery engine: turns authorized network questions into
 bounded scan plans, executes them, and returns structured, evidence-backed findings
@@ -6,8 +6,8 @@ over MCP.
 
 > **Status: Milestone 1 of 7 complete. Nothing here scans anything yet.**
 >
-> What exists: the contract layer (`sonde-types`) and the authorization engine
-> (`sonde-scope`), with 194 tests, four published JSON Schemas, and CI enforcing
+> What exists: the contract layer (`bathy-types`) and the authorization engine
+> (`bathy-scope`), with 194 tests, four published JSON Schemas, and CI enforcing
 > the project's layering and clean-room rules. **No code in this repository sends
 > a packet.** The scanning engine lands in Milestone 3.
 >
@@ -18,8 +18,8 @@ over MCP.
 
 | Crate | Delivers |
 |---|---|
-| `sonde-types` | Every type crossing a public boundary: `ScanRequest`, the immutable `Event` model, `Digest`, prefixed ULID identifiers, `NonEmpty`, `Confidence`, `TaskHandle`, canonical JSON and `plan_digest`. Zero internal dependencies, no async runtime. |
-| `sonde-scope` | Deny-by-default authorization: scope manifests with expiry, policy evaluation with stable machine-readable deny codes, and a hard budget ledger. |
+| `bathy-types` | Every type crossing a public boundary: `ScanRequest`, the immutable `Event` model, `Digest`, prefixed ULID identifiers, `NonEmpty`, `Confidence`, `TaskHandle`, canonical JSON and `plan_digest`. Zero internal dependencies, no async runtime. |
+| `bathy-scope` | Deny-by-default authorization: scope manifests with expiry, policy evaluation with stable machine-readable deny codes, and a hard budget ledger. |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
 Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
@@ -36,7 +36,7 @@ boundary, and an expiry comparison that reported an expired manifest as valid.
 
 ## Authorized use
 
-sonde is built for scanning networks you are authorized to scan. Every scan requires
+bathy is built for scanning networks you are authorized to scan. Every scan requires
 an unexpired scope manifest naming the permitted address ranges; there is no flag to
 bypass it, and a scan whose targets fall outside the manifest is refused in full
 rather than trimmed. Scans carry hard packet, rate, and runtime budgets, and probe
@@ -50,7 +50,7 @@ violate your provider's terms of service. That is your responsibility, not the t
 
 The design premise is that existing scanners were built for humans at a terminal, and
 expose their results to software as XML plus command-line string construction. That is
-a poor fit for typed tool calling. sonde targets the gap:
+a poor fit for typed tool calling. bathy targets the gap:
 
 - **Typed operations.** Every action has JSON Schema inputs and outputs. No agent
   constructs a command line.

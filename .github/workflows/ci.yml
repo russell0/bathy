@@ -19,8 +19,8 @@ jobs:
           # `unsafe fn`, `unsafe{`, `unsafe(no_mangle)`, and a bare trailing
           # `unsafe` are all caught, not just the space-delimited form. Scans
           # both crates/ and xtask/ — the binding constraint is "no crate
-          # outside sonde-packetd", not "no crate under crates/ outside
-          # sonde-packetd".
+          # outside bathy-packetd", not "no crate under crates/ outside
+          # bathy-packetd".
           #
           # `\b` leading word boundary: without it, `unsafe` matches as a
           # plain substring, so `let is_unsafe = true;` (word char `_`
@@ -30,7 +30,7 @@ jobs:
           # `is_unsafe` never has — GNU grep (this job runs on ubuntu-latest)
           # supports `\b` as an extension in -E mode.
           ! grep -rnE --include='*.rs' '\bunsafe([ {(]|$)' crates/ xtask/ \
-            | grep -v '^crates/sonde-packetd/'
+            | grep -v '^crates/bathy-packetd/'
       # Lines that legitimately name the phrase — this rule, its tests, its
       # enforcement — carry the [phrase-rule] marker and are excluded. Without
       # that exclusion this step fails on its own source. See the overview's
