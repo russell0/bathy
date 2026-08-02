@@ -57,6 +57,7 @@ fs4 = { version = "1", default-features = false, features = ["sync"] }
 # declares its own literal, higher `rust-version` -- see the comment on it
 # in `crates/bathy-store/Cargo.toml` for the exact floor and how it was
 # measured. CI verifies both floors with two separate jobs
-# (`.github/workflows/ci.yml`): `msrv` at `1.88` over the four crates that
-# still need only that, and `msrv-bathy-store` at `1.95` for this one.
+# (`.github/workflows/ci.yml`): `msrv` at `1.88` over the crates that still
+# need only that (`bathy-types`, `bathy-scope`, `bathy-evidence`,
+# `bathy-plan`, and `xtask`), and `msrv-bathy-store` at `1.95` for this one.
 rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }

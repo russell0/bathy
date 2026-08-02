@@ -67,7 +67,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p xtask --all-targets
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p xtask --all-targets
 
   msrv-bathy-store:
     runs-on: ubuntu-latest
