@@ -9,7 +9,14 @@
 //! the budget that keeps a scan polite is the same budget that keeps its
 //! results honest -- which is why the limiter lives on the emission path
 //! and is not optional.
+//!
+//! The second component is [`connect::probe_connect`]: unprivileged TCP
+//! connect scanning, the first code in this workspace that actually
+//! touches a socket. See the `connect` module doc for why its `Closed` and
+//! `Filtered` outcomes are kept distinct rather than collapsed.
 
+pub mod connect;
 pub mod rate;
 
+pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
 pub use rate::RateLimiter;

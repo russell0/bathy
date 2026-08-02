@@ -6,8 +6,10 @@ edition.workspace = true
 # workspace floor. In particular it does NOT depend on `bathy-store` (the
 # one crate that needs a higher literal floor -- see the MSRV comment on
 # `bathy-store`'s `Cargo.toml`) -- its only dependency is `tokio`, whose
-# `time`/`sync`/`rt`/`macros` features (see the workspace `Cargo.toml`)
-# build fine at the workspace floor. `BudgetLedger`, the type this task's
+# `time`/`sync`/`rt`/`macros`/`net` features (see the workspace `Cargo.toml`;
+# `net` was added for M3 Task 5's TCP connect probing) all build fine at the
+# workspace floor -- verified directly against `rustc 1.88.0`, not just
+# assumed (see this task's report). `BudgetLedger`, the type this task's
 # brief lists under "Consumes", lives in `bathy-scope` (layer 1), not
 # `bathy-store` (layer 3) -- and even that consumption is not part of this
 # task's actual deliverable (the rate limiter alone; budget-governed

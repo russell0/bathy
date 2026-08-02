@@ -68,7 +68,10 @@ rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 # attribute builds). `sync` is enabled here too because it is expected to be
 # load-bearing for the budget-governed emission work later in the same
 # crate (M3 Task 8, which shares state across concurrent acquirers) rather
-# than for anything in this task. Explicitly not `full`: that would also
-# pull in `net`, `fs`, `process`, `signal`, and more that nothing in the
-# workspace uses yet.
-tokio = { version = "1.53", features = ["time", "sync", "rt", "macros"] }
+# than for anything in this task. `net` (added for M3 Task 5,
+# `crates/bathy-engine/src/connect.rs`) is what actually gives
+# `tokio::net::TcpStream`/`TcpListener` -- unprivileged TCP connect probing
+# is the first code in the workspace that touches a socket at all.
+# Explicitly still not `full`: that would also pull in `fs`, `process`,
+# `signal`, and more that nothing in the workspace uses yet.
+tokio = { version = "1.53", features = ["time", "sync", "rt", "macros", "net"] }
