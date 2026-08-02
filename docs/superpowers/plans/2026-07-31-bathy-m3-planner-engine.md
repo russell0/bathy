@@ -272,7 +272,7 @@ Registry. No Nmap data file was consulted in producing these lists.
 IANA records *assignments*, not *observed prevalence*. These lists are ordered
 by a documented heuristic:
 
-1. System ports (0–1023) with a TCP assignment, ascending.
+1. System ports (1–1023) with a TCP assignment, ascending. Port 0 is excluded — it is not scannable.
 2. User ports (1024–49151) with a TCP assignment, ascending.
 
 This is a reasonable starting set. It is **not** a frequency ranking, and it
@@ -358,8 +358,8 @@ const COMMON_1000: &str = include_str!("../../../data/ports/common-1000.txt");
 pub enum PortError {
     #[error("cannot parse port specification `{0}`")]
     Malformed(String),
-    #[error("port 0 is not a scannable port")]
-    PortZero,
+    #[error("port 0 is not a scannable port (from `{0}`)")]
+    PortZero(String),
     #[error("range `{0}` ends before it starts")]
     ReversedRange(String),
 }
