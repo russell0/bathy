@@ -135,6 +135,50 @@ pub async fn probe_connect(target: IpAddr, port: u16, budget: Duration) -> Conne
     }
 }
 
+/// Like [`probe_connect`], but additionally reports whether a non-`Open`,
+/// non-`Closed` outcome was caused specifically by a *local* resource or
+/// policy problem rather than genuine silence from the target or path.
+///
+/// M3 Task 7's carried requirement (from Tasks 5 and 6): `Filtered` conflates
+/// local failure (`AddrNotAvailable` -- ephemeral-port exhaustion on this
+/// machine; `PermissionDenied` -- a local firewall/sandbox policy) with
+/// target silence, and at scheduler scale a local resource problem can
+/// present as thousands of `filtered` ports that describe *our* machine, not
+/// the one being scanned (see this module's own doc comment on
+/// [`classify_io_error`]). By the time `probe_connect` returns a bare
+/// [`ConnectOutcome`], that distinction is already gone -- `Filtered` alone
+/// cannot say which `io::ErrorKind` produced it. This function keeps the
+/// classification the scheduler needs without changing `probe_connect`'s own
+/// signature or behavior (every existing caller and test is unaffected;
+/// see this crate's `discovery` module, which still uses `probe_connect`
+/// directly).
+///
+/// Returns `(outcome, is_local)`. `is_local` is `true` only for
+/// `AddrNotAvailable`/`PermissionDenied`; a `probe_connect` timeout
+/// (`Err(_elapsed)`, no `io::Error` at all) and every other `Filtered`-mapped
+/// `ErrorKind` report `false`.
+pub async fn probe_connect_with_local_signal(
+    target: IpAddr,
+    port: u16,
+    budget: Duration,
+) -> (ConnectOutcome, bool) {
+    let addr = SocketAddr::new(target, port);
+    match timeout(budget, TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => {
+            drop(stream);
+            (ConnectOutcome::Open, false)
+        }
+        Ok(Err(e)) => {
+            let is_local = matches!(
+                e.kind(),
+                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::PermissionDenied
+            );
+            (classify_io_error(&e), is_local)
+        }
+        Err(_elapsed) => (ConnectOutcome::Filtered, false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::{Error, ErrorKind};
@@ -330,6 +374,91 @@ mod tests {
             0,
             "expected EOF (0 bytes read) once the client side closed"
         );
+    }
+
+    // --- Beyond the brief (M3 Task 7 carried requirement): the local-vs-
+    // target signal `probe_connect_with_local_signal` adds ---
+
+    #[tokio::test]
+    async fn local_signal_is_false_for_an_open_port() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (out, local) = probe_connect_with_local_signal(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(out, ConnectOutcome::Open);
+        assert!(!local);
+    }
+
+    #[tokio::test]
+    async fn local_signal_is_false_for_a_refused_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let (out, local) = probe_connect_with_local_signal(
+            "127.0.0.1".parse().unwrap(),
+            port,
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(out, ConnectOutcome::Closed);
+        assert!(!local);
+    }
+
+    #[tokio::test]
+    async fn local_signal_is_false_for_a_genuine_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut held = Vec::new();
+        let mut filled = false;
+        for _ in 0..256 {
+            match timeout(Duration::from_millis(150), TcpStream::connect(addr)).await {
+                Ok(Ok(stream)) => held.push(stream),
+                _ => {
+                    filled = true;
+                    break;
+                }
+            }
+        }
+        assert!(filled, "expected the accept queue to fill");
+        let (out, local) =
+            probe_connect_with_local_signal(addr.ip(), addr.port(), Duration::from_millis(300))
+                .await;
+        assert_eq!(out, ConnectOutcome::Filtered);
+        assert!(
+            !local,
+            "a silent drop on a full accept queue is target/path silence, not a local problem"
+        );
+    }
+
+    #[test]
+    fn local_signal_is_true_only_for_addr_not_available_and_permission_denied() {
+        for kind in [ErrorKind::AddrNotAvailable, ErrorKind::PermissionDenied] {
+            let e = Error::from(kind);
+            let is_local = matches!(
+                e.kind(),
+                ErrorKind::AddrNotAvailable | ErrorKind::PermissionDenied
+            );
+            assert!(is_local, "{kind:?} should be classified as local");
+        }
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::HostUnreachable,
+            ErrorKind::NetworkUnreachable,
+            ErrorKind::BrokenPipe,
+        ] {
+            let e = Error::from(kind);
+            let is_local = matches!(
+                e.kind(),
+                ErrorKind::AddrNotAvailable | ErrorKind::PermissionDenied
+            );
+            assert!(!is_local, "{kind:?} should NOT be classified as local");
+        }
     }
 
     // --- Beyond the brief: many probes in sequence must not leak fds ---

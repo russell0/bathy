@@ -382,6 +382,32 @@ impl EventLog {
         Ok(event)
     }
 
+    /// Forces a durability barrier (`sync_data`) on whatever has been
+    /// written so far, independent of whether `self` is `durable`.
+    ///
+    /// This is the primitive M3's group-commit scheduler
+    /// (`bathy_engine::durable_log::GroupCommitLog`) is built on: it opens
+    /// its log via [`Self::open_without_durability_barrier`] (so `append`
+    /// never pays a per-event `fsync`) and calls this method itself on a
+    /// bounded trigger -- whichever of *N* events or *T* milliseconds comes
+    /// first, plus unconditionally on a terminal event. See that module's
+    /// doc comment for the full crash contract this enables: a crash loses
+    /// at most the last *N* events or *T* milliseconds, never a
+    /// partially-written record (every `append` still fully writes and
+    /// newline-terminates its record before returning, regardless of
+    /// `durable`; only *when* that write is asked to survive a crash is
+    /// deferred).
+    ///
+    /// A no-op in the sense that it never fails to be safe to call on a
+    /// `durable` log too (every `append` there has already synced), just
+    /// redundant.
+    pub fn sync(&self) -> Result<(), LogError> {
+        self.file.sync_data().map_err(|source| LogError::Io {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Returns every event with `sequence > after_sequence`, in order.
     ///
     /// This is the primitive `scan.events` streaming (M5) is built on, so it
@@ -929,6 +955,45 @@ mod tests {
 
     // --- C1: the durability opt-out is explicit and named, and does not
     // affect correctness under normal (non-crash) operation. ---
+
+    // --- `sync`: the group-commit primitive M3's scheduler is built on ---
+
+    #[test]
+    fn sync_on_a_non_durable_log_is_callable_and_leaves_appends_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let mut log = EventLog::open_without_durability_barrier(dir.path(), id).unwrap();
+        log.append(progress(1), &clock(), "0.1.0").unwrap();
+        log.append(progress(2), &clock(), "0.1.0").unwrap();
+        // Before any explicit `sync`, the bytes are still visible to a
+        // read within the same process (this is what lets group commit
+        // batch fsyncs without batching visibility) -- `read_from` opens
+        // its own fresh file handle, so this also proves `sync` is not a
+        // prerequisite for `read_from` to see prior appends.
+        assert_eq!(log.read_from(0).unwrap().len(), 2);
+        log.sync().unwrap();
+        // Still correct after the explicit sync.
+        assert_eq!(log.read_from(0).unwrap().len(), 2);
+        assert_eq!(log.last_sequence(), 2);
+    }
+
+    #[test]
+    fn sync_on_a_durable_log_is_harmless() {
+        let (_d, mut log) = log();
+        log.append(progress(1), &clock(), "0.1.0").unwrap();
+        // Every append on a durable log has already synced; calling this
+        // again must not error or otherwise disturb the log.
+        log.sync().unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.last_sequence(), 1);
+    }
+
+    #[test]
+    fn sync_with_nothing_appended_yet_is_a_harmless_no_op() {
+        let (_d, log) = log();
+        log.sync().unwrap();
+        assert_eq!(log.last_sequence(), 0);
+    }
 
     #[test]
     fn the_durability_opt_out_still_round_trips_correctly() {

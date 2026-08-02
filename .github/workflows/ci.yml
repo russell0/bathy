@@ -67,12 +67,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
       - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
-      # `bathy-engine` joins this job, not `msrv-bathy-store`: its only
-      # dependency so far is `tokio`, which builds fine at the workspace
-      # floor, and it does not (yet) depend on `bathy-store` -- see the
-      # MSRV comment on `crates/bathy-engine/Cargo.toml` for why, and for
-      # when that should change.
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-engine -p xtask --all-targets
+      # `bathy-engine` moved OUT of this job in M3 Task 7: it now depends on
+      # `bathy-store` (`TaskStore`, for `scheduler.rs`'s resumption cursor),
+      # which needs a higher floor than `1.88` -- see the MSRV comment on
+      # `crates/bathy-engine/Cargo.toml`. It now joins `msrv-bathy-store`
+      # below instead.
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p xtask --all-targets
 
   msrv-bathy-store:
     runs-on: ubuntu-latest
@@ -80,7 +80,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95
       - run: rm -f rust-toolchain.toml   # the pin says stable; this job tests the floor
-      - run: cargo check -p bathy-store --all-targets
+      # `bathy-engine` joined this job in M3 Task 7 (see the MSRV comment on
+      # its `Cargo.toml`): it now depends on `bathy-store` transitively via
+      # `scheduler.rs`'s `TaskStore` usage, so it needs this same `1.95`
+      # floor to build at all, not just `bathy-store` itself.
+      - run: cargo check -p bathy-store -p bathy-engine --all-targets
 
   deny:
     runs-on: ubuntu-latest

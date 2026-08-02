@@ -2,35 +2,50 @@
 name = "bathy-engine"
 version.workspace = true
 edition.workspace = true
-# MSRV tiering: this crate depends on nothing that needs more than the
-# workspace floor. In particular it does NOT depend on `bathy-store` (the
-# one crate that needs a higher literal floor -- see the MSRV comment on
-# `bathy-store`'s `Cargo.toml`) -- its only dependency is `tokio`, whose
-# `time`/`sync`/`rt`/`macros`/`net` features (see the workspace `Cargo.toml`;
-# `net` was added for M3 Task 5's TCP connect probing) all build fine at the
-# workspace floor -- verified directly against `rustc 1.88.0`, not just
-# assumed (see this task's report). `BudgetLedger`, the type this task's
-# brief lists under "Consumes", lives in `bathy-scope` (layer 1), not
-# `bathy-store` (layer 3) -- and even that consumption is not part of this
-# task's actual deliverable (the rate limiter alone; budget-governed
-# emission is a later task in the same milestone plan). When a later task
-# gives this crate a real dependency on `bathy-store` (M3 Task 8, which
-# needs `TaskStore`), move this to `rust-version = "1.95"` at that point,
-# with the same comment shape as `bathy-store`'s own manifest, and add it
-# to the `msrv-bathy-store` CI job then -- not before, and not on the
-# strength of a dependency it doesn't have yet (see this task's report for
-# why the dispatch's premise here was wrong).
-rust-version.workspace = true
+# MSRV tiering: this crate now depends on `bathy-store` (`TaskStore`, needed
+# by `scheduler.rs`'s resumption cursor), which is the one crate in this
+# workspace that needs a rustc newer than the shared `1.88` floor --
+# `rusqlite`'s `bundled` feature pulls in `libsqlite3-sys`, whose build
+# script needs a rustc with `cfg_select!` (stable at 1.97.1, unstable-gated
+# below that, absent at 1.88 -- see the MSRV comment on `bathy-store`'s own
+# `Cargo.toml` for the exact floor and how `1.95` was measured). A crate
+# that depends on `bathy-store`, even transitively, needs that same higher
+# floor to build at all, so this crate now declares the same literal
+# `rust-version = "1.95"` rather than inheriting the workspace's `1.88`.
+# CI's `msrv-bathy-store` job (`.github/workflows/ci.yml`) now checks this
+# crate too, not just `bathy-store` itself, and this crate has moved OUT of
+# the plain `msrv` (`1.88`) job -- verified locally against both toolchains
+# (see this task's report), not just asserted here.
+#
+# (An earlier version of this comment argued this crate would move tiers
+# only once it depended on `bathy-store` for real, dismissing that as
+# premature for the rate-limiter-only work in an earlier task. That
+# dependency now exists -- `scheduler.rs` is exactly the "budget-governed
+# emission work" that comment already anticipated -- so the move happens
+# here, in M3 Task 7, not "M3 Task 8": the plan this workspace follows has
+# no task by that number, an earlier mislabeling now corrected everywhere
+# it appeared, including in the workspace `Cargo.toml`'s own `tokio` entry.)
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+# AC-3.24-3.30 (`scheduler.rs`): cooperative cancellation.
+tokio-util = { workspace = true }
+thiserror = { workspace = true }
+bathy-types = { path = "../bathy-types" }
+bathy-scope = { path = "../bathy-scope" }
+bathy-evidence = { path = "../bathy-evidence" }
+bathy-store = { path = "../bathy-store" }
+bathy-plan = { path = "../bathy-plan" }
 
 [dev-dependencies]
 # `test-util` is additive on top of the `[dependencies]` feature set above
-# (Cargo features only ever union) and is needed only by the test target:
-# `#[tokio::test(start_paused = true)]` (used for the sustained-rate test,
-# so it runs on a simulated clock instead of sleeping for real) requires it
-# to compile at all.
+# (Cargo features only ever union) and is needed by several test targets:
+# `#[tokio::test(start_paused = true)]` (the rate limiter's sustained-rate
+# test, and `scheduler`/`durable_log`'s own paused-clock tests, so they run
+# on a simulated clock instead of sleeping for real) requires it to compile
+# at all.
 tokio = { workspace = true, features = ["test-util"] }
+tempfile = { workspace = true }

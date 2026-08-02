@@ -23,11 +23,28 @@
 //! through the whole configured probe list. See the `discovery` module doc
 //! for why `Filtered`/`Unreachable` are never promoted into evidence about
 //! the target.
+//!
+//! The fourth component is [`durable_log::GroupCommitLog`]: the M2-decided
+//! group-commit batching that makes it safe for the fifth component to
+//! drive `EventLog::append` in a hot loop at all -- see that module's doc
+//! comment for the crash contract and the measured throughput this buys.
+//!
+//! The fifth component, and the one that turns the first four (plus every
+//! other M1-M3 component) into an actual scanner, is
+//! [`scheduler::Scheduler`]: budget-governed, cancellable, resumable
+//! execution of a [`bathy_plan::ScanPlan`]. See that module's doc comment
+//! for the invariants it holds: budget reserved strictly before emission,
+//! in-flight work drained (never dropped) on cancellation, resumption that
+//! neither re-probes nor skips a unit, and four distinct terminal outcomes.
 
 pub mod connect;
 pub mod discovery;
+pub mod durable_log;
 pub mod rate;
+pub mod scheduler;
 
 pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
 pub use discovery::{DiscoveryConfig, DiscoveryResult, discover_host};
+pub use durable_log::{GroupCommitConfig, GroupCommitLog};
 pub use rate::RateLimiter;
+pub use scheduler::{EngineError, RunSummary, Scheduler, SchedulerConfig};

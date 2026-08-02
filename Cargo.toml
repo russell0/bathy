@@ -67,11 +67,27 @@ rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 # `macros` (`#[tokio::test]`) and `rt` (the current-thread runtime that
 # attribute builds). `sync` is enabled here too because it is expected to be
 # load-bearing for the budget-governed emission work later in the same
-# crate (M3 Task 8, which shares state across concurrent acquirers) rather
-# than for anything in this task. `net` (added for M3 Task 5,
-# `crates/bathy-engine/src/connect.rs`) is what actually gives
-# `tokio::net::TcpStream`/`TcpListener` -- unprivileged TCP connect probing
-# is the first code in the workspace that touches a socket at all.
+# crate (M3 Task 7 -- the scheduler, which shares state across concurrent
+# acquirers) rather than for anything in this task. (Corrected from an
+# earlier version of this comment that named "M3 Task 8" -- the plan this
+# workspace follows has no such task; Task 7, the scheduler, is the very
+# next one and is exactly the "budget-governed emission work" referred to
+# here.) `net` (added for M3 Task 5, `crates/bathy-engine/src/connect.rs`)
+# is what actually gives `tokio::net::TcpStream`/`TcpListener` --
+# unprivileged TCP connect probing is the first code in the workspace that
+# touches a socket at all.
 # Explicitly still not `full`: that would also pull in `fs`, `process`,
 # `signal`, and more that nothing in the workspace uses yet.
 tokio = { version = "1.53", features = ["time", "sync", "rt", "macros", "net"] }
+# M3 Task 7 (the scheduler, `crates/bathy-engine/src/scheduler.rs`) needs
+# `tokio_util::sync::CancellationToken` for cooperative, promptly-observable
+# cancellation of a running scan (AC-3.25) -- `tokio::sync` alone has no
+# broadcast-style "please stop" primitive that a `select!` can race a
+# blocking wait against. `default-features = false` plus a minimal `rt`
+# feature (verified directly against this workspace's exact tokio-util
+# 0.7 release: `CancellationToken` lives in `tokio_util::sync`, gated by
+# the `rt` feature, not `sync` -- confirmed by compiling against each
+# candidate feature set before settling on this one, not assumed) --
+# deliberately not `full`, which would also pull in `codec`/`io`/`net`/
+# `time`/`compat`, none of which anything in this workspace uses.
+tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
