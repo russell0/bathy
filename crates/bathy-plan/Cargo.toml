@@ -1,0 +1,19 @@
+[package]
+name = "bathy-plan"
+version.workspace = true
+edition.workspace = true
+# MSRV tiering: this crate depends on nothing that needs more than the
+# workspace floor (see the MSRV comment on the workspace `Cargo.toml` and on
+# `bathy-store`'s, which is the one crate that needs a higher literal
+# floor). `bathy-plan` does not depend on `bathy-store`, so it stays in the
+# 1.88 tier and inherits the workspace value rather than declaring its own.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ipnet = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

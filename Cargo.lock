@@ -34,6 +34,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bathy-plan"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "bathy-scope"
 version = "0.1.0"
 dependencies = [
