@@ -10,3 +10,4 @@
 
 # Scratch workspaces for plan execution (ledgers, briefs, review packages).
 .superpowers/
+.DS_Store

@@ -68,8 +68,30 @@ mod tests {
 
     #[test]
     fn exceeding_the_cap_is_refused_before_allocation() {
+        // NOTE: this assertion alone does NOT prove early refusal. Under a
+        // "count after building the set" mutation it still passes — measured at
+        // 24.36s. The timing bound below is what actually proves it.
         let err = expand_targets(&["10.0.0.0/8".into()], 1024).unwrap_err();
         assert!(matches!(err, TargetError::TooManyTargets { .. }));
+    }
+
+    #[test]
+    fn cap_is_enforced_before_allocation_not_after() {
+        // 0.0.0.0/0 is 4.3 billion addresses. Refusing by counting first is
+        // instant; refusing after building the BTreeSet takes minutes and
+        // gigabytes. The bound is the assertion.
+        let t = std::time::Instant::now();
+        let err = expand_targets(&["0.0.0.0/0".into()], 1024).unwrap_err();
+        assert!(matches!(err, TargetError::TooManyTargets { .. }));
+        assert!(t.elapsed() < std::time::Duration::from_millis(200), "took {:?}", t.elapsed());
+    }
+
+    #[test]
+    fn ipv6_is_refused_at_expansion_with_an_actionable_message() {
+        for spec in ["::1", "2001:db8::/32"] {
+            let err = expand_targets(&[spec.into()], 100).unwrap_err();
+            assert!(matches!(err, TargetError::Ipv6Unsupported(_)), "{spec}");
+        }
     }
 
     #[test]
@@ -173,17 +195,19 @@ fn classify(spec: &str) -> Result<Spec, TargetError> {
 /// Hosts in a network, excluding the network and broadcast addresses for
 /// prefixes shorter than /31. RFC 3021 makes both addresses of a /31 usable,
 /// and a /32 is a single host, so neither is trimmed.
-fn usable_hosts(net: IpNet) -> Box<dyn Iterator<Item = IpAddr>> {
-    match net {
-        IpNet::V4(v4) if v4.prefix_len() < 31 => {
-            let first = u32::from(v4.network()) + 1;
-            let last = u32::from(v4.broadcast()) - 1;
-            Box::new((first..=last).map(|n| IpAddr::V4(Ipv4Addr::from(n))))
-        }
-        IpNet::V4(v4) => Box::new(Ipv4Net::hosts(&v4).map(IpAddr::V4)),
-        IpNet::V6(v6) => Box::new(v6.hosts().map(IpAddr::V6)),
-    }
+fn usable_hosts(net: Ipv4Net) -> impl Iterator<Item = IpAddr> {
+    // Use `Ipv4Net::hosts()`, do NOT hand-roll network()+1 / broadcast()-1.
+    // ipnet-2.12.0/src/ipnet.rs:847-857 applies exactly this rule and uses
+    // saturating_add/saturating_sub, which removes the 0.0.0.0/0 wrap risk
+    // structurally instead of resting on "prefix < 31 implies >= 2 host bits"
+    // holding forever. Same selection semantics for every prefix length.
+    net.hosts().map(IpAddr::V4)
 }
+
+// IPv6 is REFUSED at expansion, not expanded-then-denied. ScopeManifest::allows
+// returns false for every IPv6 address in v0.1, so expanding an IPv6 CIDR plans
+// thousands of units that all get denied — the operator deserves one actionable
+// error instead. `v6.hosts()` on a large prefix is also effectively unbounded.
 
 fn count_of(spec: &str) -> Result<u128, TargetError> {
     Ok(match classify(spec)? {
@@ -213,7 +237,8 @@ git commit -m "feat(plan): order-independent target expansion with pre-allocatio
 - **AC-3.1** A `/24` expands to 254 addresses, excluding network and broadcast.
 - **AC-3.2** A `/31` yields 2 addresses and a `/32` yields 1 (RFC 3021).
 - **AC-3.3** Output is sorted and deduplicated: permuting the input or adding overlapping specs yields an identical vector.
-- **AC-3.4** Oversized target sets are refused by counting before allocating; `10.0.0.0/8` with a cap of 1024 does not allocate 16M addresses.
+- **AC-3.4** Oversized target sets are refused by counting before allocating. Prove with a TIMING BOUND, not just an error-variant assertion — the variant assertion passes under a count-after-allocation mutation (measured 24.36s). 
+- **AC-3.31** IPv6 targets are refused at expansion with an actionable error, rather than expanded into units that scope will deny one by one.
 - **AC-3.5** Malformed specs and reversed ranges are errors whose message names the offending input.
 
 ---
