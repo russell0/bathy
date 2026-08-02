@@ -80,6 +80,53 @@ use crate::durable_log::GroupCommitConfig;
 /// commit or `progress_every` are.
 const STORE_FLUSH_BATCH: usize = 64;
 
+/// Wall-clock elapsed time, in whole seconds, rounded UP -- never
+/// `Duration::as_secs()`, which truncates.
+///
+/// M3 Task 7 fix round 2, CRITICAL-2's runtime half: review found that
+/// every runtime-ceiling comparison in this module compared against
+/// `started.elapsed().as_secs()`, which discards any sub-second remainder.
+/// For the periodic in-run check (`run`'s own dispatch loop) that is a
+/// small, self-correcting latency (at most ~1s before the NEXT check
+/// catches up). For `total_elapsed_seconds` -- what gets PERSISTED via
+/// `TaskStore::record_progress` and read back by the next resume's
+/// `BudgetLedger::resumed` -- it is not self-correcting at all: a run
+/// cancelled at, say, 800ms contributes exactly ZERO forever, on every
+/// single cancel/resume round, because the next round starts a brand new
+/// `Instant` and repeats the same truncation. Reviewer's repro: six rounds
+/// of ~800ms cancellations against a 2-second ceiling accumulated 4.95
+/// real seconds and 10,839 probed units while the persisted total stayed
+/// at 0 -- the exact "unbounded under repeated cancel/resume" defect
+/// CRITICAL-2 was opened for, still fully open after round 1's fix (which
+/// closed the *seeding* mechanism but not this truncation in what gets fed
+/// into it).
+///
+/// Rounding up instead of down means every run's contribution is always
+/// **>=** its true elapsed time, so the cumulative persisted total can
+/// never permanently fall behind real wall-clock time -- the defect is
+/// closed exactly, not merely narrowed, regardless of how many
+/// cancel/resume rounds occur. The cost is a systematic OVER-count of at
+/// most ~1 second per round (e.g. 100 rounds of 10ms each could accrue up
+/// to 100 counted seconds for 1 real second elapsed) -- but over-counting
+/// against a ceiling whose entire purpose is to STOP a scan is the safe
+/// failure direction: a scan can stop up to N seconds "early" after N
+/// rounds, but it can never again run unboundedly past its budget the way
+/// silent truncation allowed.
+///
+/// A full millisecond-precision rewrite of `BudgetLedger`/
+/// `TaskStore::record_progress`/`schema.sql` (storing and comparing
+/// milliseconds throughout instead of whole seconds) was considered and
+/// rejected as disproportionate to what review actually asked to be fixed:
+/// it would touch three crates, a schema column, and every existing
+/// whole-seconds `BudgetLedger` test for a correctness property (a
+/// cancel/resume loop's cumulative runtime can never regress) that this
+/// one-line rounding change already delivers exactly, at the two places
+/// `Instant::elapsed()` is turned into the `u64` seconds
+/// `BudgetLedger::elapsed_exceeded`'s public API expects.
+fn ceil_elapsed_seconds(elapsed: Duration) -> u64 {
+    elapsed.as_secs_f64().ceil() as u64
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error(transparent)]
@@ -230,10 +277,16 @@ impl Scheduler {
     /// `TaskStore::record_progress`, so the NEXT resume's fresh `Scheduler`
     /// can seed its own `BudgetLedger::resumed` with the true cumulative
     /// total rather than restarting the runtime clock at zero every time.
+    ///
+    /// M3 Task 7 fix round 2 (CRITICAL-2's runtime half, still open after
+    /// round 1): uses [`ceil_elapsed_seconds`], not `Duration::as_secs()` --
+    /// see that function's own doc comment for why truncating here is what
+    /// let the accumulated total lose real elapsed time, forever, on every
+    /// single run.
     fn total_elapsed_seconds(&self, started: Instant) -> u64 {
         self.ledger()
             .seconds_already_elapsed()
-            .saturating_add(started.elapsed().as_secs())
+            .saturating_add(ceil_elapsed_seconds(started.elapsed()))
     }
 
     /// Whether this scan's log already ends in a terminal event
@@ -331,7 +384,10 @@ impl Scheduler {
                 summary.cancelled = true;
                 break 'drive;
             }
-            if self.ledger().elapsed_exceeded(started.elapsed().as_secs()) {
+            if self
+                .ledger()
+                .elapsed_exceeded(ceil_elapsed_seconds(started.elapsed()))
+            {
                 summary.time_exhausted = true;
                 break 'drive;
             }
@@ -1638,6 +1694,80 @@ mod tests {
         assert_eq!(
             summary2.units_completed, 0,
             "must stop before dispatching anything new"
+        );
+    }
+
+    // M3 Task 7 fix round 2: `runtime_ceiling_is_enforced_across_a_cancel_resume_loop_via_a_fresh_scheduler`
+    // above never observes CRITICAL-2's runtime-truncation defect. Its
+    // single resume uses a ZERO-second ceiling specifically so the
+    // baseline alone (already >= 1 from round 1's own truncation, which
+    // rounds a >=1s round DOWN to something still >= 1) trips
+    // `time_exhausted` immediately -- it reads back only ONE persisted
+    // value and only checks that it is nonzero, never that a MULTI-round
+    // accumulation is actually correct. This test drives three real
+    // cancel/resume rounds, each ~1.3 real seconds, and checks the
+    // persisted cumulative total after all three -- proving each round's
+    // sub-second remainder is actually carried forward, not silently
+    // dropped every single time.
+    #[tokio::test]
+    async fn runtime_baseline_accumulates_correctly_across_three_real_cancel_resume_rounds() {
+        // 20,000, not 5,000: at ~1,300 units/round (1,000 burst + ~300
+        // throttled in the remaining 0.3s of each 1.3s window) across three
+        // rounds, a smaller plan runs out of units to dispatch before the
+        // third round's cancellation ever fires -- confirmed empirically
+        // (5,000 let round 3 exhaust the plan naturally instead of being
+        // cancelled).
+        let h = harness_with_many_units(20_000);
+        // Generous on both packets and runtime -- cancellation (not budget
+        // exhaustion) must be what stops every round, so each round's own
+        // elapsed time is genuinely under this test's control.
+        let generous_budgets = budgets(1_000_000, 1_000_000, 1_000_000);
+        let mut resume_from = 0u64;
+        for round in 0..3u32 {
+            let cancel = CancellationToken::new();
+            let c = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1_300)).await;
+                c.cancel();
+            });
+            // A fresh `Scheduler` every round (via `Harness::resume`), the
+            // same shape a real process restart takes -- reusing one
+            // `Scheduler`/`BudgetLedger` across rounds would never exercise
+            // the persist-then-reseed path this test is actually about.
+            let scheduler = h.resume(small_config(), 1_000, generous_budgets);
+            let summary = scheduler.run(&h.plan, resume_from, cancel).await.unwrap();
+            assert!(
+                summary.cancelled,
+                "round {round} must be stopped by cancellation, not exhaust the plan \
+                 (got {summary:?}) -- otherwise this round's own elapsed time is not \
+                 under this test's control"
+            );
+            resume_from = h
+                .store
+                .next_pending_unit(h.scan_id, h.plan.len())
+                .unwrap()
+                .unwrap();
+        }
+        let record = h.store.get(h.scan_id).unwrap().unwrap();
+        // Empirically: the fixed (ceil) code consistently persists 6 here
+        // (ceil(~1.3s) = 2 per round x 3 rounds); the truncating bug this
+        // test targets persists exactly 3 (floor(~1.3s) = 1 per round x 3
+        // rounds) -- NOT 0, since 1.3s truncates to 1, not 0 (a 3-round
+        // test using sub-1s rounds, matching the review's own repro more
+        // literally, would show a starker 0-vs-N gap, but would then also
+        // need `maximum_runtime_seconds` and the cancellation window tuned
+        // finely enough to stay reliably under 1s of real elapsed time on
+        // a loaded CI machine -- 1.3s rounds are more robust to scheduling
+        // jitter while still cleanly separating the two behaviors, 3 vs 6).
+        // 5 sits strictly between both observed values with margin on
+        // either side.
+        assert!(
+            record.elapsed_seconds >= 5,
+            "three rounds of ~1.3 real seconds each must accumulate to at least 5 \
+             persisted seconds (expect ~6) -- got {}. Each round's own sub-second \
+             remainder must be carried into the next round's baseline, not \
+             truncated away every time.",
+            record.elapsed_seconds
         );
     }
 

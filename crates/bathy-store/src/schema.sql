@@ -38,3 +38,12 @@ CREATE TABLE IF NOT EXISTS unit_progress (
     unit_index  INTEGER NOT NULL,
     PRIMARY KEY (scan_id, unit_index)
 ) WITHOUT ROWID;
+
+-- Schema version, stamped last so this statement only ever runs once this
+-- file's own tables/columns are genuinely in place (M3 Task 7 fix round 2).
+-- `TaskStore::open` checks `PRAGMA user_version` BEFORE running this file
+-- against an existing database, and migrates an older database (one that
+-- pre-dates this pragma entirely, and so always reads back as 0) up to this
+-- shape first -- see `open`'s own doc comment. Keep this in sync with
+-- `tasks::CURRENT_SCHEMA_VERSION`.
+PRAGMA user_version = 1;

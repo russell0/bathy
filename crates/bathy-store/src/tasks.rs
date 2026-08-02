@@ -123,7 +123,43 @@ pub enum StoreError {
     },
     #[error("no scan {0}")]
     NotFound(ScanId),
+    /// M3 Task 7 fix round 2: `TaskStore::open` checks `PRAGMA user_version`
+    /// against [`CURRENT_SCHEMA_VERSION`] before touching an existing
+    /// database, rather than silently running `schema.sql`'s `CREATE TABLE
+    /// IF NOT EXISTS` (a no-op against a table that already exists, however
+    /// stale its columns) and letting the first genuinely new column show
+    /// up as an opaque `no such column: ...` from some unrelated call much
+    /// later -- confirmed as the actual failure mode of opening a
+    /// pre-fix-round-1 database with fix round 1's code before this
+    /// version check existed. `found` is at least 2 (0 and 1 are handled by
+    /// `open`'s own migration path, not this error) unless the file is
+    /// corrupt or was produced by code this crate has never shipped.
+    #[error(
+        "state.sqlite at {path} has schema version {found}, which this build \
+         of bathy (schema version {expected}) does not know how to open \
+         safely. If {found} is HIGHER than {expected}, this store was \
+         created by a newer bathy build -- run a matching or newer build \
+         against it. If {found} is LOWER, the migration path from that \
+         version was removed or never existed in this build. Either way, \
+         refusing to open it automatically rather than risk silent data \
+         loss or corruption: move or delete the state directory to start a \
+         fresh scan, or restore a compatible bathy build."
+    )]
+    UnsupportedSchemaVersion {
+        path: PathBuf,
+        found: i64,
+        expected: i64,
+    },
 }
+
+/// The schema version [`TaskStore::open`] brings any database it opens up
+/// to (migrating an older one first) and refuses to proceed past (an
+/// unrecognized, presumably newer, one) -- see `open`'s own doc comment and
+/// [`StoreError::UnsupportedSchemaVersion`]. Kept in sync with the `PRAGMA
+/// user_version` statement at the end of `schema.sql` by convention, not by
+/// the type system; `schema_sql_stamps_the_current_schema_version` in this
+/// module's own tests is what actually pins the two together.
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 /// What `start_or_reuse` needs to either start a new scan or recognize a
 /// repeat of one already started.
@@ -201,6 +237,63 @@ impl TaskStore {
     /// `PRAGMA foreign_keys = ON` is not persisted anywhere and must be
     /// reissued on every connection -- see the module doc comment.
     ///
+    /// # Schema versioning (M3 Task 7 fix round 2)
+    ///
+    /// Before fix round 1, this project's SQLite schema had never changed
+    /// since it was first written, so `schema.sql`'s `CREATE TABLE IF NOT
+    /// EXISTS` being blind to a table that exists but has the WRONG shape
+    /// was a latent risk, not yet a real one. Fix round 1 added the
+    /// `scans.elapsed_seconds` column and made it the first real schema
+    /// change -- and there was no mechanism to detect a database that
+    /// pre-dates it. Review's repro: build a `state.sqlite` with the OLD
+    /// schema, open it with the new code -- `open` succeeds silently
+    /// (`CREATE TABLE IF NOT EXISTS scans (...)` is a no-op against a
+    /// `scans` table that already exists, missing column and all), and the
+    /// failure only surfaces three calls later, as an opaque `no such
+    /// column: elapsed_seconds` from `get`/`list`/`record_progress` --
+    /// precisely when resuming a pre-existing scan, the worst possible
+    /// moment.
+    ///
+    /// The fix establishes an actual mechanism, not a one-off patch for
+    /// this one column: `PRAGMA user_version`, checked BEFORE `schema.sql`
+    /// ever runs against an existing database.
+    ///
+    /// - `user_version == CURRENT_SCHEMA_VERSION`: already current: run
+    ///   `schema.sql` as before (idempotent pragma reassertion; see the
+    ///   module doc comment).
+    /// - `user_version == 0`: SQLite's own default for every database file
+    ///   that has never explicitly set this pragma -- indistinguishable,
+    ///   by the pragma alone, between a genuinely brand-new (empty) file
+    ///   and an existing pre-versioning database (which never set this
+    ///   pragma either, whether or not it already has `elapsed_seconds` --
+    ///   fix round 1 shipped that column without ever adding version
+    ///   tracking, so a database created by that exact build is ALSO
+    ///   version 0 despite already having the column). Disambiguated by
+    ///   inspecting the actual table/column shape rather than trusting the
+    ///   pragma: `scans` missing entirely means a fresh file (just run
+    ///   `schema.sql`, which creates everything and stamps the version);
+    ///   `scans` present but missing `elapsed_seconds` means a genuine
+    ///   pre-fix-round-1 database (migrate via `ALTER TABLE ... ADD
+    ///   COLUMN` first); `scans` present and already has the column means
+    ///   a fix-round-1-shaped database (skip the `ALTER TABLE` -- it is
+    ///   NOT idempotent and errors with "duplicate column name" on a
+    ///   second run -- and just stamp the version). All three converge on
+    ///   then running `schema.sql`, which is safe and idempotent in every
+    ///   case.
+    /// - anything else: a schema version this build has never produced and
+    ///   has no migration path for (most likely NEWER than
+    ///   `CURRENT_SCHEMA_VERSION` -- an older binary opening a store a
+    ///   newer one already migrated). Refused outright with
+    ///   [`StoreError::UnsupportedSchemaVersion`], not run against blindly:
+    ///   see that variant's own message for the operator-facing guidance.
+    ///
+    /// If a future schema change needs the disposable-store escape hatch
+    /// instead of an in-place migration (e.g. a change too invasive to
+    /// migrate safely), that is a legitimate choice, but it must still go
+    /// through this same version check and produce
+    /// `UnsupportedSchemaVersion`'s clear, actionable error -- never a
+    /// silent `open` success followed by a confusing failure elsewhere.
+    ///
     /// `clock` is `Arc<dyn Clock>`, not `Box<dyn Clock>` (C2): a `Box` can
     /// only ever be owned by this one `TaskStore`, so a caller that also
     /// needs a `Clock` elsewhere -- most concretely, the SAME scan's
@@ -228,11 +321,57 @@ impl TaskStore {
         // time on SQLite's write lock instead of failing immediately with
         // `SQLITE_BUSY`.
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
+
+        let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        match user_version {
+            v if v == CURRENT_SCHEMA_VERSION => {}
+            0 => Self::migrate_from_unversioned(&conn)?,
+            found => {
+                return Err(StoreError::UnsupportedSchemaVersion {
+                    path,
+                    found,
+                    expected: CURRENT_SCHEMA_VERSION,
+                });
+            }
+        }
         conn.execute_batch(SCHEMA_SQL)?;
+
         Ok(Self {
             conn: Mutex::new(conn),
             clock,
         })
+    }
+
+    /// Brings a `user_version == 0` database up to `scans` having
+    /// `elapsed_seconds`, without assuming which of the two real shapes
+    /// that can mean (see `open`'s own doc comment) -- checked directly via
+    /// `PRAGMA table_info`, not inferred from `user_version` alone. A no-op
+    /// (including for a brand-new, tableless database) if the column is
+    /// already present or `scans` does not exist yet; `open` runs
+    /// `schema.sql` unconditionally afterward either way, which creates a
+    /// fresh `scans` (with the column) if needed and stamps the version in
+    /// every case.
+    fn migrate_from_unversioned(conn: &Connection) -> Result<(), StoreError> {
+        let scans_exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='scans')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !scans_exists {
+            return Ok(());
+        }
+        let mut stmt = conn.prepare("PRAGMA table_info(scans)")?;
+        let has_elapsed_seconds = stmt
+            .query_map([], |r| r.get::<_, String>(1))?
+            .filter_map(Result::ok)
+            .any(|name| name == "elapsed_seconds");
+        drop(stmt);
+        if !has_elapsed_seconds {
+            conn.execute_batch(
+                "ALTER TABLE scans ADD COLUMN elapsed_seconds INTEGER NOT NULL DEFAULT 0;",
+            )?;
+        }
+        Ok(())
     }
 
     /// The idempotency rule, in one place -- see the module doc comment for
@@ -1421,5 +1560,221 @@ mod tests {
             "cascade delete must remove unit_progress rows once the parent scan is \
              deleted, given foreign_keys is genuinely on for this connection"
         );
+    }
+
+    // --- M3 Task 7 fix round 2: schema versioning / migration ---
+    //
+    // Review's repro: build a `state.sqlite` with the schema as of commit
+    // `4044af7` (before `elapsed_seconds` existed), open it with the code
+    // as of `a0d8524` (fix round 1, which added the column with no version
+    // tracking at all) -- `TaskStore::open` succeeded SILENTLY, and
+    // `get`/`list`/`record_progress` all then failed with an opaque
+    // `no such column: elapsed_seconds`, surfacing exactly when resuming a
+    // pre-existing scan. The tests below exercise the version-check
+    // mechanism this fix round adds against BOTH real pre-existing shapes
+    // (the genuine `4044af7` one, and the `a0d8524` one -- which already
+    // has the column but, like `4044af7`, never stamped a version, so
+    // `open` cannot tell them apart from `user_version` alone and must
+    // inspect the actual column shape -- see `migrate_from_unversioned`'s
+    // own doc comment) plus the "refuse a version we don't understand"
+    // path.
+
+    /// The exact schema as of commit `4044af7` -- the last commit before
+    /// M3 Task 7 added `scans.elapsed_seconds` -- copied verbatim via `git
+    /// show 4044af7:crates/bathy-store/src/schema.sql` rather than
+    /// approximated, so a test built against it is a genuine repro of the
+    /// review's own scenario, not a guess at what an old database might
+    /// have looked like.
+    const PRE_FIX_ROUND_1_SCHEMA: &str = "
+        PRAGMA journal_mode = WAL;
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE IF NOT EXISTS scans (
+            scan_id           TEXT PRIMARY KEY,
+            plan_hash         TEXT NOT NULL,
+            idempotency_key   TEXT NOT NULL,
+            scope_id          TEXT NOT NULL,
+            status            TEXT NOT NULL,
+            request_json      TEXT NOT NULL,
+            estimated_targets INTEGER NOT NULL,
+            estimated_probes  INTEGER NOT NULL,
+            packets_spent     INTEGER NOT NULL DEFAULT 0,
+            last_sequence     INTEGER NOT NULL DEFAULT 0,
+            created_at        TEXT NOT NULL,
+            updated_at        TEXT NOT NULL
+        );
+
+        CREATE UNIQUE INDEX IF NOT EXISTS scans_idempotency
+            ON scans (idempotency_key);
+
+        CREATE INDEX IF NOT EXISTS scans_status ON scans (status);
+
+        CREATE TABLE IF NOT EXISTS unit_progress (
+            scan_id     TEXT NOT NULL REFERENCES scans(scan_id) ON DELETE CASCADE,
+            unit_index  INTEGER NOT NULL,
+            PRIMARY KEY (scan_id, unit_index)
+        ) WITHOUT ROWID;
+    ";
+
+    /// Inserts one row directly into a `scans` table shaped like
+    /// `PRE_FIX_ROUND_1_SCHEMA` (works against the `a0d8524` shape too,
+    /// which is a superset), bypassing `TaskStore` entirely -- this is
+    /// what "a scan already existed before this database was migrated"
+    /// looks like on disk.
+    fn insert_raw_scan_row(conn: &Connection, scan_id: &str) {
+        conn.execute(
+            "INSERT INTO scans (scan_id, plan_hash, idempotency_key, scope_id, status,
+                                 request_json, estimated_targets, estimated_probes,
+                                 created_at, updated_at)
+             VALUES (?1, ?2, 'key', 'scope_01ARZ3NDEKTSV4RRFFQ69G5FAV', 'running',
+                     '{}', 10, 100, '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            params![scan_id, hash_a().to_string()],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn opening_a_fresh_database_stamps_the_current_schema_version() {
+        let (_d, store) = store();
+        let conn = store.conn.lock().unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn opening_a_genuine_pre_fix_round_1_database_migrates_in_place_and_preserves_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(PRE_FIX_ROUND_1_SCHEMA).unwrap();
+            insert_raw_scan_row(&raw, "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        }
+
+        // THE FIX under test: this must succeed (not error), and must not
+        // merely succeed while leaving `scans` stale -- confirmed below by
+        // actually reading the row back through the normal `TaskStore` API
+        // (`get`), the exact call the review's repro showed failing with
+        // `no such column: elapsed_seconds` three calls after a silent
+        // `open`.
+        let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
+        let id: ScanId = "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        let record = store
+            .get(id)
+            .expect("get() must succeed against a migrated database, not `no such column`")
+            .expect("the pre-existing row must survive the migration");
+        assert_eq!(
+            record.elapsed_seconds, 0,
+            "a migrated pre-existing row's new column must default to 0, not NULL \
+             or an error"
+        );
+        assert_eq!(
+            record.idempotency_key, "key",
+            "the migration must preserve pre-existing column data, not just add \
+             the new one"
+        );
+
+        let conn = store.conn.lock().unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            v, CURRENT_SCHEMA_VERSION,
+            "a migrated database must be stamped at the current version"
+        );
+    }
+
+    #[test]
+    fn opening_a_fix_round_1_shaped_database_that_never_stamped_a_version_does_not_double_migrate()
+    {
+        // `a0d8524` (fix round 1) shipped `elapsed_seconds` in schema.sql
+        // but never added version tracking -- a database created by that
+        // exact build already has the column AND `user_version == 0`,
+        // indistinguishable from the genuinely pre-fix-round-1 case by
+        // `user_version` alone. If `open` naively ran `ALTER TABLE scans
+        // ADD COLUMN elapsed_seconds ...` whenever it saw `user_version ==
+        // 0` and `scans` present, THIS is the shape that would trip
+        // "duplicate column name: elapsed_seconds" -- `migrate_from_unversioned`
+        // must check the actual column list, not just table existence.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        {
+            let raw = Connection::open(&path).unwrap();
+            // The CURRENT schema.sql already has the column; deliberately
+            // NOT setting user_version here reproduces exactly what
+            // `a0d8524`'s `TaskStore::open` (schema with the column, no
+            // version pragma at all) would have left on disk.
+            raw.execute_batch(SCHEMA_SQL).unwrap();
+            raw.execute_batch("PRAGMA user_version = 0;").unwrap();
+            insert_raw_scan_row(&raw, "scan_01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        }
+
+        let store = TaskStore::open(dir.path(), Arc::new(clock()))
+            .expect("must not error with 'duplicate column name'");
+        let id: ScanId = "scan_01ARZ3NDEKTSV4RRFFQ69G5FAW".parse().unwrap();
+        let record = store.get(id).unwrap().unwrap();
+        assert_eq!(record.elapsed_seconds, 0);
+
+        let conn = store.conn.lock().unwrap();
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn opening_the_same_migrated_database_twice_never_double_migrates() {
+        // A second, independent `open` against an ALREADY-migrated
+        // database (this fix round's own migration, not the round-1 shape
+        // above) must not attempt the `ALTER TABLE` again either --
+        // `migrate_from_unversioned` only runs at all when `user_version
+        // == 0`, and the first `open` below leaves it at
+        // `CURRENT_SCHEMA_VERSION`, so this is mostly a regression guard
+        // against a future change to that gate.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(PRE_FIX_ROUND_1_SCHEMA).unwrap();
+        }
+        TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
+        let second = TaskStore::open(dir.path(), Arc::new(clock()));
+        assert!(
+            second.is_ok(),
+            "opening an already-migrated database a second time must not error"
+        );
+    }
+
+    #[test]
+    fn opening_an_unsupported_schema_version_fails_loudly_instead_of_a_later_no_such_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.sqlite");
+        {
+            let raw = Connection::open(&path).unwrap();
+            raw.execute_batch(SCHEMA_SQL).unwrap();
+            // A version this build has never produced -- simulates either
+            // a newer bathy build's store, or a corrupted/tampered pragma.
+            raw.execute_batch("PRAGMA user_version = 999;").unwrap();
+        }
+
+        match TaskStore::open(dir.path(), Arc::new(clock())) {
+            Err(StoreError::UnsupportedSchemaVersion {
+                found, expected, ..
+            }) => {
+                assert_eq!(found, 999);
+                assert_eq!(expected, CURRENT_SCHEMA_VERSION);
+            }
+            Err(other) => panic!(
+                "expected StoreError::UnsupportedSchemaVersion, got a different \
+                 error: {other}"
+            ),
+            Ok(_) => panic!(
+                "an unrecognized schema version must fail loudly AT OPEN, not \
+                 succeed silently and fail later with an opaque error from some \
+                 unrelated call"
+            ),
+        }
     }
 }
