@@ -15,6 +15,13 @@ repository.workspace = true
 bathy-types = { path = "../bathy-types" }
 ipnet = { workspace = true }
 thiserror = { workspace = true }
+# `plan.rs` assembles the canonical JSON document `plan_digest` hashes
+# (`serde_json::json!`) and strips the raw `targets`/`ports`/`idempotency_key`
+# fields out of the serialized request first (`serde_json::to_value` +
+# `Map::remove`) -- both directly `use serde_json::...`, so it must be a
+# direct dependency here, not just a transitive one pulled in through
+# `bathy-types`.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

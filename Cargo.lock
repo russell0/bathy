@@ -40,6 +40,7 @@ dependencies = [
  "bathy-types",
  "ipnet",
  "proptest",
+ "serde_json",
  "thiserror",
 ]
 
