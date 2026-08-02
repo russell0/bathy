@@ -567,8 +567,19 @@ impl ScanPlan {
         // names an attempt, the hash names the work. Budgets ARE included, so
         // reusing a key with a larger budget is a conflict rather than a silent
         // widening.
+        // Strip `targets` and `ports` as well as `idempotency_key`. They are the
+        // caller's RAW, caller-ordered arrays; `canonical_json` sorts object keys
+        // but treats ARRAY order as significant, so leaving them in makes the
+        // hash vary with the order the caller happened to list them — directly
+        // violating AC-3.10. `expanded_targets`/`resolved_ports` below are the
+        // sorted, deduplicated forms and are the only ones that belong here.
         let mut normalized = serde_json::to_value(request).expect("request serializes");
-        normalized.as_object_mut().expect("request is an object").remove("idempotency_key");
+        {
+            let obj = normalized.as_object_mut().expect("request is an object");
+            obj.remove("idempotency_key");
+            obj.remove("targets");
+            obj.remove("ports");
+        }
         let canonical = json!({
             "engine_plan_version": 1,
             "request": normalized,
