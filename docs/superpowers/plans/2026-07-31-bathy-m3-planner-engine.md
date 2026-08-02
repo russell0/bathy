@@ -1225,9 +1225,18 @@ impl Scheduler {
             estimated_probes: plan.len(),
         })?;
 
+        // Load the COMPLETED SET, do not trust a flat `from_index` cursor.
+        // Units complete out of order under concurrency, so a scan cancelled
+        // with completions at {0..10} + {60..70} resuming from the first gap
+        // re-probes the {60..70} island. Every store-based assertion still
+        // passes, because `INSERT OR IGNORE` makes the duplicate
+        // `mark_units_done` a silent no-op — the store's view is byte-identical
+        // whether the island was skipped or re-probed. Only a real accept
+        // counter or `RunSummary::units_completed` catches it.
+        let already_done = store.completed_units(scan_id)?;
         let permits = Arc::new(Semaphore::new(self.concurrency));
         let mut in_flight = tokio::task::JoinSet::new();
-        let mut units = plan.units_from(from_index);
+        let mut units = plan.units_from(from_index).filter(|u| !already_done.contains(&u.index));
         let mut completed_batch: Vec<u64> = Vec::with_capacity(64);
 
         loop {
@@ -1310,7 +1319,11 @@ git commit -m "feat(engine): budget-governed scheduler with cancellation and res
 ```
 
 **Acceptance criteria:**
-- **AC-3.24** Budget is reserved *before* emission; total packets never exceed `maximum_packets`. Verify with a budget of 10 against a plan of thousands of units.
+- **AC-3.24** Budget is reserved *before* emission; total packets never exceed `maximum_packets`. Verify with a budget of 10 against a plan of thousands.
+  **Do NOT assert on `summary.packets_spent`** — it is read back out of the ledger, and the ledger cannot report exceeding its own ceiling, so the assertion is true for any implementation. Moving the reservation after the spawn emits ceiling+1 REAL packets and passes such a test. Assert on `units_completed <= ceiling` and on real accept counts from real listeners.
+- **AC-3.32** The ceiling holds ACROSS a resumed scan. `BudgetLedger::new` starts at zero, and cancellation deliberately emits no terminal event, so a cancelled scan resumed with a fresh ledger gets a full new budget — unbounded under repeated cancel/resume. Seed the ledger from the persisted cursor (`BudgetLedger::resumed`) and persist elapsed runtime with **ceiling, not truncating, seconds**: `Duration::as_secs()` makes any sub-second round contribute zero, and six 800ms rounds then run 4.95s against a 2s ceiling. Test a >= 3-round loop.
+- **AC-3.33** Group commit is pinned by a BEHAVIOURAL test — assert that N appends produce fewer than N real `sync_data` calls. Asserting on an internal pending counter does not pin it: swapping to a per-event-syncing log passes every such test while restoring the full 85-minute regression.
+- **AC-3.34** The SQL schema carries `PRAGMA user_version`, checked at `open`, with an actionable error on mismatch and an in-place `ALTER TABLE` migration. `xtask check-schemas` gates only the wire-level JSON schemas; nothing gates SQL, so an unmigrated column change opens silently and fails `no such column` on first read.
 - **AC-3.25** Cancellation halts the scan promptly, drains in-flight work, and leaves `next_pending_unit` pointing at a genuine resume point.
 - **AC-3.26** Resuming from index *n* probes no unit below *n* and probes no unit twice.
 - **AC-3.27** Budget exhaustion, time exhaustion, and cancellation are reported as three distinct outcomes with distinct terminal events (`budget_exhausted`, `time_exhausted`, and no terminal failure event for cancellation).
