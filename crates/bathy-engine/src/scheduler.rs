@@ -37,10 +37,24 @@
 //!    every scheduler test scanned loopback, which `allows` refuses
 //!    categorically, and none of them noticed. Fixed at the type level:
 //!    [`Scheduler::new`] takes a `manifest` and cannot be constructed
-//!    without one, and `run` re-checks every unit's target against it
+//!    without one, and `run` checks every unit's target against it
 //!    immediately before dispatch -- see this type's own doc comment on the
-//!    `manifest` field, and `run`'s doc comment, for the full reasoning and
-//!    exactly why this is a *re-check*, not the only check.
+//!    `manifest` field, and `run`'s doc comment, for the full reasoning.
+//!
+//!    A whole-branch RE-review (same milestone) found this was incomplete:
+//!    per-target authorization is a genuine *re-check* -- `bathy_scope::evaluate`
+//!    is the upstream call meant to validate it first, over the plan's full
+//!    expanded target list, before this `Scheduler` is ever constructed --
+//!    but `run` had no check at all for the other two things `evaluate`
+//!    validates: that `manifest` is *the* manifest this `scan_id` was
+//!    actually started under (not merely *a* manifest satisfying the type
+//!    system), and that it is still active. Since `evaluate` has zero
+//!    callers anywhere in this workspace as of this milestone, those two
+//!    were not belt-and-braces the way the per-target check is -- they were
+//!    the only belt, and there wasn't one. `run` now checks scope identity
+//!    (against the scan record's own `scope_id`) and expiry up front, before
+//!    `scan.started` or any unit is even considered, refusing the whole scan
+//!    exactly like the per-target check does. See `run`'s own doc comment.
 //!
 //! # Group commit
 //!
@@ -257,14 +271,22 @@ pub struct Scheduler {
     /// defect this review found: `bathy-engine` depended on `bathy-scope`
     /// since Task 1 but nothing on the emission path ever called
     /// `allows`) cannot happen again by construction, not merely by
-    /// convention. `run` re-checks every unit's target against this
-    /// immediately before dispatch -- belt and braces on top of whatever
-    /// upstream `bathy_scope::evaluate` call already ran over the plan's
-    /// full expanded target list before this `Scheduler` was even built
-    /// (see the module doc's invariant 5): that upstream call is what a
-    /// future orchestrator (M5) is expected to make, but this field is what
-    /// makes the emission path itself correct even if it didn't, or if the
-    /// plan handed to `run` does not actually match what was evaluated.
+    /// convention.
+    ///
+    /// `run` checks THREE things against this before it will ever dispatch
+    /// a unit -- see the module doc's invariant 5 for the full history:
+    /// that this really is the manifest `scan_id` was started under (its
+    /// `id` against the scan record's own `scope_id`), that it is still
+    /// active (`is_expired`), and that each individual target is inside its
+    /// allow set (`allows`). Only the last of those three is a genuine
+    /// re-check of an upstream `bathy_scope::evaluate` call a future
+    /// orchestrator (M5) is expected to make over the plan's full expanded
+    /// target list -- the first two are not belt-and-braces on anything:
+    /// `evaluate` has no caller anywhere in this workspace as of this
+    /// milestone, so for scope identity and expiry, `run`'s own checks are
+    /// currently the *only* enforcement that exists. Constructibility alone
+    /// (this field being required) never proved either of those two; only
+    /// `run`'s own checks do.
     manifest: Arc<ScopeManifest>,
     config: SchedulerConfig,
     log: Arc<Mutex<GroupCommitLog>>,
@@ -455,153 +477,205 @@ impl Scheduler {
             return Ok(summary);
         }
 
-        // AC-3.28: exactly one `scan.started`, gated on the log's own
-        // content rather than on `from_index` -- see the module doc.
-        if self.log_guard().last_sequence() == 0 {
-            self.log(EventBody::ScanStarted {
-                plan_hash: plan.hash(),
-                estimated_targets: plan.targets().len() as u64,
-                estimated_probes: plan.len(),
-            })?;
+        // M3 whole-branch re-review, Global Constraint: two of the three
+        // things `bathy_scope::evaluate` validates (scope identity and
+        // manifest expiry -- the third, per-target authorization, is the
+        // `allows` re-check inside the dispatch loop below) had NO check
+        // anywhere on the emission path at all. That is a materially
+        // different defect from CRITICAL-1's per-target gate: `evaluate`
+        // has zero callers anywhere in this workspace, so the per-target
+        // `allows` re-check below is genuinely belt-and-braces (a backstop
+        // behind an upstream call that is expected, eventually, to exist),
+        // but for scope identity and expiry THIS is currently the only
+        // check that will ever run, upstream or not. `record` (already
+        // loaded above for the plan_hash check) carries the scope_id this
+        // scan_id was actually started under; `self.manifest` is merely *a*
+        // manifest handed to `Scheduler::new` -- constructibility alone
+        // never proved it is *the* manifest this scan was authorized
+        // against, nor that it is still active. Checked once, up front,
+        // exactly like `evaluate`'s own ordering (scope mismatch, then
+        // expiry, before any target is even considered) -- and, like the
+        // per-target check, refuses the WHOLE scan rather than a probe at a
+        // time: `policy_denial` gates the entire dispatch section below via
+        // the labeled block, so a scan denied here never even reaches
+        // `scan.started`, `already_done`, or the plan's own unit list.
+        let mut policy_denial: Option<(DenyReason, String)> = None;
+        if record.scope_id != self.manifest.id() {
+            policy_denial = Some((
+                DenyReason::ScopeMismatch,
+                format!(
+                    "scan {} was started under scope {}, but this Scheduler was built with \
+                     manifest {}",
+                    self.scan_id,
+                    record.scope_id,
+                    self.manifest.id()
+                ),
+            ));
+        } else if self.manifest.is_expired(&self.clock.now_rfc3339()) {
+            policy_denial = Some((
+                DenyReason::ScopeExpired,
+                format!(
+                    "manifest {} expired before {}",
+                    self.manifest.id(),
+                    self.clock.now_rfc3339()
+                ),
+            ));
         }
 
-        // Invariant 3: the full set of units a PREVIOUS run already
-        // completed, loaded once. `from_index` alone is a necessary but not
-        // sufficient skip condition under concurrency -- see the module doc.
-        let already_done: HashSet<u64> = self
-            .store
-            .completed_units(self.scan_id)?
-            .into_iter()
-            .collect();
-
-        let permits = Arc::new(Semaphore::new(self.config.concurrency.max(1)));
-        let mut in_flight: JoinSet<(ScanUnit, ConnectOutcome, bool)> = JoinSet::new();
-        let mut units = plan.units_from(from_index);
-        let mut completed_batch: Vec<u64> = Vec::with_capacity(STORE_FLUSH_BATCH);
-        let mut last_progress_emitted_at: u64 = 0;
-        // M3 whole-branch review, CRITICAL-1: set (once) the first time the
-        // per-unit re-check below refuses a target, so the terminal-event
-        // section after the drive loop can emit exactly one `policy.denied`
-        // naming it -- mirroring how `budget_exhausted`/`time_exhausted`
-        // build their own event detail after the loop rather than inline.
-        let mut policy_denial_detail: Option<String> = None;
-
-        'drive: loop {
-            if cancel.is_cancelled() {
-                summary.cancelled = true;
-                break 'drive;
-            }
-            if self
-                .ledger()
-                .elapsed_exceeded(ceil_elapsed_seconds(started.elapsed()))
-            {
-                summary.time_exhausted = true;
-                break 'drive;
+        'dispatch: {
+            if policy_denial.is_some() {
+                break 'dispatch;
             }
 
-            let Some(unit) = units.next() else {
-                break 'drive;
-            };
-
-            if already_done.contains(&unit.index) {
-                continue;
+            // AC-3.28: exactly one `scan.started`, gated on the log's own
+            // content rather than on `from_index` -- see the module doc.
+            if self.log_guard().last_sequence() == 0 {
+                self.log(EventBody::ScanStarted {
+                    plan_hash: plan.hash(),
+                    estimated_targets: plan.targets().len() as u64,
+                    estimated_probes: plan.len(),
+                })?;
             }
 
-            // M3 whole-branch review, CRITICAL-1: the actual emission-path
-            // gate. Checked here -- immediately before the rate-limiter
-            // wait and the budget reservation below, i.e. as early and as
-            // cheaply as possible, and unconditionally, on every single
-            // unit -- rather than trusted to have already happened via
-            // whatever upstream `bathy_scope::evaluate` call this
-            // `Scheduler`'s caller may or may not have made. This is not
-            // expected to ever trip in correct operation (every target
-            // `run` sees should already have passed `evaluate` before this
-            // `Scheduler` was even constructed), which is exactly why it is
-            // treated as fatal to the whole scan -- like budget/time
-            // exhaustion -- rather than "skip this one unit and keep
-            // going": a manifest re-check failing mid-run means something
-            // upstream is already wrong, and trimming just the offending
-            // unit would be the "trimmed rather than refused in full"
-            // behavior this project's own authorization model rejects (see
-            // `bathy_scope::policy::evaluate`'s doc comment).
-            if !self.manifest.allows(unit.target) {
-                policy_denial_detail = Some(format!(
-                    "{} is not authorized by manifest {} (unit index {})",
-                    unit.target,
-                    self.manifest.id(),
-                    unit.index
-                ));
-                summary.policy_denied = true;
-                break 'drive;
+            // Invariant 3: the full set of units a PREVIOUS run already
+            // completed, loaded once. `from_index` alone is a necessary but
+            // not sufficient skip condition under concurrency -- see the
+            // module doc.
+            let already_done: HashSet<u64> = self
+                .store
+                .completed_units(self.scan_id)?
+                .into_iter()
+                .collect();
+
+            let permits = Arc::new(Semaphore::new(self.config.concurrency.max(1)));
+            let mut in_flight: JoinSet<(ScanUnit, ConnectOutcome, bool)> = JoinSet::new();
+            let mut units = plan.units_from(from_index);
+            let mut completed_batch: Vec<u64> = Vec::with_capacity(STORE_FLUSH_BATCH);
+            let mut last_progress_emitted_at: u64 = 0;
+
+            'drive: loop {
+                if cancel.is_cancelled() {
+                    summary.cancelled = true;
+                    break 'drive;
+                }
+                if self
+                    .ledger()
+                    .elapsed_exceeded(ceil_elapsed_seconds(started.elapsed()))
+                {
+                    summary.time_exhausted = true;
+                    break 'drive;
+                }
+
+                let Some(unit) = units.next() else {
+                    break 'drive;
+                };
+
+                if already_done.contains(&unit.index) {
+                    continue;
+                }
+
+                // M3 whole-branch review, CRITICAL-1: the actual
+                // emission-path gate for PER-TARGET authorization. Checked
+                // here -- immediately before the rate-limiter wait and the
+                // budget reservation below, i.e. as early and as cheaply as
+                // possible, and unconditionally, on every single unit --
+                // rather than trusted to have already happened via whatever
+                // upstream `bathy_scope::evaluate` call this `Scheduler`'s
+                // caller may or may not have made. This is not expected to
+                // ever trip in correct operation (every target `run` sees
+                // should already have passed `evaluate` before this
+                // `Scheduler` was even constructed), which is exactly why
+                // it is treated as fatal to the whole scan -- like
+                // budget/time exhaustion -- rather than "skip this one unit
+                // and keep going": a manifest re-check failing mid-run
+                // means something upstream is already wrong, and trimming
+                // just the offending unit would be the "trimmed rather than
+                // refused in full" behavior this project's own
+                // authorization model rejects (see
+                // `bathy_scope::policy::evaluate`'s doc comment).
+                if !self.manifest.allows(unit.target) {
+                    policy_denial = Some((
+                        DenyReason::TargetOutOfScope,
+                        format!(
+                            "{} is not authorized by manifest {} (unit index {})",
+                            unit.target,
+                            self.manifest.id(),
+                            unit.index
+                        ),
+                    ));
+                    break 'drive;
+                }
+
+                // Cancellable wait for a rate-limiter token AND a
+                // concurrency slot: a cancellation arriving mid-wait must
+                // not be delayed behind either. Whichever branch `select!`
+                // does not pick is dropped mid-poll -- so if `cancel` wins,
+                // `unit` is simply abandoned: never marked done, and (per
+                // invariant 1) no budget is ever reserved for it, so it is
+                // correctly resumable.
+                let acquired = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => None,
+                    permit = async {
+                        self.limiter.acquire(1).await;
+                        permits.clone().acquire_owned().await.expect("semaphore is never closed")
+                    } => Some(permit),
+                };
+                let Some(permit) = acquired else {
+                    summary.cancelled = true;
+                    break 'drive;
+                };
+
+                // AC-3.24: reserve budget BEFORE emission, as late as
+                // possible -- immediately before the unit is actually
+                // dispatched. A refused reservation ends the scan; `unit`
+                // above is never spawned, so the total packets emitted can
+                // never exceed `maximum_packets`.
+                if self.ledger().try_spend_packets(1).is_err() {
+                    drop(permit);
+                    summary.budget_exhausted = true;
+                    break 'drive;
+                }
+
+                let timeout = self.config.connect_timeout;
+                in_flight.spawn(async move {
+                    let (outcome, local) =
+                        probe_connect_with_local_signal(unit.target, unit.endpoint.port, timeout)
+                            .await;
+                    drop(permit);
+                    (unit, outcome, local)
+                });
+
+                while let Some(done) = in_flight.try_join_next() {
+                    self.record(done?, &mut summary, &mut completed_batch)?;
+                }
+                if completed_batch.len() >= STORE_FLUSH_BATCH {
+                    self.flush_progress(
+                        &mut completed_batch,
+                        summary.units_completed,
+                        &mut last_progress_emitted_at,
+                        plan.len(),
+                        started,
+                    )?;
+                }
             }
 
-            // Cancellable wait for a rate-limiter token AND a concurrency
-            // slot: a cancellation arriving mid-wait must not be delayed
-            // behind either. Whichever branch `select!` does not pick is
-            // dropped mid-poll -- so if `cancel` wins, `unit` is simply
-            // abandoned: never marked done, and (per invariant 1) no budget
-            // is ever reserved for it, so it is correctly resumable.
-            let acquired = tokio::select! {
-                biased;
-                () = cancel.cancelled() => None,
-                permit = async {
-                    self.limiter.acquire(1).await;
-                    permits.clone().acquire_owned().await.expect("semaphore is never closed")
-                } => Some(permit),
-            };
-            let Some(permit) = acquired else {
-                summary.cancelled = true;
-                break 'drive;
-            };
-
-            // AC-3.24: reserve budget BEFORE emission, as late as possible
-            // -- immediately before the unit is actually dispatched. A
-            // refused reservation ends the scan; `unit` above is never
-            // spawned, so the total packets emitted can never exceed
-            // `maximum_packets`.
-            if self.ledger().try_spend_packets(1).is_err() {
-                drop(permit);
-                summary.budget_exhausted = true;
-                break 'drive;
-            }
-
-            let timeout = self.config.connect_timeout;
-            in_flight.spawn(async move {
-                let (outcome, local) =
-                    probe_connect_with_local_signal(unit.target, unit.endpoint.port, timeout).await;
-                drop(permit);
-                (unit, outcome, local)
-            });
-
-            while let Some(done) = in_flight.try_join_next() {
+            // Invariant 2: drain, never drop, work already in flight. These
+            // probes were already paid for out of the budget (reserved
+            // before spawn, above), and their results are real observations
+            // -- this loop runs unconditionally, regardless of which branch
+            // above broke the dispatch loop.
+            while let Some(done) = in_flight.join_next().await {
                 self.record(done?, &mut summary, &mut completed_batch)?;
             }
-            if completed_batch.len() >= STORE_FLUSH_BATCH {
-                self.flush_progress(
-                    &mut completed_batch,
-                    summary.units_completed,
-                    &mut last_progress_emitted_at,
-                    plan.len(),
-                    started,
-                )?;
-            }
+            self.flush_progress(
+                &mut completed_batch,
+                summary.units_completed,
+                &mut last_progress_emitted_at,
+                plan.len(),
+                started,
+            )?;
         }
-
-        // Invariant 2: drain, never drop, work already in flight. These
-        // probes were already paid for out of the budget (reserved before
-        // spawn, above), and their results are real observations -- this
-        // loop runs unconditionally, regardless of which branch above broke
-        // the dispatch loop.
-        while let Some(done) = in_flight.join_next().await {
-            self.record(done?, &mut summary, &mut completed_batch)?;
-        }
-        self.flush_progress(
-            &mut completed_batch,
-            summary.units_completed,
-            &mut last_progress_emitted_at,
-            plan.len(),
-            started,
-        )?;
 
         summary.packets_spent = self.ledger().packets_spent();
 
@@ -633,9 +707,10 @@ impl Scheduler {
                 ),
             })?;
             self.store.set_status(self.scan_id, TaskStatus::Failed)?;
-        } else if let Some(detail) = policy_denial_detail {
+        } else if let Some((reason_code, detail)) = policy_denial {
+            summary.policy_denied = true;
             self.log(EventBody::PolicyDenied {
-                reason_code: DenyReason::TargetOutOfScope,
+                reason_code,
                 detail,
             })?;
             self.store.set_status(self.scan_id, TaskStatus::Denied)?;
@@ -762,10 +837,25 @@ impl Scheduler {
     /// `record_progress` advance is durable only after the events it
     /// certifies are.** Costs one extra `fsync` per `STORE_FLUSH_BATCH`
     /// (64) units on top of whatever `GroupCommitLog`'s own bounded
-    /// trigger would have done anyway -- see
-    /// `flush_progress_forces_a_log_sync_before_the_store_durably_marks_units_done`
-    /// below, which pins the ordering directly rather than trusting this
-    /// comment.
+    /// trigger would have done anyway.
+    ///
+    /// Two tests pin two different halves of this, deliberately not just
+    /// one: `flush_progress_forces_a_log_sync_before_the_store_durably_marks_units_done`
+    /// below proves a real sync is genuinely happening on this path at all
+    /// (a concurrent observer never sees the store show completed units
+    /// while `log.sync_calls()` is still zero) -- but M3 whole-branch
+    /// RE-review found that test alone is decoration against the literal
+    /// inversion this doc comment describes: `flush_progress` has no
+    /// `.await` inside it, so swapping the two calls' *order* back (while
+    /// keeping both present) is invisible to any concurrent poller, and a
+    /// real crash between the two lines needs no `.await` point to
+    /// reproduce. `a_failed_force_sync_leaves_the_store_resumption_cursor_untouched`
+    /// is the test that actually pins the ORDER: it forces `force_sync`
+    /// itself to fail (via the test-only `GroupCommitLog::fail_next_sync_for_tests`)
+    /// and asserts `mark_units_done` never ran at all -- the property this
+    /// paragraph claims -- which is only true if `force_sync` is called,
+    /// and its `?` checked, BEFORE `mark_units_done`, not merely somewhere
+    /// in the same function.
     ///
     /// `units_completed` is passed by value rather than borrowing
     /// `RunSummary` so this can run interleaved with `record`'s own `&mut
@@ -1174,6 +1264,60 @@ mod tests {
     fn reopened_status(h: &Harness) -> TaskStatus {
         let reopened = TaskStore::open(h._dir.path(), Arc::clone(&h.clock)).unwrap();
         reopened.get(h.scan_id).unwrap().unwrap().status
+    }
+
+    /// M3 whole-branch re-review (Global Constraint, item 1): a manifest
+    /// that would otherwise authorize loopback (via
+    /// `for_tests_allowing_loopback`, matching `default_manifest`'s own
+    /// shape) but carries a DIFFERENT `id` than `scope_id()` -- the value
+    /// every harness's `ScanRequest.authorization_scope_id` (and therefore
+    /// the scan record's own `scope_id` column) is built with. Proves
+    /// `run`'s scope-identity check, not the allow-set match: this
+    /// manifest's `allowed_cidrs` would happily let a 127.0.0.1 target
+    /// through if scope identity weren't checked first.
+    fn manifest_for_a_different_scope() -> Arc<ScopeManifest> {
+        Arc::new(
+            ScopeManifest::for_tests_allowing_loopback(
+                r#"{
+                  "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FBW",
+                  "description": "Global Constraint fixture: right shape, wrong scope",
+                  "not_after": "2099-01-01T00:00:00.000Z",
+                  "allowed_cidrs": ["127.0.0.1/32"],
+                  "budget_ceiling": {
+                    "maximum_packets": 1000000,
+                    "maximum_runtime_seconds": 3600,
+                    "maximum_packets_per_second": 1000000
+                  }
+                }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// M3 whole-branch re-review (Global Constraint, item 1): a manifest
+    /// matching `scope_id()` and otherwise identical in shape to
+    /// `default_manifest` (loopback allowed via `for_tests_allowing_loopback`),
+    /// except `not_after` is years in the past -- `is_expired` against any
+    /// `FixedClock` seed this module uses (all fixed to `2026-08-01...`)
+    /// returns `true`. Proves `run`'s expiry check, not the scope-identity
+    /// or allow-set checks.
+    fn expired_manifest_allowing_loopback() -> Arc<ScopeManifest> {
+        Arc::new(
+            ScopeManifest::for_tests_allowing_loopback(
+                r#"{
+                  "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "description": "Global Constraint fixture: right scope, expired",
+                  "not_after": "2020-01-01T00:00:00.000Z",
+                  "allowed_cidrs": ["127.0.0.1/32"],
+                  "budget_ceiling": {
+                    "maximum_packets": 1000000,
+                    "maximum_runtime_seconds": 3600,
+                    "maximum_packets_per_second": 1000000
+                  }
+                }"#,
+            )
+            .unwrap(),
+        )
     }
 
     fn small_config() -> SchedulerConfig {
@@ -2704,23 +2848,195 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // M3 whole-branch RE-review, Global Constraint (item 1): the per-unit
+    // `allows` re-check above proves per-TARGET authorization, but a
+    // `Scheduler` is only required to hold *a* `ScopeManifest` -- nothing
+    // before this fix ever checked it was *the* manifest this scan was
+    // actually authorized under (`record.scope_id`), or that it was still
+    // active (`is_expired`). `bathy_scope::evaluate` -- the upfront check
+    // that validates both -- has zero callers anywhere in this workspace,
+    // so unlike the per-target re-check, these two are not belt-and-braces:
+    // they are the only belt. Both proven the same way CRITICAL-1's own
+    // headline defect was: a real bound listener, and a real accept count
+    // that must stay at zero.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_refuses_when_the_manifest_belongs_to_a_different_scope_than_the_scan_record() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+
+        let manifest = manifest_for_a_different_scope();
+        // Fixture sanity: this manifest's own allow-set/loopback exception
+        // WOULD authorize the target -- the only thing that can refuse it
+        // is the scope-identity check.
+        assert!(manifest.allows("127.0.0.1".parse::<std::net::IpAddr>().unwrap()));
+
+        let port_spec = port.to_string();
+        let h = make_harness(
+            &["127.0.0.1"],
+            &[port_spec.as_str()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest,
+        );
+        // Fixture sanity: the scan record's own scope_id (from
+        // `ScanRequest.authorization_scope_id`, via `scope_id()`) really is
+        // different from the manifest's id above.
+        assert_ne!(
+            h.store.get(h.scan_id).unwrap().unwrap().scope_id,
+            "scope_01ARZ3NDEKTSV4RRFFQ69G5FBW".parse().unwrap()
+        );
+
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.policy_denied, "got {summary:?}");
+        assert_eq!(summary.units_completed, 0);
+        assert_eq!(summary.packets_spent, 0);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "Global Constraint: a real TCP accept occurred under a manifest belonging \
+             to a DIFFERENT authorization scope than the scan record names"
+        );
+
+        let events = h.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::PolicyDenied { reason_code, .. } if *reason_code == DenyReason::ScopeMismatch)),
+            "expected a policy.denied event with reason_code scope_mismatch, got {events:#?}"
+        );
+        assert_eq!(
+            h.store.get(h.scan_id).unwrap().unwrap().status,
+            TaskStatus::Denied
+        );
+    }
+
+    #[tokio::test]
+    async fn run_refuses_under_an_expired_manifest() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+
+        let manifest = expired_manifest_allowing_loopback();
+        // Fixture sanity: expired against this module's own clock seed
+        // (every harness's `FixedClock` is fixed to `2026-08-01T...`).
+        assert!(manifest.is_expired("2026-08-01T15:04:31.182Z"));
+        assert!(
+            manifest.allows("127.0.0.1".parse::<std::net::IpAddr>().unwrap()),
+            "fixture sanity: everything BUT expiry would authorize this target"
+        );
+
+        let port_spec = port.to_string();
+        let h = make_harness(
+            &["127.0.0.1"],
+            &[port_spec.as_str()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest,
+        );
+
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.policy_denied, "got {summary:?}");
+        assert_eq!(summary.units_completed, 0);
+        assert_eq!(summary.packets_spent, 0);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "Global Constraint: a real TCP accept occurred under an EXPIRED manifest"
+        );
+
+        let events = h.events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::PolicyDenied { reason_code, .. } if *reason_code == DenyReason::ScopeExpired)),
+            "expected a policy.denied event with reason_code scope_expired, got {events:#?}"
+        );
+        assert_eq!(
+            h.store.get(h.scan_id).unwrap().unwrap().status,
+            TaskStatus::Denied
+        );
+    }
+
+    // A scope-validity denial (scope mismatch or expiry) is a whole-scan,
+    // pre-dispatch refusal: unlike the per-unit `target_out_of_scope` path
+    // (which lets `scan.started` through before the loop discovers a bad
+    // unit), this must refuse before `scan.started` is ever emitted --
+    // there is no unit-by-unit discovery involved, the manifest is already
+    // known to be wrong before the plan is even touched.
+    #[tokio::test]
+    async fn a_scope_validity_denial_emits_no_scan_started() {
+        let manifest = expired_manifest_allowing_loopback();
+        let h = make_harness(
+            &["127.0.0.1"],
+            &["9"],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest,
+        );
+        h.run_to_completion().await.unwrap();
+        let events = h.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly the one policy.denied event, nothing else, got {events:#?}"
+        );
+        assert!(matches!(&events[0].body, EventBody::PolicyDenied { .. }));
+    }
+
+    // ------------------------------------------------------------------
     // M3 whole-branch review, CRITICAL-2: `flush_progress` must make the
     // log durable BEFORE the store durably marks units done -- never the
     // other way around (see that method's own doc comment for the full
-    // reasoning).
+    // reasoning). Two tests, deliberately, proving two different things --
+    // see the RE-review note on the second one for why the first is not
+    // enough by itself.
     // ------------------------------------------------------------------
 
     // An observer task, not an after-the-fact assertion: `flush_progress`
     // itself runs synchronously (no `.await` inside it), so within one call
     // there is no interleaving point a concurrent task could ever observe
-    // -- the ordering bug this test targets shows up only BETWEEN calls,
-    // while `run`'s own dispatch loop is `.await`ing the next rate-limiter
-    // permit or socket connect. A `GroupCommitConfig` with a huge
-    // `max_events`/`max_interval` removes every OTHER source of a real log
-    // sync during the run, so `sync_calls()` can only ever advance via the
-    // explicit `force_sync()` this fix adds to `flush_progress` --
-    // isolating exactly the mechanism under test, the same technique the
-    // reviewer used to prove the bug (`68 completed units, 0 real fsyncs`).
+    // -- what THIS test can catch shows up only BETWEEN calls, while `run`'s
+    // own dispatch loop is `.await`ing the next rate-limiter permit or
+    // socket connect. A `GroupCommitConfig` with a huge `max_events`/
+    // `max_interval` removes every OTHER source of a real log sync during
+    // the run, so `sync_calls()` can only ever advance via the explicit
+    // `force_sync()` this fix adds to `flush_progress` -- isolating exactly
+    // the mechanism under test, the same technique the reviewer used to
+    // prove the bug (`68 completed units, 0 real fsyncs`).
+    //
+    // M3 whole-branch RE-review: this test alone is NOT sufficient, and the
+    // re-review proved that concretely -- reverting `flush_progress` to its
+    // literal original bug shape (`mark_units_done` first, no `force_sync`
+    // call of its own at all) still leaves this test passing, because
+    // `flush_progress` has no `.await` inside it: there is no interleaving
+    // point within one call for a concurrent poller to ever observe, and a
+    // real crash between the two lines needs no `.await` point to reproduce
+    // either. What this test actually proves is that a real sync happens
+    // SOMEWHERE on this path at all, at roughly the right cadence -- a real
+    // property, worth keeping, just not the ordering one. See
+    // `a_failed_force_sync_leaves_the_store_resumption_cursor_untouched`
+    // below for the test that actually pins the order.
     #[tokio::test]
     async fn flush_progress_forces_a_log_sync_before_the_store_durably_marks_units_done() {
         const N: u64 = 512; // several STORE_FLUSH_BATCH (64) batches
@@ -2782,6 +3098,49 @@ mod tests {
             h.log.lock().unwrap().sync_calls() >= 1,
             "sanity: this run must have forced at least one real sync via force_sync \
              (max_events/max_interval were both configured to never trigger on their own)"
+        );
+    }
+
+    // M3 whole-branch RE-review, CRITICAL-2 item 2: the actual ordering
+    // pin. `GroupCommitLog::fail_next_sync_for_tests` (test-only, see its
+    // own doc comment for why a genuine fsync failure isn't available
+    // portably or safely in this workspace) makes the very next real sync
+    // attempt fail instead of touching the log at all. Arming it before
+    // `run` means `flush_progress`'s own `force_sync()?` call (the one
+    // this fix wave added) is what fails -- and if `force_sync` genuinely
+    // runs, and is genuinely checked, BEFORE `mark_units_done`, that `?`
+    // must short-circuit the whole function before `mark_units_done` is
+    // ever reached. `h.probed_indices()` (the store's own resumption
+    // cursor) being completely empty afterward is only explainable by that
+    // ordering; if `mark_units_done` ran first (or the two calls' order
+    // were ever flipped back), this unit would show up as done despite the
+    // sync that was supposed to certify it having failed.
+    #[tokio::test]
+    async fn a_failed_force_sync_leaves_the_store_resumption_cursor_untouched() {
+        let port = open_port().await;
+        let h = harness(&["127.0.0.1"], &[port]);
+        h.log.lock().unwrap().fail_next_sync_for_tests();
+
+        let err = h.run_to_completion().await.unwrap_err();
+        assert!(
+            matches!(err, EngineError::Log(_)),
+            "expected the synthetic sync failure to propagate as EngineError::Log, \
+             got {err:?}"
+        );
+
+        assert!(
+            h.probed_indices().is_empty(),
+            "force_sync failing must mean mark_units_done never ran at all -- the \
+             store's resumption cursor must be completely untouched, not partially \
+             advanced: {:?}",
+            h.probed_indices()
+        );
+        // The scan never reached its terminal-event section either: no
+        // status transition (IMPORTANT-1) ever ran, so the store's status
+        // is still exactly its construction-time default.
+        assert_eq!(
+            h.store.get(h.scan_id).unwrap().unwrap().status,
+            TaskStatus::Pending
         );
     }
 
