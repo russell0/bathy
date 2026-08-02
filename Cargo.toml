@@ -59,8 +59,13 @@ fs4 = { version = "1", default-features = false, features = ["sync"] }
 # measured. CI verifies both floors with two separate jobs
 # (`.github/workflows/ci.yml`): `msrv` at `1.88` over the crates that still
 # need only that (`bathy-types`, `bathy-scope`, `bathy-evidence`,
-# `bathy-plan`, `bathy-engine`, and `xtask`), and `msrv-bathy-store` at
-# `1.95` for this one.
+# `bathy-plan`, and `xtask`), and `msrv-bathy-store` at `1.95` for
+# `bathy-store` and `bathy-engine` (which depends on it -- see the MSRV
+# comment on `crates/bathy-engine/Cargo.toml`. M3 whole-branch review,
+# MINOR: this comment previously still listed `bathy-engine` in the `1.88`
+# tier after it had already moved to `1.95` in `ci.yml` and in its own
+# `Cargo.toml` -- stale documentation, not a stale gate; `ci.yml` itself was
+# always correct).
 rusqlite = { version = "0.40.1", features = ["bundled", "fallible_uint"] }
 # `bathy-engine`'s token-bucket rate limiter (`crates/bathy-engine/src/rate.rs`)
 # needs `time` (Instant/Duration/sleep) and, for its own test module,
