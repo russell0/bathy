@@ -40,6 +40,36 @@
 //! property, not an optimization -- `10.0.0.0/8` requested with a cap of
 //! 1024 must be refused without ever allocating room for the 16,777,214
 //! addresses it would otherwise expand to.
+//!
+//! ## The pre-count is conservative, not exact, across overlapping specs
+//!
+//! M3 whole-branch review, MINOR: the pre-count pass sums `count_of(spec)`
+//! independently for every spec in the request and never deduplicates
+//! across specs -- only the SECOND pass (the one that actually builds the
+//! `BTreeSet`) merges overlap. Two requests that name the same address
+//! twice, whether identically (`["10.0.0.0/24", "10.0.0.0/24"]`) or via
+//! partial overlap (`["10.0.0.0/24", "10.0.0.128/25"]`, the second entirely
+//! contained in the first), are counted as if every address in both specs
+//! were distinct: `254 + 254 = 508` for the first example, when the
+//! deduplicated result is 254 addresses. A request whose overlapping specs
+//! would fit under `max` once deduplicated can therefore still be refused
+//! with [`TargetError::TooManyTargets`] by the pre-count pass, which never
+//! gets far enough to discover the overlap.
+//!
+//! This is a deliberate trade-off, not an oversight: computing an exact,
+//! dedup-aware count ahead of the second pass would mean either doing the
+//! real set-union work twice (defeating the point of a cheap pre-count) or
+//! adding interval/set arithmetic across three different spec shapes
+//! (single address, `a-b` range, CIDR) for a case -- a caller deliberately
+//! submitting overlapping specs -- that is not the common one target
+//! expansion is optimized for. The failure direction is the safe one:
+//! refusing a request that would have fit is a caller-visible error asking
+//! for narrower specs, never a silent under-count that could let more
+//! addresses through than `max` permits (the actual safety property this
+//! pass exists for -- see above -- is preserved exactly; this trade-off
+//! only ever makes the check MORE conservative, never less). A caller that
+//! hits this should merge overlapping specs itself rather than rely on this
+//! function to notice the overlap for it.
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
