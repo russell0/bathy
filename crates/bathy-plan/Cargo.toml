@@ -12,6 +12,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bathy-types = { path = "../bathy-types" }
 ipnet = { workspace = true }
 thiserror = { workspace = true }
 

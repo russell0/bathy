@@ -13,3 +13,11 @@ serde_json = { workspace = true }
 # forbidden-substring rule still applies to it like any other workspace
 # member.
 bathy-types = { path = "../crates/bathy-types" }
+# `gen-ports`: the IANA registry CSV embeds commas, quotes, and (in a handful
+# of multi-paragraph Description fields) literal newlines inside quoted
+# fields -- verified against the real downloaded file, see the task report.
+# A naive `split(',')` breaks on exactly those rows. `csv` is only a
+# dependency of this dev tool, not of any crate on the scan path, so it needs
+# no entry in `LAYERS` and no exemption from `check-deps`'s forbidden-
+# substring rule (it isn't a model/inference client).
+csv = "1"

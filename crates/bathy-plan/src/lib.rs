@@ -1,8 +1,9 @@
 #![forbid(unsafe_code)]
 
 //! `bathy-plan`: turning a scan request into the concrete units a plan is
-//! made of. This first slice covers target expansion only -- see
-//! [`targets::expand_targets`].
+//! made of. So far that covers target expansion (see
+//! [`targets::expand_targets`]) and port selection (see
+//! [`ports::resolve_ports`]).
 //!
 //! Target expansion is a different question from scope authorization
 //! (`bathy_scope::ScopeManifest::allows`, in the crate one layer below this
@@ -13,6 +14,8 @@
 //! they diverge -- and nothing in this crate consults scope, or should be
 //! read as assuming scope agrees with it.
 
+pub mod ports;
 pub mod targets;
 
+pub use ports::{PortError, resolve_ports};
 pub use targets::{TargetError, expand_targets};
