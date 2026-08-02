@@ -11,6 +11,13 @@ CREATE TABLE IF NOT EXISTS scans (
     estimated_targets INTEGER NOT NULL,
     estimated_probes  INTEGER NOT NULL,
     packets_spent     INTEGER NOT NULL DEFAULT 0,
+    -- Wall-clock runtime, in whole seconds, spent across every run of this
+    -- scan so far. Read back on resume (M3 Task 7 fix round 1, CRITICAL-2)
+    -- to seed `BudgetLedger::resumed`'s runtime baseline -- without it, a
+    -- cancelled scan resumed by a fresh Scheduler/BudgetLedger gets a full
+    -- new runtime budget every time, the same hole `packets_spent` closes
+    -- for the packet ceiling.
+    elapsed_seconds   INTEGER NOT NULL DEFAULT 0,
     last_sequence     INTEGER NOT NULL DEFAULT 0,
     created_at        TEXT NOT NULL,
     updated_at        TEXT NOT NULL

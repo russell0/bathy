@@ -49,3 +49,14 @@ bathy-plan = { path = "../bathy-plan" }
 # at all.
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
+# M3 Task 7 fix round 1, IMPORTANT-4: `connect.rs`'s
+# `classifies_a_genuine_os_produced_addrnotavailable_error` test needs to
+# bind a socket's LOCAL address to a specific (unowned) address to trigger a
+# genuine, OS-produced `EADDRNOTAVAIL` -- `std`/`tokio`'s own `TcpStream`
+# types expose no way to choose an outbound socket's local address before
+# connecting. Already resolved in this workspace's dependency tree
+# (`libsqlite3-sys` -> `mio` -> `socket2` -- see `cargo tree -p bathy-engine`
+# in this task's report), so this adds no new supply-chain surface, only a
+# direct `[dev-dependencies]` edge onto a crate already present at this
+# exact version.
+socket2 = "0.6"

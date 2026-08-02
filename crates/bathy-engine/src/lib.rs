@@ -44,7 +44,7 @@ pub mod rate;
 pub mod scheduler;
 
 pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
-pub use discovery::{DiscoveryConfig, DiscoveryResult, discover_host};
+pub use discovery::{DiscoveryConfig, DiscoveryConfigError, DiscoveryResult, discover_host};
 pub use durable_log::{GroupCommitConfig, GroupCommitLog};
 pub use rate::RateLimiter;
 pub use scheduler::{EngineError, RunSummary, Scheduler, SchedulerConfig};

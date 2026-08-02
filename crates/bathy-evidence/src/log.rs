@@ -113,6 +113,19 @@ pub struct EventLog {
     /// C1: whether `append` pays for an `fsync` after every write. See
     /// [`Self::open`] vs [`Self::open_without_durability_barrier`].
     durable: bool,
+    /// Count of real `sync_data()` syscalls this handle has issued, across
+    /// both `append`'s own per-record barrier (when `durable`) and any
+    /// explicit [`Self::sync`] call. M3 Task 7 fix round 1, IMPORTANT-1: a
+    /// caller batching barriers on top of this type
+    /// (`bathy_engine::durable_log::GroupCommitLog`) needs a way to prove,
+    /// in a test, that real syscalls were actually batched -- its own
+    /// internal "how many events are pending" counter cannot: if that
+    /// caller were accidentally handed a `durable` `EventLog` (this crate's
+    /// own per-event barrier still firing on every `append`, independent of
+    /// whatever batching decision the wrapper makes on top), the wrapper's
+    /// internal counter would look identical either way. This field is the
+    /// ground truth a test can check instead.
+    sync_calls: std::sync::atomic::AtomicU64,
 }
 
 impl EventLog {
@@ -200,6 +213,7 @@ impl EventLog {
             offsets,
             end_offset,
             durable,
+            sync_calls: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -371,10 +385,7 @@ impl EventLog {
             // already has to account for; unlike `EvidenceStore::put`'s
             // fresh temp file, there is no separately-durable metadata
             // change like a rename to also cover here).
-            self.file.sync_data().map_err(|source| LogError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
+            self.raw_sync()?;
         }
         self.offsets.push(self.end_offset);
         self.end_offset += line.len() as u64;
@@ -402,10 +413,25 @@ impl EventLog {
     /// `durable` log too (every `append` there has already synced), just
     /// redundant.
     pub fn sync(&self) -> Result<(), LogError> {
+        self.raw_sync()
+    }
+
+    /// The one place that actually issues `sync_data()`, shared by
+    /// `append`'s own conditional barrier and the public [`Self::sync`], so
+    /// [`Self::sync_calls`] counts every real syscall regardless of which
+    /// caller triggered it.
+    fn raw_sync(&self) -> Result<(), LogError> {
+        self.sync_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.file.sync_data().map_err(|source| LogError::Io {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// See [`Self`]'s own doc comment on the `sync_calls` field.
+    pub fn sync_calls(&self) -> u64 {
+        self.sync_calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Returns every event with `sequence > after_sequence`, in order.
@@ -993,6 +1019,39 @@ mod tests {
         let (_d, log) = log();
         log.sync().unwrap();
         assert_eq!(log.last_sequence(), 0);
+    }
+
+    // --- `sync_calls`: the real-syscall ground truth (M3 Task 7 fix round
+    // 1, IMPORTANT-1) that a batching wrapper's own internal bookkeeping
+    // cannot substitute for. ---
+
+    #[test]
+    fn a_non_durable_log_issues_no_sync_calls_until_sync_is_called_explicitly() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let mut log = EventLog::open_without_durability_barrier(dir.path(), id).unwrap();
+        assert_eq!(log.sync_calls(), 0);
+        log.append(progress(1), &clock(), "0.1.0").unwrap();
+        log.append(progress(2), &clock(), "0.1.0").unwrap();
+        assert_eq!(
+            log.sync_calls(),
+            0,
+            "append on a non-durable log must not issue a real sync_data() call"
+        );
+        log.sync().unwrap();
+        assert_eq!(log.sync_calls(), 1);
+        log.sync().unwrap();
+        assert_eq!(log.sync_calls(), 2);
+    }
+
+    #[test]
+    fn a_durable_log_issues_exactly_one_sync_call_per_append() {
+        let (_d, mut log) = log();
+        assert_eq!(log.sync_calls(), 0);
+        for expected in 1..=5u64 {
+            log.append(progress(expected), &clock(), "0.1.0").unwrap();
+            assert_eq!(log.sync_calls(), expected);
+        }
     }
 
     #[test]

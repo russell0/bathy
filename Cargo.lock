@@ -29,6 +29,7 @@ dependencies = [
  "bathy-scope",
  "bathy-store",
  "bathy-types",
+ "socket2",
  "tempfile",
  "thiserror",
  "tokio",

@@ -157,6 +157,25 @@ pub async fn probe_connect(target: IpAddr, port: u16, budget: Duration) -> Conne
 /// `AddrNotAvailable`/`PermissionDenied`; a `probe_connect` timeout
 /// (`Err(_elapsed)`, no `io::Error` at all) and every other `Filtered`-mapped
 /// `ErrorKind` report `false`.
+/// Whether `e`'s kind indicates a LOCAL resource or policy problem
+/// (`AddrNotAvailable` -- ephemeral-port exhaustion on this machine;
+/// `PermissionDenied` -- a local firewall/sandbox policy) rather than
+/// target/path silence. Factored out of [`probe_connect_with_local_signal`]
+/// (which is the only production caller) specifically so a test can drive
+/// this exact classification directly -- with synthetic `io::Error`s AND, in
+/// `connect::tests::classifies_a_genuine_os_produced_addrnotavailable_error`,
+/// a REAL one the OS actually produced -- rather than the test re-deriving
+/// its own copy of the same `matches!` and asserting against itself (M3
+/// Task 7 fix round 1, IMPORTANT-4: an earlier version of this module did
+/// exactly that, and deleting `probe_connect_with_local_signal` entirely
+/// left the test passing).
+pub fn is_local_failure(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::PermissionDenied
+    )
+}
+
 pub async fn probe_connect_with_local_signal(
     target: IpAddr,
     port: u16,
@@ -168,13 +187,7 @@ pub async fn probe_connect_with_local_signal(
             drop(stream);
             (ConnectOutcome::Open, false)
         }
-        Ok(Err(e)) => {
-            let is_local = matches!(
-                e.kind(),
-                std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::PermissionDenied
-            );
-            (classify_io_error(&e), is_local)
-        }
+        Ok(Err(e)) => (classify_io_error(&e), is_local_failure(&e)),
         Err(_elapsed) => (ConnectOutcome::Filtered, false),
     }
 }
@@ -434,15 +447,21 @@ mod tests {
         );
     }
 
+    // M3 Task 7 fix round 1, IMPORTANT-4: an earlier version of this test
+    // re-derived the SAME `matches!` inline instead of calling
+    // `is_local_failure` -- it never invoked one line of production code,
+    // and deleting `probe_connect_with_local_signal` entirely still left it
+    // passing. This version calls the real function; both halves are
+    // exercised (the two kinds that must classify local, and a spread of
+    // kinds -- including every one `classify_io_error`'s own test already
+    // names -- that must not).
     #[test]
     fn local_signal_is_true_only_for_addr_not_available_and_permission_denied() {
         for kind in [ErrorKind::AddrNotAvailable, ErrorKind::PermissionDenied] {
-            let e = Error::from(kind);
-            let is_local = matches!(
-                e.kind(),
-                ErrorKind::AddrNotAvailable | ErrorKind::PermissionDenied
+            assert!(
+                is_local_failure(&Error::from(kind)),
+                "{kind:?} should be classified as local"
             );
-            assert!(is_local, "{kind:?} should be classified as local");
         }
         for kind in [
             ErrorKind::ConnectionRefused,
@@ -452,13 +471,46 @@ mod tests {
             ErrorKind::NetworkUnreachable,
             ErrorKind::BrokenPipe,
         ] {
-            let e = Error::from(kind);
-            let is_local = matches!(
-                e.kind(),
-                ErrorKind::AddrNotAvailable | ErrorKind::PermissionDenied
+            assert!(
+                !is_local_failure(&Error::from(kind)),
+                "{kind:?} should NOT be classified as local"
             );
-            assert!(!is_local, "{kind:?} should NOT be classified as local");
         }
+    }
+
+    // The stronger half IMPORTANT-4 also asks for: a REAL OS-produced
+    // `io::Error`, not a synthetic `Error::from(kind)` this test authored
+    // itself. Binding the outbound socket's LOCAL address to
+    // `10.255.255.254` -- an address essentially never assigned to a real
+    // interface on any host this test runs on -- makes the kernel itself
+    // refuse with `EADDRNOTAVAIL` ("Can't assign requested address") before
+    // any packet is even attempted, deterministically and without touching
+    // the network or needing root: confirmed empirically (see this task's
+    // fix-round-1 report) against this exact environment before writing
+    // this assertion, not assumed from the `ErrorKind` name alone.
+    #[test]
+    fn classifies_a_genuine_os_produced_addrnotavailable_error() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .unwrap();
+        let bogus_local: std::net::SocketAddr = "10.255.255.254:0".parse().unwrap();
+        let err = socket
+            .bind(&bogus_local.into())
+            .expect_err("binding to an address this host does not own must fail");
+        assert_eq!(
+            err.kind(),
+            ErrorKind::AddrNotAvailable,
+            "setup: expected a real EADDRNOTAVAIL, got {err:?} -- if this fails, the \
+             triggering technique itself needs revisiting for this environment, not \
+             is_local_failure"
+        );
+        assert!(
+            is_local_failure(&err),
+            "a genuine OS-produced AddrNotAvailable must classify as local"
+        );
     }
 
     // --- Beyond the brief: many probes in sequence must not leak fds ---

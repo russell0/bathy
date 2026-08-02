@@ -33,12 +33,63 @@ use tokio::time::Duration;
 use crate::connect::{ConnectOutcome, probe_connect};
 use crate::rate::RateLimiter;
 
+/// [`DiscoveryConfig::new`]'s single failure mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum DiscoveryConfigError {
+    /// A carried requirement from M3 Tasks 5/6, closed in Task 7 fix round
+    /// 1 (IMPORTANT, "Also"): an empty `probe_ports` list must be a hard
+    /// error at construction, not a legal "probe nothing" configuration --
+    /// see [`DiscoveryConfig`]'s own doc comment for why.
+    #[error(
+        "DiscoveryConfig::probe_ports must not be empty -- a config with \
+         nothing to probe reports every host down without a single \
+         measurement ever having been taken, which is a config mistake \
+         silently reporting an entire subnet as down, not a legitimate \
+         result"
+    )]
+    EmptyProbePorts,
+}
+
 /// Configuration for one [`discover_host`] call.
+///
+/// `probe_ports` and `timeout` are private; [`Self::new`] is the only
+/// fallible constructor, and [`Default::default`] the sanctioned
+/// (non-empty) default -- there is no way to construct a `DiscoveryConfig`
+/// with an empty `probe_ports`. An earlier version of this type had public
+/// fields and no constructor at all, so `DiscoveryConfig { probe_ports:
+/// vec![], .. }` compiled and ran, silently reporting every target "down"
+/// with zero packets spent -- indistinguishable, from the caller's side,
+/// from a genuinely exhaustive probe that found nothing. That is a config
+/// MISTAKE (an empty port list was never meant, or a filter upstream
+/// emptied it by accident), not a deliberate "probe nothing and report
+/// down" request, and letting it construct at all buries the mistake
+/// instead of surfacing it. See [`DiscoveryConfigError::EmptyProbePorts`].
+#[derive(Debug)]
 pub struct DiscoveryConfig {
     /// Tried in order. Defaults to 443, 80, 22 -- chosen because a host that
     /// answers on none of these and is silent is usually genuinely absent.
-    pub probe_ports: Vec<u16>,
-    pub timeout: Duration,
+    probe_ports: Vec<u16>,
+    timeout: Duration,
+}
+
+impl DiscoveryConfig {
+    pub fn new(probe_ports: Vec<u16>, timeout: Duration) -> Result<Self, DiscoveryConfigError> {
+        if probe_ports.is_empty() {
+            return Err(DiscoveryConfigError::EmptyProbePorts);
+        }
+        Ok(Self {
+            probe_ports,
+            timeout,
+        })
+    }
+
+    pub fn probe_ports(&self) -> &[u16] {
+        &self.probe_ports
+    }
+
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
 }
 
 impl Default for DiscoveryConfig {
@@ -79,22 +130,22 @@ pub struct DiscoveryResult {
 /// `crate::rate`'s module doc) is on that emission path unconditionally,
 /// never bypassed for the sake of a "cheap" single-probe case.
 ///
-/// An empty `config.probe_ports` is a deliberate, not a degenerate, case:
-/// there is nothing to probe, so nothing is learned, and the result is
-/// `up: false`, `method: "no-response"`, `packets_spent: 0` -- the same
-/// "every configured port exhausted without a conclusive answer" outcome
-/// as a non-empty list that never got a conclusive answer, just reached
-/// with zero probes because there were zero to attempt.
+/// `config.probe_ports` is never empty by the time it reaches here --
+/// [`DiscoveryConfig::new`] refuses to construct one that is (M3 Task 7 fix
+/// round 1, carried from Tasks 5/6: an earlier version of this function's
+/// own doc comment framed an empty list as "deliberate, not degenerate" and
+/// let it construct and run, silently reporting every target down with zero
+/// measurements taken).
 pub async fn discover_host(
     target: IpAddr,
     config: &DiscoveryConfig,
     limiter: &RateLimiter,
 ) -> DiscoveryResult {
     let mut spent = 0u64;
-    for port in &config.probe_ports {
+    for port in config.probe_ports() {
         limiter.acquire(1).await;
         spent += 1;
-        match probe_connect(target, *port, config.timeout).await {
+        match probe_connect(target, *port, config.timeout()).await {
             ConnectOutcome::Open => {
                 return DiscoveryResult {
                     up: true,
@@ -146,10 +197,7 @@ mod tests {
     async fn a_listening_host_is_discovered_via_the_open_port() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let cfg = DiscoveryConfig {
-            probe_ports: vec![port],
-            timeout: Duration::from_secs(2),
-        };
+        let cfg = DiscoveryConfig::new(vec![port], Duration::from_secs(2)).unwrap();
         let r = discover_host("127.0.0.1".parse().unwrap(), &cfg, &limiter()).await;
         assert!(r.up);
         assert_eq!(r.method, "tcp-connect-open");
@@ -160,10 +208,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let cfg = DiscoveryConfig {
-            probe_ports: vec![port],
-            timeout: Duration::from_secs(2),
-        };
+        let cfg = DiscoveryConfig::new(vec![port], Duration::from_secs(2)).unwrap();
         let r = discover_host("127.0.0.1".parse().unwrap(), &cfg, &limiter()).await;
         assert!(r.up, "a refusal is positive evidence of a live host");
         assert_eq!(r.method, "tcp-connect-refused");
@@ -173,10 +218,7 @@ mod tests {
     async fn discovery_stops_at_the_first_conclusive_probe() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let open = listener.local_addr().unwrap().port();
-        let cfg = DiscoveryConfig {
-            probe_ports: vec![open, 9, 9, 9],
-            timeout: Duration::from_secs(2),
-        };
+        let cfg = DiscoveryConfig::new(vec![open, 9, 9, 9], Duration::from_secs(2)).unwrap();
         let r = discover_host("127.0.0.1".parse().unwrap(), &cfg, &limiter()).await;
         assert_eq!(
             r.packets_spent, 1,
@@ -186,10 +228,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unroutable_host_is_reported_down_after_exhausting_probes() {
-        let cfg = DiscoveryConfig {
-            probe_ports: vec![80, 443],
-            timeout: Duration::from_millis(200),
-        };
+        let cfg = DiscoveryConfig::new(vec![80, 443], Duration::from_millis(200)).unwrap();
         let r = discover_host("192.0.2.1".parse().unwrap(), &cfg, &limiter()).await;
         assert!(!r.up);
         assert_eq!(r.packets_spent, 2);
@@ -229,13 +268,10 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let _held = fill_accept_queue(addr).await;
 
-        let cfg = DiscoveryConfig {
-            // Same overloaded port three times: every attempt against it
-            // is silently dropped, so this also proves discovery doesn't
-            // give up early on a run of `Filtered` results.
-            probe_ports: vec![addr.port(); 3],
-            timeout: Duration::from_millis(100),
-        };
+        // Same overloaded port three times: every attempt against it is
+        // silently dropped, so this also proves discovery doesn't give up
+        // early on a run of `Filtered` results.
+        let cfg = DiscoveryConfig::new(vec![addr.port(); 3], Duration::from_millis(100)).unwrap();
         let r = discover_host(addr.ip(), &cfg, &limiter()).await;
         assert!(
             !r.up,
@@ -245,23 +281,32 @@ mod tests {
         assert_eq!(r.method, "no-response");
     }
 
-    // --- Beyond the brief: empty probe_ports is a deliberate case ---
+    // --- M3 Task 7 fix round 1 (carried from Tasks 5/6): empty probe_ports
+    // is a HARD ERROR at construction, not a legal "probe nothing" config.
     //
-    // Nothing configured to probe means nothing was learned, which is the
-    // same conclusion as a non-empty list that never got a conclusive
-    // answer -- just reached with zero probes instead of the configured
-    // list being exhausted. This pins that decision down rather than
-    // leaving it as an accident of the loop never executing.
-    #[tokio::test]
-    async fn empty_probe_ports_reports_down_with_zero_packets_spent() {
-        let cfg = DiscoveryConfig {
-            probe_ports: vec![],
-            timeout: Duration::from_secs(2),
-        };
-        let r = discover_host("127.0.0.1".parse().unwrap(), &cfg, &limiter()).await;
-        assert!(!r.up);
-        assert_eq!(r.packets_spent, 0);
-        assert_eq!(r.method, "no-response");
+    // An earlier version of this module treated an empty `probe_ports` as
+    // "deliberate, not degenerate" and let it construct and run, reporting
+    // `up: false`/`packets_spent: 0` -- the SAME shape a genuinely
+    // exhaustive, inconclusive probe produces, with no way for a caller to
+    // tell "this subnet is empty" from "this config was a mistake and
+    // nothing was ever actually probed". `DiscoveryConfig::new` now refuses
+    // to construct at all, per the carried requirement's own headline
+    // ("hard error at construction").
+
+    #[test]
+    fn discovery_config_new_rejects_an_empty_probe_ports_list() {
+        let err = DiscoveryConfig::new(vec![], Duration::from_secs(2)).unwrap_err();
+        assert_eq!(err, DiscoveryConfigError::EmptyProbePorts);
+    }
+
+    #[test]
+    fn discovery_config_new_accepts_a_non_empty_probe_ports_list() {
+        assert!(DiscoveryConfig::new(vec![80], Duration::from_secs(2)).is_ok());
+    }
+
+    #[test]
+    fn discovery_config_default_is_non_empty() {
+        assert!(!DiscoveryConfig::default().probe_ports().is_empty());
     }
 
     // --- Beyond the brief: the rate limiter is not optional ---
@@ -287,10 +332,7 @@ mod tests {
 
         tokio::time::pause();
         let l = RateLimiter::new(1);
-        let cfg = DiscoveryConfig {
-            probe_ports: vec![addr.port(); 3],
-            timeout: Duration::from_millis(100),
-        };
+        let cfg = DiscoveryConfig::new(vec![addr.port(); 3], Duration::from_millis(100)).unwrap();
         let t = tokio::time::Instant::now();
         let r = discover_host(addr.ip(), &cfg, &l).await;
         let elapsed = t.elapsed();

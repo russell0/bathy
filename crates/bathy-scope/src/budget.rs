@@ -11,10 +11,32 @@ pub struct BudgetExhausted {
 /// Hard accounting. `try_spend_packets` is checked *before* emission, and a
 /// refused spend leaves the ledger untouched so a caller that retries with a
 /// smaller amount still gets a correct answer.
+///
+/// # Resumption (M3 Task 7 fix round 1, CRITICAL-2)
+///
+/// A ledger built with [`Self::new`] always starts at zero. That is correct
+/// for a genuinely fresh scan, but wrong for a *resumed* one: a caller that
+/// builds a brand new `BudgetLedger::new` for a scan that already spent
+/// packets (or wall-clock runtime) in a previous, cancelled run hands that
+/// resumed run a full, unspent budget all over again. Under a cancel/resume
+/// retry loop this defeats the ceiling entirely -- the mechanism budgets
+/// exist for. [`Self::resumed`] is the fix: it seeds both counters from
+/// whatever a caller has persisted about prior runs of the same scan (see
+/// `bathy_store::tasks::TaskStore::record_progress` and
+/// `bathy_engine::scheduler`, which is the actual caller in this workspace).
 #[derive(Debug, Clone)]
 pub struct BudgetLedger {
     budgets: Budgets,
     packets_spent: u64,
+    /// Wall-clock runtime, in seconds, already elapsed across previous runs
+    /// of this scan -- zero for a ledger built with [`Self::new`]. Not
+    /// tracked automatically the way `packets_spent` is (there is no
+    /// `try_spend_seconds`): [`Self::elapsed_exceeded`] takes each call's
+    /// own elapsed time as an argument and adds this baseline to it, so a
+    /// caller (`Scheduler::run`) that restarts its own `Instant` on every
+    /// invocation still gets a ceiling that accounts for time spent in
+    /// earlier runs.
+    seconds_already_elapsed: u64,
 }
 
 impl BudgetLedger {
@@ -22,8 +44,38 @@ impl BudgetLedger {
         Self {
             budgets,
             packets_spent: 0,
+            seconds_already_elapsed: 0,
         }
     }
+
+    /// Seeds a ledger for a scan resuming after a previous run: as if
+    /// `packets_already_spent` packets had already been spent and
+    /// `seconds_already_elapsed` seconds of wall-clock runtime had already
+    /// passed, before this ledger's own lifetime even began.
+    ///
+    /// `packets_already_spent` is clamped to `budgets.maximum_packets`
+    /// (`.min`, not stored verbatim): if it somehow arrives at or past the
+    /// ceiling (the ceiling was lowered between runs, or a caller passes a
+    /// stale/corrupt value), the correct resulting state is "no packets
+    /// remaining," not an inconsistent one a subsequent `saturating_add` in
+    /// `try_spend_packets` would silently paper over anyway. There is no
+    /// equivalent clamp for `seconds_already_elapsed` against
+    /// `maximum_runtime_seconds`: unlike packets, exceeding the runtime
+    /// ceiling is meant to trip [`Self::elapsed_exceeded`] on the very next
+    /// check (see `elapsed_seconds_already_exceeding_the_ceiling_trips_immediately`),
+    /// not be silently capped down to "exactly at the ceiling, not over."
+    pub fn resumed(
+        budgets: Budgets,
+        packets_already_spent: u64,
+        seconds_already_elapsed: u64,
+    ) -> Self {
+        Self {
+            budgets,
+            packets_spent: packets_already_spent.min(budgets.maximum_packets),
+            seconds_already_elapsed,
+        }
+    }
+
     pub fn packets_spent(&self) -> u64 {
         self.packets_spent
     }
@@ -44,8 +96,22 @@ impl BudgetLedger {
         self.packets_spent = after;
         Ok(())
     }
+    /// `elapsed_seconds` is THIS run's own elapsed time (what a caller's own
+    /// `Instant::now().elapsed()` reports); the ledger adds whatever
+    /// baseline [`Self::resumed`] seeded it with before comparing against
+    /// the ceiling, so a resumed scan's runtime budget also survives a
+    /// cancel/resume cycle rather than restarting every call.
     pub fn elapsed_exceeded(&self, elapsed_seconds: u64) -> bool {
-        elapsed_seconds > self.budgets.maximum_runtime_seconds
+        self.seconds_already_elapsed.saturating_add(elapsed_seconds)
+            > self.budgets.maximum_runtime_seconds
+    }
+    /// The runtime baseline this ledger was seeded with (zero for
+    /// [`Self::new`]). Exposed so a caller persisting a resumption cursor
+    /// (`Scheduler::run`) can compute the NEXT baseline as
+    /// `seconds_already_elapsed() + this_run_elapsed`, without needing to
+    /// separately track what it originally seeded this ledger with.
+    pub fn seconds_already_elapsed(&self) -> u64 {
+        self.seconds_already_elapsed
     }
     pub fn packets_per_second(&self) -> u32 {
         self.budgets.maximum_packets_per_second
@@ -214,5 +280,79 @@ mod tests {
     fn packets_per_second_reports_the_configured_ceiling() {
         let l = BudgetLedger::new(budgets(100, 60, 42));
         assert_eq!(l.packets_per_second(), 42);
+    }
+
+    // --- M3 Task 7 fix round 1, CRITICAL-2: BudgetLedger::resumed ---
+
+    #[test]
+    fn a_fresh_ledger_has_zero_baseline_of_either_kind() {
+        let l = BudgetLedger::new(budgets(100, 60, 10));
+        assert_eq!(l.packets_spent(), 0);
+        assert_eq!(l.seconds_already_elapsed(), 0);
+        assert!(!l.elapsed_exceeded(60));
+        assert!(l.elapsed_exceeded(61));
+    }
+
+    #[test]
+    fn resumed_seeds_packets_spent_from_a_prior_run() {
+        let mut l = BudgetLedger::resumed(budgets(100, 60, 10), 60, 0);
+        assert_eq!(l.packets_spent(), 60);
+        assert_eq!(l.packets_remaining(), 40);
+        assert!(l.try_spend_packets(40).is_ok());
+        assert!(
+            l.try_spend_packets(1).is_err(),
+            "the ceiling must be measured against the SEEDED total, not reset to zero"
+        );
+    }
+
+    #[test]
+    fn resumed_packets_already_spent_at_or_past_the_ceiling_is_clamped_not_stored_verbatim() {
+        // The ceiling was lowered between runs, or a caller passes a stale
+        // value at/above it -- either way, the correct resulting state is
+        // "no packets remaining", not packets_spent > maximum_packets.
+        let l = BudgetLedger::resumed(budgets(100, 60, 10), 500, 0);
+        assert_eq!(l.packets_spent(), 100);
+        assert_eq!(l.packets_remaining(), 0);
+    }
+
+    #[test]
+    fn resumed_ledger_accumulates_elapsed_seconds_across_runs() {
+        // 8 seconds already elapsed from a previous run, a 10-second
+        // ceiling: 1 more second of THIS run's own elapsed time must not
+        // trip it (8+1=9), but 3 more must (8+3=11).
+        let l = BudgetLedger::resumed(budgets(100, 10, 10), 0, 8);
+        assert_eq!(l.seconds_already_elapsed(), 8);
+        assert!(!l.elapsed_exceeded(1));
+        assert!(l.elapsed_exceeded(3));
+    }
+
+    #[test]
+    fn elapsed_seconds_already_exceeding_the_ceiling_trips_immediately() {
+        // Unlike packets_spent, seconds_already_elapsed is NOT clamped to
+        // the ceiling -- a resumed scan whose prior runs already used up
+        // the whole runtime budget must report exhausted on the very first
+        // check of the new run, with zero of ITS OWN elapsed time yet.
+        let l = BudgetLedger::resumed(budgets(100, 5, 10), 0, 9);
+        assert!(l.elapsed_exceeded(0));
+    }
+
+    #[test]
+    fn resumed_with_zero_baselines_behaves_exactly_like_new() {
+        let a = BudgetLedger::new(budgets(100, 60, 10));
+        let b = BudgetLedger::resumed(budgets(100, 60, 10), 0, 0);
+        assert_eq!(a.packets_spent(), b.packets_spent());
+        assert_eq!(a.packets_remaining(), b.packets_remaining());
+        assert_eq!(a.seconds_already_elapsed(), b.seconds_already_elapsed());
+        for e in [0, 59, 60, 61, 1_000] {
+            assert_eq!(a.elapsed_exceeded(e), b.elapsed_exceeded(e), "elapsed={e}");
+        }
+    }
+
+    #[test]
+    fn resumed_elapsed_accumulation_does_not_overflow() {
+        let l = BudgetLedger::resumed(budgets(100, 100, 10), 0, u64::MAX - 5);
+        // saturating_add, not a panicking/wrapping `+`: still exceeded, not
+        // a panic in debug or a wrapped-around false negative in release.
+        assert!(l.elapsed_exceeded(10));
     }
 }

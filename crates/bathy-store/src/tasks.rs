@@ -163,6 +163,9 @@ pub struct TaskRecord {
     pub estimated_targets: u64,
     pub estimated_probes: u64,
     pub packets_spent: u64,
+    /// Wall-clock runtime, in whole seconds, spent across every run of this
+    /// scan so far -- see `record_progress`'s own doc comment.
+    pub elapsed_seconds: u64,
     pub last_sequence: u64,
     pub created_at: String,
     pub updated_at: String,
@@ -329,8 +332,8 @@ impl TaskStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         conn.query_row(
             "SELECT scan_id, plan_hash, idempotency_key, scope_id, status, request_json,
-                    estimated_targets, estimated_probes, packets_spent, last_sequence,
-                    created_at, updated_at
+                    estimated_targets, estimated_probes, packets_spent, elapsed_seconds,
+                    last_sequence, created_at, updated_at
              FROM scans WHERE scan_id = ?1",
             params![scan_id.to_string()],
             row_to_record,
@@ -362,25 +365,40 @@ impl TaskStore {
     /// indistinguishable from "a fresh scan legitimately hasn't progressed
     /// yet").
     ///
-    /// Both values are taken as absolute counters set by the caller (whoever
+    /// `elapsed_seconds` (M3 Task 7 fix round 1, CRITICAL-2) joined this
+    /// method's signature for the same reason: without it, nothing persists
+    /// how much wall-clock runtime a scan has already used across its
+    /// previous runs, so a resumed scan's `maximum_runtime_seconds` ceiling
+    /// could be defeated by a cancel/resume loop exactly the way
+    /// `packets_spent` could before this method existed at all. Read back
+    /// via [`Self::get`] and fed into `bathy_scope::budget::BudgetLedger::resumed`.
+    ///
+    /// Every value is taken as an absolute counter set by the caller (whoever
     /// is driving the scan and reading `EventLog::last_sequence`/tracking
-    /// packet spend), not incremented here -- this method has no way to
-    /// know whether a given call represents new progress or a resume
-    /// re-recording state already on disk, so it always writes exactly what
-    /// it is given, the same way `set_status` always writes exactly the
-    /// status it is given.
+    /// packet spend/elapsed runtime), not incremented here -- this method has
+    /// no way to know whether a given call represents new progress or a
+    /// resume re-recording state already on disk, so it always writes
+    /// exactly what it is given, the same way `set_status` always writes
+    /// exactly the status it is given.
     pub fn record_progress(
         &self,
         scan_id: ScanId,
         last_sequence: u64,
         packets_spent: u64,
+        elapsed_seconds: u64,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let now = self.clock.now_rfc3339();
         let changed = conn.execute(
-            "UPDATE scans SET last_sequence = ?1, packets_spent = ?2, updated_at = ?3 \
-             WHERE scan_id = ?4",
-            params![last_sequence, packets_spent, now, scan_id.to_string()],
+            "UPDATE scans SET last_sequence = ?1, packets_spent = ?2, elapsed_seconds = ?3, \
+             updated_at = ?4 WHERE scan_id = ?5",
+            params![
+                last_sequence,
+                packets_spent,
+                elapsed_seconds,
+                now,
+                scan_id.to_string()
+            ],
         )?;
         if changed == 0 {
             return Err(StoreError::NotFound(scan_id));
@@ -392,7 +410,8 @@ impl TaskStore {
         let conn = self.conn.lock().expect("store mutex poisoned");
         const BASE: &str = "SELECT scan_id, plan_hash, idempotency_key, scope_id, status,
                                     request_json, estimated_targets, estimated_probes,
-                                    packets_spent, last_sequence, created_at, updated_at
+                                    packets_spent, elapsed_seconds, last_sequence,
+                                    created_at, updated_at
                              FROM scans";
         match filter.status {
             Some(status) => {
@@ -481,9 +500,10 @@ fn row_to_record(r: &Row<'_>) -> rusqlite::Result<TaskRecord> {
         estimated_targets: r.get(6)?,
         estimated_probes: r.get(7)?,
         packets_spent: r.get(8)?,
-        last_sequence: r.get(9)?,
-        created_at: r.get(10)?,
-        updated_at: r.get(11)?,
+        elapsed_seconds: r.get(9)?,
+        last_sequence: r.get(10)?,
+        created_at: r.get(11)?,
+        updated_at: r.get(12)?,
     })
 }
 
@@ -1080,6 +1100,7 @@ mod tests {
         let record = store.get(id).unwrap().unwrap();
         assert_eq!(record.last_sequence, 0);
         assert_eq!(record.packets_spent, 0);
+        assert_eq!(record.elapsed_seconds, 0);
     }
 
     #[test]
@@ -1089,10 +1110,11 @@ mod tests {
             .start_or_reuse(&req("key-a", hash_a()))
             .unwrap()
             .scan_id();
-        store.record_progress(id, 42, 1_000).unwrap();
+        store.record_progress(id, 42, 1_000, 17).unwrap();
         let record = store.get(id).unwrap().unwrap();
         assert_eq!(record.last_sequence, 42);
         assert_eq!(record.packets_spent, 1_000);
+        assert_eq!(record.elapsed_seconds, 17);
     }
 
     #[test]
@@ -1109,7 +1131,7 @@ mod tests {
                 .start_or_reuse(&req("key-a", hash_a()))
                 .unwrap()
                 .scan_id();
-            store.record_progress(id, 17, 250).unwrap();
+            store.record_progress(id, 17, 250, 9).unwrap();
         }
         let store = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
         let record = store.get(id).unwrap().unwrap();
@@ -1120,6 +1142,10 @@ mod tests {
         assert_eq!(
             record.packets_spent, 250,
             "packets_spent must survive a real close and reopen"
+        );
+        assert_eq!(
+            record.elapsed_seconds, 9,
+            "elapsed_seconds must survive a real close and reopen"
         );
     }
 
@@ -1133,17 +1159,23 @@ mod tests {
             .start_or_reuse(&req("key-a", hash_a()))
             .unwrap()
             .scan_id();
-        store.record_progress(id, 5, 50).unwrap();
-        store.record_progress(id, 9, 90).unwrap();
+        store.record_progress(id, 5, 50, 2).unwrap();
+        store.record_progress(id, 9, 90, 6).unwrap();
         let record = store.get(id).unwrap().unwrap();
         assert_eq!(record.last_sequence, 9);
         assert_eq!(record.packets_spent, 90);
+        assert_eq!(
+            record.elapsed_seconds, 6,
+            "elapsed_seconds is also an absolute write, not accumulated here"
+        );
     }
 
     #[test]
     fn record_progress_resume_path_reads_back_exactly_what_was_written() {
         // The concrete scenario C4 names: a resumed scan reads
-        // `last_sequence` back to know where to continue replaying from.
+        // `last_sequence` back to know where to continue replaying from --
+        // and, per CRITICAL-2 (M3 Task 7 fix round 1), `packets_spent` and
+        // `elapsed_seconds` back too, to seed `BudgetLedger::resumed`.
         let dir = tempfile::tempdir().unwrap();
         let id;
         {
@@ -1152,16 +1184,24 @@ mod tests {
                 .start_or_reuse(&req("key-a", hash_a()))
                 .unwrap()
                 .scan_id();
-            store.record_progress(id, 3, 30).unwrap();
-            store.record_progress(id, 8, 80).unwrap();
+            store.record_progress(id, 3, 30, 1).unwrap();
+            store.record_progress(id, 8, 80, 4).unwrap();
         }
         // Simulates the resume path: reopen the store as a fresh process
         // would, then read the cursor back before doing anything else.
         let resumed = TaskStore::open(dir.path(), Arc::new(clock())).unwrap();
-        let resume_from = resumed.get(id).unwrap().unwrap().last_sequence;
+        let record = resumed.get(id).unwrap().unwrap();
         assert_eq!(
-            resume_from, 8,
+            record.last_sequence, 8,
             "resume must read back the last value actually written, not 0"
+        );
+        assert_eq!(
+            record.packets_spent, 80,
+            "resume must read back packets_spent, to seed BudgetLedger::resumed"
+        );
+        assert_eq!(
+            record.elapsed_seconds, 4,
+            "resume must read back elapsed_seconds, to seed BudgetLedger::resumed's runtime baseline"
         );
     }
 
@@ -1170,7 +1210,7 @@ mod tests {
         let (_d, store) = store();
         let bogus = clock().new_scan_id();
         assert!(matches!(
-            store.record_progress(bogus, 1, 1),
+            store.record_progress(bogus, 1, 1, 1),
             Err(StoreError::NotFound(_))
         ));
     }

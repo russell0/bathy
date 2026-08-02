@@ -134,6 +134,18 @@ impl GroupCommitLog {
         self.log.read_from(after_sequence)
     }
 
+    /// The real, syscall-level ground truth for how many `fsync`s this log
+    /// has actually issued -- see `EventLog::sync_calls`'s own doc comment.
+    /// This is what a test proving group commit's batching actually works
+    /// must assert on (M3 Task 7 fix round 1, IMPORTANT-1): the internal
+    /// `pending`/trigger bookkeeping this type does on top is unaffected by
+    /// whether the wrapped log happens to also be durable underneath, so it
+    /// cannot, on its own, distinguish "batching genuinely reduced syscalls"
+    /// from "the wrapped log was secretly durable all along."
+    pub fn sync_calls(&self) -> u64 {
+        self.log.sync_calls()
+    }
+
     /// Appends one record, then syncs if the bounded trigger has fired:
     /// `pending` reaching `config.max_events`, `config.max_interval` having
     /// elapsed since the last sync, or `body` being a terminal event kind
@@ -297,6 +309,46 @@ mod tests {
         assert_eq!(
             log.pending, 0,
             "must sync exactly when pending reaches max_events"
+        );
+    }
+
+    // --- M3 Task 7 fix round 1, IMPORTANT-1: pin the real syscall count,
+    // not the internal `pending` counter. The reviewer's exact repro: swap
+    // `EventLog::open_without_durability_barrier` in `GroupCommitLog::open`
+    // for the DURABLE `EventLog::open` -- every test above that only checks
+    // `pending` keeps passing (the wrapper's own bookkeeping is unaffected),
+    // silently reinstating the per-event fsync the whole module exists to
+    // avoid. `sync_calls()` is the ground truth that mutation cannot hide
+    // from: with 500 appends and `max_events = 50`, the correct
+    // implementation issues on the order of 10 real syncs; a secretly-durable
+    // wrapped log issues 500, plus whatever the wrapper's own batching adds
+    // on top -- either way, far more than a generous upper bound the correct
+    // implementation can never cross. ---
+
+    #[test]
+    fn batching_produces_far_fewer_real_sync_calls_than_events_appended() {
+        let (_d, mut log) = open(GroupCommitConfig {
+            max_events: 50,
+            max_interval: Duration::from_secs(1_000), // the count trigger alone must carry this
+        });
+        for i in 1..=500u64 {
+            log.append(progress(i), &clock(), "0.1.0").unwrap();
+        }
+        // 500 / 50 = 10 count-triggered syncs; generous upper bound (still
+        // two orders of magnitude below 500) so this isn't brittle against
+        // the exact batch-boundary count.
+        assert!(
+            log.sync_calls() <= 15,
+            "expected on the order of 10 batched syncs for 500 appends at \
+             max_events=50, got {} real sync_data() calls -- batching is not \
+             actually reducing real fsync traffic",
+            log.sync_calls()
+        );
+        assert!(
+            log.sync_calls() < 500,
+            "must be strictly fewer syncs than events appended -- {} syncs for \
+             500 appends means every append is syncing, i.e. no batching at all",
+            log.sync_calls()
         );
     }
 
