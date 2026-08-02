@@ -69,3 +69,17 @@ tempfile = { workspace = true }
 # direct `[dev-dependencies]` edge onto a crate already present at this
 # exact version.
 socket2 = "0.6"
+
+[features]
+# M3 whole-branch re-review, CRITICAL-2 item 2: `GroupCommitLog::fail_next_sync_for_tests`
+# (`src/durable_log.rs`) needs a registered feature name for its
+# `cfg(any(test, feature = "test-util"))` gate, the same pattern
+# `bathy-scope`'s own `test-util` feature uses for
+# `ScopeManifest::for_tests_allowing_loopback` -- see that crate's
+# `Cargo.toml` for the fuller reasoning. Declared here even though nothing
+# outside this crate currently enables it (`cfg(test)` alone already covers
+# this crate's own tests): Cargo's `unexpected_cfgs` lint requires a
+# `feature` name referenced in a `cfg` to be declared in `[features]`, and
+# an undeclared-but-referenced feature name is exactly the kind of drift
+# this lint exists to catch.
+test-util = []

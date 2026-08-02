@@ -46,6 +46,8 @@
 //! `EvidenceStore::put` the way this type batches `EventLog::append`.
 
 use std::path::Path;
+#[cfg(any(test, feature = "test-util"))]
+use std::path::PathBuf;
 
 use tokio::time::{Duration, Instant};
 
@@ -105,6 +107,27 @@ pub struct GroupCommitLog {
     config: GroupCommitConfig,
     pending: u64,
     last_sync: Instant,
+    /// M3 whole-branch re-review, CRITICAL-2 item 2: **test-only**, and not
+    /// reachable from a production build. `Scheduler::flush_progress`'s
+    /// durability contract ("`force_sync` returning `Err` must leave the
+    /// store's resumption cursor untouched") cannot be pinned with a
+    /// genuine `fsync` failure -- this workspace forbids `unsafe` code
+    /// everywhere outside `bathy-packetd` (CI enforces this directly), so
+    /// there is no safe way to invalidate an already-open file descriptor
+    /// out from under `EventLog`, and permission bits on the path do not
+    /// affect a syscall against an fd already open. This flag is the
+    /// alternative: [`Self::fail_next_sync_for_tests`] arms it, and the
+    /// very next call to [`Self::sync_now`] (the one shared implementation
+    /// both [`Self::append`]'s own trigger and [`Self::force_sync`] call)
+    /// returns a synthetic [`LogError::Io`] instead of touching the real
+    /// log, once, then disarms itself. Gated exactly like
+    /// `bathy_scope::ScopeManifest::for_tests_allowing_loopback`: behind
+    /// `cfg(any(test, feature = "test-util"))`, so the field and the branch
+    /// that reads it are entirely absent -- not merely unset -- from any
+    /// binary built without this crate's own `test-util` feature, which
+    /// nothing this workspace ships ever enables.
+    #[cfg(any(test, feature = "test-util"))]
+    fail_next_sync: bool,
 }
 
 impl GroupCommitLog {
@@ -119,7 +142,40 @@ impl GroupCommitLog {
             config,
             pending: 0,
             last_sync: Instant::now(),
+            #[cfg(any(test, feature = "test-util"))]
+            fail_next_sync: false,
         })
+    }
+
+    /// **Test-only.** Arms a synthetic failure for the very next real sync
+    /// attempt (via `append`'s own trigger OR an explicit `force_sync` call,
+    /// whichever comes first) -- see the doc comment on the `fail_next_sync`
+    /// field for why this exists and why it cannot reach a production build.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn fail_next_sync_for_tests(&mut self) {
+        self.fail_next_sync = true;
+    }
+
+    /// The one real implementation behind both [`Self::append`]'s own
+    /// bounded trigger and [`Self::force_sync`]: sync the wrapped log, reset
+    /// the batching bookkeeping, or (test builds only) return a synthetic
+    /// failure instead without touching the real log at all -- see
+    /// `fail_next_sync`'s own doc comment.
+    fn sync_now(&mut self) -> Result<(), LogError> {
+        #[cfg(any(test, feature = "test-util"))]
+        if self.fail_next_sync {
+            self.fail_next_sync = false;
+            return Err(LogError::Io {
+                path: PathBuf::from("<synthetic test failure, no real path>"),
+                source: std::io::Error::other(
+                    "GroupCommitLog::fail_next_sync_for_tests armed this failure",
+                ),
+            });
+        }
+        self.log.sync()?;
+        self.pending = 0;
+        self.last_sync = Instant::now();
+        Ok(())
     }
 
     pub fn scan_id(&self) -> ScanId {
@@ -165,9 +221,7 @@ impl GroupCommitLog {
             || self.pending >= self.config.max_events
             || self.last_sync.elapsed() >= self.config.max_interval
         {
-            self.log.sync()?;
-            self.pending = 0;
-            self.last_sync = Instant::now();
+            self.sync_now()?;
         }
         Ok(event)
     }
@@ -189,10 +243,7 @@ impl GroupCommitLog {
     /// scheduler pays this one small, fixed cost once per run rather than
     /// none.
     pub fn force_sync(&mut self) -> Result<(), LogError> {
-        self.log.sync()?;
-        self.pending = 0;
-        self.last_sync = Instant::now();
-        Ok(())
+        self.sync_now()
     }
 }
 
