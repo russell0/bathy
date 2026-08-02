@@ -87,6 +87,22 @@ pub struct ScopeManifest {
     /// `load` should ever be able to inspect or act on an unverified
     /// signature value, only know that one was present.
     had_signature: bool,
+    /// M3 whole-branch review, CRITICAL-1: exists ONLY so
+    /// [`Self::for_tests_allowing_loopback`] can make a single, explicitly
+    /// named exception to [`Self::allows`]'s otherwise-unconditional
+    /// loopback refusal (see [`is_ordinary_unicast`]) for real socket tests
+    /// in other crates (`bathy-engine`'s scheduler exercises real
+    /// `127.0.0.1` listeners; that is the only address a sandboxed test
+    /// process can portably bind and connect to). [`Self::load`] -- the
+    /// only constructor a manifest document's JSON can ever reach -- always
+    /// sets this `false`; there is no field in the wire format that could
+    /// ever set it `true`. And the field itself, along with the branch in
+    /// `allows` that reads it, is entirely ABSENT -- not merely unset --
+    /// from any binary built without this crate's `test-util` feature,
+    /// i.e. from anything this workspace actually ships. See that
+    /// constructor's own doc comment for the full reasoning.
+    #[cfg(any(test, feature = "test-util"))]
+    allow_loopback_for_tests: bool,
 }
 
 impl ScopeManifest {
@@ -181,7 +197,50 @@ impl ScopeManifest {
             denied,
             ceiling: raw.budget_ceiling,
             had_signature: raw.signature.is_some(),
+            #[cfg(any(test, feature = "test-util"))]
+            allow_loopback_for_tests: false,
         })
+    }
+
+    /// **Test-only, and not reachable from a production build.** Loads a
+    /// manifest exactly as [`Self::load`] would, except that [`Self::allows`]
+    /// additionally treats IPv4 loopback (`127.0.0.0/8`) as passing the
+    /// ordinary-unicast gate for *this instance only* -- the deny set and
+    /// allow set still apply normally on top of that, so `json` must still
+    /// list a loopback-covering CIDR in `allowed_cidrs` (e.g. `127.0.0.1/32`)
+    /// for `allows(127.0.0.1)` to actually return `true`.
+    ///
+    /// # Why this exists
+    ///
+    /// M3 whole-branch review, CRITICAL-1: `bathy-engine`'s scheduler tests
+    /// drive real TCP sockets end to end (real `TcpListener`s, real accept
+    /// counts, so a scope-authorization bug can be proven by execution, not
+    /// merely asserted past). The only address a sandboxed test process can
+    /// portably bind and connect to without relying on a specific network
+    /// interface being configured is loopback -- but [`Self::allows`]
+    /// refuses every loopback address unconditionally by design (see
+    /// [`is_ordinary_unicast`]'s doc comment), and that refusal must hold in
+    /// anything actually shipped. This constructor is the one, explicitly
+    /// named door around it, scoped as narrowly as possible:
+    ///
+    /// - Gated behind `cfg(any(test, feature = "test-util"))`. `test-util` is
+    ///   enabled only via a `[dev-dependencies]` edge from another crate
+    ///   (`bathy-engine/Cargo.toml`), which -- under this workspace's
+    ///   `resolver = "3"` -- Cargo never folds into a normal, non-test build.
+    ///   A release build of anything this workspace ships compiles this
+    ///   function, the field it sets, and the branch in `allows` that reads
+    ///   it, out of existence entirely; there is nothing to bypass at
+    ///   runtime because there is nothing there.
+    /// - [`Self::load`] -- the constructor every real manifest document goes
+    ///   through -- always sets the underlying flag `false` and has no wire
+    ///   field that could ever change that, so a manifest loaded from an
+    ///   operator-supplied JSON document can never take this path by
+    ///   accident.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn for_tests_allowing_loopback(json: &str) -> Result<Self, ManifestError> {
+        let mut manifest = Self::load(json)?;
+        manifest.allow_loopback_for_tests = true;
+        Ok(manifest)
     }
 
     pub fn id(&self) -> ScopeId {
@@ -261,8 +320,16 @@ impl ScopeManifest {
     pub fn allows(&self, ip: IpAddr) -> bool {
         // Property 3: reserved ranges are refused before either CIDR set is
         // even consulted. No manifest, however permissive, can route around
-        // this check.
-        if !is_ordinary_unicast(ip) {
+        // this check -- except the single, explicitly named, test-gated
+        // exception below, which does not exist in a production build at
+        // all (see `for_tests_allowing_loopback`'s own doc comment).
+        #[cfg(any(test, feature = "test-util"))]
+        let ordinary_or_test_loopback = is_ordinary_unicast(ip)
+            || (self.allow_loopback_for_tests && matches!(ip, IpAddr::V4(v4) if v4.is_loopback()));
+        #[cfg(not(any(test, feature = "test-util")))]
+        let ordinary_or_test_loopback = is_ordinary_unicast(ip);
+
+        if !ordinary_or_test_loopback {
             return false;
         }
         // Property 2: deny beats allow. This check runs, and can return
@@ -558,6 +625,68 @@ mod tests {
         assert!(!m.allows(ip("255.255.255.255")), "broadcast");
         assert!(!m.allows(ip("169.254.1.1")), "link-local");
         assert!(m.allows(ip("10.30.0.42")), "ordinary unicast still allowed");
+    }
+
+    // --- M3 whole-branch review, CRITICAL-1: `for_tests_allowing_loopback`
+    // is the one, explicitly named door around the loopback refusal above --
+    // pinned down precisely, so a change to `allows` cannot silently widen
+    // (or narrow into uselessness) what it actually permits. ---
+
+    #[test]
+    fn for_tests_allowing_loopback_permits_loopback_when_also_in_the_allow_set() {
+        let permissive = MANIFEST.replace(
+            r#""allowed_cidrs": ["10.30.0.0/24"]"#,
+            r#""allowed_cidrs": ["10.30.0.0/24", "127.0.0.1/32"]"#,
+        );
+        let m = ScopeManifest::for_tests_allowing_loopback(&permissive).unwrap();
+        assert!(
+            m.allows(ip("127.0.0.1")),
+            "the whole point of this constructor"
+        );
+        assert!(
+            m.allows(ip("10.30.0.42")),
+            "ordinary allow-set matching must still work normally"
+        );
+    }
+
+    #[test]
+    fn for_tests_allowing_loopback_still_refuses_loopback_absent_from_the_allow_set() {
+        // The loopback exception only lifts the `is_ordinary_unicast` gate --
+        // the allow-set match still has to succeed on its own. `MANIFEST`
+        // itself never lists a loopback CIDR.
+        let m = ScopeManifest::for_tests_allowing_loopback(MANIFEST).unwrap();
+        assert!(
+            !m.allows(ip("127.0.0.1")),
+            "loopback was never added to this manifest's own allow set"
+        );
+    }
+
+    #[test]
+    fn for_tests_allowing_loopback_still_refuses_every_other_reserved_address() {
+        let permissive = MANIFEST.replace(
+            r#""allowed_cidrs": ["10.30.0.0/24"]"#,
+            r#""allowed_cidrs": ["0.0.0.0/0"]"#,
+        );
+        let m = ScopeManifest::for_tests_allowing_loopback(&permissive).unwrap();
+        assert!(!m.allows(ip("224.0.0.1")), "multicast");
+        assert!(!m.allows(ip("255.255.255.255")), "broadcast");
+        assert!(!m.allows(ip("169.254.1.1")), "link-local");
+        assert!(m.allows(ip("127.0.0.1")), "sanity: loopback IS exempted");
+    }
+
+    #[test]
+    fn a_manifest_loaded_normally_never_gets_the_loopback_exception() {
+        // `load` (the only constructor real manifest JSON can ever reach)
+        // always sets the underlying flag `false` -- there is no field in
+        // the wire format that could ever set it. Loading the exact same
+        // permissive-loopback JSON `for_tests_allowing_loopback` accepts
+        // above through the ordinary `load` path must still refuse loopback.
+        let permissive = MANIFEST.replace(
+            r#""allowed_cidrs": ["10.30.0.0/24"]"#,
+            r#""allowed_cidrs": ["10.30.0.0/24", "127.0.0.1/32"]"#,
+        );
+        let m = ScopeManifest::load(&permissive).unwrap();
+        assert!(!m.allows(ip("127.0.0.1")));
     }
 
     #[test]

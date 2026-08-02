@@ -16,3 +16,16 @@ time = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+
+[features]
+# M3 whole-branch review, CRITICAL-1: `ScopeManifest::for_tests_allowing_loopback`
+# (see `src/manifest.rs`) needs to be reachable from OTHER crates' own test
+# targets (`bathy-engine`'s scheduler tests drive real loopback sockets), not
+# only from this crate's own `cfg(test)`, which does not turn on when this
+# crate is compiled merely as another crate's dependency. This feature is the
+# cross-crate door: enabled only via a `[dev-dependencies]` edge (see
+# `bathy-engine/Cargo.toml`), which -- under this workspace's `resolver = "3"`
+# (root `Cargo.toml`) -- Cargo does not fold into a normal, non-test build of
+# anything that depends on this crate the ordinary way. No production binary
+# this workspace ships ever enables it.
+test-util = []
