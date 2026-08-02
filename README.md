@@ -9,14 +9,18 @@ over MCP.
 >
 > bathy scans. `bathy-engine`'s scheduler drives real, unprivileged TCP connect
 > scanning against IPv4 targets: budget- and rate-governed, cancellable, and
-> resumable, with authorization checked once over a scan's full expanded target
-> list before any packet exists (`bathy_scope::evaluate`) and re-checked again,
-> unconditionally, immediately before every single probe is actually emitted
-> (`Scheduler::run` — see `crates/bathy-engine/src/scheduler.rs`'s module doc
-> for why both checks exist and why the second one cannot be skipped by
-> forgetting to call the first). Every observation lands in a durable,
-> gap-free, append-only event log (`bathy-evidence`) before the SQLite state
-> that indexes it is made durable — never the other way around.
+> resumable. Every `Scheduler::run` call verifies, before it will ever emit a
+> probe, that its manifest is the one this scan was actually authorized under
+> (not merely *a* manifest), that the manifest is still active (unexpired), and
+> that each individual target is inside its allow set — see
+> `crates/bathy-engine/src/scheduler.rs`'s module doc. That is currently the
+> *only* enforcement point: `bathy_scope::evaluate`, the library function this
+> crate provides for validating a request against a manifest before a plan is
+> even built, has no caller anywhere in this workspace yet — wiring it into an
+> orchestrator is Milestone 5's job, once a CLI/MCP surface exists to call it
+> from. Every observation lands in a durable, gap-free, append-only event log
+> (`bathy-evidence`) before the SQLite state that indexes it is made durable —
+> never the other way around.
 >
 > What does not exist yet: interpretation (service and version identification,
 > Milestone 4), a CLI or an MCP server (Milestone 5), privileged SYN/ICMP
@@ -37,7 +41,7 @@ over MCP.
 | `bathy-evidence` | The content-addressed blob store and the append-only, gap-free event log that is this project's actual source of truth — SQLite state elsewhere is a derived index rebuildable from it, never the reverse. |
 | `bathy-store` | SQLite-backed scan state: idempotency (a repeated key with an identical plan reuses the scan; a different plan is refused as a conflict), a resumption cursor, and per-scan lifecycle status. A scan starts `pending` and `bathy-engine`'s scheduler transitions it to `completed`, `cancelled`, `failed`, or `denied` on each of its own terminal outcomes; `running`/`paused` are reserved for Milestone 5's pause/resume CLI surface. |
 | `bathy-plan` | Turns a `ScanRequest` into a deterministic, indexable `ScanPlan`: target expansion, port selection, and the content hash idempotency and resumption are built on. |
-| `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, authorization re-checked on the actual emission path. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
+| `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
 Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
@@ -55,15 +59,17 @@ boundary, and an expiry comparison that reported an expired manifest as valid.
 ## Authorized use
 
 bathy is built for scanning networks you are authorized to scan. Every scan requires
-an unexpired scope manifest naming the permitted address ranges; there is no flag to
-bypass it. Authorization is checked on two independent code paths — once over a
-scan's full expanded target list before any packet exists, and again immediately
-before every single probe is emitted — and either check refuses the whole scan
-rather than silently trimming the offending targets. Scans carry hard packet, rate,
-and runtime budgets. v0.1 probe traffic is a plain, unprivileged TCP connect: it
-carries no identifying payload — that is a v0.1 limitation, not a claim otherwise.
-Detection evasion and anonymization are permanent non-goals regardless — see the
-design notes before opening a feature request for either.
+an unexpired scope manifest naming the permitted address ranges, bound to the exact
+scope the scan was started under; there is no flag to bypass it, and a scan is
+refused in full — never silently trimmed — the moment any of that fails: the
+manifest belongs to a different scope, the manifest has expired, or a single target
+falls outside its allow set. `bathy-engine`'s scheduler enforces all three directly,
+on the actual emission path, immediately before every probe; that is the only
+enforcement point that exists today (see the Status note above). Scans carry hard
+packet, rate, and runtime budgets. v0.1 probe traffic is a plain, unprivileged TCP
+connect: it carries no identifying payload — that is a v0.1 limitation, not a claim
+otherwise. Detection evasion and anonymization are permanent non-goals regardless —
+see the design notes before opening a feature request for either.
 
 Scanning networks without authorization may be unlawful in your jurisdiction and may
 violate your provider's terms of service. That is your responsibility, not the tool's.
@@ -80,8 +86,11 @@ a poor fit for typed tool calling. bathy targets the gap:
 - **Evidence.** Every finding cites content-addressed response bytes. `evidence.get`
   returns exactly what justified a claim; `fingerprint.explain` says which rule fired
   and why.
-- **Scope enforcement.** Deny-by-default manifests with expiry, enforced twice on
-  independent code paths.
+- **Scope enforcement.** Deny-by-default manifests with expiry, checked against
+  scope identity, expiry, and per-target authorization on the actual emission
+  path — see "Authorized use" above for exactly what runs today versus what is
+  still planned (an upfront, pre-plan check via `bathy_scope::evaluate`, wired
+  in once Milestone 5 has an orchestrator to call it from).
 - **Differential scanning.** "What changed since Monday" is a first-class query, with
   confidence noise separated from substantive change.
 
