@@ -25,6 +25,43 @@
 //! subnet is empty" from "this machine is out of ephemeral ports". See the
 //! task report for a recommendation on giving `DiscoveryResult` a distinct
 //! signal for that case in M3 Task 7.
+//!
+//! # A library-only deliverable in v0.1 (M3 whole-branch review, IMPORTANT-4)
+//!
+//! [`discover_host`] has no caller in this crate outside its own tests, and
+//! [`EventBody::HostDiscovered`](bathy_types::event::EventBody::HostDiscovered)
+//! is constructed nowhere in production. This is a deliberate scope
+//! decision, not an oversight left over from M3, and not the same shape as
+//! CRITICAL-1 (nothing on the emission path consulting scope): scope
+//! authorization is a boundary every scan must cross regardless of what it
+//! is scanning *for*; host discovery is one specific technique among
+//! several this crate offers for *finding* hosts, and `crate::scheduler`'s
+//! v0.1 scan loop always probes every configured port on every plan unit
+//! directly, for every [`bathy_types::request::Objective`] -- it does not
+//! yet branch on objective at all (that routing decision, including what
+//! `Objective::HostInventory` should actually DO differently, does not
+//! exist yet and is out of this fix wave's scope).
+//!
+//! Wiring `discover_host` into the scheduler now would be premature for a
+//! second reason: `docs/superpowers/plans/2026-07-31-bathy-m6-packetd.md`
+//! already specifies `discover_host_combined`, which tries privileged ICMP
+//! first (via `bathy-packetd`) and falls back to exactly this module's TCP
+//! method on an inconclusive result -- recording whichever method actually
+//! produced the answer on `host.discovered`. That is the real integration
+//! point for `host.discovered` events; wiring this crate's TCP-only method
+//! into the scheduler ahead of it would mean redoing the same wiring twice,
+//! once here and once in M6, or shipping a "discovery" that silently never
+//! uses ICMP even once packetd exists. M3's own exit-criteria end-to-end
+//! test (`crates/bathy-engine/tests/`) reflects this directly: it expects
+//! exactly `scan.started`, `port.state` x2, `scan.completed` for a plain
+//! port scan -- no `host.discovered` -- which is what a scheduler that
+//! does not call this module at all correctly produces.
+//!
+//! `discover_host`/[`DiscoveryConfig`]/[`DiscoveryResult`] therefore ship in
+//! v0.1 as a correct, independently tested library building block, publicly
+//! exported from this crate (see `crate::lib`'s own doc comment), with no
+//! production caller yet -- exactly the shape M6's plan already expects to
+//! consume.
 
 use std::net::IpAddr;
 

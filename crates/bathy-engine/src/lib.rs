@@ -22,7 +22,12 @@
 //! discovery stops at the first conclusive answer rather than working
 //! through the whole configured probe list. See the `discovery` module doc
 //! for why `Filtered`/`Unreachable` are never promoted into evidence about
-//! the target.
+//! the target -- and (M3 whole-branch review, IMPORTANT-4) for why this
+//! component ships in v0.1 as a correct, independently tested library
+//! building block with no caller in [`scheduler::Scheduler`] yet: M6
+//! (`bathy-packetd`) is the plan's actual integration point for
+//! `host.discovered`, via `discover_host_combined`, which tries privileged
+//! ICMP first and falls back to exactly this module's TCP method.
 //!
 //! The fourth component is [`durable_log::GroupCommitLog`]: the M2-decided
 //! group-commit batching that makes it safe for the fifth component to
