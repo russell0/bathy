@@ -41,6 +41,15 @@ bathy-store = { path = "../bathy-store" }
 bathy-plan = { path = "../bathy-plan" }
 
 [dev-dependencies]
+# M3 whole-branch review, CRITICAL-1: `ScopeManifest::for_tests_allowing_loopback`
+# (`bathy-scope`) is what lets this crate's scheduler tests build a manifest
+# that authorizes the real `127.0.0.1` sockets those tests drive -- see that
+# constructor's own doc comment, and `bathy-scope/Cargo.toml`'s `test-util`
+# feature comment, for why a `[dev-dependencies]` edge (rather than enabling
+# the feature on the `[dependencies]` edge above) is what keeps this
+# reachable from this crate's own tests without ever reaching a normal,
+# non-test build of this crate.
+bathy-scope = { path = "../bathy-scope", features = ["test-util"] }
 # `test-util` is additive on top of the `[dependencies]` feature set above
 # (Cargo features only ever union) and is needed by several test targets:
 # `#[tokio::test(start_paused = true)]` (the rate limiter's sustained-rate

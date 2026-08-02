@@ -24,10 +24,23 @@
 //!    dispatches `plan.units_from(from_index)` with no such check; see this
 //!    task's report for the concrete race and the round-trip test that
 //!    catches it.)
-//! 4. **Four outcomes are distinct.** Plan exhaustion, cancellation, budget
-//!    exhaustion, and time exhaustion each get their own [`RunSummary`]
-//!    field, and three of the four (all but cancellation) their own
-//!    terminal event -- see AC-3.27.
+//! 4. **Five outcomes are distinct.** Plan exhaustion, cancellation, budget
+//!    exhaustion, time exhaustion, and policy denial each get their own
+//!    [`RunSummary`] field, and four of the five (all but cancellation)
+//!    their own terminal event -- see AC-3.27. (Policy denial is a M3
+//!    whole-branch-review addition, CRITICAL-1 below; the brief's own text
+//!    only ever enumerated the first three.)
+//! 5. **Scope is consulted on the actual emission path, not assumed.** M3
+//!    whole-branch review, CRITICAL-1: `bathy-engine` had depended on
+//!    `bathy-scope` since this crate's very first task, but nothing on the
+//!    emission path ever called [`bathy_scope::ScopeManifest::allows`] --
+//!    every scheduler test scanned loopback, which `allows` refuses
+//!    categorically, and none of them noticed. Fixed at the type level:
+//!    [`Scheduler::new`] takes a `manifest` and cannot be constructed
+//!    without one, and `run` re-checks every unit's target against it
+//!    immediately before dispatch -- see this type's own doc comment on the
+//!    `manifest` field, and `run`'s doc comment, for the full reasoning and
+//!    exactly why this is a *re-check*, not the only check.
 //!
 //! # Group commit
 //!
@@ -58,11 +71,12 @@ use tokio_util::sync::CancellationToken;
 
 use bathy_evidence::LogError;
 use bathy_plan::{ScanPlan, ScanUnit};
-use bathy_scope::BudgetLedger;
+use bathy_scope::{BudgetLedger, ScopeManifest};
 use bathy_store::{StoreError, TaskStore};
 use bathy_types::clock::Clock;
-use bathy_types::event::{EventBody, PortState, Target};
-use bathy_types::ids::ScanId;
+use bathy_types::event::{DenyReason, EventBody, PortState, Target};
+use bathy_types::ids::{Digest, ScanId};
+use bathy_types::task::TaskStatus;
 
 use crate::connect::{ConnectOutcome, probe_connect_with_local_signal};
 use crate::durable_log::GroupCommitLog;
@@ -135,6 +149,26 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error("a scan worker task panicked or was cancelled by the runtime: {0}")]
     Join(#[from] tokio::task::JoinError),
+    /// M3 whole-branch review, IMPORTANT-3: `run` refused to execute `plan`
+    /// against `scan_id` because `plan.hash()` does not match the
+    /// `plan_hash` the store recorded when this scan was started.
+    /// `bathy-plan`'s own module doc calls the unit-index-to-target mapping
+    /// "a compatibility surface in the same sense a wire format is" --
+    /// resuming against a plan that does not hash to what was originally
+    /// approved would silently point every remaining probe at the wrong
+    /// host and port, not raise an error. Failing loudly here, before a
+    /// single unit is dispatched, is what turns that into an error instead.
+    #[error(
+        "refusing to run scan {scan_id}: the supplied plan hashes to {actual}, but this scan \
+         was started (and, if resuming, previously ran) against plan_hash {expected} -- \
+         running a different plan against an existing scan_id would silently misdirect \
+         every resumed probe at the wrong host and port"
+    )]
+    PlanMismatch {
+        scan_id: ScanId,
+        expected: Digest,
+        actual: Digest,
+    },
 }
 
 /// The outcome of one [`Scheduler::run`] call. See the module doc comment's
@@ -157,6 +191,17 @@ pub struct RunSummary {
     pub cancelled: bool,
     pub budget_exhausted: bool,
     pub time_exhausted: bool,
+    /// M3 whole-branch review, CRITICAL-1: set when `run`'s own re-check of
+    /// a unit's target against [`Scheduler`]'s manifest (immediately before
+    /// dispatch -- see that type's doc comment on its `manifest` field)
+    /// refuses it. Stops the scan exactly like `budget_exhausted`/
+    /// `time_exhausted` do -- see `run`'s doc comment for why this is
+    /// treated as fatal to the whole scan rather than "skip this one unit
+    /// and continue" -- and, unlike them, is not expected to ever trigger
+    /// in correct operation: every target `run` sees should already have
+    /// passed [`bathy_scope::evaluate`] before this `Scheduler` was ever
+    /// constructed. Its own terminal event is `EventBody::PolicyDenied`.
+    pub policy_denied: bool,
     /// M3 Task 7's carried requirement from Tasks 5/6: a count of probes
     /// whose `Filtered` outcome was attributable to a *local* resource or
     /// policy problem (ephemeral-port exhaustion, a local firewall) rather
@@ -205,6 +250,22 @@ impl Default for SchedulerConfig {
 pub struct Scheduler {
     limiter: RateLimiter,
     ledger: Mutex<BudgetLedger>,
+    /// M3 whole-branch review, CRITICAL-1: the type-level fix. There is no
+    /// `Scheduler::new` overload and no `Default` impl that omits this --
+    /// constructing a `Scheduler` at all requires handing it a manifest, so
+    /// "a scheduler was built with literally no scope awareness" (the
+    /// defect this review found: `bathy-engine` depended on `bathy-scope`
+    /// since Task 1 but nothing on the emission path ever called
+    /// `allows`) cannot happen again by construction, not merely by
+    /// convention. `run` re-checks every unit's target against this
+    /// immediately before dispatch -- belt and braces on top of whatever
+    /// upstream `bathy_scope::evaluate` call already ran over the plan's
+    /// full expanded target list before this `Scheduler` was even built
+    /// (see the module doc's invariant 5): that upstream call is what a
+    /// future orchestrator (M5) is expected to make, but this field is what
+    /// makes the emission path itself correct even if it didn't, or if the
+    /// plan handed to `run` does not actually match what was evaluated.
+    manifest: Arc<ScopeManifest>,
     config: SchedulerConfig,
     log: Arc<Mutex<GroupCommitLog>>,
     store: Arc<TaskStore>,
@@ -232,10 +293,28 @@ impl Scheduler {
     /// `clock` must be the exact `Arc<dyn Clock>` also passed to whatever
     /// `TaskStore::open` produced `store` -- see this type's own doc comment
     /// on the `clock` field for why.
+    ///
+    /// `manifest` is required, not optional -- see this type's own doc
+    /// comment on its `manifest` field for why (CRITICAL-1).
+    ///
+    /// There is no separate `limiter` parameter. M3 whole-branch review,
+    /// IMPORTANT-2: an earlier version of this constructor took a
+    /// `RateLimiter` built by the caller from whatever pps value it chose,
+    /// wholly independent of `ledger`'s own `maximum_packets_per_second` --
+    /// `bathy_scope::evaluate` validates a request's pps against the
+    /// manifest ceiling, and then nothing enforced that the ledger and the
+    /// limiter actually agreed on what that ceiling *was*. Two options were
+    /// available: derive the limiter from the ledger (making a mismatch
+    /// unrepresentable), or keep both parameters and reject a mismatch at
+    /// construction (making a mismatch representable but caught). This
+    /// constructor derives: a caller cannot even ask for two different pps
+    /// values in the first place, which is strictly stronger than
+    /// validating that two independently-supplied ones happen to agree, and
+    /// removes a parameter besides.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        limiter: RateLimiter,
         ledger: BudgetLedger,
+        manifest: Arc<ScopeManifest>,
         config: SchedulerConfig,
         log: Arc<Mutex<GroupCommitLog>>,
         store: Arc<TaskStore>,
@@ -243,9 +322,11 @@ impl Scheduler {
         scan_id: ScanId,
         engine_version: impl Into<String>,
     ) -> Self {
+        let limiter = RateLimiter::new(ledger.packets_per_second());
         Self {
             limiter,
             ledger: Mutex::new(ledger),
+            manifest,
             config,
             log,
             store,
@@ -349,6 +430,26 @@ impl Scheduler {
         let started = Instant::now();
         let mut summary = RunSummary::default();
 
+        // M3 whole-branch review, IMPORTANT-3: refuse to run a plan that
+        // does not hash to what this scan_id was actually started (and, if
+        // resuming, previously ran) against. Checked before anything else,
+        // including `already_terminated` -- a mismatched plan handed to an
+        // already-terminated scan is still a caller bug worth surfacing
+        // loudly, not one this method should paper over by returning early
+        // before ever looking at `plan` at all. See `EngineError::PlanMismatch`.
+        let record = self
+            .store
+            .get(self.scan_id)?
+            .ok_or(StoreError::NotFound(self.scan_id))?;
+        let actual_hash = plan.hash();
+        if record.plan_hash != actual_hash {
+            return Err(EngineError::PlanMismatch {
+                scan_id: self.scan_id,
+                expected: record.plan_hash,
+                actual: actual_hash,
+            });
+        }
+
         if self.already_terminated()? {
             summary.packets_spent = self.ledger().packets_spent();
             return Ok(summary);
@@ -378,6 +479,12 @@ impl Scheduler {
         let mut units = plan.units_from(from_index);
         let mut completed_batch: Vec<u64> = Vec::with_capacity(STORE_FLUSH_BATCH);
         let mut last_progress_emitted_at: u64 = 0;
+        // M3 whole-branch review, CRITICAL-1: set (once) the first time the
+        // per-unit re-check below refuses a target, so the terminal-event
+        // section after the drive loop can emit exactly one `policy.denied`
+        // naming it -- mirroring how `budget_exhausted`/`time_exhausted`
+        // build their own event detail after the loop rather than inline.
+        let mut policy_denial_detail: Option<String> = None;
 
         'drive: loop {
             if cancel.is_cancelled() {
@@ -398,6 +505,34 @@ impl Scheduler {
 
             if already_done.contains(&unit.index) {
                 continue;
+            }
+
+            // M3 whole-branch review, CRITICAL-1: the actual emission-path
+            // gate. Checked here -- immediately before the rate-limiter
+            // wait and the budget reservation below, i.e. as early and as
+            // cheaply as possible, and unconditionally, on every single
+            // unit -- rather than trusted to have already happened via
+            // whatever upstream `bathy_scope::evaluate` call this
+            // `Scheduler`'s caller may or may not have made. This is not
+            // expected to ever trip in correct operation (every target
+            // `run` sees should already have passed `evaluate` before this
+            // `Scheduler` was even constructed), which is exactly why it is
+            // treated as fatal to the whole scan -- like budget/time
+            // exhaustion -- rather than "skip this one unit and keep
+            // going": a manifest re-check failing mid-run means something
+            // upstream is already wrong, and trimming just the offending
+            // unit would be the "trimmed rather than refused in full"
+            // behavior this project's own authorization model rejects (see
+            // `bathy_scope::policy::evaluate`'s doc comment).
+            if !self.manifest.allows(unit.target) {
+                policy_denial_detail = Some(format!(
+                    "{} is not authorized by manifest {} (unit index {})",
+                    unit.target,
+                    self.manifest.id(),
+                    unit.index
+                ));
+                summary.policy_denied = true;
+                break 'drive;
             }
 
             // Cancellable wait for a rate-limiter token AND a concurrency
@@ -470,8 +605,16 @@ impl Scheduler {
 
         summary.packets_spent = self.ledger().packets_spent();
 
-        // AC-3.27: three distinct terminal outcomes get their own event;
-        // cancellation deliberately gets none.
+        // AC-3.27: four distinct terminal outcomes get their own event and
+        // status (M3 whole-branch review, CRITICAL-1 added `policy_denied`
+        // to what the brief's own text enumerated); cancellation
+        // deliberately gets no event, but (IMPORTANT-1) does get a status.
+        // M3 whole-branch review, IMPORTANT-1: `TaskStore::set_status` had
+        // no caller outside its own tests -- a completed scan's status
+        // stayed `Pending` forever, and `StartOutcome::Reused { status }`
+        // (M2's mechanism for telling a repeat idempotency key what
+        // happened to the original scan) could therefore never report
+        // anything but `Pending`, indistinguishable from "never started".
         if summary.budget_exhausted {
             self.log(EventBody::ScanFailed {
                 reason_code: "budget_exhausted".into(),
@@ -480,6 +623,7 @@ impl Scheduler {
                     summary.units_completed
                 ),
             })?;
+            self.store.set_status(self.scan_id, TaskStatus::Failed)?;
         } else if summary.time_exhausted {
             self.log(EventBody::ScanFailed {
                 reason_code: "time_exhausted".into(),
@@ -488,12 +632,22 @@ impl Scheduler {
                     summary.units_completed
                 ),
             })?;
-        } else if !summary.cancelled {
+            self.store.set_status(self.scan_id, TaskStatus::Failed)?;
+        } else if let Some(detail) = policy_denial_detail {
+            self.log(EventBody::PolicyDenied {
+                reason_code: DenyReason::TargetOutOfScope,
+                detail,
+            })?;
+            self.store.set_status(self.scan_id, TaskStatus::Denied)?;
+        } else if summary.cancelled {
+            self.store.set_status(self.scan_id, TaskStatus::Cancelled)?;
+        } else {
             self.log(EventBody::ScanCompleted {
                 probes_sent: summary.units_completed,
                 packets_spent: summary.packets_spent,
                 findings: summary.open_ports,
             })?;
+            self.store.set_status(self.scan_id, TaskStatus::Completed)?;
         }
 
         // A clean return from `run` -- of any kind, including cancellation,
@@ -522,6 +676,36 @@ impl Scheduler {
     /// (well, appended -- durability is `GroupCommitLog`'s job): if logging
     /// fails, this unit is not counted as completed and not pushed onto
     /// `completed_batch`, so it is never marked done in the store either.
+    ///
+    /// # A narrow, accepted gap (M3 whole-branch review, MINOR)
+    ///
+    /// If `self.log(...)` below fails, `record` (and, via `?`, the whole
+    /// `run` call) returns `Err` -- but the real probe already happened
+    /// (the packet was already on the wire before `record` was ever
+    /// called: see the dispatch loop's own comment on reserving budget
+    /// "immediately before the unit is actually dispatched") and the
+    /// budget for it was already spent in the in-memory `BudgetLedger`
+    /// before that. Because `run` aborts without reaching its own final
+    /// `flush_progress`/`record_progress` calls, that spend is never
+    /// persisted for THIS unit either. A caller that retries `run` after
+    /// such a failure (e.g. a transient disk error) therefore both
+    /// re-probes this exact unit (it was never marked done, so it is not
+    /// in `already_done` on the next `run`) and under-counts the persisted
+    /// cumulative spend by one packet relative to what was actually put on
+    /// the wire -- a narrow, real gap in the packets-per-second-of-actual-
+    /// wire-traffic accounting under a rare failure mode (an event log
+    /// write failing mid-run), not in the packet *ceiling* (a resumed
+    /// ledger still enforces its ceiling correctly against whatever it WAS
+    /// told was spent; it just cannot know about spend that was never
+    /// persisted at all). Closing this fully would mean making a single
+    /// unit's probe-and-record idempotent under retry -- either tolerating
+    /// (and de-duplicating) a repeated real probe of the same unit, or
+    /// giving the store a third state between "not started" and "done"
+    /// for "attempted, outcome unknown" -- either of which is a real
+    /// design question disproportionate to what a log-append failure
+    /// (already rare; `EventLog::append` failing means a genuine I/O
+    /// error) warrants fixing in this fix wave. Documented and accepted
+    /// rather than silently left implicit.
     fn record(
         &self,
         done: (ScanUnit, ConnectOutcome, bool),
@@ -551,10 +735,37 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Flushes `completed` to the `TaskStore` resumption cursor
-    /// (`mark_units_done`), then -- only once at least `progress_every`
-    /// units have completed since the last emission -- appends one
-    /// `scan.progress` event (AC-3.30) and clears `completed`.
+    /// Forces the log durable, then flushes `completed` to the `TaskStore`
+    /// resumption cursor (`mark_units_done`), then -- only once at least
+    /// `progress_every` units have completed since the last emission --
+    /// appends one `scan.progress` event (AC-3.30) and clears `completed`.
+    ///
+    /// # Ordering (M3 whole-branch review, CRITICAL-2)
+    ///
+    /// `self.log_guard().force_sync()` runs FIRST, unconditionally, before
+    /// `mark_units_done` -- never the other way around. `mark_units_done`
+    /// is a genuinely fsync'd SQLite commit (`synchronous=FULL`), and
+    /// `bathy-evidence/src/lib.rs`'s own module doc calls the event log
+    /// "the source of truth for a scan; SQLite state ... is a derived
+    /// index rebuildable from it, never the other way around." An earlier
+    /// version of this method called `mark_units_done` first and left the
+    /// log's own `force_sync` to run only once, at the very end of `run` --
+    /// which meant a crash between the two could leave the store durably
+    /// reporting units complete that the log had not yet issued a single
+    /// real `fsync` for at all. On resume, `already_done` (loaded from
+    /// exactly what `mark_units_done` persisted) would then skip those
+    /// units forever, permanently discarding observations the log never
+    /// actually held durably in the first place -- the exact inversion the
+    /// M2 durability contract ("never invert this") was written to
+    /// prevent, just against a component M2 never had (one that writes
+    /// both the log and the store). **The cursor `mark_units_done`/
+    /// `record_progress` advance is durable only after the events it
+    /// certifies are.** Costs one extra `fsync` per `STORE_FLUSH_BATCH`
+    /// (64) units on top of whatever `GroupCommitLog`'s own bounded
+    /// trigger would have done anyway -- see
+    /// `flush_progress_forces_a_log_sync_before_the_store_durably_marks_units_done`
+    /// below, which pins the ordering directly rather than trusting this
+    /// comment.
     ///
     /// `units_completed` is passed by value rather than borrowing
     /// `RunSummary` so this can run interleaved with `record`'s own `&mut
@@ -573,6 +784,14 @@ impl Scheduler {
         if completed.is_empty() {
             return Ok(());
         }
+        // CRITICAL-2: durable before durable-claimed-durable. See this
+        // method's own doc comment. The `?` here is also why the ORDER
+        // (not just the presence) of this call matters, not only for a
+        // concurrent observer: if `force_sync` itself fails, this returns
+        // before `mark_units_done` ever runs, so a failed sync can never
+        // be followed by the store claiming the units it was supposed to
+        // certify are durably done anyway.
+        self.log_guard().force_sync()?;
         self.store.mark_units_done(self.scan_id, completed)?;
         if units_completed.saturating_sub(*last_progress_emitted_at)
             >= self.config.progress_every.max(1)
@@ -675,7 +894,6 @@ mod tests {
         n: u64,
         budgets: Budgets,
         config: SchedulerConfig,
-        limiter_pps: u32,
     ) -> (Harness, HashMap<u16, Arc<AtomicU64>>) {
         let mut counts: HashMap<u16, Arc<AtomicU64>> = HashMap::new();
         let mut ports: Vec<u16> = Vec::with_capacity(n as usize);
@@ -694,7 +912,13 @@ mod tests {
         }
         let specs: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
         let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
-        let h = make_harness(&["127.0.0.1"], &spec_refs, budgets, config, limiter_pps);
+        let h = make_harness(
+            &["127.0.0.1"],
+            &spec_refs,
+            budgets,
+            config,
+            default_manifest(),
+        );
         (h, counts)
     }
 
@@ -730,6 +954,11 @@ mod tests {
         /// the C2/M2 one-clock-per-scan requirement (M3 Task 7 fix round 1,
         /// CRITICAL-2's own tests need exactly this).
         clock: Arc<dyn Clock>,
+        /// The SAME manifest `scheduler` was built with -- exposed so
+        /// `resume` can build a second `Scheduler` against the same
+        /// authorization boundary without a caller having to thread it
+        /// through separately (M3 whole-branch review, CRITICAL-1).
+        manifest: Arc<ScopeManifest>,
     }
 
     impl Harness {
@@ -756,13 +985,18 @@ mod tests {
         /// off, and it is what M3 Task 7 fix round 1's CRITICAL-2 tests
         /// exercise -- a naive `BudgetLedger::new(budgets)` here would
         /// reproduce the exact hole the review found.
-        fn resume(&self, config: SchedulerConfig, limiter_pps: u32, budgets: Budgets) -> Scheduler {
+        /// M3 whole-branch review, CRITICAL-1: no separate `limiter_pps`
+        /// parameter any more -- `budgets` alone determines the resumed
+        /// scheduler's real throttle (IMPORTANT-2), and `manifest` reuses
+        /// the SAME authorization boundary `self.scheduler` was built with,
+        /// via the `manifest` field above.
+        fn resume(&self, config: SchedulerConfig, budgets: Budgets) -> Scheduler {
             let record = self.store.get(self.scan_id).unwrap().unwrap();
             let ledger =
                 BudgetLedger::resumed(budgets, record.packets_spent, record.elapsed_seconds);
             Scheduler::new(
-                RateLimiter::new(limiter_pps),
                 ledger,
+                Arc::clone(&self.manifest),
                 config,
                 Arc::clone(&self.log),
                 Arc::clone(&self.store),
@@ -773,12 +1007,20 @@ mod tests {
         }
     }
 
-    fn make_harness(
+    /// Like `make_harness`, but with a caller-chosen `GroupCommitConfig`.
+    /// `make_harness` itself just delegates here with the default config;
+    /// this is broken out only because ONE test below
+    /// (`flush_progress_forces_a_log_sync_before_the_store_durably_marks_units_done`,
+    /// CRITICAL-1's durability-ordering sibling, CRITICAL-2) needs to
+    /// eliminate every OTHER source of a real log sync to isolate the
+    /// mechanism it is actually testing.
+    fn make_harness_with_group_commit(
         targets: &[&str],
         port_specs: &[&str],
         budgets: Budgets,
         config: SchedulerConfig,
-        limiter_pps: u32,
+        manifest: Arc<ScopeManifest>,
+        group_commit: GroupCommitConfig,
     ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         // One shared `Arc<dyn Clock>` for both `TaskStore` and every
@@ -821,14 +1063,13 @@ mod tests {
         let scan_id = outcome.scan_id();
 
         let log = Arc::new(Mutex::new(
-            GroupCommitLog::open(dir.path(), scan_id, GroupCommitConfig::default()).unwrap(),
+            GroupCommitLog::open(dir.path(), scan_id, group_commit).unwrap(),
         ));
 
         let ledger = BudgetLedger::new(budgets);
-        let limiter = RateLimiter::new(limiter_pps);
         let scheduler = Scheduler::new(
-            limiter,
             ledger,
+            Arc::clone(&manifest),
             config,
             Arc::clone(&log),
             Arc::clone(&store),
@@ -845,7 +1086,94 @@ mod tests {
             log,
             scan_id,
             clock,
+            manifest,
         }
+    }
+
+    fn make_harness(
+        targets: &[&str],
+        port_specs: &[&str],
+        budgets: Budgets,
+        config: SchedulerConfig,
+        manifest: Arc<ScopeManifest>,
+    ) -> Harness {
+        make_harness_with_group_commit(
+            targets,
+            port_specs,
+            budgets,
+            config,
+            manifest,
+            GroupCommitConfig::default(),
+        )
+    }
+
+    /// The manifest every helper in this module builds a `Scheduler` with,
+    /// unless a test specifically needs a different one (the CRITICAL-1/
+    /// IMPORTANT-1 "denied" tests below do, via
+    /// `manifest_denying_loopback`). Built via
+    /// `ScopeManifest::for_tests_allowing_loopback` -- see that
+    /// constructor's own doc comment for why: virtually every test in this
+    /// module drives real `127.0.0.1` sockets, which `ScopeManifest::allows`
+    /// refuses categorically outside of this one, explicitly named,
+    /// test-only exception (M3 whole-branch review, CRITICAL-1's own "the
+    /// loopback problem is yours to solve for the tests" wrinkle -- every
+    /// scheduler test in this module scans a refused address, so leaving
+    /// this unsolved would mean CRITICAL-1's own fix could never pass this
+    /// module's suite at all).
+    fn default_manifest() -> Arc<ScopeManifest> {
+        Arc::new(
+            ScopeManifest::for_tests_allowing_loopback(
+                r#"{
+                  "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "description": "bathy-engine scheduler test fixture -- loopback allowed only via for_tests_allowing_loopback",
+                  "not_after": "2099-01-01T00:00:00.000Z",
+                  "allowed_cidrs": ["127.0.0.1/32"],
+                  "budget_ceiling": {
+                    "maximum_packets": 100000000,
+                    "maximum_runtime_seconds": 100000000,
+                    "maximum_packets_per_second": 100000000
+                  }
+                }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// A manifest matching `scope_id()` that authorizes an unrelated subnet
+    /// only, built through the ORDINARY, non-test `ScopeManifest::load` --
+    /// `allows(127.0.0.1)` is `false` here for exactly the reason it would
+    /// be for any real manifest scoped away from loopback, nothing to do
+    /// with this module's own loopback exception. Used by the CRITICAL-1
+    /// and IMPORTANT-1 "denied" tests below, which target 127.0.0.1
+    /// specifically to prove the scheduler's own per-unit re-check -- not
+    /// this test harness's loopback allowance -- is what refuses it.
+    fn manifest_denying_loopback() -> Arc<ScopeManifest> {
+        Arc::new(
+            ScopeManifest::load(
+                r#"{
+                  "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                  "description": "CRITICAL-1 fixture: authorizes an unrelated subnet only",
+                  "not_after": "2099-01-01T00:00:00.000Z",
+                  "allowed_cidrs": ["10.30.0.0/24"],
+                  "budget_ceiling": {
+                    "maximum_packets": 1000000,
+                    "maximum_runtime_seconds": 3600,
+                    "maximum_packets_per_second": 1000000
+                  }
+                }"#,
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Re-opens a FRESH `TaskStore` against the harness's own database
+    /// directory and reads back `scan_id`'s status -- proving IMPORTANT-1's
+    /// fix persists (survives a reopen/reconnect), not merely that the
+    /// harness's own already-open `Arc<TaskStore>` reflects an in-memory
+    /// write.
+    fn reopened_status(h: &Harness) -> TaskStatus {
+        let reopened = TaskStore::open(h._dir.path(), Arc::clone(&h.clock)).unwrap();
+        reopened.get(h.scan_id).unwrap().unwrap().status
     }
 
     fn small_config() -> SchedulerConfig {
@@ -864,7 +1192,7 @@ mod tests {
             &spec_refs,
             budgets(1_000_000, 3_600, 1_000_000),
             small_config(),
-            1_000_000,
+            default_manifest(),
         )
     }
 
@@ -875,20 +1203,23 @@ mod tests {
     /// whole scan finish before a test could ever observe it mid-flight --
     /// see `cancellation_stops_promptly_and_leaves_a_resumable_cursor` and
     /// `progress_events_are_emitted_periodically_during_a_long_scan` below,
-    /// which both depend on this).
+    /// which both depend on this). M3 whole-branch review, IMPORTANT-2: the
+    /// pacing value now lives directly in `Budgets.maximum_packets_per_second`
+    /// (there is no longer a separate limiter-pps parameter to diverge from
+    /// it -- `Scheduler::new` derives its limiter from the ledger).
     fn harness_with_many_units(n: u64) -> Harness {
         let end = 20_000 + n - 1;
         let spec = format!("20000-{end}");
         make_harness(
             &["127.0.0.1"],
             &[spec.as_str()],
-            budgets(1_000_000, 3_600, 1_000_000),
+            budgets(1_000_000, 3_600, 1_000),
             SchedulerConfig {
                 concurrency: 64,
                 connect_timeout: Duration::from_millis(300),
                 progress_every: 500,
             },
-            1_000,
+            default_manifest(),
         )
     }
 
@@ -898,7 +1229,7 @@ mod tests {
             &["20000-29999"], // 10,000 ports: "thousands of units" against a ceiling of `budget`
             budgets(budget, 3_600, 1_000_000),
             small_config(),
-            1_000_000,
+            default_manifest(),
         )
     }
 
@@ -1029,7 +1360,7 @@ mod tests {
                 connect_timeout: Duration::from_millis(800),
                 progress_every: 500,
             },
-            1_000_000,
+            default_manifest(),
         );
         assert_eq!(h.plan.len(), 2);
 
@@ -1164,7 +1495,7 @@ mod tests {
                 connect_timeout: Duration::from_secs(5),
                 progress_every: 500,
             },
-            1_000_000,
+            default_manifest(),
         );
         assert_eq!(h.plan.len(), N);
 
@@ -1328,7 +1659,7 @@ mod tests {
                 connect_timeout: Duration::from_millis(300),
                 progress_every: 500,
             },
-            1_000_000,
+            default_manifest(),
         );
         assert_eq!(h.plan.len(), 5);
         h.run_to_completion().await.unwrap();
@@ -1483,7 +1814,6 @@ mod tests {
             PLAN_SIZE,
             budgets(CEILING, 3_600, 1_000_000),
             small_config(),
-            1_000_000,
         )
         .await;
         assert_eq!(h.plan.len(), PLAN_SIZE);
@@ -1510,7 +1840,7 @@ mod tests {
             &["20000-20009"], // exactly 10 ports -> 10 units
             budgets(10, 3_600, 1_000_000),
             small_config(),
-            1_000_000,
+            default_manifest(),
         );
         assert_eq!(h.plan.len(), 10);
         let summary = h.run_to_completion().await.unwrap();
@@ -1544,7 +1874,6 @@ mod tests {
         // than the ceiling of 10.
         const PLAN_SIZE: u64 = 20;
         const CEILING: u64 = 10;
-        let scan_budgets = budgets(CEILING, 3_600, 1_000_000);
         // pps=3: `RateLimiter`'s capacity equals its configured pps, so a
         // burst >= CEILING (10) would let run1 dispatch and spend the
         // WHOLE ceiling before the poller task below ever gets scheduled
@@ -1556,9 +1885,16 @@ mod tests {
         // executor uses to run the poller -- guaranteeing run1 genuinely
         // spends SOME (not zero, not all) of the ceiling before
         // cancellation lands, the exact shape of the review's own repro
-        // (run1 spent=6).
+        // (run1 spent=6). M3 whole-branch review, IMPORTANT-2: this pps now
+        // lives directly in `scan_budgets` (there is no separate
+        // limiter-pps parameter any more), so run2's resume below uses its
+        // OWN, faster-pps `Budgets` value (`resume_budgets`) sharing the
+        // same packet ceiling -- run2 does not need run1's deliberately
+        // slow pacing, only its unspent budget.
+        let scan_budgets = budgets(CEILING, 3_600, 3);
+        let resume_budgets = budgets(CEILING, 3_600, 1_000_000);
         let (h, counts) =
-            harness_with_real_listeners(PLAN_SIZE, scan_budgets, small_config(), 3).await;
+            harness_with_real_listeners(PLAN_SIZE, scan_budgets, small_config()).await;
         assert_eq!(h.plan.len(), PLAN_SIZE);
 
         let cancel = CancellationToken::new();
@@ -1603,7 +1939,7 @@ mod tests {
         // seeded from run1's persisted spend via `BudgetLedger::resumed` --
         // not a naive `BudgetLedger::new`, which would hand run2 a full,
         // unspent ceiling (reproduced below as a mutation).
-        let resumed_scheduler = h.resume(small_config(), 1_000_000, scan_budgets);
+        let resumed_scheduler = h.resume(small_config(), resume_budgets);
         let resume_from = h
             .store
             .next_pending_unit(h.scan_id, PLAN_SIZE)
@@ -1677,7 +2013,7 @@ mod tests {
         // file (see `budgets`'s own doc comment) -- this never round-trips
         // through JSON.
         let tight_runtime_budgets = budgets(1_000_000, 0, 1_000_000);
-        let resumed_scheduler = h.resume(small_config(), 1_000_000, tight_runtime_budgets);
+        let resumed_scheduler = h.resume(small_config(), tight_runtime_budgets);
         let resume_from = h
             .store
             .next_pending_unit(h.scan_id, h.plan.len())
@@ -1718,10 +2054,13 @@ mod tests {
         // (5,000 let round 3 exhaust the plan naturally instead of being
         // cancelled).
         let h = harness_with_many_units(20_000);
-        // Generous on both packets and runtime -- cancellation (not budget
-        // exhaustion) must be what stops every round, so each round's own
-        // elapsed time is genuinely under this test's control.
-        let generous_budgets = budgets(1_000_000, 1_000_000, 1_000_000);
+        // Generous on packets and runtime, but deliberately paced at 1,000
+        // pps -- cancellation (not budget exhaustion) must be what stops
+        // every round, so each round's own elapsed time is genuinely under
+        // this test's control. M3 whole-branch review, IMPORTANT-2: the
+        // pacing value now lives directly in this same `Budgets` (there is
+        // no separate limiter-pps parameter any more).
+        let generous_budgets = budgets(1_000_000, 1_000_000, 1_000);
         let mut resume_from = 0u64;
         for round in 0..3u32 {
             let cancel = CancellationToken::new();
@@ -1734,7 +2073,7 @@ mod tests {
             // same shape a real process restart takes -- reusing one
             // `Scheduler`/`BudgetLedger` across rounds would never exercise
             // the persist-then-reseed path this test is actually about.
-            let scheduler = h.resume(small_config(), 1_000, generous_budgets);
+            let scheduler = h.resume(small_config(), generous_budgets);
             let summary = scheduler.run(&h.plan, resume_from, cancel).await.unwrap();
             assert!(
                 summary.cancelled,
@@ -1776,9 +2115,11 @@ mod tests {
         let h = make_harness(
             &["127.0.0.1"],
             &["20000-29999"],
-            budgets(1_000_000, 1, 1_000_000), // 1s runtime ceiling, sizeable plan
+            // 1s runtime ceiling, sizeable plan, pps=50 -- slow enough that
+            // 1 second elapses before the plan finishes.
+            budgets(1_000_000, 1, 50),
             small_config(),
-            50, // slow enough that 1 second elapses before the plan finishes
+            default_manifest(),
         );
         let summary = h.run_to_completion().await.unwrap();
         assert!(summary.time_exhausted);
@@ -2092,13 +2433,16 @@ mod tests {
         let h = make_harness(
             &["127.0.0.1"],
             &spec_refs,
-            budgets(1_000_000, 3_600, 1_000_000),
+            // pps=8 folded directly into the ceiling-bearing `Budgets`
+            // value (M3 whole-branch review, IMPORTANT-2: no more separate
+            // limiter-pps parameter) -- see the comment above on why 8.
+            budgets(1_000_000, 3_600, 8),
             SchedulerConfig {
                 concurrency: 10,
                 connect_timeout: Duration::from_secs(5),
                 progress_every: 500,
             },
-            8,
+            default_manifest(),
         );
         assert_eq!(h.plan.len(), N);
 
@@ -2217,5 +2561,425 @@ mod tests {
             .filter(|e| matches!(&e.body, EventBody::PortStateObserved { .. }))
             .count();
         assert_eq!(port_states as u64, N);
+    }
+
+    // ------------------------------------------------------------------
+    // M3 whole-branch review, CRITICAL-1: proven by execution, the same
+    // way the review itself proved it -- a manifest that authorizes only
+    // an unrelated subnet, a plan addressing a REAL bound listener on
+    // 127.0.0.1, and a scheduler that must refuse to ever connect to it.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn scheduler_refuses_to_emit_a_single_packet_against_a_target_the_manifest_denies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(AtomicU64::new(0));
+        let counter = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(s);
+            }
+        });
+
+        let port_spec = port.to_string();
+        let h = make_harness(
+            &["127.0.0.1"],
+            &[port_spec.as_str()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest_denying_loopback(),
+        );
+
+        let summary = h.run_to_completion().await.unwrap();
+
+        assert!(
+            summary.policy_denied,
+            "the scheduler must refuse a target the manifest denies, got {summary:?}"
+        );
+        assert_eq!(summary.units_completed, 0, "no unit may be probed");
+        assert_eq!(
+            summary.packets_spent, 0,
+            "no budget may be spent on a target the manifest refuses"
+        );
+
+        // Give a real TCP handshake every chance to register before
+        // asserting it never happened -- a short, bounded wait, not a race
+        // resolved by asserting immediately. A real loopback connect that
+        // was actually attempted completes in well under a millisecond;
+        // 100ms is generous.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "CRITICAL-1: a real TCP accept occurred against an address the manifest \
+             refuses -- exactly the defect proven by execution in the review"
+        );
+
+        let events = h.events();
+        let denials: Vec<&Event> = events
+            .iter()
+            .filter(|e| matches!(&e.body, EventBody::PolicyDenied { .. }))
+            .collect();
+        assert_eq!(
+            denials.len(),
+            1,
+            "expected exactly one policy.denied event, got {denials:?}"
+        );
+        assert!(
+            matches!(
+                &denials[0].body,
+                EventBody::PolicyDenied { reason_code, .. } if *reason_code == DenyReason::TargetOutOfScope
+            ),
+            "expected reason_code target_out_of_scope, got {:?}",
+            denials[0].body
+        );
+        // No other terminal event alongside it.
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(
+                    &e.body,
+                    EventBody::ScanCompleted { .. } | EventBody::ScanFailed { .. }
+                ))
+                .count(),
+            0
+        );
+
+        assert_eq!(
+            h.store.get(h.scan_id).unwrap().unwrap().status,
+            TaskStatus::Denied
+        );
+    }
+
+    // The re-check must stop the WHOLE scan, not just skip the one denied
+    // unit and keep going: an authorized unit sequenced AFTER a denied one
+    // in the plan must never be dispatched either. Port-major ordering
+    // (`bathy-plan`) makes this easy to construct: two targets on the same
+    // single port means unit 0 and unit 1 are the two hosts, in target
+    // order.
+    #[tokio::test]
+    async fn a_policy_denial_stops_the_whole_scan_not_just_the_offending_unit() {
+        // `manifest_denying_loopback` authorizes only 10.30.0.0/24 -- driven
+        // directly with two synthetic IPv4 addresses: one it denies
+        // (8.8.8.8, sorts numerically first, so it's unit 0) and one it
+        // WOULD allow if `allows` were ever reached for it (10.30.0.1, unit
+        // 1) -- proving the scan halts at the first denial rather than
+        // working through the rest of the plan. Neither address is ever
+        // actually connected to: `summary.units_completed == 0` below is
+        // exactly the proof that the scan stops before unit 0's own
+        // (never-happens) dispatch, let alone unit 1's.
+        let manifest = manifest_denying_loopback();
+        assert!(!manifest.allows("8.8.8.8".parse::<std::net::IpAddr>().unwrap()));
+        assert!(manifest.allows("10.30.0.1".parse::<std::net::IpAddr>().unwrap()));
+
+        let h = make_harness(
+            &["8.8.8.8", "10.30.0.1"],
+            &["9"],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest,
+        );
+        // `expand_targets` sorts numerically: unit 0 is 8.8.8.8 (denied),
+        // unit 1 is 10.30.0.1 (would be allowed).
+        assert_eq!(h.plan.len(), 2);
+        assert_eq!(
+            h.plan.unit(0).unwrap().target,
+            "8.8.8.8".parse::<std::net::IpAddr>().unwrap()
+        );
+        assert_eq!(
+            h.plan.unit(1).unwrap().target,
+            "10.30.0.1".parse::<std::net::IpAddr>().unwrap()
+        );
+
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.policy_denied);
+        assert_eq!(
+            summary.units_completed, 0,
+            "unit 1 (10.30.0.1, which the manifest WOULD allow) must never be \
+             reached once unit 0 is refused"
+        );
+        assert!(h.probed_indices().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // M3 whole-branch review, CRITICAL-2: `flush_progress` must make the
+    // log durable BEFORE the store durably marks units done -- never the
+    // other way around (see that method's own doc comment for the full
+    // reasoning).
+    // ------------------------------------------------------------------
+
+    // An observer task, not an after-the-fact assertion: `flush_progress`
+    // itself runs synchronously (no `.await` inside it), so within one call
+    // there is no interleaving point a concurrent task could ever observe
+    // -- the ordering bug this test targets shows up only BETWEEN calls,
+    // while `run`'s own dispatch loop is `.await`ing the next rate-limiter
+    // permit or socket connect. A `GroupCommitConfig` with a huge
+    // `max_events`/`max_interval` removes every OTHER source of a real log
+    // sync during the run, so `sync_calls()` can only ever advance via the
+    // explicit `force_sync()` this fix adds to `flush_progress` --
+    // isolating exactly the mechanism under test, the same technique the
+    // reviewer used to prove the bug (`68 completed units, 0 real fsyncs`).
+    #[tokio::test]
+    async fn flush_progress_forces_a_log_sync_before_the_store_durably_marks_units_done() {
+        const N: u64 = 512; // several STORE_FLUSH_BATCH (64) batches
+        let end = 20_000 + N - 1;
+        let spec = format!("20000-{end}");
+        // pps=300: `RateLimiter`'s capacity equals its configured pps, so
+        // the first 300 units burst through immediately and the remaining
+        // ~212 are genuinely throttled -- real `.await` yield points spread
+        // across roughly the whole run, giving the poller below many
+        // chances to interleave between `flush_progress` calls (as opposed
+        // to the whole 512-unit scan completing inside one scheduling
+        // burst with no observable gap at all).
+        let h = make_harness_with_group_commit(
+            &["127.0.0.1"],
+            &[spec.as_str()],
+            budgets(1_000_000, 3_600, 300),
+            SchedulerConfig {
+                concurrency: 16,
+                connect_timeout: Duration::from_millis(300),
+                progress_every: 500,
+            },
+            default_manifest(),
+            GroupCommitConfig {
+                max_events: 1_000_000,
+                max_interval: Duration::from_secs(1_000),
+            },
+        );
+
+        let violation = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let violation_poll = Arc::clone(&violation);
+        let store = Arc::clone(&h.store);
+        let log = Arc::clone(&h.log);
+        let scan_id = h.scan_id;
+        let poller = tokio::spawn(async move {
+            loop {
+                let done = store.completed_units(scan_id).unwrap().len() as u64;
+                let synced = log.lock().unwrap().sync_calls();
+                if done > 0 && synced == 0 {
+                    violation_poll.store(true, Ordering::SeqCst);
+                    break;
+                }
+                if done >= N {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        let summary = h.run_to_completion().await.unwrap();
+        poller.await.unwrap();
+
+        assert_eq!(summary.units_completed, N);
+        assert!(
+            !violation.load(Ordering::SeqCst),
+            "observed the store durably reporting completed units while the log had \
+             issued zero real fsync(s) -- CRITICAL-2's inverted durability ordering"
+        );
+        assert!(
+            h.log.lock().unwrap().sync_calls() >= 1,
+            "sanity: this run must have forced at least one real sync via force_sync \
+             (max_events/max_interval were both configured to never trigger on their own)"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M3 whole-branch review, IMPORTANT-1: `TaskStore::set_status` had no
+    // caller outside its own tests -- a scan's status stayed `Pending`
+    // forever regardless of outcome. Each test below drives `run` to a
+    // different terminal outcome and checks the persisted status survives
+    // a fresh `TaskStore::open` against the same directory, not just that
+    // the harness's own already-open connection reflects it.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn set_status_transitions_to_completed_on_plan_exhaustion_and_survives_reopen() {
+        let port = open_port().await;
+        let h = harness(&["127.0.0.1"], &[port]);
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(
+            !summary.cancelled
+                && !summary.budget_exhausted
+                && !summary.time_exhausted
+                && !summary.policy_denied
+        );
+        assert_eq!(reopened_status(&h), TaskStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn set_status_transitions_to_cancelled_on_cancellation_and_survives_reopen() {
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // already cancelled before run() even starts
+        let h = harness_with_many_units(50);
+        let summary = h.scheduler.run(&h.plan, 0, cancel).await.unwrap();
+        assert!(summary.cancelled);
+        assert_eq!(reopened_status(&h), TaskStatus::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn set_status_transitions_to_failed_on_budget_exhaustion_and_survives_reopen() {
+        let h = harness_with_packet_budget(5);
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.budget_exhausted);
+        assert_eq!(reopened_status(&h), TaskStatus::Failed);
+    }
+
+    #[tokio::test]
+    async fn set_status_transitions_to_denied_on_a_policy_refusal_and_survives_reopen() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = listener.accept().await {
+                drop(s);
+            }
+        });
+        let port_spec = port.to_string();
+        let h = make_harness(
+            &["127.0.0.1"],
+            &[port_spec.as_str()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest_denying_loopback(),
+        );
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.policy_denied);
+        assert_eq!(reopened_status(&h), TaskStatus::Denied);
+    }
+
+    // ------------------------------------------------------------------
+    // M3 whole-branch review, IMPORTANT-2: `Scheduler::new` no longer takes
+    // a separate `RateLimiter` -- it derives one from
+    // `ledger.packets_per_second()`. This is a structural fix (a caller can
+    // no longer even ask for two different pps values), but this test is
+    // the behavioral guard: a scan's REAL throttle must actually track
+    // whatever `Budgets.maximum_packets_per_second` says, not some
+    // independently-configured value that happened to match by convention
+    // in every other test in this module.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn the_schedulers_real_throttle_tracks_the_budgets_configured_pps_not_a_separate_value() {
+        const N: u64 = 200;
+        const PPS: u32 = 100; // deliberately below N
+        let end = 20_000 + N - 1;
+        let spec = format!("20000-{end}");
+        let h = make_harness(
+            &["127.0.0.1"],
+            &[spec.as_str()],
+            budgets(1_000_000, 3_600, PPS),
+            SchedulerConfig {
+                concurrency: 32,
+                connect_timeout: Duration::from_millis(300),
+                progress_every: 500,
+            },
+            default_manifest(),
+        );
+
+        let start = Instant::now();
+        let summary = h.run_to_completion().await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(summary.units_completed, N);
+
+        // `RateLimiter`'s bucket capacity equals its configured pps, so PPS
+        // tokens are available immediately and the remaining `N - PPS` must
+        // be paced at PPS/second -- a scan this size finishing near
+        // instantly would mean the scheduler's real limiter was not built
+        // from `PPS` at all. 50% of the theoretical minimum is a generous
+        // lower bound: comfortably clear of scheduling jitter while still
+        // failing hard for "not actually throttled."
+        let theoretical_minimum = Duration::from_secs_f64((N - PPS as u64) as f64 / PPS as f64);
+        assert!(
+            elapsed >= theoretical_minimum.mul_f64(0.5),
+            "a scan of {N} units at a configured {PPS} pps finished in {elapsed:?}, well \
+             under the ~{theoretical_minimum:?} the configured throttle should have taken \
+             -- the scheduler's real limiter does not appear to be built from Budgets' \
+             own maximum_packets_per_second"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // M3 whole-branch review, IMPORTANT-3: `run` must refuse a plan that
+    // does not hash to what this scan_id was actually started (and, if
+    // resuming, previously ran) against.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn run_refuses_a_plan_whose_hash_does_not_match_the_scans_stored_plan_hash() {
+        let port = open_port().await;
+        let h = harness(&["127.0.0.1"], &[port]);
+
+        // A DIFFERENT plan for the same request shape -- same targets, same
+        // everything else, but a different (fixed, always-distinct-from-a-
+        // real-ephemeral-port) port selection, so it hashes differently.
+        // Built directly, without ever going through `TaskStore::start_or_reuse`
+        // again for this scan_id, to isolate exactly the case `run` itself
+        // must catch: whatever plan a caller hands it, on a scan_id that
+        // already names a different one.
+        let different_request = ScanRequest {
+            targets: NonEmpty::try_from(vec!["127.0.0.1".to_string()]).unwrap(),
+            authorization_scope_id: scope_id(),
+            objective: Objective::InventoryExposedServices,
+            ports: PortSelection::Explicit {
+                explicit: NonEmpty::try_from(vec!["1".to_string()]).unwrap(),
+            },
+            service_detection: ServiceDetection::default(),
+            budgets: budgets(1_000_000, 3_600, 1_000_000),
+            evidence_level: EvidenceLevel::Headers,
+            idempotency_key: "harness-key".into(),
+        };
+        let different_plan = ScanPlan::build(&different_request, 1_000_000).unwrap();
+        assert_ne!(
+            different_plan.hash(),
+            h.plan.hash(),
+            "test fixture sanity: the two plans must actually differ"
+        );
+
+        let err = h
+            .scheduler
+            .run(&different_plan, 0, CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, EngineError::PlanMismatch { .. }),
+            "expected PlanMismatch, got {err:?}"
+        );
+        assert!(
+            h.events().is_empty(),
+            "a mismatched plan must not emit anything at all, not even scan.started"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_accepts_a_plan_that_hashes_to_exactly_what_the_scan_was_started_with() {
+        // The positive case, stated directly rather than only inferred from
+        // every other test in this module happening to pass `h.plan`
+        // itself: an explicitly REBUILT plan (a fresh `ScanPlan::build`
+        // call, not `h.plan` by reference) that hashes identically must be
+        // accepted exactly like the original.
+        let port = open_port().await;
+        let h = harness(&["127.0.0.1"], &[port]);
+        let request = ScanRequest {
+            targets: NonEmpty::try_from(vec!["127.0.0.1".to_string()]).unwrap(),
+            authorization_scope_id: scope_id(),
+            objective: Objective::InventoryExposedServices,
+            ports: PortSelection::Explicit {
+                explicit: NonEmpty::try_from(vec![port.to_string()]).unwrap(),
+            },
+            service_detection: ServiceDetection::default(),
+            budgets: budgets(1_000_000, 3_600, 1_000_000),
+            evidence_level: EvidenceLevel::Headers,
+            idempotency_key: "harness-key".into(),
+        };
+        let rebuilt_plan = ScanPlan::build(&request, 1_000_000).unwrap();
+        assert_eq!(rebuilt_plan.hash(), h.plan.hash(), "test fixture sanity");
+
+        let summary = h
+            .scheduler
+            .run(&rebuilt_plan, 0, CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(summary.units_completed, 1);
     }
 }
