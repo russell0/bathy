@@ -208,8 +208,18 @@ mod tests {
     #[test]
     fn port_zero_error_names_the_offending_input() {
         let err = resolve_ports(&explicit(&["0"])).unwrap_err();
-        assert!(format!("{err}").contains('0'));
         assert!(matches!(err, PortError::PortZero(ref s) if s == "0"));
+        // Exact match, not `.contains('0')`: the static text "port 0 is not
+        // a scannable port" already contains a literal '0' on its own, so a
+        // `.contains('0')` check is coincidentally satisfied even if the
+        // `{0}` field were dropped from the format string entirely --
+        // confirmed by mutation (see the task fix report). Asserting the
+        // full rendered message is the only way this test actually fails
+        // when the field stops being interpolated.
+        assert_eq!(
+            format!("{err}"),
+            "port 0 is not a scannable port (from `0`)"
+        );
     }
 
     #[test]
@@ -260,6 +270,73 @@ mod tests {
     fn a_mixture_of_individual_ports_and_ranges_across_multiple_specs() {
         let sel = explicit(&["443", "1-3", "8080", "3-5"]);
         assert_eq!(resolve_ports(&sel).unwrap(), vec![1, 2, 3, 4, 5, 443, 8080]);
+    }
+
+    // ---- Determinism (property) -----------------------------------------
+    //
+    // The fixed two-case example above (`explicit_selection_is_sorted_and_
+    // deduplicated_regardless_of_input_order`) only ever proves the property
+    // holds for `["80","22","80"]` vs `["22","80"]`. This is the same
+    // property as `targets::expand_targets`'s own
+    // `any_permutation_of_specs_yields_an_identical_output_vector` --
+    // reused here with the same `permute` shape -- because it protects the
+    // same guarantee: `plan_hash` must not depend on the order a caller
+    // happened to list ports in, and only a property test over arbitrary
+    // permutations, not a couple of fixed examples, actually establishes
+    // that for every input shape, not just the ones someone thought to
+    // write down.
+
+    /// A Fisher-Yates permutation driven entirely by proptest-generated
+    /// integers -- identical in shape to `targets::tests::permute`, kept as
+    /// its own copy here rather than shared, since both are private test
+    /// helpers in different modules.
+    fn permute<T: Clone>(items: &[T], swaps: &[usize]) -> Vec<T> {
+        let mut v = items.to_vec();
+        let n = v.len();
+        for i in (1..n).rev() {
+            let j = swaps[n - 1 - i] % (i + 1);
+            v.swap(i, j);
+        }
+        v
+    }
+
+    /// Always a *valid* explicit port spec (a single port or an ascending
+    /// range, both within 1..=65535) -- this property is about order
+    /// independence of a selection that resolves successfully, not about
+    /// error handling, which the AC-3.9 tests above already cover.
+    fn valid_port_spec_strategy() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        prop_oneof![
+            (1u16..=u16::MAX).prop_map(|p| p.to_string()),
+            (1u16..=u16::MAX, 1u16..=u16::MAX).prop_map(|(x, y)| {
+                let (a, b) = if x <= y { (x, y) } else { (y, x) };
+                format!("{a}-{b}")
+            }),
+        ]
+    }
+
+    proptest::proptest! {
+        /// For *any* non-empty list of valid port specs, permuting the input
+        /// must not change `resolve_ports`'s output. This is what keeps
+        /// `plan_hash` stable regardless of the order a caller lists ports
+        /// in -- an order-dependent resolution would turn every idempotent
+        /// retry with reordered ports into a spurious plan-hash conflict.
+        #[test]
+        fn any_permutation_of_a_valid_explicit_selection_yields_an_identical_output_vector(
+            (specs, swaps) in {
+                use proptest::strategy::Strategy;
+                proptest::collection::vec(valid_port_spec_strategy(), 1..8).prop_flat_map(|specs| {
+                    let len = specs.len();
+                    (proptest::strategy::Just(specs), proptest::collection::vec(proptest::prelude::any::<usize>(), len))
+                })
+            }
+        ) {
+            let permuted = permute(&specs, &swaps);
+            let as_selection = |v: &[String]| explicit(&v.iter().map(String::as_str).collect::<Vec<_>>());
+            let original = resolve_ports(&as_selection(&specs)).unwrap();
+            let after_permutation = resolve_ports(&as_selection(&permuted)).unwrap();
+            proptest::prop_assert_eq!(original, after_permutation);
+        }
     }
 
     // ---- AC-3.7 ---------------------------------------------------------
