@@ -1,0 +1,34 @@
+[package]
+name = "bathy-engine"
+version.workspace = true
+edition.workspace = true
+# MSRV tiering: this crate depends on nothing that needs more than the
+# workspace floor. In particular it does NOT depend on `bathy-store` (the
+# one crate that needs a higher literal floor -- see the MSRV comment on
+# `bathy-store`'s `Cargo.toml`) -- its only dependency is `tokio`, whose
+# `time`/`sync`/`rt`/`macros` features (see the workspace `Cargo.toml`)
+# build fine at the workspace floor. `BudgetLedger`, the type this task's
+# brief lists under "Consumes", lives in `bathy-scope` (layer 1), not
+# `bathy-store` (layer 3) -- and even that consumption is not part of this
+# task's actual deliverable (the rate limiter alone; budget-governed
+# emission is a later task in the same milestone plan). When a later task
+# gives this crate a real dependency on `bathy-store` (M3 Task 8, which
+# needs `TaskStore`), move this to `rust-version = "1.95"` at that point,
+# with the same comment shape as `bathy-store`'s own manifest, and add it
+# to the `msrv-bathy-store` CI job then -- not before, and not on the
+# strength of a dependency it doesn't have yet (see this task's report for
+# why the dispatch's premise here was wrong).
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+
+[dev-dependencies]
+# `test-util` is additive on top of the `[dependencies]` feature set above
+# (Cargo features only ever union) and is needed only by the test target:
+# `#[tokio::test(start_paused = true)]` (used for the sustained-rate test,
+# so it runs on a simulated clock instead of sleeping for real) requires it
+# to compile at all.
+tokio = { workspace = true, features = ["test-util"] }
