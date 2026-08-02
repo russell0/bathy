@@ -29,7 +29,7 @@ over MCP.
 > library call — see `crates/bathy-engine/tests/end_to_end_scan.rs` for exactly
 > that, exercised end to end against real sockets.
 >
-> Plans for all seven milestones — 185 numbered acceptance criteria — are in
+> Plans for all seven milestones — 192 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
 
 ## What works today
@@ -64,7 +64,10 @@ scope the scan was started under; there is no flag to bypass it, and a scan is
 refused in full — never silently trimmed — the moment any of that fails: the
 manifest belongs to a different scope, the manifest has expired, or a single target
 falls outside its allow set. `bathy-engine`'s scheduler enforces all three directly,
-on the actual emission path, immediately before every probe; that is the only
+on the actual emission path. Scope identity and expiry are checked once per
+`Scheduler::run`, before any probe is dispatched; the allow/deny set is checked
+per unit, immediately before each probe. A manifest that expires mid-scan does
+not halt the run in progress. That is the only
 enforcement point that exists today (see the Status note above). Scans carry hard
 packet, rate, and runtime budgets. v0.1 probe traffic is a plain, unprivileged TCP
 connect: it carries no identifying payload — that is a v0.1 limitation, not a claim

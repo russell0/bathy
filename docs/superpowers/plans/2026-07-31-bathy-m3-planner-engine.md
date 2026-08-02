@@ -382,7 +382,7 @@ pub fn resolve_ports(selection: &PortSelection) -> Result<Vec<u16>, PortError> {
                     let a: u16 = a.parse().map_err(|_| PortError::Malformed(spec.clone()))?;
                     let b: u16 = b.parse().map_err(|_| PortError::Malformed(spec.clone()))?;
                     if a == 0 {
-                        return Err(PortError::PortZero);
+                        return Err(PortError::PortZero(spec.clone()));
                     }
                     if b < a {
                         return Err(PortError::ReversedRange(spec.clone()));
@@ -391,7 +391,7 @@ pub fn resolve_ports(selection: &PortSelection) -> Result<Vec<u16>, PortError> {
                 } else {
                     let p: u16 = spec.parse().map_err(|_| PortError::Malformed(spec.clone()))?;
                     if p == 0 {
-                        return Err(PortError::PortZero);
+                        return Err(PortError::PortZero(spec.clone()));
                     }
                     out.push(p);
                 }
@@ -1244,7 +1244,9 @@ impl Scheduler {
                 summary.cancelled = true;
                 break;
             }
-            if self.ledger.lock().unwrap().elapsed_exceeded(started.elapsed().as_secs()) {
+            // CEILING, not truncating — as_secs() makes any sub-second resumed round
+            // contribute zero, so six 800ms rounds run 4.95s against a 2s ceiling.
+            if self.ledger.lock().unwrap().elapsed_exceeded(ceil_elapsed_seconds(started.elapsed())) {
                 summary.time_exhausted = true;
                 break;
             }
@@ -1328,6 +1330,8 @@ git commit -m "feat(engine): budget-governed scheduler with cancellation and res
 - **AC-3.26** Resuming from index *n* probes no unit below *n* and probes no unit twice.
 - **AC-3.27** Budget exhaustion, time exhaustion, and cancellation are reported as three distinct outcomes with distinct terminal events (`budget_exhausted`, `time_exhausted`, and no terminal failure event for cancellation).
 - **AC-3.28** Every scan begins with exactly one `scan.started` carrying the `plan_hash` and ends with exactly one terminal event.
+- **AC-3.35** `Scheduler` is NOT CONSTRUCTIBLE without a `ScopeManifest`. Nothing on the emission path may reach `TcpStream::connect` without having consulted it. This is the Global Constraint's only enforcement point in v0.1 — `bathy_scope::evaluate` has zero callers until M5 — so the scheduler must independently verify all three properties: the manifest's id matches the scan record's `authorization_scope_id`, the manifest is not expired, and each target passes `allows()`. Prove each with a real TCP accept counter showing ZERO accepts, not merely with a `RunSummary` field. Note loopback is categorically refused by `is_ordinary_unicast`, so every scheduler test is itself a scan of a refused address — tests need a `#[cfg]`-gated loopback exception that is provably unreachable from production.
+- **AC-3.36** The event log is force-synced BEFORE the resumption cursor is written. `mark_units_done` is a durable WAL commit; if it lands first, a crash leaves the store certifying units the log has no record of, and resume skips them permanently. Pin the ORDER, not merely the presence of the sync — a test that only catches a missing `force_sync` survives the two calls being swapped.
 - **AC-3.29** Every probed unit produces exactly one `port.state` event — no duplicates, no omissions.
 - **AC-3.30** `scan.progress` events are emitted periodically during long scans.
 
