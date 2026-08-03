@@ -127,6 +127,20 @@ pub enum ProbeError {
 ///
 /// The cap exists because the peer is hostile by assumption: a probe must not
 /// be able to be induced to read unbounded data into memory.
+///
+/// THE BYTE CAP IS LOAD-BEARING, NOT A BACKSTOP. Against a peer that floods
+/// without ever pausing, the deadline CANNOT bound the read: tokio's `timeout`
+/// polls the wrapped future first and only consults the sleep timer when that
+/// poll returns `Pending` (see tokio's own `timeout.rs` doc: "it is possible for
+/// the future to complete and exceed the timeout without returning an error").
+/// An always-ready socket starves the timer structurally. Measured: removing the
+/// cap grew RSS past 1.1 GB in 5 seconds, still climbing, never returning.
+///
+/// The deadline is what bounds the OTHER attack — a peer that dribbles one byte
+/// every few hundred ms, where every individual read succeeds so a naive
+/// per-read timeout never fires. Compute the deadline as an absolute instant and
+/// shrink the remaining budget each iteration; do not reset it per read.
+/// Both mechanisms are needed; neither substitutes for the other.
 pub struct ProbeIo {
     stream: TcpStream,
     read_cap: usize,
@@ -215,7 +229,7 @@ git commit -m "feat(probe): bounded probe framework with versioned ids and inten
 ```
 
 **Acceptance criteria:**
-- **AC-4.1** `ProbeIo::read_bounded` never accumulates more than `DEFAULT_READ_CAP` bytes regardless of peer behavior, and reports truncation.
+- **AC-4.1** `ProbeIo::read_bounded` never accumulates more than `DEFAULT_READ_CAP` bytes regardless of peer behaviour, and reports truncation. Test BOTH hostile shapes separately — a flooding peer (bounded only by the cap; the deadline provably cannot help) and a dribbling peer (bounded only by an absolute, non-resetting deadline). A test that only covers one leaves the other entirely unguarded.
 - **AC-4.2** Probe selection is ordered by port affinity; TLS leads on 443, SSH on 22.
 - **AC-4.3** `intensity` bounds probe count per endpoint and provably cannot influence which target or port is contacted.
 - **AC-4.4** Every registered probe id is unique and carries a version suffix.
