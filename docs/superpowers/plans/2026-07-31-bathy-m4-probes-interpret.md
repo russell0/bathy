@@ -624,8 +624,14 @@ static HTTP_NGINX: Rule = Rule {
         source: "RFC 9112 §4, RFC 9110 §10.2.4, capture from nginx in lab fixture `web-nginx`",
     },
     matcher: |bytes| {
-        // Operate on bytes, tolerate invalid UTF-8, never index without checking.
-        let text = String::from_utf8_lossy(bytes);
+        // DO NOT use String::from_utf8_lossy offsets as indices into `bytes`.
+        // U+FFFD is three bytes, so every invalid byte inflates subsequent
+        // offsets by two — the span then cites the WRONG bytes (silently) or
+        // panics out of bounds. One stray 0x80 anywhere before the match is
+        // enough. Scan line by line with strict `std::str::from_utf8` and add
+        // the line's byte offset back, so `line_start + m.end() <= bytes.len()`
+        // holds by construction.
+        let text = utf8_lines(bytes);
         if !text.starts_with("HTTP/") {
             return None;
         }
@@ -668,11 +674,12 @@ git commit -m "feat(interpret): pure rule engine with confidence ladder and cite
 **Acceptance criteria:**
 - **AC-4.10** `interpret` is pure: `bathy-interpret`'s dependency tree contains no async runtime, no filesystem access, and no clock. Asserted in CI.
 - **AC-4.11** Confidence comes from a single declared ladder; product+version outranks product-only outranks protocol-only. No magic numbers in match arms.
-- **AC-4.12** Every `Interpretation` carries a `rule_id`, a `matched_span` indexing real bytes of the response, and a rationale. `explain(rule_id)` returns documentation for every rule that can fire.
+- **AC-4.12** Every `Interpretation` carries a `rule_id`, a `matched_span` indexing real bytes of the response, and a rationale. `explain(rule_id)` returns documentation for every rule that can fire. **Assert the cited slice CONTENT for every rule, not just one** — a span-shifting mutation in any rule that lacks a content assertion survives silently, and a property test that only checks `end <= len` cannot catch an off-by-one that still lands in bounds.
+- **AC-4.17** Any property test over arbitrary bytes must be INSTRUMENTED to prove it reaches the code it claims to cover. A naive `any::<u8>()` strategy measured 6 non-empty results in 4096 cases and zero spans past offset 6 — it never reached the offset arithmetic in a single real rule and could not fail. Report the non-empty and deep-span counts.
 - **AC-4.13** Unrecognized input yields an empty vector. Interpretation never guesses a service.
 - **AC-4.14** `interpret` returns byte-identical results for identical input, and its output ordering is total and stable.
 - **AC-4.15** `interpret` does not panic on any input: empty, all-zero, all-`0xff`, and non-UTF-8 bytes at multiple lengths. Reinforced by a fuzz target in M7.
-- **AC-4.16** Every rule declares a non-empty `source` and no rule's source mentions Nmap. Asserted by a test over the whole rule set.
+- **AC-4.16** Every rule declares a non-empty `source` and no rule's source mentions Nmap. Asserted by a test over the whole rule set. **Additionally: every citation must be checked against the actual RFC or vendor text before it ships.** A source field asserting a section that does not contain the claimed sentence is affirmative evidence the section was not read, and the no-Nmap grep structurally cannot catch it. Quote verbatim or paraphrase openly — do not present a simplification in quote formatting.
 
 ---
 
