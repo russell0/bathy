@@ -23,7 +23,9 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use bathy_engine::{GroupCommitConfig, GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
+use bathy_evidence::EvidenceStore;
 use bathy_plan::ScanPlan;
+use bathy_probe::ProbeRegistry;
 use bathy_scope::{BudgetLedger, ScopeManifest};
 use bathy_store::{StartRequest, TaskStore};
 use bathy_types::clock::{Clock, FixedClock};
@@ -128,6 +130,9 @@ async fn scanning_127_0_0_1_against_two_open_ports_produces_a_gap_free_log_match
         GroupCommitLog::open(dir.path(), scan_id, GroupCommitConfig::default()).unwrap(),
     ));
 
+    let evidence = Arc::new(EvidenceStore::open(dir.path()).unwrap());
+    let probes = Arc::new(ProbeRegistry::standard());
+
     let ledger = BudgetLedger::new(budgets);
     let scheduler = Scheduler::new(
         ledger,
@@ -138,6 +143,10 @@ async fn scanning_127_0_0_1_against_two_open_ports_produces_a_gap_free_log_match
         Arc::clone(&clock),
         scan_id,
         "0.1.0",
+        request.service_detection,
+        request.evidence_level,
+        evidence,
+        probes,
     );
 
     let summary: RunSummary = scheduler

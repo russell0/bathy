@@ -55,7 +55,9 @@ name = "bathy-engine"
 version = "0.1.0"
 dependencies = [
  "bathy-evidence",
+ "bathy-interpret",
  "bathy-plan",
+ "bathy-probe",
  "bathy-scope",
  "bathy-store",
  "bathy-types",

@@ -2,7 +2,7 @@
 //! [`ScanPlan`]. This is the component that turns every other M1-M3 piece
 //! into an actual scanner.
 //!
-//! # Four invariants
+//! # Six invariants
 //!
 //! 1. **Budget is reserved before emission, never after.** [`Scheduler::run`]
 //!    calls [`BudgetLedger::try_spend_packets`] immediately before spawning a
@@ -56,6 +56,25 @@
 //!    `scan.started` or any unit is even considered, refusing the whole scan
 //!    exactly like the per-target check does. See `run`'s own doc comment.
 //!
+//!    M4 Task 5 extends this same posture to the second connection service
+//!    detection opens on an already-`Open` endpoint: [`Scheduler::detect_service`]
+//!    re-checks `manifest.allows` immediately before its own reconnect,
+//!    rather than trusting the per-unit check moments earlier (above) to
+//!    still cover it -- see that method's own doc comment.
+//! 6. **Evidence is stored before the event that cites it, never the
+//!    reverse.** M4 Task 5's own carried rule (the analogous store/log
+//!    ordering M3's review found inverted one layer up, at group-commit
+//!    granularity -- see "Group commit" below): [`Scheduler::emit_service_observed`]
+//!    calls [`bathy_evidence::EvidenceStore::put_capped`] and checks its
+//!    `?` BEFORE calling `self.log(EventBody::ServiceObserved { .. })`. A
+//!    crash between the two leaves an orphaned blob (harmless); the reverse
+//!    would leave a `service.observed` event whose `evidence_refs` entry no
+//!    `EvidenceStore::get` call could ever resolve. `evidence_level: none`
+//!    is not a special case of this rule but a direct consequence of a
+//!    type: `EventBody::ServiceObserved::evidence_refs` is
+//!    `NonEmpty<Digest>`, so with no evidence stored there is no digest to
+//!    cite and therefore no event -- see that method's own doc comment.
+//!
 //! # Group commit
 //!
 //! `run` never calls a per-event-syncing `EventLog::append` directly; it
@@ -76,20 +95,26 @@
 //! calls.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-use bathy_evidence::LogError;
+use bathy_evidence::{EvidenceError, EvidenceStore, LogError};
+use bathy_interpret::interpret;
 use bathy_plan::{ScanPlan, ScanUnit};
+use bathy_probe::{ProbeIo, ProbeRegistry, select_probes};
 use bathy_scope::{BudgetLedger, ScopeManifest};
 use bathy_store::{StoreError, TaskStore};
 use bathy_types::clock::Clock;
-use bathy_types::event::{DenyReason, EventBody, PortState, Target};
+use bathy_types::event::{DenyReason, EventBody, Observation, PortState, Target};
 use bathy_types::ids::{Digest, ScanId};
+use bathy_types::nonempty::NonEmpty;
+use bathy_types::request::{EvidenceLevel, ServiceDetection};
 use bathy_types::task::TaskStatus;
 
 use crate::connect::{ConnectOutcome, probe_connect_with_local_signal};
@@ -161,6 +186,13 @@ pub enum EngineError {
     Log(#[from] LogError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// M4 Task 5: `Scheduler::emit_service_observed`'s `EvidenceStore::put_capped`
+    /// call. Propagated as a hard error, the same way a `Log`/`Store`
+    /// failure already is -- a failed evidence write must never be silently
+    /// swallowed while the probe budget it cost has already been spent; see
+    /// this task's report for why "skip storing and continue" was rejected.
+    #[error(transparent)]
+    Evidence(#[from] EvidenceError),
     #[error("a scan worker task panicked or was cancelled by the runtime: {0}")]
     Join(#[from] tokio::task::JoinError),
     /// M3 whole-branch review, IMPORTANT-3: `run` refused to execute `plan`
@@ -302,6 +334,50 @@ pub struct Scheduler {
     clock: Arc<dyn Clock>,
     scan_id: ScanId,
     engine_version: String,
+    /// M4 Task 5: whether (and how hard) `record` attempts service
+    /// identification on an `Open` endpoint, and how many probes
+    /// `select_probes` is authorized to try -- see `detect_service`.
+    /// Carried as plain request-derived config, the same way `manifest`
+    /// and `ledger` are: nothing in `ScanPlan` retains this (see
+    /// `bathy_plan::ScanPlan`'s own fields), so a caller must hand it to
+    /// this constructor directly rather than have it rederived from the
+    /// plan.
+    service_detection: ServiceDetection,
+    /// M4 Task 5: how much of a matched probe's raw response
+    /// `emit_service_observed` is allowed to store as evidence --
+    /// `EvidenceLevel::None` stores nothing and, by direct consequence of
+    /// `EventBody::ServiceObserved::evidence_refs` being `NonEmpty<Digest>`,
+    /// emits no event at all (AC-4.23). See that method's own doc comment.
+    evidence_level: EvidenceLevel,
+    /// M4 Task 5: where `emit_service_observed` stores a matched probe's raw
+    /// response before appending the `service.observed` event that cites
+    /// it -- never the other way around; see this module's own ordering
+    /// rule at the top of this file.
+    evidence: Arc<EvidenceStore>,
+    /// M4 Task 5: the probes `detect_service` chooses from via
+    /// `select_probes`. `Arc`-shared (not owned outright) purely so it can
+    /// be built once by a caller and reused across scheduler instances --
+    /// `ProbeRegistry::standard()` is deterministic and stateless, so
+    /// sharing one instance costs nothing and avoids re-validating the
+    /// eight probes' ids on every `Scheduler::new` call.
+    probes: Arc<ProbeRegistry>,
+}
+
+/// One matched probe's identification, ready to be turned into a
+/// `service.observed` event once its evidence has actually been stored --
+/// see [`Scheduler::emit_service_observed`]. Deliberately does not carry a
+/// `Digest`: computing one is [`EvidenceStore::put_capped`]'s job, not
+/// [`Scheduler::detect_service`]'s, so this type cannot even represent
+/// "evidence referenced before it is stored."
+struct ServiceFinding {
+    observation: Observation,
+    /// The exact, untruncated bytes `capture.response` held. Capping
+    /// happens in `emit_service_observed`, at the byte count
+    /// `evidence_level` implies -- not here, so this type always carries
+    /// the real, complete evidence regardless of what a caller later
+    /// chooses to keep.
+    evidence: Vec<u8>,
+    probe_id: &'static str,
 }
 
 impl Scheduler {
@@ -333,6 +409,9 @@ impl Scheduler {
     /// values in the first place, which is strictly stronger than
     /// validating that two independently-supplied ones happen to agree, and
     /// removes a parameter besides.
+    /// M4 Task 5 added the last four parameters (`service_detection` through
+    /// `probes`) -- see their own field doc comments on this type for what
+    /// each governs.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         ledger: BudgetLedger,
@@ -343,6 +422,10 @@ impl Scheduler {
         clock: Arc<dyn Clock>,
         scan_id: ScanId,
         engine_version: impl Into<String>,
+        service_detection: ServiceDetection,
+        evidence_level: EvidenceLevel,
+        evidence: Arc<EvidenceStore>,
+        probes: Arc<ProbeRegistry>,
     ) -> Self {
         let limiter = RateLimiter::new(ledger.packets_per_second());
         Self {
@@ -355,6 +438,10 @@ impl Scheduler {
             clock,
             scan_id,
             engine_version: engine_version.into(),
+            service_detection,
+            evidence_level,
+            evidence,
+            probes,
         }
     }
 
@@ -647,7 +734,8 @@ impl Scheduler {
                 });
 
                 while let Some(done) = in_flight.try_join_next() {
-                    self.record(done?, &mut summary, &mut completed_batch)?;
+                    self.record(done?, &mut summary, &mut completed_batch)
+                        .await?;
                 }
                 if completed_batch.len() >= STORE_FLUSH_BATCH {
                     self.flush_progress(
@@ -666,7 +754,8 @@ impl Scheduler {
             // -- this loop runs unconditionally, regardless of which branch
             // above broke the dispatch loop.
             while let Some(done) = in_flight.join_next().await {
-                self.record(done?, &mut summary, &mut completed_batch)?;
+                self.record(done?, &mut summary, &mut completed_batch)
+                    .await?;
             }
             self.flush_progress(
                 &mut completed_batch,
@@ -781,7 +870,29 @@ impl Scheduler {
     /// (already rare; `EventLog::append` failing means a genuine I/O
     /// error) warrants fixing in this fix wave. Documented and accepted
     /// rather than silently left implicit.
-    fn record(
+    /// M4 Task 5: `record` is now `async` and (for an `Open` outcome, with
+    /// `service_detection.enabled`) does real network I/O of its own --
+    /// `detect_service`'s reconnect and probe attempts -- between logging
+    /// `port.state` and (if a probe found something) `service.observed`.
+    ///
+    /// This deliberately keeps identification serialized through the same
+    /// single call site that already owns event ordering for one unit,
+    /// rather than spawning it onto the `JoinSet` alongside the connect
+    /// probe itself: doing so would require `ledger`/`log`/`evidence` to
+    /// each be `Arc`-shared into a `'static` task (today only `log`,
+    /// `store`, and `evidence` already are; `ledger` is a plain `Mutex`
+    /// owned by `self`), and -- more importantly -- would reintroduce
+    /// exactly the ordering race this task's ordering rule exists to
+    /// forbid: two independently-scheduled tasks racing to append
+    /// `port.state` and `service.observed` for the same unit with no
+    /// guarantee which lands first. Keeping both appends inside one
+    /// sequential call, on the single thread that already drives `record`
+    /// for every unit, makes "port.state before service.observed" true by
+    /// construction (AC-4.21) rather than by a timing argument. The cost is
+    /// that identification for one endpoint blocks the dispatch loop from
+    /// advancing to the next unit while it runs -- accepted for this task;
+    /// see this task's report.
+    async fn record(
         &self,
         done: (ScanUnit, ConnectOutcome, bool),
         summary: &mut RunSummary,
@@ -801,12 +912,149 @@ impl Scheduler {
         })?;
         if outcome == ConnectOutcome::Open {
             summary.open_ports += 1;
+            // AC-4.22: `service_detection.enabled = false` must send zero
+            // probe bytes -- checked here, before `detect_service` is ever
+            // called, so a disabled detection setting has no path at all to
+            // the reconnect it gates, not merely an early return inside it.
+            if self.service_detection.enabled
+                && let Some(finding) = self.detect_service(&unit).await?
+            {
+                self.emit_service_observed(&unit, finding)?;
+            }
         }
         if local_failure {
             summary.local_resource_failures += 1;
         }
         completed_batch.push(unit.index);
         summary.units_completed += 1;
+        Ok(())
+    }
+
+    /// Attempts to identify the service behind `unit`, which `record` calls
+    /// only after that unit's *own* connect probe already reported
+    /// [`ConnectOutcome::Open`] -- this method never itself checks
+    /// reachability, only identity.
+    ///
+    /// Tries [`select_probes`]'s candidates, in order, stopping at the
+    /// first one whose [`bathy_interpret::interpret`] result is non-empty
+    /// (the brief's own Step 3 wording). A candidate that fails to connect,
+    /// fails to execute (`ProbeError`), or whose capture `interpret`s to
+    /// nothing is skipped, not fatal -- `detect_service` moves on to the
+    /// next candidate, or returns `Ok(None)` once the candidates (or the
+    /// budget, see below) are exhausted.
+    ///
+    /// # Budget (AC-4.24)
+    ///
+    /// One packet is reserved, via the exact same [`BudgetLedger`] the
+    /// connect probe already spent from, immediately before each
+    /// individual probe attempt's own reconnect -- never before the
+    /// candidate list is chosen, and never for more than one attempt at a
+    /// time. A refused reservation stops trying further probes for *this*
+    /// endpoint outright; unlike a refused connect-probe reservation in the
+    /// main dispatch loop (which ends the whole scan), this only ends
+    /// identification for the one unit already in progress -- the
+    /// connect-probe reservation gates whether a NEW unit starts at all,
+    /// while this gates whether an ALREADY-`Open` unit's identification
+    /// continues, which is a strictly smaller decision and does not by
+    /// itself mean the ledger has nothing left for the next unit's own
+    /// connect-probe reservation (that check runs independently, in the
+    /// dispatch loop, before this method is ever reached for the next
+    /// unit).
+    ///
+    /// # Scope: the second connection is gated too
+    ///
+    /// Re-checks `self.manifest.allows(unit.target)` before dialing the
+    /// reconnect, even though `unit.target` already passed this exact check
+    /// in the dispatch loop moments earlier, before the connect probe whose
+    /// `Open` outcome is what led here. Not dead code: this is the same
+    /// belt-and-braces posture the module doc's invariant 5 describes for
+    /// every other point that is about to put a packet on the wire, applied
+    /// to the one this task adds -- a service probe that trusted an earlier
+    /// check to still hold, rather than re-asking, would be the exact
+    /// defect M3's whole-branch review found and closed, reopened one layer
+    /// up. `detect_service_refuses_to_reconnect_when_the_manifest_denies_the_target`
+    /// below calls this method directly against a denying manifest and
+    /// asserts zero real accepts on a live listener, independent of
+    /// whatever the outer dispatch loop's own gate does.
+    async fn detect_service(&self, unit: &ScanUnit) -> Result<Option<ServiceFinding>, EngineError> {
+        if !self.manifest.allows(unit.target) {
+            return Ok(None);
+        }
+
+        let candidates = select_probes(
+            unit.endpoint.port,
+            self.service_detection.intensity,
+            &self.probes,
+        );
+
+        for probe in candidates {
+            if self.ledger().try_spend_packets(1).is_err() {
+                break;
+            }
+
+            let addr = SocketAddr::new(unit.target, unit.endpoint.port);
+            let dial =
+                tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr)).await;
+            let Ok(Ok(stream)) = dial else {
+                continue;
+            };
+
+            let mut io = ProbeIo::new(stream, unit.endpoint.port, self.config.connect_timeout);
+            let Ok(capture) = probe.execute(&mut io).await else {
+                continue;
+            };
+
+            let Some(top) = interpret(&capture).into_iter().next() else {
+                continue;
+            };
+
+            return Ok(Some(ServiceFinding {
+                observation: top.observation,
+                evidence: capture.response,
+                probe_id: capture.probe_id,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    /// Stores `finding`'s evidence, THEN appends `service.observed` citing
+    /// the resulting digest -- see this module's own ordering rule at the
+    /// top of this file. A crash between the two leaves an orphaned blob
+    /// (harmless: nothing ever cited it); the reverse would leave a
+    /// `service.observed` whose `evidence_refs` entry no `EvidenceStore::get`
+    /// call could ever resolve, which is the exact failure this whole
+    /// design exists to prevent.
+    ///
+    /// `EvidenceLevel::None` returns `Ok(())` immediately, storing nothing
+    /// and appending nothing (AC-4.23). This is not a special case bolted
+    /// on here -- it follows directly from `EventBody::ServiceObserved::
+    /// evidence_refs` being `NonEmpty<Digest>`: with no bytes stored there
+    /// is no digest to cite, and a `service.observed` finding without
+    /// evidence is unrepresentable by that type. The alternative -- inventing
+    /// a placeholder digest, or relaxing the field to `Option<NonEmpty<Digest>>`
+    /// -- would let a finding exist with nothing backing it, which is the
+    /// provenance guarantee this whole crate is built to uphold.
+    fn emit_service_observed(
+        &self,
+        unit: &ScanUnit,
+        finding: ServiceFinding,
+    ) -> Result<(), EngineError> {
+        let cap = match self.evidence_level {
+            EvidenceLevel::None => return Ok(()),
+            EvidenceLevel::Headers => 8 * 1024,
+            EvidenceLevel::Full => 64 * 1024,
+        };
+        // Ordering is mandatory: `put_capped` (store) runs to completion,
+        // its `?` checked, BEFORE `self.log(...)` (append) is ever called.
+        let (digest, _truncated) = self.evidence.put_capped(&finding.evidence, cap)?;
+        self.log(EventBody::ServiceObserved {
+            target: Target { ip: unit.target },
+            endpoint: unit.endpoint,
+            observation: finding.observation,
+            evidence_refs: NonEmpty::new(digest),
+            probe_id: finding.probe_id.to_string(),
+        })?;
         Ok(())
     }
 
@@ -923,9 +1171,11 @@ mod tests {
 
     use tokio::net::{TcpListener, TcpStream};
 
+    use bathy_evidence::EvidenceStore;
+    use bathy_probe::ProbeRegistry;
     use bathy_store::StartRequest;
     use bathy_types::clock::FixedClock;
-    use bathy_types::event::{Event, PortState};
+    use bathy_types::event::{Endpoint, Event, PortState, Transport};
     use bathy_types::ids::ScopeId;
     use bathy_types::nonempty::NonEmpty;
     use bathy_types::request::{
@@ -1049,6 +1299,20 @@ mod tests {
         /// authorization boundary without a caller having to thread it
         /// through separately (M3 whole-branch review, CRITICAL-1).
         manifest: Arc<ScopeManifest>,
+        /// M4 Task 5: the SAME evidence store `scheduler` writes matched
+        /// probe evidence into -- exposed so a test can call
+        /// `EvidenceStore::contains`/`get` directly against whatever digest
+        /// a `service.observed` event cited, without reopening a second
+        /// store over the same directory.
+        evidence: Arc<EvidenceStore>,
+        /// M4 Task 5: the exact `ServiceDetection`/`EvidenceLevel` this
+        /// harness's `scheduler` was built with -- exposed so `resume`
+        /// (below) can build a second `Scheduler` for the same scan without
+        /// silently reverting to different detection settings.
+        service_detection: ServiceDetection,
+        evidence_level: EvidenceLevel,
+        /// M4 Task 5: the SAME probe registry `scheduler` was built with.
+        probes: Arc<ProbeRegistry>,
     }
 
     impl Harness {
@@ -1064,6 +1328,47 @@ mod tests {
 
         fn probed_indices(&self) -> Vec<u64> {
             self.store.completed_units(self.scan_id).unwrap()
+        }
+
+        /// M4 Task 5: the number of real blob files under this harness's
+        /// evidence store's `blobs/` directory -- a filesystem-level count,
+        /// not derived from the event log at all, so
+        /// `evidence_level_none_stores_no_blobs_and_therefore_emits_no_service_observed`
+        /// below can prove "zero blobs on disk" directly rather than only
+        /// via the log's own absence of a citing event (which the type
+        /// system already makes redundant -- see `emit_service_observed`'s
+        /// own doc comment). Counts regular files only, skipping the
+        /// `.tmp-*` names `EvidenceStore::put` uses for its
+        /// write-then-rename staging (see `bathy_evidence::store`'s own doc
+        /// comment) -- none should ever survive a clean test run, but a
+        /// panic mid-`put` in some OTHER test sharing this process could
+        /// theoretically leave one behind on a shared temp root, and this
+        /// helper should not miscount because of that.
+        fn evidence_blob_count(&self) -> u64 {
+            fn walk(dir: &std::path::Path, count: &mut u64) {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        walk(&path, count);
+                    } else if !path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with(".tmp-"))
+                    {
+                        *count += 1;
+                    }
+                }
+            }
+            let mut count = 0;
+            walk(&self.evidence_root(), &mut count);
+            count
+        }
+
+        fn evidence_root(&self) -> std::path::PathBuf {
+            self._dir.path().join("blobs")
         }
 
         /// Builds a SECOND, independent `Scheduler` for the SAME scan --
@@ -1093,6 +1398,10 @@ mod tests {
                 Arc::clone(&self.clock),
                 self.scan_id,
                 "0.1.0",
+                self.service_detection,
+                self.evidence_level,
+                Arc::clone(&self.evidence),
+                Arc::clone(&self.probes),
             )
         }
     }
@@ -1111,6 +1420,61 @@ mod tests {
         config: SchedulerConfig,
         manifest: Arc<ScopeManifest>,
         group_commit: GroupCommitConfig,
+    ) -> Harness {
+        make_harness_core(
+            targets,
+            port_specs,
+            budgets,
+            config,
+            manifest,
+            group_commit,
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        )
+    }
+
+    /// Like [`make_harness`], but with caller-chosen `service_detection`/
+    /// `evidence_level` instead of this module's own defaults
+    /// (`ServiceDetection::default()`, `EvidenceLevel::Headers`) -- what
+    /// every M4 Task 5 test that needs detection disabled, a tighter
+    /// intensity, or `EvidenceLevel::None` builds its harness with.
+    fn make_harness_with_detection(
+        targets: &[&str],
+        port_specs: &[&str],
+        budgets: Budgets,
+        config: SchedulerConfig,
+        manifest: Arc<ScopeManifest>,
+        service_detection: ServiceDetection,
+        evidence_level: EvidenceLevel,
+    ) -> Harness {
+        make_harness_core(
+            targets,
+            port_specs,
+            budgets,
+            config,
+            manifest,
+            GroupCommitConfig::default(),
+            service_detection,
+            evidence_level,
+        )
+    }
+
+    /// The one real builder every `make_harness*` function above funnels
+    /// into. Broken out (M4 Task 5) so adding `service_detection`/
+    /// `evidence_level` knobs did not require touching either of this
+    /// module's two pre-existing, widely-called builders' own signatures --
+    /// every call site written before this task keeps compiling unchanged,
+    /// getting this module's own defaults exactly as before.
+    #[allow(clippy::too_many_arguments)]
+    fn make_harness_core(
+        targets: &[&str],
+        port_specs: &[&str],
+        budgets: Budgets,
+        config: SchedulerConfig,
+        manifest: Arc<ScopeManifest>,
+        group_commit: GroupCommitConfig,
+        service_detection: ServiceDetection,
+        evidence_level: EvidenceLevel,
     ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         // One shared `Arc<dyn Clock>` for both `TaskStore` and every
@@ -1133,9 +1497,9 @@ mod tests {
                 )
                 .unwrap(),
             },
-            service_detection: ServiceDetection::default(),
+            service_detection,
             budgets,
-            evidence_level: EvidenceLevel::Headers,
+            evidence_level,
             idempotency_key: "harness-key".into(),
         };
         let plan = ScanPlan::build(&request, 1_000_000).unwrap();
@@ -1155,6 +1519,12 @@ mod tests {
         let log = Arc::new(Mutex::new(
             GroupCommitLog::open(dir.path(), scan_id, group_commit).unwrap(),
         ));
+        // M4 Task 5: opened at the SAME root the harness's own `TempDir`
+        // owns -- `EvidenceStore::open` creates its own `blobs/`
+        // subdirectory there, alongside the log and SQLite files, with no
+        // name collision (see `bathy_evidence::store`'s own layout).
+        let evidence = Arc::new(EvidenceStore::open(dir.path()).unwrap());
+        let probes = Arc::new(ProbeRegistry::standard());
 
         let ledger = BudgetLedger::new(budgets);
         let scheduler = Scheduler::new(
@@ -1166,6 +1536,10 @@ mod tests {
             Arc::clone(&clock),
             scan_id,
             "0.1.0",
+            service_detection,
+            evidence_level,
+            Arc::clone(&evidence),
+            Arc::clone(&probes),
         );
 
         Harness {
@@ -1177,6 +1551,10 @@ mod tests {
             scan_id,
             clock,
             manifest,
+            evidence,
+            service_detection,
+            evidence_level,
+            probes,
         }
     }
 
@@ -1630,7 +2008,18 @@ mod tests {
         }
         let specs: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
         let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
-        let h = make_harness(
+        // M4 Task 5: service detection is explicitly disabled for this
+        // harness. This test's accept counters are the ground truth for
+        // "was this unit's CONNECT probe issued more than once" -- a
+        // property this test predates Task 5 and has nothing to do with
+        // service identification. With detection left at this module's
+        // default (enabled), an `Open` unit's own identification reconnects
+        // would land on the SAME counter this test reads, inflating a
+        // correctly-resumed unit's count past 1 for a reason unrelated to
+        // what this test checks. `detect_service`'s own scope-gate and
+        // budget behavior are covered directly by dedicated tests elsewhere
+        // in this module instead.
+        let h = make_harness_with_detection(
             &["127.0.0.1"],
             &spec_refs,
             budgets(1_000_000, 3_600, 1_000_000),
@@ -1640,6 +2029,11 @@ mod tests {
                 progress_every: 500,
             },
             default_manifest(),
+            ServiceDetection {
+                enabled: false,
+                intensity: 0,
+            },
+            EvidenceLevel::Headers,
         );
         assert_eq!(h.plan.len(), N);
 
@@ -2474,6 +2868,7 @@ mod tests {
                 &mut summary,
                 &mut completed_batch,
             )
+            .await
             .unwrap();
 
         assert_eq!(
@@ -2574,7 +2969,14 @@ mod tests {
         // connection arriving late, not a scheduler bug) -- confirmed by
         // rerunning under `--test-threads=1`, where it never flaked; see
         // this task's report.
-        let h = make_harness(
+        // M4 Task 5: service detection disabled -- see the identical note on
+        // `resuming_skips_a_completed_island_above_the_first_gap_not_just_a_contiguous_prefix`
+        // above; this test's per-port accept counters are ground truth for
+        // "was this unit's CONNECT probe issued more than once across a
+        // cancel/resume round," and an enabled detection setting would add
+        // its own reconnects onto the exact same counters for an unrelated
+        // reason.
+        let h = make_harness_with_detection(
             &["127.0.0.1"],
             &spec_refs,
             // pps=8 folded directly into the ceiling-bearing `Budgets`
@@ -2587,6 +2989,11 @@ mod tests {
                 progress_every: 500,
             },
             default_manifest(),
+            ServiceDetection {
+                enabled: false,
+                intensity: 0,
+            },
+            EvidenceLevel::Headers,
         );
         assert_eq!(h.plan.len(), N);
 
@@ -3340,5 +3747,556 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(summary.units_completed, 1);
+    }
+
+    // ==================================================================
+    // M4 Task 5: wiring probes and interpretation into the scheduler.
+    // AC-4.20 through AC-4.24.
+    //
+    // The brief's own Step 1 sketch references `harness_with_http_stub()`,
+    // `harness_with_http_stub_no_detection()`,
+    // `harness_with_http_stub_evidence_none()`,
+    // `harness_with_tight_budget_and_http_stub(3)`, `h.evidence`, and
+    // `h.stub_request_count()` without defining any of them -- the same
+    // "Step 3 is a sketch" gap this module's very first harness comment
+    // (above) already documents for M3 Task 7. `HttpStub` and
+    // `spawn_http_stub` below fill that gap; the harness-plus-stub
+    // constructors below return `(Harness, HttpStub)` rather than adding a
+    // `stub_request_count()` method onto `Harness` itself, since a stub is
+    // not part of what every OTHER harness in this module needs.
+    // ==================================================================
+
+    /// A real TCP listener that plays BOTH roles a `service_detection`
+    /// -enabled scan puts the SAME endpoint through: the scheduler's own
+    /// connect probe (a bare connect, which writes nothing and reads
+    /// nothing) and, if that reports `Open` and detection is enabled,
+    /// `http-get-v1`'s own reconnect (writes a real `GET /` request, reads
+    /// the reply) -- see `Scheduler::detect_service`'s own doc comment for
+    /// why these are two independent TCP connections to the very same
+    /// address, never one reused socket.
+    ///
+    /// Distinguishes the two by what arrives, not by call order (multiple
+    /// units in flight concurrently means "first accept" is not reliably
+    /// "the connect probe"): if the peer sends at least one byte within a
+    /// short window, this replies with a canned response headers that
+    /// `bathy_interpret::rules`'s `http.server.nginx.v1` matches (the exact
+    /// shape `crate::probes::http`'s own unit tests and M4 Task 2's real
+    /// nginx capture use); a bare connect-and-drop (`probe_connect_with_local_signal`
+    /// writes nothing) sees the read time out at 0 bytes and gets no reply
+    /// at all, matching real `ConnectOutcome::Open` semantics exactly.
+    struct HttpStub {
+        port: u16,
+        accepts: Arc<AtomicU64>,
+        requests: Arc<AtomicU64>,
+        bytes_received: Arc<AtomicU64>,
+    }
+
+    impl HttpStub {
+        fn port(&self) -> u16 {
+            self.port
+        }
+        /// Every real TCP accept this listener has served -- both bare
+        /// connects and real probe requests.
+        fn accept_count(&self) -> u64 {
+            self.accepts.load(Ordering::SeqCst)
+        }
+        /// Accepts that actually carried at least one byte from the peer --
+        /// i.e., a real probe request, not a bare connect-and-drop.
+        fn request_count(&self) -> u64 {
+            self.requests.load(Ordering::SeqCst)
+        }
+        /// Total bytes received across every connection this listener has
+        /// ever accepted. AC-4.22's own proof obligation ("count bytes the
+        /// stub receives, not just the absence of events") reads this
+        /// directly, rather than only checking that no `service.observed`
+        /// event was emitted.
+        fn bytes_received(&self) -> u64 {
+            self.bytes_received.load(Ordering::SeqCst)
+        }
+    }
+
+    const NGINX_RESPONSE: &[u8] =
+        b"HTTP/1.1 200 OK\r\nServer: nginx/1.26.0\r\nConnection: close\r\n\r\n<html></html>";
+
+    async fn spawn_http_stub() -> HttpStub {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicU64::new(0));
+        let requests = Arc::new(AtomicU64::new(0));
+        let bytes_received = Arc::new(AtomicU64::new(0));
+        let (a, r, b) = (
+            Arc::clone(&accepts),
+            Arc::clone(&requests),
+            Arc::clone(&bytes_received),
+        );
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            while let Ok((mut sock, _)) = listener.accept().await {
+                a.fetch_add(1, Ordering::SeqCst);
+                let (r, b) = (Arc::clone(&r), Arc::clone(&b));
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf))
+                        .await
+                        .ok()
+                        .and_then(|res| res.ok())
+                        .unwrap_or(0);
+                    if n > 0 {
+                        b.fetch_add(n as u64, Ordering::SeqCst);
+                        r.fetch_add(1, Ordering::SeqCst);
+                        let _ = sock.write_all(NGINX_RESPONSE).await;
+                    }
+                });
+            }
+        });
+        HttpStub {
+            port,
+            accepts,
+            requests,
+            bytes_received,
+        }
+    }
+
+    /// `service_detection: ServiceDetection::default()` (enabled, intensity
+    /// 4), `evidence_level: Headers` -- what most of this section's tests
+    /// need.
+    async fn harness_with_http_stub() -> (Harness, HttpStub) {
+        let stub = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+        (h, stub)
+    }
+
+    async fn harness_with_http_stub_no_detection() -> (Harness, HttpStub) {
+        let stub = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            ServiceDetection {
+                enabled: false,
+                intensity: 4,
+            },
+            EvidenceLevel::Headers,
+        );
+        (h, stub)
+    }
+
+    async fn harness_with_http_stub_evidence_none() -> (Harness, HttpStub) {
+        let stub = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::None,
+        );
+        (h, stub)
+    }
+
+    // --- From the brief (Step 1), adapted: `h.stub_request_count()` and
+    // `h.evidence` become the returned `stub`/`h.evidence` above -- see
+    // this section's own header comment. ---
+
+    #[tokio::test]
+    async fn an_open_port_with_service_detection_emits_port_state_then_service_observed() {
+        let (h, _stub) = harness_with_http_stub().await;
+        h.run_to_completion().await.unwrap();
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+        let state_at = events
+            .iter()
+            .position(|e| matches!(&e.body, EventBody::PortStateObserved { .. }))
+            .unwrap();
+        let service_at = events
+            .iter()
+            .position(|e| matches!(&e.body, EventBody::ServiceObserved { .. }))
+            .unwrap();
+        assert!(
+            state_at < service_at,
+            "reachability is established before identification"
+        );
+        // Not just an event, a REAL finding: the exact shape the stub sent.
+        match &events[service_at].body {
+            EventBody::ServiceObserved {
+                observation,
+                probe_id,
+                ..
+            } => {
+                assert_eq!(observation.service, "http");
+                assert_eq!(observation.product.as_deref(), Some("nginx"));
+                assert_eq!(probe_id, "http-get-v1");
+            }
+            other => panic!("expected ServiceObserved, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn evidence_is_stored_before_the_event_that_references_it() {
+        let (h, _stub) = harness_with_http_stub().await;
+        h.run_to_completion().await.unwrap();
+        let mut checked = 0;
+        for e in h.log.lock().unwrap().read_from(0).unwrap() {
+            if let EventBody::ServiceObserved { evidence_refs, .. } = &e.body {
+                for d in evidence_refs.iter() {
+                    assert!(h.evidence.contains(d), "dangling evidence ref {d}");
+                    assert!(h.evidence.get(d).is_ok());
+                    checked += 1;
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "test fixture sanity: expected >= 1 evidence ref to check"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_detection_disabled_emits_no_service_events_and_sends_no_probes() {
+        let (h, stub) = harness_with_http_stub_no_detection().await;
+        h.run_to_completion().await.unwrap();
+        assert!(
+            !h.log
+                .lock()
+                .unwrap()
+                .read_from(0)
+                .unwrap()
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::ServiceObserved { .. }))
+        );
+        assert_eq!(stub.request_count(), 0);
+        // AC-4.22's stronger half, per this task's own review guidance:
+        // count bytes the stub actually RECEIVED, not merely the absence of
+        // a `service.observed` event -- a scheduler that connected and
+        // wrote SOME bytes without them happening to form a request the
+        // stub's own `n > 0` branch counted as a "request" would still pass
+        // a request-count-only check.
+        assert_eq!(
+            stub.bytes_received(),
+            0,
+            "service_detection.enabled = false must put zero probe bytes on the wire"
+        );
+        // The plain connect probe itself still ran (this endpoint IS
+        // `Open`) -- so this is genuinely "detection sent nothing," not
+        // "nothing touched this port at all." Polled, not asserted
+        // immediately: `run_to_completion` returning only means the
+        // CLIENT-side `TcpStream::connect` resolved, not that this stub's
+        // own spawned acceptor task has been polled far enough to have
+        // incremented its counter yet.
+        for _ in 0..200 {
+            if stub.accept_count() >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(stub.accept_count() >= 1, "test fixture sanity");
+    }
+
+    #[tokio::test]
+    async fn evidence_level_none_stores_no_blobs_and_therefore_emits_no_service_observed() {
+        // Root-cause note (this task's report): the brief's own Step 1
+        // sketch for this test (`evidence_level_none_stores_no_bodies_but_
+        // still_reports_the_observation`) asserted a `ServiceObserved`
+        // event WAS present even under `evidence_level: none`. That
+        // contradicts this same brief's own Step 3 text and AC-4.23, both
+        // of which say `evidence_level: none` "emits no service.observed
+        // event at all" -- and it is not merely a documentation
+        // disagreement: `EventBody::ServiceObserved::evidence_refs` is
+        // `NonEmpty<Digest>`, so representing a finding with zero evidence
+        // would require either a placeholder digest citing bytes nobody
+        // stored (reintroducing the exact dangling-reference failure this
+        // whole design exists to prevent) or relaxing the field to
+        // `Option<NonEmpty<Digest>>` (weakening the type's own guarantee
+        // for every OTHER evidence level too). Neither is acceptable, so
+        // this test asserts the behavior the type actually allows, not the
+        // brief's self-contradictory literal assertion.
+        let (h, stub) = harness_with_http_stub_evidence_none().await;
+        h.run_to_completion().await.unwrap();
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::ServiceObserved { .. })),
+            "evidence_level: none must emit no service.observed event"
+        );
+        assert_eq!(h.evidence_blob_count(), 0);
+        // The probe still ran (budget was still spent identifying, even
+        // though nothing gets kept) -- confirms this is "found nothing
+        // worth keeping," not "never tried."
+        assert!(stub.request_count() >= 1, "test fixture sanity");
+    }
+
+    #[tokio::test]
+    async fn probe_packets_are_charged_to_the_same_budget_as_connect_probes() {
+        // M3's review (carried into this task by the dispatch): asserting
+        // only on `summary.packets_spent <= 3` proves nothing, because the
+        // ledger cannot report exceeding its own ceiling by construction --
+        // a bug that let MORE real packets go out than the ledger recorded
+        // would look identical to correct behavior on that assertion alone.
+        // This test's ground truth is a REAL listener's own accept counter,
+        // like `budget_ceiling_is_never_exceeded_measured_by_real_accept_counts_not_the_ledger`
+        // above uses for the plain connect-probe case.
+        //
+        // Deliberately a single unit whose peer never sends a matching
+        // reply (a bare accept-and-drop, like `open_port()`): this keeps
+        // every probe attempt sequential and deterministic (all inside one
+        // `detect_service` call, never racing a second unit's own
+        // dispatch), so the exact accept count this ceiling permits is
+        // knowable ahead of time: 1 (the connect probe) + 2 (two probe
+        // attempts, each failing to find a match and moving on) = 3, with
+        // the third probe attempt's OWN budget reservation refused before
+        // it ever reconnects.
+        let (h, counts) =
+            harness_with_real_listeners(1, budgets(3, 3_600, 1_000_000), small_config()).await;
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.packets_spent <= 3);
+
+        settle_accept_counters(&counts, 3).await;
+        let total: u64 = counts.values().map(|c| c.load(Ordering::SeqCst)).sum();
+        assert_eq!(
+            total, 3,
+            "a budget of 3 must permit at most 3 REAL accepts across connect AND probe traffic, got {total}"
+        );
+        assert_eq!(summary.packets_spent, 3);
+    }
+
+    #[tokio::test]
+    async fn service_detection_scope_gate_covers_the_second_connection_not_just_the_first() {
+        // M3's review found the scheduler once emitted packets without
+        // consulting scope at all; this task's dispatch calls out that
+        // service detection opens a SECOND connection to the same
+        // endpoint, and that connection must be gated too, not exempted
+        // because the port scan already passed the first one. Calls
+        // `detect_service` directly (private, but this module is a child
+        // of `scheduler` -- see the existing precedent at `record`'s own
+        // direct-call test above) against a manifest that denies the
+        // target, so this is independent of whatever the outer dispatch
+        // loop's own per-unit gate does (that gate would, in real
+        // operation, already have refused the whole scan before
+        // `detect_service` is ever reached -- this test isolates the
+        // second, belt-and-braces check inside `detect_service` itself).
+        let stub = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest_denying_loopback(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+        let unit = ScanUnit {
+            index: 0,
+            target: "127.0.0.1".parse().unwrap(),
+            endpoint: Endpoint {
+                transport: Transport::Tcp,
+                port: stub.port(),
+            },
+        };
+        let result = h.scheduler.detect_service(&unit).await.unwrap();
+        assert!(
+            result.is_none(),
+            "a denied target must never be reconnected to for identification"
+        );
+        assert_eq!(
+            stub.accept_count(),
+            0,
+            "a denied target's second connection must never even dial, let alone accept"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_observer_polling_concurrently_never_sees_a_dangling_evidence_ref() {
+        // The reviewer technique M3's report credits for actually catching
+        // an ordering inversion: an observer running CONCURRENTLY with the
+        // scan, not a check only after `run_to_completion` returns -- a
+        // `put` that fails must leave no event referencing it, and a
+        // same-thread "check after the fact" cannot distinguish "never
+        // raced" from "got lucky."
+        let (h, _stub) = harness_with_http_stub().await;
+        let log = Arc::clone(&h.log);
+        let evidence = Arc::clone(&h.evidence);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_observer = Arc::clone(&stop);
+        let mut dangling_refs_seen: Vec<String> = Vec::new();
+        let observer = tokio::spawn(async move {
+            let mut dangling = Vec::new();
+            while !stop_observer.load(Ordering::SeqCst) {
+                let events = log.lock().unwrap().read_from(0).unwrap();
+                for e in events {
+                    if let EventBody::ServiceObserved { evidence_refs, .. } = &e.body {
+                        for d in evidence_refs.iter() {
+                            if !evidence.contains(d) {
+                                dangling.push(d.to_string());
+                            }
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+            dangling
+        });
+
+        h.run_to_completion().await.unwrap();
+        stop.store(true, Ordering::SeqCst);
+        dangling_refs_seen.extend(observer.await.unwrap());
+
+        assert!(
+            dangling_refs_seen.is_empty(),
+            "observer saw a dangling evidence ref mid-flight: {dangling_refs_seen:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn port_state_precedes_service_observed_for_every_endpoint_and_no_evidence_ref_ever_dangles()
+     {
+        // A real end-to-end run over MULTIPLE endpoints, not just one --
+        // walking every event, not only the first `port.state`/
+        // `service.observed` pair, and checking `EvidenceStore::get` (not
+        // merely `contains`, which does not verify the bytes) for every
+        // single `evidence_refs` entry the whole run produced.
+        let stub_a = spawn_http_stub().await;
+        let stub_b = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub_a.port().to_string(), &stub_b.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Full,
+        );
+        let summary = h.run_to_completion().await.unwrap();
+        assert_eq!(summary.open_ports, 2, "test fixture sanity");
+
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+
+        // Per-endpoint ordering: for every `service.observed`, the SAME
+        // endpoint's `port.state` occurred earlier in the log.
+        let mut service_observed_count = 0;
+        for (i, e) in events.iter().enumerate() {
+            if let EventBody::ServiceObserved { endpoint, .. } = &e.body {
+                service_observed_count += 1;
+                let state_index = events[..i].iter().position(|earlier| {
+                    matches!(
+                        &earlier.body,
+                        EventBody::PortStateObserved { endpoint: ep, state: PortState::Open, .. }
+                            if ep.port == endpoint.port
+                    )
+                });
+                assert!(
+                    state_index.is_some(),
+                    "service.observed for port {} has no preceding port.state(open) for the \
+                     same endpoint",
+                    endpoint.port
+                );
+            }
+        }
+        assert_eq!(
+            service_observed_count, 2,
+            "both stubs must be identified, given AC-4.21 is being proven over more than one \
+             endpoint"
+        );
+
+        // No dangling ref, walked over the WHOLE log, verified with `get`
+        // (not just `contains`) so a corrupted-but-present blob would also
+        // be caught.
+        let mut checked = 0;
+        for e in &events {
+            if let EventBody::ServiceObserved { evidence_refs, .. } = &e.body {
+                for d in evidence_refs.iter() {
+                    let bytes = h.evidence.get(d).unwrap_or_else(|err| {
+                        panic!(
+                            "evidence_refs entry {d} does not resolve via EvidenceStore::get: {err}"
+                        )
+                    });
+                    assert!(!bytes.is_empty());
+                    checked += 1;
+                }
+            }
+            if let EventBody::PortStateObserved {
+                evidence_refs: Some(refs),
+                ..
+            } = &e.body
+            {
+                for d in refs.iter() {
+                    assert!(
+                        h.evidence.get(d).is_ok(),
+                        "dangling port.state evidence ref {d}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(
+            checked, 2,
+            "expected exactly one evidence ref per identified endpoint"
+        );
+    }
+
+    // The ordering proof that does not depend on cooperative task
+    // scheduling happening to interleave: `emit_service_observed` itself
+    // has no `.await` between its `put_capped` call and its `log` call (both
+    // are synchronous), so on `#[tokio::test]`'s default single-threaded
+    // runtime an observer task polling concurrently (above) can never
+    // actually land IN BETWEEN them -- it can only ever see "neither yet"
+    // or "both already," identically whether the two calls are in the
+    // correct order or swapped. The real-world failure mode this whole
+    // ordering rule defends against is a CRASH between the two lines, not a
+    // scheduler interleaving, and the way M2/M3 proved the analogous
+    // store/log ordering was to force a REAL failure on the store side and
+    // assert the log side never ran -- `GroupCommitLog::fail_next_sync_for_tests`
+    // for the group-commit case. `bathy-evidence` has no equivalent
+    // test-only injection door, so this forces a REAL `EvidenceStore::put`
+    // failure instead, via an unwritable `blobs/` directory -- no mock, a
+    // genuine `EACCES` from the OS.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_evidence_write_leaves_no_service_observed_event_that_would_have_cited_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (h, _stub) = harness_with_http_stub().await;
+        let blobs = h.evidence_root();
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let result = h.run_to_completion().await;
+
+        // Restore write permission unconditionally (even on assertion
+        // failure below) so the harness's `TempDir` can still clean itself
+        // up on drop.
+        std::fs::set_permissions(&blobs, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "a real EvidenceStore::put failure must propagate as a real error, not be swallowed"
+        );
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::ServiceObserved { .. })),
+            "a failed evidence write must never be followed by the event that would have cited \
+             it -- got {events:#?}"
+        );
+        // The port.state event for the same endpoint DID make it through --
+        // this failure is specific to the evidence/service-observed path,
+        // not a wholesale inability to log anything at all.
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::PortStateObserved { .. })),
+            "port.state should still have been appended before the evidence write was attempted"
+        );
     }
 }

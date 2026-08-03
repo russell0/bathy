@@ -30,7 +30,18 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
+# M4 Task 5: `scheduler.rs` now reconnects to an `Open` endpoint itself (see
+# `Scheduler::detect_service`) and drives a `bathy_probe::Probe` over that
+# second socket by hand, which needs `AsyncReadExt`/`AsyncWriteExt` the same
+# way `bathy-probe`'s own `ProbeIo` does -- see that crate's `Cargo.toml` for
+# the exact error this feature avoids. Declared explicitly here rather than
+# relied upon via Cargo's feature unification with the `bathy-probe`
+# dependency below (which would also happen to supply it): this crate's own
+# test harness (`scheduler.rs`'s `#[cfg(test)] mod tests`) uses
+# `AsyncReadExt`/`AsyncWriteExt` directly too, so it is a real, direct need
+# of this crate, not merely an incidental grant from what another crate in
+# the graph happens to request.
+tokio = { workspace = true, features = ["io-util"] }
 # AC-3.24-3.30 (`scheduler.rs`): cooperative cancellation.
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
@@ -39,6 +50,13 @@ bathy-scope = { path = "../bathy-scope" }
 bathy-evidence = { path = "../bathy-evidence" }
 bathy-store = { path = "../bathy-store" }
 bathy-plan = { path = "../bathy-plan" }
+# M4 Task 5: the probe framework and rule registry `scheduler.rs`'s
+# `Scheduler::detect_service` wires into the scan loop. Both sit below
+# `bathy-engine` in `xtask`'s `LAYERS` (`..., bathy-interpret, bathy-probe,
+# bathy-engine, ...`), so this is a downhill dependency, not a violation of
+# the layer order `check-deps` enforces.
+bathy-probe = { path = "../bathy-probe" }
+bathy-interpret = { path = "../bathy-interpret" }
 
 [dev-dependencies]
 # M3 whole-branch review, CRITICAL-1: `ScopeManifest::for_tests_allowing_loopback`
