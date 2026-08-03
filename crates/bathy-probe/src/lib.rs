@@ -19,6 +19,7 @@
 //! comment for exactly how.
 
 pub mod framework;
+pub mod probes;
 
 pub use framework::{Probe, ProbeError, ProbeIo, ProbeKind, ProbeRegistry, select_probes};
 // `ProbeCapture` is defined in `bathy-types` (see that type's own doc

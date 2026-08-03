@@ -262,6 +262,55 @@ impl ProbeIo {
             }
         }
     }
+
+    /// Reads up to `n` bytes (capped by `read_cap`, like [`Self::read_bounded`]),
+    /// but -- unlike `read_bounded` -- returns as soon as `n` bytes have
+    /// arrived, rather than continuing to wait out the rest of `deadline`
+    /// to confirm the peer has nothing more to say.
+    ///
+    /// This exists for the narrow case of a protocol whose reply at a given
+    /// step has a length fixed by the spec itself, where the peer is not
+    /// expected to close the connection afterward (so `read_bounded` alone
+    /// would have no way to detect completion short of waiting out the
+    /// whole deadline). `postgres-startup-v1` is the one probe in this
+    /// crate that needs this: PostgreSQL's reply to an `SSLRequest` is
+    /// defined by the wire protocol to be exactly one byte (`S` or `N`),
+    /// and a real server keeps the connection open afterward rather than
+    /// closing it (confirmed against a real `postgres:16-alpine` container
+    /// -- see this task's report). Knowing "the reply here is exactly N
+    /// bytes" is protocol *framing* knowledge, the same category as the
+    /// length this crate already relies on to build requests (e.g. the
+    /// DNS probe's TCP length prefix) -- not protocol *interpretation* of
+    /// what the bytes mean, which stays out of this crate entirely (see
+    /// this crate's top-level doc comment).
+    ///
+    /// Returns `(bytes, truncated)` with the same `truncated` semantics as
+    /// [`Self::read_bounded`]: `false` on a clean EOF or on collecting the
+    /// full `n` bytes requested, `true` if the deadline elapsed first with
+    /// at least one byte already read.
+    pub async fn read_at_most(&mut self, n: usize) -> Result<(Vec<u8>, bool), ProbeError> {
+        let target = n.min(self.read_cap);
+        let mut out = vec![0u8; target];
+        let mut filled = 0usize;
+        let deadline = tokio::time::Instant::now() + self.deadline;
+
+        while filled < target {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(remaining, self.stream.read(&mut out[filled..])).await {
+                Ok(Ok(0)) => {
+                    out.truncate(filled);
+                    return Ok((out, false)); // clean EOF before `n` bytes arrived
+                }
+                Ok(Ok(k)) => filled += k,
+                Ok(Err(e)) => return Err(ProbeError::Io(e)),
+                Err(_elapsed) => {
+                    out.truncate(filled);
+                    return Ok((out, filled > 0));
+                }
+            }
+        }
+        Ok((out, false)) // got exactly `target` bytes: complete, by definition of this call
+    }
 }
 
 /// A single protocol probe.
@@ -323,195 +372,33 @@ impl ProbeRegistry {
         Self { probes }
     }
 
-    /// The registry M4 Task 1's own tests exercise. Contains minimal,
-    /// honest placeholder probes -- see `builtin`'s module doc comment for
-    /// exactly what "placeholder" means here and what M4 Task 2 is expected
-    /// to replace.
+    /// The eight real, clean-room protocol probes (M4 Task 2). Each
+    /// submodule under `crate::probes` documents its own wire behavior and
+    /// names the exact source (RFC section, vendor doc, or captured
+    /// container image + digest) its request bytes come from -- see
+    /// `crate::probes`' own doc comment for the structural check that no
+    /// probe's source mentions Nmap.
+    ///
+    /// Two ids are load-bearing beyond this module: `tls-v1` and
+    /// `ssh-banner-v1` are asserted by name in `probes_are_ordered_by_port_
+    /// affinity` below, carried over unchanged from M4 Task 1's own
+    /// placeholder registry (which reserved exactly these two ids for this
+    /// task to fill in for real).
     pub fn standard() -> Self {
         Self::new(vec![
-            Box::new(builtin::TlsV1),
-            Box::new(builtin::SshBannerV1),
-            Box::new(builtin::FtpBannerV1),
-            Box::new(builtin::TcpEchoV1),
-            Box::new(builtin::RawBannerV1),
+            Box::new(crate::probes::http::HttpGetProbe),
+            Box::new(crate::probes::tls::TlsProbe),
+            Box::new(crate::probes::ssh::SshBannerProbe),
+            Box::new(crate::probes::smtp::SmtpBannerProbe),
+            Box::new(crate::probes::dns::DnsVersionBindProbe),
+            Box::new(crate::probes::postgres::PostgresStartupProbe),
+            Box::new(crate::probes::mysql::MysqlGreetingProbe),
+            Box::new(crate::probes::redis::RedisPingProbe),
         ])
     }
 
     pub fn all(&self) -> Vec<&dyn Probe> {
         self.probes.iter().map(AsRef::as_ref).collect()
-    }
-}
-
-/// Minimal, honest placeholder probes.
-///
-/// These exist only to give M4 Task 1's own tests (ordering, the intensity
-/// budget, id uniqueness) something real to select over -- none of them
-/// claim protocol conformance. `execute` here does nothing more than a
-/// bare, protocol-agnostic byte exchange through the same [`ProbeIo`] a
-/// real probe would use: a send-first probe writes a single `\n` and reads
-/// whatever comes back; a listen-first probe only reads. That is
-/// deliberately *not* a TLS ClientHello, an SSH banner parser, or any other
-/// protocol-specific behavior -- writing those correctly, from RFCs and
-/// vendor docs rather than from any Nmap-derived source (the milestone's
-/// clean-room requirement), is M4 Task 2's own scoped deliverable
-/// (`crates/bathy-probe/src/probes/{http,tls,ssh,dns,smtp,postgres,mysql,
-/// redis}.rs`), not this task's.
-///
-/// Two ids here are load-bearing beyond this module: `tls-v1` and
-/// `ssh-banner-v1` are asserted by name in `probes_are_ordered_by_port_
-/// affinity` (this file) because M4 Task 2's plan already commits to
-/// reusing exactly those ids for the real TLS and SSH probes. The other
-/// three (`ftp-banner-v1`, `tcp-echo-probe-v1`, `raw-banner-v1`) are
-/// filler, chosen not to collide with any of the plan's other five
-/// eventual ids (`http-get-v1`, `dns-version-bind-v1`, `smtp-banner-v1`,
-/// `postgres-startup-v1`, `mysql-greeting-v1`, `redis-ping-v1`) so Task 2
-/// can add those without first having to remove anything here; Task 2 is,
-/// however, expected to replace `ProbeRegistry::standard()`'s contents
-/// wholesale with the real eight, not merely extend this list.
-mod builtin {
-    use super::*;
-
-    async fn minimal_send_first(
-        id: &'static str,
-        io: &mut ProbeIo,
-    ) -> Result<ProbeCapture, ProbeError> {
-        let start = std::time::Instant::now();
-        let request = b"\n".to_vec();
-        io.write_all(&request).await?;
-        let (response, truncated) = io.read_bounded().await?;
-        if response.is_empty() {
-            return Err(ProbeError::EmptyResponse);
-        }
-        Ok(ProbeCapture {
-            probe_id: id,
-            transport: io.transport(),
-            port: io.port(),
-            request: Some(request),
-            response,
-            elapsed_micros: start.elapsed().as_micros() as u64,
-            truncated,
-        })
-    }
-
-    async fn minimal_listen_first(
-        id: &'static str,
-        io: &mut ProbeIo,
-    ) -> Result<ProbeCapture, ProbeError> {
-        let start = std::time::Instant::now();
-        let (response, truncated) = io.read_bounded().await?;
-        if response.is_empty() {
-            return Err(ProbeError::EmptyResponse);
-        }
-        Ok(ProbeCapture {
-            probe_id: id,
-            transport: io.transport(),
-            port: io.port(),
-            request: None,
-            response,
-            elapsed_micros: start.elapsed().as_micros() as u64,
-            truncated,
-        })
-    }
-
-    pub struct TlsV1;
-    #[async_trait]
-    impl Probe for TlsV1 {
-        fn id(&self) -> &'static str {
-            "tls-v1"
-        }
-        fn kind(&self) -> ProbeKind {
-            ProbeKind::SendFirst
-        }
-        fn affinity(&self, port: u16) -> u8 {
-            match port {
-                443 | 8443 | 993 | 995 => 100,
-                _ => 10,
-            }
-        }
-        async fn execute(&self, io: &mut ProbeIo) -> Result<ProbeCapture, ProbeError> {
-            minimal_send_first(self.id(), io).await
-        }
-    }
-
-    pub struct SshBannerV1;
-    #[async_trait]
-    impl Probe for SshBannerV1 {
-        fn id(&self) -> &'static str {
-            "ssh-banner-v1"
-        }
-        fn kind(&self) -> ProbeKind {
-            ProbeKind::ListenFirst
-        }
-        fn affinity(&self, port: u16) -> u8 {
-            match port {
-                22 | 2222 => 100,
-                _ => 8,
-            }
-        }
-        async fn execute(&self, io: &mut ProbeIo) -> Result<ProbeCapture, ProbeError> {
-            minimal_listen_first(self.id(), io).await
-        }
-    }
-
-    pub struct FtpBannerV1;
-    #[async_trait]
-    impl Probe for FtpBannerV1 {
-        fn id(&self) -> &'static str {
-            "ftp-banner-v1"
-        }
-        fn kind(&self) -> ProbeKind {
-            ProbeKind::ListenFirst
-        }
-        fn affinity(&self, port: u16) -> u8 {
-            match port {
-                21 => 100,
-                _ => 6,
-            }
-        }
-        async fn execute(&self, io: &mut ProbeIo) -> Result<ProbeCapture, ProbeError> {
-            minimal_listen_first(self.id(), io).await
-        }
-    }
-
-    pub struct TcpEchoV1;
-    #[async_trait]
-    impl Probe for TcpEchoV1 {
-        fn id(&self) -> &'static str {
-            "tcp-echo-probe-v1"
-        }
-        fn kind(&self) -> ProbeKind {
-            ProbeKind::SendFirst
-        }
-        fn affinity(&self, port: u16) -> u8 {
-            match port {
-                7 | 9 | 13 | 19 => 100,
-                _ => 4,
-            }
-        }
-        async fn execute(&self, io: &mut ProbeIo) -> Result<ProbeCapture, ProbeError> {
-            minimal_send_first(self.id(), io).await
-        }
-    }
-
-    /// The always-a-candidate, lowest-priority fallback: never the first
-    /// choice for any port, but never disqualified either, so it is what
-    /// widens as `intensity` rises past the ports every other probe here
-    /// already targets by name.
-    pub struct RawBannerV1;
-    #[async_trait]
-    impl Probe for RawBannerV1 {
-        fn id(&self) -> &'static str {
-            "raw-banner-v1"
-        }
-        fn kind(&self) -> ProbeKind {
-            ProbeKind::ListenFirst
-        }
-        fn affinity(&self, _port: u16) -> u8 {
-            3
-        }
-        async fn execute(&self, io: &mut ProbeIo) -> Result<ProbeCapture, ProbeError> {
-            minimal_listen_first(self.id(), io).await
-        }
     }
 }
 
