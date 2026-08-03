@@ -1,0 +1,19 @@
+---
+source: crates/bathy-interpret/tests/replay.rs
+expression: snapshot
+---
+[
+  {
+    "service": "mysql",
+    "product": "MySQL",
+    "version": "8.4.11",
+    "confidence": 0.95,
+    "rule_id": "mysql.handshake.v10.v1",
+    "matched_span": {
+      "start": 5,
+      "end": 11
+    },
+    "matched_bytes_hex": "382e342e3131",
+    "rationale": "The greeting's protocol-version byte was 0x0a (HandshakeV10), followed by a NUL-terminated server-version string."
+  }
+]

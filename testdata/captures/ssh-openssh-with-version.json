@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/linuxserver/openssh-server:latest, digest sha256:96b9a4d3b5106746d08d43a6911650d4d21f7d5c7f2ac9660e792bdb5e63157c (same image/digest as M4 Task 2's report). Reached via a locally run container (host-mapped port 22222 -> container port 2222); `port` below is recorded as the canonical SSH port 22. `ssh-banner-v1` is listen-first (`request` is null), so this capture was taken by opening the TCP connection and reading, sending nothing -- a plain Python `socket` script, no nmap involved. Exercises ssh.banner.openssh.v1 (ProductAndVersion) via the real `SSH-2.0-OpenSSH_10.3` identification string; also exercises ssh.protocol.bare.v1 in the same capture, since that rule's regex has no exclusion for OpenSSH specifically (both rules fire independently -- see task-4-report.md).",
+  "capture": {
+    "probe_id": "ssh-banner-v1",
+    "transport": "tcp",
+    "port": 22,
+    "request": null,
+    "response": "U1NILTIuMC1PcGVuU1NIXzEwLjMNCg==",
+    "elapsed_micros": 3100,
+    "truncated": false
+  }
+}

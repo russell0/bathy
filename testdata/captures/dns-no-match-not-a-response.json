@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a captured server reply): the literal bytes of the *query* `bathy_probe::probes::dns::build_query()` sends (RFC 1035 SS4.1.1/SS4.1.2-shaped), reused here as a stand-in `response` -- the QR bit is clear (a query, not a response), which `dns_bind_version` must reject per RFC 1035 SS4.1.1. Models a plausible pathological peer: a misbehaving middlebox or loopback relay that echoes the query back verbatim instead of answering it. Pins AC-4.13 (\"never guess\") on structurally well-formed DNS bytes that are nonetheless not a valid answer.",
+  "capture": {
+    "probe_id": "dns-version-bind-v1",
+    "transport": "tcp",
+    "port": 53,
+    "request": "AB5TRAAAAAEAAAAAAAAHdmVyc2lvbgRiaW5kAAAQAAM=",
+    "response": "AB5TRAAAAAEAAAAAAAAHdmVyc2lvbgRiaW5kAAAQAAM=",
+    "elapsed_micros": 1900,
+    "truncated": false
+  }
+}

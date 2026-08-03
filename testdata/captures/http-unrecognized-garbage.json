@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): arbitrary non-HTTP bytes (does not even start with `HTTP/`), representing a peer that answered on the port but is not an HTTP server at all -- e.g. a misconfigured port mapping or a protocol this crate has no rule for. Pins AC-4.13 (\"never guess\") against a realistic false-positive shape, not just the empty-vector case already covered by unit tests in `crates/bathy-interpret/src/interpret.rs`.",
+  "capture": {
+    "probe_id": "http-get-v1",
+    "transport": "tcp",
+    "port": 8080,
+    "request": "R0VUIC8gSFRUUC8xLjENCkhvc3Q6IDEyNy4wLjAuMTo4MDgwDQpVc2VyLUFnZW50OiBiYXRoeS8wLjEuMCAoK2h0dHBzOi8vZ2l0aHViLmNvbS9ydXNzZWxsMC9iYXRoeSkNCkFjY2VwdDogKi8qDQpDb25uZWN0aW9uOiBjbG9zZQ0KDQo=",
+    "response": "3q2+7yBub3QgYSBwcm90b2NvbCBhdCBhbGwsIGp1c3Qgbm9pc2U=",
+    "elapsed_micros": 750,
+    "truncated": false
+  }
+}

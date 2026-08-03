@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/library/postgres:16-alpine, digest sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777 (same image/digest as M4 Task 2's report, run without SSL configured). Reached via a locally run container (host-mapped port 25432 -> container port 5432); `port` below is recorded as the canonical PostgreSQL port 5432. Sent the exact fixed 8-byte `SSLRequest` (`bathy_probe::probes::postgres::SSL_REQUEST`) with a plain Python `socket` script and read exactly one byte, matching `ProbeIo::read_at_most(1)`'s own contract -- no nmap involved. Exercises postgres.sslrequest.declined.v1 (ProtocolOnly) via the real single-byte `N` reply.",
+  "capture": {
+    "probe_id": "postgres-startup-v1",
+    "transport": "tcp",
+    "port": 5432,
+    "request": "AAAACATSFi8=",
+    "response": "Tg==",
+    "elapsed_micros": 1100,
+    "truncated": false
+  }
+}

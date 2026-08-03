@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/boky/postfix:latest, digest sha256:aafc772384232497bed875e1eb66b4d3e54ba1ebc86e2e185a6dc1dbc48182ef (same image/digest as M4 Task 2's report, run with ALLOWED_SENDER_DOMAINS=bathy.invalid so Postfix starts). Reached via a locally run container (host-mapped port 22525 -> container port 25); `port` below is recorded as the canonical SMTP port 25. A plain Python `socket` script read the greeting, then sent exactly `EHLO bathy.invalid\\r\\n` (the fixed line `bathy_probe::probes::smtp::SmtpBannerProbe` builds) and read the capability-list reply -- no nmap involved. `response` is the real greeting (`220 <container-hostname> ESMTP Postfix (Debian)`) concatenated with the real multiline `250-`/`250 ` capability list, exactly as `SmtpBannerProbe::execute` assembles it. Exercises smtp.banner.postfix.v1 (ProductOnly) and smtp.protocol.bare.v1 together, the same corroborating-evidence pattern seen on the HTTP and SSH nginx/OpenSSH fixtures.",
+  "capture": {
+    "probe_id": "smtp-banner-v1",
+    "transport": "tcp",
+    "port": 25,
+    "request": "RUhMTyBiYXRoeS5pbnZhbGlkDQo=",
+    "response": "MjIwIGYyZWQ0OTQ5N2Y4ZiBFU01UUCBQb3N0Zml4IChEZWJpYW4pDQoyNTAtZjJlZDQ5NDk3ZjhmDQoyNTAtUElQRUxJTklORw0KMjUwLVNJWkUNCjI1MC1WUkZZDQoyNTAtRVRSTg0KMjUwLVNUQVJUVExTDQoyNTAtRU5IQU5DRURTVEFUVVNDT0RFUw0KMjUwLThCSVRNSU1FDQoyNTAtRFNODQoyNTAtU01UUFVURjgNCjI1MCBDSFVOS0lORw0K",
+    "elapsed_micros": 4300,
+    "truncated": false
+  }
+}

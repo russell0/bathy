@@ -1,0 +1,19 @@
+---
+source: crates/bathy-interpret/tests/replay.rs
+expression: snapshot
+---
+[
+  {
+    "service": "postgresql",
+    "product": null,
+    "version": null,
+    "confidence": 0.7,
+    "rule_id": "postgres.sslrequest.declined.v1",
+    "matched_span": {
+      "start": 0,
+      "end": 1
+    },
+    "matched_bytes_hex": "4e",
+    "rationale": "The server replied with the single byte `N`, PostgreSQL's documented SSLRequest reply meaning it will not negotiate SSL."
+  }
+]

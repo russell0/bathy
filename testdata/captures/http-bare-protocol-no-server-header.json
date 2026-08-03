@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): a minimal, well-formed HTTP/1.0 status line with no `Server:` header at all, per RFC 9112 SS4 (\"status-line = HTTP-version SP status-code SP [ reason-phrase ]\"). Built by hand to pin the weak-evidence path (http.protocol.bare.v1) -- a real server that omits or suppresses its `Server` header, which several hardened deployments deliberately do.",
+  "capture": {
+    "probe_id": "http-get-v1",
+    "transport": "tcp",
+    "port": 8080,
+    "request": "R0VUIC8gSFRUUC8xLjENCkhvc3Q6IDEyNy4wLjAuMTo4MDgwDQpVc2VyLUFnZW50OiBiYXRoeS8wLjEuMCAoK2h0dHBzOi8vZ2l0aHViLmNvbS9ydXNzZWxsMC9iYXRoeSkNCkFjY2VwdDogKi8qDQpDb25uZWN0aW9uOiBjbG9zZQ0KDQo=",
+    "response": "SFRUUC8xLjAgNDA0IE5vdCBGb3VuZA0KDQo=",
+    "elapsed_micros": 900,
+    "truncated": false
+  }
+}

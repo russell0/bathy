@@ -150,6 +150,32 @@ pub fn explain(rule_id: &str) -> Option<&'static RuleDoc> {
     ALL_RULES.iter().map(|r| &r.doc).find(|d| d.id == rule_id)
 }
 
+/// Every distinct probe id this crate has at least one rule for -- the
+/// "registry" M4 Task 4's replay corpus (`crates/bathy-interpret/tests/replay.rs`)
+/// checks each fixture's `probe_id` against, closing that task's own "the
+/// corpus is data, so test the data" requirement.
+///
+/// Deliberately *not* `bathy_probe::framework::ProbeRegistry`'s own id list:
+/// depending on `bathy-probe` from this crate, even as a dev-dependency,
+/// would contradict this crate's own `src/lib.rs` doc comment (this crate
+/// sits *below* `bathy-probe` in the workspace layer order specifically so
+/// its tests need no upward dependency at all) and would fail
+/// `xtask check-deps`, which inspects a package's dev-dependencies too, not
+/// only its normal ones (`find_violations` in `xtask/src/main.rs` does not
+/// filter `cargo metadata`'s dependency list by kind). This crate's own rule
+/// registry is the authoritative "what probe ids do I know how to interpret"
+/// answer from *inside* this crate, which is the only registry `interpret`
+/// itself actually consults (see [`rules_for`]) -- a fixture naming a probe
+/// id this function doesn't return could never produce a real rule match
+/// regardless of what `bathy-probe` itself knows about, so it is exactly the
+/// right check for a corpus that exists to regression-test `interpret`.
+pub fn known_probe_ids() -> impl Iterator<Item = &'static str> {
+    let mut ids: Vec<&'static str> = ALL_RULES.iter().map(|r| r.probe_id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids.into_iter()
+}
+
 /// Splits `bytes` on `\n` and returns each line's starting byte offset
 /// (relative to `bytes`) together with its content as `&str` -- but only
 /// for lines that are themselves valid UTF-8. See this module's doc
@@ -851,6 +877,30 @@ static ALL_RULES: &[Rule] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- known_probe_ids ---
+
+    #[test]
+    fn known_probe_ids_lists_every_probe_this_crate_has_rules_for_deduped_and_sorted() {
+        // Pinned against M4 Task 2's eight real probe ids by name -- a
+        // change here (an id added, removed, or renamed) is exactly the
+        // kind of thing M4 Task 4's replay corpus depends on staying in
+        // sync with the fixtures under `testdata/captures/`.
+        let ids: Vec<&str> = known_probe_ids().collect();
+        assert_eq!(
+            ids,
+            vec![
+                "dns-version-bind-v1",
+                "http-get-v1",
+                "mysql-greeting-v1",
+                "postgres-startup-v1",
+                "redis-ping-v1",
+                "smtp-banner-v1",
+                "ssh-banner-v1",
+                "tls-v1",
+            ]
+        );
+    }
 
     // --- The ladder ---
 

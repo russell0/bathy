@@ -136,15 +136,36 @@ mod tests {
     }
 
     proptest! {
+        // Root-cause fix, M4 Task 4 mutation testing (found while
+        // mutation-testing `sort_stable`'s tie-break for the replay
+        // corpus's own verification -- see that task's report): the
+        // original version of this property drew *continuous* confidences
+        // (`0.0f64..=1.0`) and assigned them to ids in an already-
+        // alphabetically-ascending registration order (`["a","b",...,"h"]`).
+        // Two independent reasons made it unable to actually observe a
+        // broken tie-break: continuous floats tie with probability zero, so
+        // its own `a == b` branch almost never ran; and even on the rare
+        // exact tie, `sort_by` is a *stable* sort, so a mutant that replaced
+        // the real tie-break with a no-op (`Ordering::Equal`) would leave
+        // tied items in registration order -- which this property's
+        // original id assignment already happened to be ascending by id,
+        // so the assertion passed regardless. Reproduced directly: replacing
+        // `sort_stable`'s `.then_with(|| a.rule_id.cmp(b.rule_id))` with
+        // `.then_with(|| std::cmp::Ordering::Equal)` left this property
+        // green while failing this module's own
+        // `tie_break_is_by_rule_id_not_registration_order` immediately.
+        // Fixed with a coarse, 5-rung confidence domain (so genuine ties are
+        // common, not measure-zero) and a *descending* id-to-registration
+        // mapping (so a no-op tiebreak's stable-sort fallback disagrees with
+        // the required ascending-by-id order on every tie this generates).
         #[test]
         fn sort_stable_is_deterministic_and_produces_a_total_order(
-            confidences in proptest::collection::vec(0.0f64..=1.0, 0..8),
+            picks in proptest::collection::vec((0u8..5, 0usize..8), 0..8),
         ) {
-            let ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
-            let items: Vec<Interpretation> = confidences
+            let ids = ["h", "g", "f", "e", "d", "c", "b", "a"];
+            let items: Vec<Interpretation> = picks
                 .iter()
-                .enumerate()
-                .map(|(i, &c)| interp(ids[i], c))
+                .map(|&(rung, id_ix)| interp(ids[id_ix], f64::from(rung) * 0.2))
                 .collect();
             let sorted_once = sort_stable(items.clone());
             let sorted_twice = sort_stable(items);

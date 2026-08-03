@@ -1,0 +1,19 @@
+---
+source: crates/bathy-interpret/tests/replay.rs
+expression: snapshot
+---
+[
+  {
+    "service": "redis",
+    "product": null,
+    "version": null,
+    "confidence": 0.5,
+    "rule_id": "redis.protocol.resp_shaped.v1",
+    "matched_span": {
+      "start": 0,
+      "end": 22
+    },
+    "matched_bytes_hex": "2d45525220756e6b6e6f776e20636f6d6d616e640d0a",
+    "rationale": "The reply began with a valid RESP type sigil and carried a proper CRLF line terminator, but was not the literal `+PONG` a real Redis server sends -- consistent with a RESP-compatible service, not a confirmed product."
+  }
+]

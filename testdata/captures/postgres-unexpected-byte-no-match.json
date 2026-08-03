@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): PostgreSQL's own \"Protocol Flow\" SS54.2.10 documents exactly two valid single-byte `SSLRequest` replies, `S` and `N`; this fixture is a single byte that is neither, modeling a non-PostgreSQL peer (or a protocol version whose startup reply differs) answering on the port. Pins AC-4.13 (\"never guess\"): a byte that is close to, but not, a documented reply must not be coerced into either rule.",
+  "capture": {
+    "probe_id": "postgres-startup-v1",
+    "transport": "tcp",
+    "port": 5432,
+    "request": "AAAACATSFi8=",
+    "response": "RQ==",
+    "elapsed_micros": 1050,
+    "truncated": false
+  }
+}

@@ -1,0 +1,19 @@
+---
+source: crates/bathy-interpret/tests/replay.rs
+expression: snapshot
+---
+[
+  {
+    "service": "dns",
+    "product": "BIND",
+    "version": "9.18.50",
+    "confidence": 0.95,
+    "rule_id": "dns.version_bind.txt_chaos.v1",
+    "matched_span": {
+      "start": 45,
+      "end": 52
+    },
+    "matched_bytes_hex": "392e31382e3530",
+    "rationale": "The reply's answer section carried a TXT/CH record -- the documented response to a `version.bind` query -- containing a version string."
+  }
+]

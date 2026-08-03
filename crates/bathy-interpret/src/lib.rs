@@ -60,7 +60,7 @@ mod interpret;
 mod rules;
 
 pub use interpret::{Interpretation, interpret};
-pub use rules::{RuleDoc, Specificity, all_rules, explain};
+pub use rules::{RuleDoc, Specificity, all_rules, explain, known_probe_ids};
 
 #[cfg(test)]
 mod tests {

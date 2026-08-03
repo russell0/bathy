@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): a well-formed SSH identification string per RFC 4253 SS4.2 (`SSH-protoversion-softwareversion`), naming `libssh` rather than OpenSSH -- no libssh container was run for this task. Pins the weak-evidence path (ssh.protocol.bare.v1): the connection is confirmed to speak SSH, but the specific software is not one this crate's rule set recognizes by name.",
+  "capture": {
+    "probe_id": "ssh-banner-v1",
+    "transport": "tcp",
+    "port": 22,
+    "request": null,
+    "response": "U1NILTIuMC1saWJzc2hfMC45LjYNCg==",
+    "elapsed_micros": 2200,
+    "truncated": false
+  }
+}

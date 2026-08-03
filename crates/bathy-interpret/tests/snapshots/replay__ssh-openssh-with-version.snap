@@ -1,0 +1,32 @@
+---
+source: crates/bathy-interpret/tests/replay.rs
+expression: snapshot
+---
+[
+  {
+    "service": "ssh",
+    "product": "OpenSSH",
+    "version": "10.3",
+    "confidence": 0.95,
+    "rule_id": "ssh.banner.openssh.v1",
+    "matched_span": {
+      "start": 0,
+      "end": 20
+    },
+    "matched_bytes_hex": "5353482d322e302d4f70656e5353485f31302e33",
+    "rationale": "The SSH identification string named the OpenSSH software version, per the `SSH-protoversion-softwareversion` format."
+  },
+  {
+    "service": "ssh",
+    "product": null,
+    "version": null,
+    "confidence": 0.7,
+    "rule_id": "ssh.protocol.bare.v1",
+    "matched_span": {
+      "start": 0,
+      "end": 8
+    },
+    "matched_bytes_hex": "5353482d322e302d",
+    "rationale": "The response is a well-formed SSH identification string, but the software field did not match any known product."
+  }
+]

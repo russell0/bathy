@@ -1,0 +1,19 @@
+---
+source: crates/bathy-interpret/tests/replay.rs
+expression: snapshot
+---
+[
+  {
+    "service": "smtp",
+    "product": null,
+    "version": null,
+    "confidence": 0.7,
+    "rule_id": "smtp.protocol.bare.v1",
+    "matched_span": {
+      "start": 0,
+      "end": 4
+    },
+    "matched_bytes_hex": "32323020",
+    "rationale": "The response is a well-formed 220 SMTP greeting, but no product name in it matched any known rule."
+  }
+]

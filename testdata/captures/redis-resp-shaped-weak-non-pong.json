@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): a real Redis server always replies `+PONG` to `PING` -- there is no way to elicit a different, still-valid RESP reply from an unmodified Redis container using this probe's fixed request, so a genuinely different reply requires a different, RESP-compatible server (e.g. KeyDB, Dragonfly) this task did not run. This is exactly `-ERR unknown command`, the shape documented in Redis's own RESP protocol specification's \"Simple errors\" section (a reply beginning `-` and terminated by CRLF), used here to pin the weak-evidence path (redis.protocol.resp_shaped.v1) directly.",
+  "capture": {
+    "probe_id": "redis-ping-v1",
+    "transport": "tcp",
+    "port": 6379,
+    "request": "KjENCiQ0DQpQSU5HDQo=",
+    "response": "LUVSUiB1bmtub3duIGNvbW1hbmQNCg==",
+    "elapsed_micros": 300,
+    "truncated": false
+  }
+}

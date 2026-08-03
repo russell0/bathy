@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/library/mysql:8.4, digest sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb (same image/digest as M4 Task 2's report). Reached via a locally run container (host-mapped port 23306 -> container port 3306); `port` below is recorded as the canonical MySQL port 3306. `mysql-greeting-v1` is listen-first (`request` is null); a plain Python `socket` script opened the connection and read the greeting, sending nothing -- no nmap involved. This capture's connection-id and auth-plugin-data (salt) bytes differ from the ones embedded in `crates/bathy-probe/src/probes/mysql.rs`'s own `MYSQL_GREETING_HEX` test fixture because MySQL generates a fresh random scramble per connection (RFC-independent, server-generated per RFC-less MySQL wire docs); the `protocol_version` byte (0x0a) and NUL-terminated `server_version` string (`8.4.11`) -- the only bytes `mysql_handshake_v10` reads -- are identical. Exercises mysql.handshake.v10.v1 (ProductAndVersion).",
+  "capture": {
+    "probe_id": "mysql-greeting-v1",
+    "transport": "tcp",
+    "port": 3306,
+    "request": null,
+    "response": "SgAAAAo4LjQuMTEACAAAAG9tT0p/AwJlAP///wIA/98VAAAAAAAAAAAAAFctFAE/KBslYXYfLQBjYWNoaW5nX3NoYTJfcGFzc3dvcmQA",
+    "elapsed_micros": 2900,
+    "truncated": false
+  }
+}

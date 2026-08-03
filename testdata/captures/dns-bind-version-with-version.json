@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/internetsystemsconsortium/bind9:9.18, digest sha256:1ffb29c718ee2540c5643c1e8166629a07bbd505f99107baae535e9f86eb7eef (same image/digest as M4 Task 2's report; identical bytes to the `BIND_REPLY_HEX` fixture already embedded verbatim in `crates/bathy-probe/src/probes/dns.rs` and `crates/bathy-interpret/src/rules.rs`'s own tests -- re-captured independently for this task with a plain Python `socket` script, not copy-pasted, and confirmed byte-for-byte identical). Reached via a locally run container (host-mapped port 25353 -> container port 53/tcp); `port` below is recorded as the canonical DNS port 53. Sent the exact fixed-transaction-id `version.bind`/TXT/CHAOS query `bathy_probe::probes::dns::build_query()` builds. Exercises dns.version_bind.txt_chaos.v1 (ProductAndVersion) via the real TXT record reading `9.18.50`.",
+  "capture": {
+    "probe_id": "dns-version-bind-v1",
+    "transport": "tcp",
+    "port": 53,
+    "request": "AB5TRAAAAAEAAAAAAAAHdmVyc2lvbgRiaW5kAAAQAAM=",
+    "response": "AEBTRIQAAAEAAQABAAAHdmVyc2lvbgRiaW5kAAAQAAPADAAQAAMAAAAAAAgHOS4xOC41MMAMAAIAAwAAAAAAAsAM",
+    "elapsed_micros": 2600,
+    "truncated": false
+  }
+}

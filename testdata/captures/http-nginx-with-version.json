@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/library/nginx:1.27-alpine, digest sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10 (same image/digest as M4 Task 2's report). Reached via a locally run container (host-mapped port 28080 -> container port 80); `port` below is recorded as nginx's canonical port 80 since `interpret()` never reads this field and 80 is the realistic scenario this probe targets. Captured with a plain Python `socket` script (crates/bathy-interpret has no nmap dependency and none was run) sending the exact bytes `bathy_probe::probes::http::HttpGetProbe` builds. Exercises http.server.nginx.v1 (ProductAndVersion) via the real `Server: nginx/1.27.5` header.",
+  "capture": {
+    "probe_id": "http-get-v1",
+    "transport": "tcp",
+    "port": 80,
+    "request": "R0VUIC8gSFRUUC8xLjENCkhvc3Q6IDEyNy4wLjAuMToyODA4MA0KVXNlci1BZ2VudDogYmF0aHkvMC4xLjAgKCtodHRwczovL2dpdGh1Yi5jb20vcnVzc2VsbDAvYmF0aHkpDQpBY2NlcHQ6ICovKg0KQ29ubmVjdGlvbjogY2xvc2UNCg0K",
+    "response": "SFRUUC8xLjEgMjAwIE9LDQpTZXJ2ZXI6IG5naW54LzEuMjcuNQ0KRGF0ZTogTW9uLCAwMyBBdWcgMjAyNiAyMjo1NjoxOCBHTVQNCkNvbnRlbnQtVHlwZTogdGV4dC9odG1sDQpDb250ZW50LUxlbmd0aDogNjE1DQpMYXN0LU1vZGlmaWVkOiBXZWQsIDE2IEFwciAyMDI1IDEyOjU1OjM0IEdNVA0KQ29ubmVjdGlvbjogY2xvc2UNCkVUYWc6ICI2N2ZmYThjNi0yNjciDQpBY2NlcHQtUmFuZ2VzOiBieXRlcw0KDQo8IURPQ1RZUEUgaHRtbD4KPGh0bWw+CjxoZWFkPgo8dGl0bGU+V2VsY29tZSB0byBuZ2lueCE8L3RpdGxlPgo8c3R5bGU+Cmh0bWwgeyBjb2xvci1zY2hlbWU6IGxpZ2h0IGRhcms7IH0KYm9keSB7IHdpZHRoOiAzNWVtOyBtYXJnaW46IDAgYXV0bzsKZm9udC1mYW1pbHk6IFRhaG9tYSwgVmVyZGFuYSwgQXJpYWwsIHNhbnMtc2VyaWY7IH0KPC9zdHlsZT4KPC9oZWFkPgo8Ym9keT4KPGgxPldlbGNvbWUgdG8gbmdpbnghPC9oMT4KPHA+SWYgeW91IHNlZSB0aGlzIHBhZ2UsIHRoZSBuZ2lueCB3ZWIgc2VydmVyIGlzIHN1Y2Nlc3NmdWxseSBpbnN0YWxsZWQgYW5kCndvcmtpbmcuIEZ1cnRoZXIgY29uZmlndXJhdGlvbiBpcyByZXF1aXJlZC48L3A+Cgo8cD5Gb3Igb25saW5lIGRvY3VtZW50YXRpb24gYW5kIHN1cHBvcnQgcGxlYXNlIHJlZmVyIHRvCjxhIGhyZWY9Imh0dHA6Ly9uZ2lueC5vcmcvIj5uZ2lueC5vcmc8L2E+Ljxici8+CkNvbW1lcmNpYWwgc3VwcG9ydCBpcyBhdmFpbGFibGUgYXQKPGEgaHJlZj0iaHR0cDovL25naW54LmNvbS8iPm5naW54LmNvbTwvYT4uPC9wPgoKPHA+PGVtPlRoYW5rIHlvdSBmb3IgdXNpbmcgbmdpbnguPC9lbT48L3A+CjwvYm9keT4KPC9odG1sPgo=",
+    "elapsed_micros": 1420,
+    "truncated": false
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "captured_from": "REAL CAPTURE: docker.io/library/redis:7-alpine, digest sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2 (same image/digest as M4 Task 2's report). Reached via a locally run container (host-mapped port 26379 -> container port 6379); `port` below is recorded as the canonical Redis port 6379. Sent the exact fixed RESP `PING` (`bathy_probe::probes::redis::PING`) with a plain Python `socket` script -- no nmap involved. Exercises redis.ping.pong.v1 (ProtocolOnly) and redis.protocol.resp_shaped.v1 together: the weak rule's own matcher has no exclusion for the literal `+PONG` case, so both fire independently on this real reply -- a corroborating-evidence pattern (also seen on the HTTP/SSH/SMTP fixtures above), pinned here so a future change that narrows the weak rule's scope shows up as a snapshot diff rather than silently.",
+  "capture": {
+    "probe_id": "redis-ping-v1",
+    "transport": "tcp",
+    "port": 6379,
+    "request": "KjENCiQ0DQpQSU5HDQo=",
+    "response": "K1BPTkcNCg==",
+    "elapsed_micros": 350,
+    "truncated": false
+  }
+}

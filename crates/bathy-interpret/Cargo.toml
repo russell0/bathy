@@ -25,9 +25,28 @@ bathy-types = { path = "../bathy-types" }
 regex = { workspace = true }
 
 [dev-dependencies]
+# M4 Task 4 (`tests/replay.rs`): fixtures on disk store request/response
+# bytes as base64 (the brief's own fixture shape), decoded once at load
+# time. Dev-only, like everything else below -- see the note on `insta`.
+base64 = "0.23.0"
+# M4 Task 4: snapshot-compares `interpret`'s output against a committed
+# corpus of recorded captures (`testdata/captures/`). Dev-only:
+# `cargo tree -p bathy-interpret --edges normal` (the purity check AC-4.10
+# requires) does not walk dev-dependencies at all, so this crate's headline
+# claim -- "depends on exactly two crates, `bathy-types` and `regex`" (see
+# `src/lib.rs`'s module doc comment) -- is unaffected by anything in this
+# section.
+insta = { version = "1.48.0", features = ["json"] }
 # Property-testing `interpret`'s span-validity and determinism guarantees
 # (AC-4.14, AC-4.15) over arbitrary byte inputs -- see `src/interpret.rs`'s
-# test module. Dev-only: `cargo tree -p bathy-interpret --edges normal`
-# (the purity check AC-4.10 requires) does not walk dev-dependencies at all,
-# so this does not appear in, or threaten, that assertion.
+# test module.
 proptest = { workspace = true }
+# M4 Task 4: `ProbeCapture` itself is deliberately not `Serialize`/
+# `Deserialize` (see `bathy_types::capture`'s own doc comment -- nothing in
+# M4 puts it on the wire, so adding derives ungoverned by `xtask
+# check-schemas` would be a promise nobody is checking). `tests/replay.rs`
+# therefore defines its own small `Deserialize`-only fixture shape, local to
+# the test binary, and constructs a real `ProbeCapture` from it by hand --
+# these two crates are what that deserialization needs.
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

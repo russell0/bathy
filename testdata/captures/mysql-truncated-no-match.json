@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): the correct `protocol_version` byte (0x0a, HandshakeV10) followed by an incomplete, non-NUL-terminated `server_version` string (\"8.4\" with no trailing NUL) -- the same shape as `crates/bathy-interpret/src/rules.rs`'s own `mysql_handshake_v10_rejects_a_missing_nul_terminator` unit test. Models a real failure mode: a packet truncated by a read cap or a hostile/broken peer before the version string's terminator arrived. Pins AC-4.13 (\"never guess\") -- the protocol-version byte alone is not sufficient evidence to report a version.",
+  "capture": {
+    "probe_id": "mysql-greeting-v1",
+    "transport": "tcp",
+    "port": 3306,
+    "request": null,
+    "response": "AAAAAAo4LjQ=",
+    "elapsed_micros": 400,
+    "truncated": true
+  }
+}

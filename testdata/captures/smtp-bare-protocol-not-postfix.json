@@ -1,0 +1,12 @@
+{
+  "captured_from": "SYNTHETIC (not a container capture): a well-formed 220 SMTP greeting per RFC 5321 SS4.2 (`nnn-`/`nnn ` reply ABNF), naming Sendmail rather than Postfix -- no Sendmail container was run for this task. Pins the weak-evidence path (smtp.protocol.bare.v1): the connection is confirmed to speak SMTP, but the named product is not one this crate's rule set recognizes.",
+  "capture": {
+    "probe_id": "smtp-banner-v1",
+    "transport": "tcp",
+    "port": 25,
+    "request": null,
+    "response": "MjIwIG1haWwuZXhhbXBsZS5jb20gRVNNVFAgU2VuZG1haWwNCg==",
+    "elapsed_micros": 1800,
+    "truncated": false
+  }
+}
