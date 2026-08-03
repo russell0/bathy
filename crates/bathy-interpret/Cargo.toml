@@ -1,0 +1,33 @@
+[package]
+name = "bathy-interpret"
+version.workspace = true
+edition.workspace = true
+# 1.88 MSRV tier: this crate depends on nothing that needs more than the
+# workspace floor (see the MSRV comment on the workspace `Cargo.toml`).
+# `bathy-types` and `regex` (its only two dependencies -- see the module doc
+# comment on `src/lib.rs` for why that pair, and no others, is load-bearing)
+# both build fine at 1.88. CI's `msrv` job (`.github/workflows/ci.yml`) now
+# checks this crate alongside `bathy-types`/`bathy-scope`/`bathy-evidence`/
+# `bathy-plan`/`bathy-probe`/`xtask`, not the higher `msrv-bathy-store` tier
+# `bathy-store`/`bathy-engine` need for `rusqlite`'s `bundled` feature.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bathy-types = { path = "../bathy-types" }
+# The one dependency this crate needs to interpret text-shaped protocol
+# banners (HTTP `Server:` headers, SSH identification strings, SMTP
+# greetings) without hand-rolling ad hoc string scanning for each one.
+# Default features (`std`, `perf`, `unicode`) are all pure computation over
+# in-memory byte slices -- no I/O, no threads spawned, nothing that could
+# compromise the purity this crate exists to guarantee (see `src/lib.rs`).
+regex = { workspace = true }
+
+[dev-dependencies]
+# Property-testing `interpret`'s span-validity and determinism guarantees
+# (AC-4.14, AC-4.15) over arbitrary byte inputs -- see `src/interpret.rs`'s
+# test module. Dev-only: `cargo tree -p bathy-interpret --edges normal`
+# (the purity check AC-4.10 requires) does not walk dev-dependencies at all,
+# so this does not appear in, or threaten, that assertion.
+proptest = { workspace = true }

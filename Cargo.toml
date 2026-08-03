@@ -23,6 +23,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
 thiserror = "2"
+# M4 Task 3 (`crates/bathy-interpret`): the pure rule engine matches
+# protocol banners against patterns like `^Server:[ \t]*nginx(?:/(...))?`
+# via `regex::Regex`, compiled once per rule via `std::sync::LazyLock`
+# rather than per call (see that crate's `src/rules.rs`). Default features
+# only -- no `logging`, `pattern`, or other extras `bathy-interpret` doesn't
+# use. `regex` and its transitive deps (`regex-automata`, `regex-syntax`,
+# `aho-corasick`, `memchr`) are pure computation over in-memory byte slices:
+# no filesystem, clock, network, or randomness, which is exactly what keeps
+# `bathy-interpret`'s dependency tree pure per AC-4.10.
+regex = "1.13"
 blake3 = "1"
 ulid = "3"
 ipnet = { version = "2", features = ["serde"] }

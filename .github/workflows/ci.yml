@@ -41,6 +41,38 @@ jobs:
           # supports `\b` as an extension in -E mode.
           ! grep -rnE --include='*.rs' '\bunsafe([ {(]|$)' crates/ xtask/ \
             | grep -v '^crates/bathy-packetd/'
+      - name: bathy-interpret's dependency tree is pure (AC-4.10)
+        run: |
+          # `bathy-interpret` (M4 Task 3) may depend on `bathy-types` and
+          # `regex` only -- no async runtime, no filesystem access, no
+          # clock, no randomness of its own. That constraint is what lets
+          # M4 Task 4's replay corpus run with the network interface down
+          # and M7's fuzz target run without sockets (see that crate's own
+          # `src/lib.rs` doc comment). Checked two ways, by execution
+          # against the real dependency graph rather than by inspecting the
+          # Cargo.toml alone (a comment or a stray `path = ...` drifting out
+          # of sync with reality would not be caught by reading the
+          # manifest):
+          #
+          # 1. The *direct* dependency set must be exactly {bathy-types,
+          #    regex} -- nothing added, nothing silently dropped.
+          direct=$(cargo tree -p bathy-interpret --edges normal --depth 1 --prefix none \
+            | tail -n +2 | awk '{print $1}' | sort)
+          expected=$(printf 'bathy-types\nregex\n' | sort)
+          if [ "$direct" != "$expected" ]; then
+            echo "bathy-interpret's direct dependencies changed:"
+            echo "  got:  $(echo "$direct" | tr '\n' ' ')"
+            echo "  want: $(echo "$expected" | tr '\n' ' ')"
+            exit 1
+          fi
+          # 2. Nothing in the *whole* tree (direct + transitive) is an
+          #    async runtime, filesystem, or clock-touching crate this
+          #    pure, in-memory byte-matching decision has no business
+          #    reaching -- guards against a *transitive* dependency of
+          #    `bathy-types` or `regex` growing one of these in the future
+          #    without anyone noticing.
+          ! cargo tree -p bathy-interpret --edges normal --prefix none \
+            | grep -iE '^(tokio|tokio-util|mio|async-trait|fs4|rusqlite|libsqlite3-sys|walkdir|tempfile|filetime)( |$)'
       # Lines that legitimately name the phrase — this rule, its tests, its
       # enforcement — carry the [phrase-rule] marker and are excluded. Without
       # that exclusion this step fails on its own source. See the overview's
@@ -77,7 +109,12 @@ jobs:
       # `bathy-types` (see the MSRV comment on `crates/bathy-probe/Cargo.toml`),
       # so it stays in the `1.88` tier rather than moving to
       # `msrv-bathy-store` the way `bathy-engine` did.
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p xtask --all-targets
+      #
+      # `bathy-interpret` joined this job in M4 Task 3: it depends only on
+      # `bathy-types` and `regex` (see the MSRV comment on
+      # `crates/bathy-interpret/Cargo.toml`), so -- like `bathy-probe` --
+      # it stays in the `1.88` tier rather than `msrv-bathy-store`.
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p xtask --all-targets
 
   msrv-bathy-store:
     runs-on: ubuntu-latest
