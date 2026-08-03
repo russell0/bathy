@@ -312,57 +312,266 @@ mod tests {
         }
     }
 
+    // --- Structured strategies for the property tests below ---
+    //
+    // Root-cause fix, M4 Task 3 review round 1: the original version of
+    // both property tests below generated *fully arbitrary* bytes
+    // (`proptest::collection::vec(any::<u8>(), 0..300)`) and picked among
+    // 8 known probe ids uniformly. Reviewed at 4096 cases: only 6 ever
+    // produced a non-empty `interpret` result, and none of those 6
+    // produced a span with `end > 6` -- meaning the property never once
+    // reached the offset arithmetic in `http_nginx`, `ssh_openssh`,
+    // `smtp_postfix`, `dns_bind_version`, or `mysql_handshake_v10`. A
+    // property test that (almost) never exercises the code path it claims
+    // to cover is not evidence for that coverage; citing it as AC-4.12
+    // evidence, as this task's own report did, was not supportable.
+    //
+    // The strategies below generate a *protocol-shaped* response for a
+    // matching probe id most of the time (weight 3 per protocol below,
+    // 24 total), each parameterized by proptest-chosen random fields
+    // (version numbers, hostnames, DNS record content, ...) and passed
+    // through `with_corruption`, which -- itself randomly, per case --
+    // either leaves the bytes alone, truncates them at a random point, or
+    // splices a random extra byte in at a random point. That keeps every
+    // rule's happy path, near-miss path, and truncation/corruption path
+    // all live and reachable, not just the near-certain "matches nothing"
+    // outcome of pure `any::<u8>()` bytes. A residual arm (weight 6) still
+    // generates fully arbitrary bytes against an arbitrary probe id
+    // (including an unknown one), preserving the original "never panics /
+    // never guesses on garbage" coverage the vacuous version did provide.
+
+    /// Randomly leaves `valid` bytes alone, truncates them at a random
+    /// point, or splices one random extra byte in at a random point.
+    fn with_corruption(valid: impl Strategy<Value = Vec<u8>>) -> impl Strategy<Value = Vec<u8>> {
+        (valid, 0u8..3, any::<usize>(), any::<u8>()).prop_map(|(bytes, mode, at, extra)| match mode
+        {
+            0 => bytes,
+            1 => {
+                if bytes.is_empty() {
+                    bytes
+                } else {
+                    let cut = at % (bytes.len() + 1);
+                    bytes[..cut].to_vec()
+                }
+            }
+            _ => {
+                let mut b = bytes;
+                let pos = at % (b.len() + 1);
+                b.insert(pos, extra);
+                b
+            }
+        })
+    }
+
+    fn http_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (1u16..500, 0u16..500, 0u16..500, any::<bool>()).prop_map(
+            |(major, minor, patch, with_version)| {
+                let server = if with_version {
+                    format!("nginx/{major}.{minor}.{patch}")
+                } else {
+                    "nginx".to_string()
+                };
+                format!("HTTP/1.1 200 OK\r\nServer: {server}\r\n\r\n").into_bytes()
+            },
+        )
+    }
+
+    fn ssh_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (1u16..50, 0u16..50, any::<bool>()).prop_map(|(major, minor, with_patch)| {
+            let patch = if with_patch {
+                format!("p{minor}")
+            } else {
+                String::new()
+            };
+            format!("SSH-2.0-OpenSSH_{major}.{minor}{patch}\r\n").into_bytes()
+        })
+    }
+
+    fn smtp_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (0u32..1000, any::<bool>()).prop_map(|(host_n, is_postfix)| {
+            let software = if is_postfix { "Postfix" } else { "Sendmail" };
+            format!("220 host{host_n}.example.com ESMTP {software}\r\n").into_bytes()
+        })
+    }
+
+    fn mysql_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (
+            0u8..30,
+            0u8..30,
+            0u8..30,
+            proptest::collection::vec(any::<u8>(), 0..20),
+        )
+            .prop_map(|(major, minor, patch, trailing)| {
+                let mut bytes = vec![0u8, 0, 0, 0, 0x0a]; // header + protocol_version
+                bytes.extend_from_slice(format!("{major}.{minor}.{patch}").as_bytes());
+                bytes.push(0); // NUL terminator
+                bytes.extend_from_slice(&trailing);
+                bytes
+            })
+    }
+
+    /// Builds a synthetic-but-wire-valid `version.bind`/TXT/CHAOS reply
+    /// (the same shape `dns_bind_version` in `rules.rs` parses, and the
+    /// same shape the real BIND capture in that module's tests has), with
+    /// a proptest-chosen transaction id and version string.
+    fn build_synthetic_dns_reply(id: u16, version: &str) -> Vec<u8> {
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&id.to_be_bytes());
+        msg.extend_from_slice(&0x8400u16.to_be_bytes()); // flags: response
+        msg.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+        msg.extend_from_slice(&1u16.to_be_bytes()); // ANCOUNT
+        msg.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+        msg.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
+        for label in ["version", "bind"] {
+            msg.push(label.len() as u8);
+            msg.extend_from_slice(label.as_bytes());
+        }
+        msg.push(0); // root label
+        msg.extend_from_slice(&16u16.to_be_bytes()); // QTYPE TXT
+        msg.extend_from_slice(&3u16.to_be_bytes()); // QCLASS CH
+        msg.extend_from_slice(&[0xC0, 0x0C]); // answer name: pointer to offset 12
+        msg.extend_from_slice(&16u16.to_be_bytes()); // TYPE TXT
+        msg.extend_from_slice(&3u16.to_be_bytes()); // CLASS CH
+        msg.extend_from_slice(&0u32.to_be_bytes()); // TTL
+        let rdata_len = 1 + version.len();
+        msg.extend_from_slice(&(rdata_len as u16).to_be_bytes());
+        msg.push(version.len() as u8);
+        msg.extend_from_slice(version.as_bytes());
+
+        let mut framed = Vec::with_capacity(2 + msg.len());
+        framed.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+        framed.extend_from_slice(&msg);
+        framed
+    }
+
+    fn dns_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        (any::<u16>(), 1usize..15).prop_map(|(id, version_len)| {
+            let version: String = (0..version_len)
+                .map(|i| (b'0' + (i % 10) as u8) as char)
+                .collect();
+            build_synthetic_dns_reply(id, &version)
+        })
+    }
+
+    fn tls_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(any::<u8>(), 0..50).prop_map(|trailing| {
+            let mut bytes = vec![0x16, 0x03, 0x03, 0x00, 0x02, 0x02];
+            bytes.extend_from_slice(&trailing);
+            bytes
+        })
+    }
+
+    fn redis_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            Just(b"+PONG\r\n".to_vec()),
+            Just(b"-ERR unknown command\r\n".to_vec()),
+            Just(b":1000\r\n".to_vec()),
+            Just(b"$-1\r\n".to_vec()),
+        ]
+    }
+
+    fn postgres_valid_bytes() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![Just(b"S".to_vec()), Just(b"N".to_vec())]
+    }
+
+    fn probe_and_response_strategy() -> impl Strategy<Value = (&'static str, Vec<u8>)> {
+        prop_oneof![
+            3 => with_corruption(http_valid_bytes()).prop_map(|b| ("http-get-v1", b)),
+            3 => with_corruption(ssh_valid_bytes()).prop_map(|b| ("ssh-banner-v1", b)),
+            3 => with_corruption(smtp_valid_bytes()).prop_map(|b| ("smtp-banner-v1", b)),
+            3 => with_corruption(mysql_valid_bytes()).prop_map(|b| ("mysql-greeting-v1", b)),
+            3 => with_corruption(dns_valid_bytes()).prop_map(|b| ("dns-version-bind-v1", b)),
+            3 => with_corruption(tls_valid_bytes()).prop_map(|b| ("tls-v1", b)),
+            3 => with_corruption(redis_valid_bytes()).prop_map(|b| ("redis-ping-v1", b)),
+            3 => with_corruption(postgres_valid_bytes()).prop_map(|b| ("postgres-startup-v1", b)),
+            6 => (
+                prop_oneof![
+                    Just("http-get-v1"),
+                    Just("tls-v1"),
+                    Just("ssh-banner-v1"),
+                    Just("smtp-banner-v1"),
+                    Just("dns-version-bind-v1"),
+                    Just("postgres-startup-v1"),
+                    Just("mysql-greeting-v1"),
+                    Just("redis-ping-v1"),
+                    Just("totally-unknown-probe-id"),
+                ],
+                proptest::collection::vec(any::<u8>(), 0..300),
+            ),
+        ]
+    }
+
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(512))]
+        #![proptest_config(ProptestConfig::with_cases(2048))]
 
         // AC-4.12 / verification beyond the brief: every span the rule set
         // can ever produce is a valid range into the response it was
-        // computed from, over arbitrary bytes and arbitrary probe ids --
-        // not just the specific fixtures the brief's own tests use.
+        // computed from. Uses `probe_and_response_strategy` (see above)
+        // so this actually exercises the offset arithmetic in every rule,
+        // not just the "nothing matched" path -- see this test module's
+        // note on why the earlier, fully-arbitrary-bytes version of this
+        // property was near-vacuous.
         #[test]
         fn matched_span_is_always_a_valid_range_into_the_response(
-            probe_idx in 0usize..9,
-            response in proptest::collection::vec(any::<u8>(), 0..300),
+            (probe_id, response) in probe_and_response_strategy(),
         ) {
-            let probe_ids = [
-                "http-get-v1",
-                "tls-v1",
-                "ssh-banner-v1",
-                "smtp-banner-v1",
-                "dns-version-bind-v1",
-                "postgres-startup-v1",
-                "mysql-greeting-v1",
-                "redis-ping-v1",
-            ];
-            let probe_id = probe_ids[probe_idx % probe_ids.len()];
             let c = cap(probe_id, 1, &response);
-            for i in interpret(&c) {
+            let interpretations = interpret(&c);
+            for i in &interpretations {
                 prop_assert!(i.matched_span.start <= i.matched_span.end);
                 prop_assert!(i.matched_span.end <= c.response.len());
             }
         }
 
-        // AC-4.14: same bytes in, byte-identical vector out, over arbitrary
-        // input -- not just the one fixture the brief's own determinism
-        // test pins.
+        // AC-4.14: same bytes in, byte-identical vector out, over inputs
+        // that actually reach real rule matches (not just arbitrary bytes
+        // that almost always produce an empty, trivially-equal vector).
         #[test]
         fn interpret_is_deterministic_over_arbitrary_input(
-            probe_idx in 0usize..9,
-            response in proptest::collection::vec(any::<u8>(), 0..300),
+            (probe_id, response) in probe_and_response_strategy(),
         ) {
-            let probe_ids = [
-                "http-get-v1",
-                "tls-v1",
-                "ssh-banner-v1",
-                "smtp-banner-v1",
-                "dns-version-bind-v1",
-                "postgres-startup-v1",
-                "mysql-greeting-v1",
-                "redis-ping-v1",
-            ];
-            let probe_id = probe_ids[probe_idx % probe_ids.len()];
             let c = cap(probe_id, 1, &response);
             prop_assert_eq!(interpret(&c), interpret(&c));
         }
+
+    }
+
+    // Companion to the two properties above, run directly rather than as a
+    // `proptest!` property: measures, with real counts, that
+    // `probe_and_response_strategy` actually reaches matches and deep
+    // spans most of the time -- not just "less vacuous in theory". The
+    // original strategy this replaces was independently audited at 4096
+    // cases: 6 non-empty results, 0 with `matched_span.end > 6` (i.e. it
+    // essentially never reached any rule's offset arithmetic). This test
+    // is what backs the claim that the replacement strategy is different
+    // in kind, not just in case count.
+    #[test]
+    fn structured_strategy_reaches_real_matches_and_deep_spans_most_of_the_time() {
+        use proptest::strategy::ValueTree;
+        use proptest::test_runner::TestRunner;
+        let mut runner = TestRunner::default();
+        let strategy = probe_and_response_strategy();
+        const TOTAL: usize = 2000;
+        let mut non_empty = 0usize;
+        let mut deep_span = 0usize;
+        for _ in 0..TOTAL {
+            let (probe_id, response) = strategy.new_tree(&mut runner).unwrap().current();
+            let interpretations = interpret(&cap(probe_id, 1, &response));
+            if !interpretations.is_empty() {
+                non_empty += 1;
+            }
+            if interpretations.iter().any(|i| i.matched_span.end > 6) {
+                deep_span += 1;
+            }
+        }
+        assert!(
+            non_empty * 100 >= TOTAL * 30,
+            "expected at least 30% of {TOTAL} structured cases to produce a match, got {non_empty}"
+        );
+        assert!(
+            deep_span * 100 >= TOTAL * 20,
+            "expected at least 20% of {TOTAL} structured cases to produce a span past byte 6 \
+             (i.e. actually reach a rule's own offset arithmetic), got {deep_span}"
+        );
     }
 }

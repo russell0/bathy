@@ -184,14 +184,25 @@ fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
 }
 
 // =====================================================================
-// HTTP -- source: RFC 9112 §3 ("Request Line"/status line shape), RFC 9110
-// §10.2.4 (`Server`). Corroborated against a real server:
-// `docker.io/library/nginx:1.27-alpine`, digest
+// HTTP -- source: RFC 9112 §4 ("Status Line": `status-line = HTTP-version
+// SP status-code SP [ reason-phrase ]`), RFC 9110 §10.2.4 (`Server`).
+// (Root-cause fix, M4 Task 3 review round 1: this previously cited §3,
+// which is "Request Line" -- the ABNF for what a *client* sends, not a
+// server's response. §4 is the section that actually defines the
+// status-line shape these rules match against.) Corroborated against a
+// real server: `docker.io/library/nginx:1.27-alpine`, digest
 // `sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10`
 // (M4 Task 2 report), which replied `HTTP/1.1 200 OK\r\nServer:
 // nginx/1.27.5\r\n...`.
 // =====================================================================
 
+/// The response's first line that is valid UTF-8 -- not unconditionally its
+/// literal first line. A well-formed HTTP status line is always plain
+/// ASCII and therefore always valid UTF-8, so for any real HTTP response
+/// this distinction is moot: the first valid-UTF-8 line *is* byte 0.
+/// [`utf8_lines`] is still what supplies the "valid UTF-8" half of that
+/// guarantee, which is why this function is phrased in terms of it rather
+/// than indexing `bytes` directly.
 fn http_status_line(bytes: &[u8]) -> Option<(usize, &str)> {
     let (start, first) = *utf8_lines(bytes).first()?;
     if first.starts_with("HTTP/") {
@@ -244,6 +255,20 @@ fn http_bare_protocol(bytes: &[u8]) -> Option<Hit> {
 // against `docker.io/linuxserver/openssh-server:latest`, digest
 // `sha256:96b9a4d3b5106746d08d43a6911650d4d21f7d5c7f2ac9660e792bdb5e63157c`
 // (M4 Task 2 report), which sent `SSH-2.0-OpenSSH_10.3\r\n` unprompted.
+//
+// Both matchers below scan *every* line, not just the first, and stop at
+// the first one that matches. This is not defensive-for-its-own-sake:
+// §4.2 itself says "The server MAY send other lines of data before
+// sending the version string... Such lines MUST NOT begin with 'SSH-'...
+// Clients MUST be able to process such lines." A matcher that only ever
+// looked at line 0 would false-negative on exactly this RFC-sanctioned
+// case -- a real, spec-compliant server whose banner isn't byte 0. (Root-
+// cause fix, M4 Task 3 review round 1: an earlier version of both
+// functions here called `utf8_lines(bytes).first()`, which is *always*
+// offset 0 by construction -- so it both missed this case and made the
+// `line_start + …` term in `Hit::span` provably dead code, indistinguishable
+// by any test from a version that dropped the offset entirely. See
+// `tests::ssh_openssh_finds_the_identification_line_after_a_preamble_line`.)
 // =====================================================================
 
 static SSH_OPENSSH_RE: LazyLock<Regex> =
@@ -253,35 +278,54 @@ static SSH_BANNER_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^SSH-\d\.\d+-").expect("static regex compiles"));
 
 fn ssh_openssh(bytes: &[u8]) -> Option<Hit> {
-    let (start, first) = *utf8_lines(bytes).first()?;
-    let caps = SSH_OPENSSH_RE.captures(first)?;
-    let m = caps.get(0)?;
-    let version = caps.get(1)?.as_str().to_owned();
-    Some(Hit {
-        product: Some("OpenSSH".to_owned()),
-        version: Some(version),
-        specificity: Specificity::ProductAndVersion,
-        span: (start + m.start())..(start + m.end()),
-    })
+    for (line_start, line) in utf8_lines(bytes) {
+        let Some(caps) = SSH_OPENSSH_RE.captures(line) else {
+            continue;
+        };
+        let m = caps.get(0)?;
+        let version = caps.get(1)?.as_str().to_owned();
+        return Some(Hit {
+            product: Some("OpenSSH".to_owned()),
+            version: Some(version),
+            specificity: Specificity::ProductAndVersion,
+            span: (line_start + m.start())..(line_start + m.end()),
+        });
+    }
+    None
 }
 
 fn ssh_bare_protocol(bytes: &[u8]) -> Option<Hit> {
-    let (start, first) = *utf8_lines(bytes).first()?;
-    let m = SSH_BANNER_RE.find(first)?;
-    Some(Hit {
-        product: None,
-        version: None,
-        specificity: Specificity::ProtocolOnly,
-        span: (start + m.start())..(start + m.end()),
-    })
+    for (line_start, line) in utf8_lines(bytes) {
+        if let Some(m) = SSH_BANNER_RE.find(line) {
+            return Some(Hit {
+                product: None,
+                version: None,
+                specificity: Specificity::ProtocolOnly,
+                span: (line_start + m.start())..(line_start + m.end()),
+            });
+        }
+    }
+    None
 }
 
 // =====================================================================
 // PostgreSQL -- source: PostgreSQL's own Frontend/Backend Protocol
-// documentation, "Message Formats" §`SSLRequest`
-// (<https://www.postgresql.org/docs/current/protocol-message-formats.html>):
-// the server replies with exactly one byte, `S` (will negotiate SSL) or `N`
-// (will not), to a startup packet carrying the fixed SSLRequest code.
+// documentation, split across two pages of the same doc set, not one:
+//
+// - The *request* bytes (an 8-byte message: length 8, then the fixed
+//   SSLRequest code 80877103) are "Message Formats" §SSLRequest
+//   (<https://www.postgresql.org/docs/current/protocol-message-formats.html>).
+//   That page defines what the client sends; it does not document the
+//   server's reply at all.
+// - The *reply*'s meaning is documented separately, in "Protocol Flow"
+//   §54.2.10 ("SSL Session Encryption",
+//   <https://www.postgresql.org/docs/current/protocol-flow.html>): "The
+//   server then responds with a single byte containing S or N, indicating
+//   that it is willing or unwilling to perform SSL, respectively." (Root-
+//   cause fix, M4 Task 3 review round 1: both rules below previously cited
+//   only the request-format page for this fact too -- verified against the
+//   live page, which covers the request shape only.)
+//
 // Corroborated against `docker.io/library/postgres:16-alpine`, digest
 // `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`
 // (M4 Task 2 report), which replied `N` (run without SSL configured) to
@@ -346,26 +390,42 @@ fn redis_pong(bytes: &[u8]) -> Option<Hit> {
 /// this recognizes the *wire format*, not the product -- exactly
 /// [`Specificity::Weak`]'s definition ("consistent with the service but not
 /// conclusive"), not a guess that it is Redis itself.
+///
+/// Requires an actual `\r\n` terminator (RESP's own line terminator, per
+/// the RESP protocol specification's "Simple strings" section: "terminated
+/// by CRLF") after the sigil, not just a matching first byte. (Root-cause
+/// fix, M4 Task 3 review round 1: a single stray byte from an arbitrary
+/// binary protocol -- `0x2b` alone, say -- happens to equal `+` and
+/// previously matched on its own; requiring the terminator this rule's own
+/// rationale claims to have found is what makes "RESP-shaped" an honest
+/// description rather than a one-byte coincidence.)
 fn redis_resp_shaped_reply(bytes: &[u8]) -> Option<Hit> {
     let sigil = *bytes.first()?;
-    if matches!(sigil, b'+' | b'-' | b':' | b'$' | b'*') {
-        Some(Hit {
-            product: None,
-            version: None,
-            specificity: Specificity::Weak,
-            span: 0..1,
-        })
-    } else {
-        None
+    if !matches!(sigil, b'+' | b'-' | b':' | b'$' | b'*') {
+        return None;
     }
+    let crlf_at = bytes.windows(2).position(|w| w == b"\r\n")?;
+    Some(Hit {
+        product: None,
+        version: None,
+        specificity: Specificity::Weak,
+        span: 0..(crlf_at + 2),
+    })
 }
 
 // =====================================================================
-// MySQL -- source: MySQL's own "Protocol::HandshakeV10" documentation
-// (<https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html>):
-// byte 4 of the packet is `protocol_version` (0x0a for HandshakeV10),
-// followed immediately by a NUL-terminated `server_version` string.
-// Corroborated against `docker.io/library/mysql:8.4`, digest
+// MySQL -- source: MySQL's own "Protocol::HandshakeV10" *packet-layout*
+// page
+// (<https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_v10.html>)
+// -- not the "Connection Phase" overview page this previously cited, which
+// only links to the packet layout without itself listing the fields
+// (verified against the live page; root-cause fix, M4 Task 3 review round
+// 1). The layout page's own field table lists `protocol_version` as
+// `int<1>`, "Always 10", as the first field, with `server_version` --
+// `string<NUL>` -- immediately after it. Byte 4 of the packet is therefore
+// `protocol_version` (0x0a for HandshakeV10), followed immediately by the
+// NUL-terminated `server_version` string. Corroborated against
+// `docker.io/library/mysql:8.4`, digest
 // `sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb`
 // (M4 Task 2 report), whose captured `HandshakeV10` packet's version string
 // reads `8.4.11` -- the exact bytes reused as this rule's own test fixture
@@ -491,9 +551,22 @@ fn dns_bind_version(bytes: &[u8]) -> Option<Hit> {
 }
 
 // =====================================================================
-// SMTP -- source: RFC 5321 §3.1 ("Session Initiation": "the SMTP server
-// MUST send a 220 'Service ready' reply"), §4.3.1 (multiline reply
-// format, `nnn-`/`nnn `). Corroborated against `docker.io/boky/postfix:latest`,
+// SMTP -- source: RFC 5321 §3.1 ("Session Initiation": "An SMTP session is
+// initiated when a client opens a connection to a server and the server
+// responds with an opening message" -- §3.1 itself permits a 554 reply
+// here instead of 220, so this is a description of the usual case, not a
+// promise about wording); §4.3.1 ("Sequencing Overview": "Normally, a
+// receiver will send a 220 'Service ready' reply" -- likewise descriptive);
+// §4.2 ("SMTP Replies": the `nnn-`/`nnn ` multiline reply ABNF these
+// rules' regexes depend on). (Root-cause fix, M4 Task 3 review round 1:
+// this previously attributed the quotation "the SMTP server MUST send a
+// 220 'Service ready' reply" to §3.1 -- that sentence does not appear
+// anywhere in §3.1, RFC 5321 makes no MUST-level promise about the
+// greeting at all, and the real "Normally... will send" sentence is in
+// §4.3.1, not §3.1. The multiline-reply ABNF was also miscited to §4.3.1
+// -- it is in §4.2, "SMTP Replies". Verified against the live RFC text for
+// this fix, not re-derived from the earlier, uncorroborated citation.)
+// Corroborated against `docker.io/boky/postfix:latest`,
 // digest `sha256:aafc772384232497bed875e1eb66b4d3e54ba1ebc86e2e185a6dc1dbc48182ef`
 // (M4 Task 2 report), which replied `220 <host> ESMTP Postfix (Debian)\r\n`.
 // =====================================================================
@@ -504,15 +577,28 @@ static SMTP_GREETING_RE: LazyLock<Regex> =
 static SMTP_POSTFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^220[ -].*\bPostfix\b").expect("static regex compiles"));
 
+/// Scans every line, not just the first: RFC 5321 §4.2's own ABNF for the
+/// `Greeting` allows a *multiline* 220 reply (`"220-" Domain [SP text] CRLF
+/// *("220-" [text] CRLF) "220" SP [text] CRLF`), so the text naming a
+/// product may legitimately be on a continuation line rather than the very
+/// first one. (Root-cause fix, M4 Task 3 review round 1: an earlier
+/// version only checked `utf8_lines(bytes).first()`, which is always
+/// offset 0 -- making `Hit::span`'s offset term dead code for every
+/// realistic single-line-greeting test, the same issue fixed in
+/// `ssh_openssh` above. See
+/// `tests::smtp_postfix_finds_the_product_on_a_continuation_line`.)
 fn smtp_postfix(bytes: &[u8]) -> Option<Hit> {
-    let (start, first) = *utf8_lines(bytes).first()?;
-    let m = SMTP_POSTFIX_RE.find(first)?;
-    Some(Hit {
-        product: Some("Postfix".to_owned()),
-        version: None,
-        specificity: Specificity::ProductOnly,
-        span: (start + m.start())..(start + m.end()),
-    })
+    for (line_start, line) in utf8_lines(bytes) {
+        if let Some(m) = SMTP_POSTFIX_RE.find(line) {
+            return Some(Hit {
+                product: Some("Postfix".to_owned()),
+                version: None,
+                specificity: Specificity::ProductOnly,
+                span: (line_start + m.start())..(line_start + m.end()),
+            });
+        }
+    }
+    None
 }
 
 fn smtp_bare_protocol(bytes: &[u8]) -> Option<Hit> {
@@ -568,7 +654,7 @@ static ALL_RULES: &[Rule] = &[
             service: "http",
             specificity: Specificity::ProductAndVersion,
             rationale: "The `Server` response header declared `nginx`, optionally followed by a version.",
-            source: "RFC 9112 §3 (status line), RFC 9110 §10.2.4 (`Server`); capture from \
+            source: "RFC 9112 §4 (\"Status Line\"), RFC 9110 §10.2.4 (`Server`); capture from \
                       nginx:1.27-alpine (digest sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10), \
                       M4 Task 2 report",
         },
@@ -582,7 +668,8 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProtocolOnly,
             rationale: "The response's first line is a well-formed HTTP status line, but no \
                         `Server` header matched any known product.",
-            source: "RFC 9112 §3 (\"Request Line\"/status-line ABNF: HTTP-version SP status-code)",
+            source: "RFC 9112 §4 (\"Status Line\": `status-line = HTTP-version SP status-code SP \
+                      [ reason-phrase ]`)",
         },
         matcher: http_bare_protocol,
     },
@@ -621,8 +708,10 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProtocolOnly,
             rationale: "The server replied with the single byte `S`, PostgreSQL's documented \
                         SSLRequest reply meaning it will negotiate SSL.",
-            source: "PostgreSQL Frontend/Backend Protocol, \"Message Formats\" §SSLRequest \
-                      (postgresql.org/docs/current/protocol-message-formats.html); capture from \
+            source: "PostgreSQL \"Protocol Flow\" §54.2.10 (\"SSL Session Encryption\": \"The \
+                      server then responds with a single byte containing S or N, indicating \
+                      that it is willing or unwilling to perform SSL, respectively.\" -- \
+                      postgresql.org/docs/current/protocol-flow.html); capture from \
                       postgres:16-alpine (digest sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777), \
                       M4 Task 2 report",
         },
@@ -636,8 +725,10 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProtocolOnly,
             rationale: "The server replied with the single byte `N`, PostgreSQL's documented \
                         SSLRequest reply meaning it will not negotiate SSL.",
-            source: "PostgreSQL Frontend/Backend Protocol, \"Message Formats\" §SSLRequest \
-                      (postgresql.org/docs/current/protocol-message-formats.html); capture from \
+            source: "PostgreSQL \"Protocol Flow\" §54.2.10 (\"SSL Session Encryption\": \"The \
+                      server then responds with a single byte containing S or N, indicating \
+                      that it is willing or unwilling to perform SSL, respectively.\" -- \
+                      postgresql.org/docs/current/protocol-flow.html); capture from \
                       postgres:16-alpine (digest sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777), \
                       M4 Task 2 report -- the container itself replied `N`",
         },
@@ -663,10 +754,12 @@ static ALL_RULES: &[Rule] = &[
             id: "redis.protocol.resp_shaped.v1",
             service: "redis",
             specificity: Specificity::Weak,
-            rationale: "The reply began with a valid RESP type sigil, but was not the literal \
-                        `+PONG` a real Redis server sends -- consistent with a RESP-compatible \
-                        service, not a confirmed product.",
-            source: "Redis RESP protocol specification \
+            rationale: "The reply began with a valid RESP type sigil and carried a proper CRLF \
+                        line terminator, but was not the literal `+PONG` a real Redis server \
+                        sends -- consistent with a RESP-compatible service, not a confirmed \
+                        product.",
+            source: "Redis RESP protocol specification, \"Simple strings\" (a reply is \
+                      \"terminated by CRLF\") \
                       (redis.io/docs/latest/develop/reference/protocol-spec/), structural only",
         },
         matcher: redis_resp_shaped_reply,
@@ -679,8 +772,10 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProductAndVersion,
             rationale: "The greeting's protocol-version byte was 0x0a (HandshakeV10), followed \
                         by a NUL-terminated server-version string.",
-            source: "MySQL \"Protocol::HandshakeV10\" documentation \
-                      (dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html); \
+            source: "MySQL \"Protocol::HandshakeV10\" field-layout table (protocol_version: \
+                      int<1>, \"Always 10\"; immediately followed by server_version: \
+                      string<NUL>) -- dev.mysql.com/doc/dev/mysql-server/latest/\
+                      page_protocol_connection_phase_packets_protocol_handshake_v10.html; \
                       capture from mysql:8.4 \
                       (digest sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb), \
                       M4 Task 2 report",
@@ -712,8 +807,9 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProductOnly,
             rationale: "The 220 greeting named Postfix. Postfix's greeting does not carry a \
                         version number, so no version can be extracted.",
-            source: "RFC 5321 §3.1 (\"Session Initiation\"), §4.3.1 (multiline reply format); \
-                      capture from boky/postfix:latest \
+            source: "RFC 5321 §4.2 (\"SMTP Replies\": the `nnn-`/`nnn ` multiline reply ABNF \
+                      this rule's regex scans every line for a match against); capture from \
+                      boky/postfix:latest \
                       (digest sha256:aafc772384232497bed875e1eb66b4d3e54ba1ebc86e2e185a6dc1dbc48182ef), \
                       M4 Task 2 report",
         },
@@ -727,8 +823,10 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProtocolOnly,
             rationale: "The response is a well-formed 220 SMTP greeting, but no product name in \
                         it matched any known rule.",
-            source: "RFC 5321 §3.1 (\"Session Initiation\": \"the SMTP server MUST send a 220 \
-                      'Service ready' reply\")",
+            source: "RFC 5321 §4.3.1 (\"Sequencing Overview\": \"Normally, a receiver will send \
+                      a 220 'Service ready' reply\" -- descriptive, not a MUST; §3.1 explicitly \
+                      permits a 554 reply instead), §4.2 (\"SMTP Replies\": `nnn-`/`nnn ` \
+                      multiline reply ABNF)",
         },
         matcher: smtp_bare_protocol,
     },
@@ -801,10 +899,12 @@ mod tests {
 
     #[test]
     fn http_nginx_extracts_product_and_version() {
-        let hit = http_nginx(b"HTTP/1.1 200 OK\r\nServer: nginx/1.27.5\r\n\r\n").unwrap();
+        let bytes = b"HTTP/1.1 200 OK\r\nServer: nginx/1.27.5\r\n\r\n";
+        let hit = http_nginx(bytes).unwrap();
         assert_eq!(hit.product.as_deref(), Some("nginx"));
         assert_eq!(hit.version.as_deref(), Some("1.27.5"));
         assert_eq!(hit.specificity, Specificity::ProductAndVersion);
+        assert_eq!(&bytes[hit.span.clone()], b"Server: nginx/1.27.5");
     }
 
     #[test]
@@ -824,18 +924,81 @@ mod tests {
         assert!(http_nginx(b"HTTP/1.1 200 OK\r\nServer: Apache/2.4.62\r\n\r\n").is_none());
     }
 
+    // --- Soundness regression: the brief's own worked example reused
+    // `String::from_utf8_lossy` offsets as indices into the original
+    // bytes, which silently cites the wrong bytes (or panics) once
+    // anything before the match isn't valid UTF-8. These two tests are
+    // built to fail under that unsound version specifically -- reverting
+    // `http_nginx` to a whole-response-lossy-conversion implementation and
+    // running the suite is this task's own review-round-1 finding; see the
+    // fix report for the reproduced failure. ---
+
+    #[test]
+    fn http_nginx_cites_the_correct_bytes_when_invalid_utf8_precedes_the_match() {
+        // A stray 0x80 (a lone UTF-8 continuation byte, invalid on its own)
+        // sits on an earlier header line, strictly before the `Server:`
+        // line that actually matches. `utf8_lines` skips only that one
+        // invalid line; `http_nginx` must still report a span pointing at
+        // the real `Server:` bytes, at their real offset in the original
+        // buffer -- not an offset computed against a lossy re-encoding of
+        // the whole response (which would grow by 2 bytes at the one
+        // invalid byte, a `String::from_utf8_lossy` implementation would
+        // silently misalign every offset after it).
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        bytes.extend_from_slice(b"X-Bad: \x80\r\n");
+        bytes.extend_from_slice(b"Server: nginx/1.26.0\r\n");
+        bytes.extend_from_slice(b"\r\n");
+        let hit = http_nginx(&bytes).unwrap();
+        assert_eq!(hit.version.as_deref(), Some("1.26.0"));
+        assert_eq!(
+            &bytes[hit.span.clone()],
+            b"Server: nginx/1.26.0",
+            "span must index the real bytes even with invalid UTF-8 earlier in the response"
+        );
+    }
+
+    #[test]
+    fn http_nginx_span_stays_in_bounds_when_the_match_ends_at_the_last_byte() {
+        // No trailing CRLF at all: the `Server:` line is both the match
+        // and the literal last byte of the buffer. A lossy-offset
+        // implementation whose earlier invalid byte inflated every
+        // downstream offset by 2 would push `span.end` past
+        // `bytes.len()`, which panics on the slice index below rather than
+        // merely being wrong.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"HTTP/1.1 200 OK\r\n");
+        bytes.extend_from_slice(b"X-Bad: \x80\r\n");
+        bytes.extend_from_slice(b"Server: nginx/1.26.0"); // ends the buffer, no CRLF
+        let hit = http_nginx(&bytes).unwrap();
+        assert_eq!(
+            hit.span.end,
+            bytes.len(),
+            "the match ends exactly at the buffer's end"
+        );
+        assert_eq!(&bytes[hit.span.clone()], b"Server: nginx/1.26.0");
+    }
+
     #[test]
     fn http_bare_protocol_matches_any_status_line() {
-        assert!(http_bare_protocol(b"HTTP/1.0 404 Not Found\r\n\r\n").is_some());
+        let bytes = b"HTTP/1.0 404 Not Found\r\n\r\n";
+        let hit = http_bare_protocol(bytes).unwrap();
+        assert_eq!(
+            &bytes[hit.span.clone()],
+            b"HTTP/1.0 404 Not Found\r",
+            "span must be exactly the status line, not the whole response"
+        );
     }
 
     // --- SSH ---
 
     #[test]
     fn ssh_openssh_extracts_version_and_ignores_the_trailing_comment() {
-        let hit = ssh_openssh(b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n").unwrap();
+        let bytes = b"SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13\r\n";
+        let hit = ssh_openssh(bytes).unwrap();
         assert_eq!(hit.product.as_deref(), Some("OpenSSH"));
         assert_eq!(hit.version.as_deref(), Some("9.6p1"));
+        assert_eq!(&bytes[hit.span.clone()], b"SSH-2.0-OpenSSH_9.6p1");
     }
 
     #[test]
@@ -851,16 +1014,46 @@ mod tests {
         assert!(ssh_openssh(b"SSH-2.0-libssh_0.9.6\r\n").is_none());
     }
 
+    // RFC 4253 §4.2: "The server MAY send other lines of data before
+    // sending the version string... Clients MUST be able to process such
+    // lines." A matcher that only ever looked at line 0 would false-
+    // negative here; it would also make `Hit::span`'s line-offset term
+    // untestable (offset 0 either way). This is both the false-negative
+    // fix and its own regression test, together.
+    #[test]
+    fn ssh_openssh_finds_the_identification_line_after_a_preamble_line() {
+        let bytes = b"Some preamble the server sent first\r\nSSH-2.0-OpenSSH_9.6p1\r\n";
+        let hit = ssh_openssh(bytes).unwrap();
+        assert_eq!(hit.version.as_deref(), Some("9.6p1"));
+        assert_eq!(&bytes[hit.span.clone()], b"SSH-2.0-OpenSSH_9.6p1");
+        assert!(
+            hit.span.start > 0,
+            "the identification line is not at offset 0 here, so this also proves the \
+             line-offset term in Hit::span is real, not dead code"
+        );
+    }
+
     #[test]
     fn ssh_bare_protocol_matches_any_ssh_banner() {
-        assert!(ssh_bare_protocol(b"SSH-2.0-libssh_0.9.6\r\n").is_some());
+        let bytes = b"SSH-2.0-libssh_0.9.6\r\n";
+        let hit = ssh_bare_protocol(bytes).unwrap();
+        assert_eq!(&bytes[hit.span.clone()], b"SSH-2.0-");
+    }
+
+    #[test]
+    fn ssh_bare_protocol_finds_the_identification_line_after_a_preamble_line() {
+        let bytes = b"Some preamble the server sent first\r\nSSH-2.0-libssh_0.9.6\r\n";
+        let hit = ssh_bare_protocol(bytes).unwrap();
+        assert_eq!(&bytes[hit.span.clone()], b"SSH-2.0-");
+        assert!(hit.span.start > 0);
     }
 
     // --- Postgres ---
 
     #[test]
     fn postgres_ssl_accepted_matches_exactly_s() {
-        assert!(postgres_ssl_accepted(b"S").is_some());
+        let hit = postgres_ssl_accepted(b"S").unwrap();
+        assert_eq!(&b"S"[hit.span.clone()], b"S");
         assert!(postgres_ssl_accepted(b"N").is_none());
         assert!(postgres_ssl_accepted(b"SS").is_none());
     }
@@ -868,7 +1061,8 @@ mod tests {
     #[test]
     fn postgres_ssl_declined_matches_the_real_captured_reply() {
         // postgres:16-alpine (M4 Task 2 report) replied exactly `N`.
-        assert!(postgres_ssl_declined(b"N").is_some());
+        let hit = postgres_ssl_declined(b"N").unwrap();
+        assert_eq!(&b"N"[hit.span.clone()], b"N");
         assert!(postgres_ssl_declined(b"S").is_none());
     }
 
@@ -876,19 +1070,33 @@ mod tests {
 
     #[test]
     fn redis_pong_matches_the_real_captured_reply() {
-        assert!(redis_pong(b"+PONG\r\n").is_some());
+        let bytes = b"+PONG\r\n";
+        let hit = redis_pong(bytes).unwrap();
+        assert_eq!(&bytes[hit.span.clone()], b"+PONG");
     }
 
     #[test]
     fn redis_resp_shaped_reply_is_weak_for_a_non_pong_resp_value() {
-        let hit = redis_resp_shaped_reply(b"-ERR unknown command\r\n").unwrap();
+        let bytes = b"-ERR unknown command\r\n";
+        let hit = redis_resp_shaped_reply(bytes).unwrap();
         assert_eq!(hit.specificity, Specificity::Weak);
+        assert_eq!(&bytes[hit.span.clone()], b"-ERR unknown command\r\n");
     }
 
     #[test]
     fn redis_resp_shaped_reply_does_not_match_non_resp_bytes() {
         assert!(redis_resp_shaped_reply(b"HTTP/1.1 200 OK\r\n").is_none());
         assert!(redis_resp_shaped_reply(b"").is_none());
+    }
+
+    // --- Root-cause fix, M4 Task 3 review round 1: a single stray sigil
+    // byte with no CRLF terminator used to match on its own -- one byte
+    // from an arbitrary binary protocol is not meaningful RESP evidence.
+    #[test]
+    fn redis_resp_shaped_reply_rejects_a_lone_sigil_byte_with_no_crlf() {
+        assert!(redis_resp_shaped_reply(b"+").is_none());
+        assert!(redis_resp_shaped_reply(b"+X").is_none());
+        assert!(redis_resp_shaped_reply(b"+no terminator here").is_none());
     }
 
     // --- MySQL ---
@@ -913,6 +1121,13 @@ mod tests {
         let hit = mysql_handshake_v10(&bytes).unwrap();
         assert_eq!(hit.product.as_deref(), Some("MySQL"));
         assert_eq!(hit.version.as_deref(), Some("8.4.11"));
+        // Asserted independently of `hit.version` above: `version` and
+        // `span` are computed from the same offsets in the real code, but
+        // a mutant that shifts only `Hit::span` (leaving the string
+        // extraction that produces `.version` untouched) would pass the
+        // assertion above while citing the wrong bytes. Re-deriving the
+        // expected text from `hit.span` itself is what catches that.
+        assert_eq!(&bytes[hit.span.clone()], b"8.4.11");
     }
 
     #[test]
@@ -947,6 +1162,11 @@ mod tests {
         let hit = dns_bind_version(&bytes).unwrap();
         assert_eq!(hit.product.as_deref(), Some("BIND"));
         assert_eq!(hit.version.as_deref(), Some("9.18.50"));
+        // See the identical comment on the MySQL test above: re-derive the
+        // expected text from `hit.span` itself, independent of whatever
+        // internal offsets produced `.version`, so a span-only shift is
+        // caught even when `.version` still happens to be correct.
+        assert_eq!(&bytes[hit.span.clone()], b"9.18.50");
     }
 
     #[test]
@@ -992,9 +1212,14 @@ mod tests {
 
     #[test]
     fn smtp_postfix_matches_the_real_captured_greeting() {
-        let hit = smtp_postfix(b"220 mail.example.com ESMTP Postfix\r\n").unwrap();
+        let bytes = b"220 mail.example.com ESMTP Postfix\r\n";
+        let hit = smtp_postfix(bytes).unwrap();
         assert_eq!(hit.product.as_deref(), Some("Postfix"));
         assert!(hit.version.is_none());
+        assert_eq!(
+            &bytes[hit.span.clone()],
+            b"220 mail.example.com ESMTP Postfix"
+        );
     }
 
     #[test]
@@ -1002,9 +1227,29 @@ mod tests {
         assert!(smtp_postfix(b"220 mail.example.com ESMTP Sendmail\r\n").is_none());
     }
 
+    // RFC 5321 §4.2's own `Greeting` ABNF allows a multiline 220 reply
+    // (`"220-" Domain [SP text] CRLF *("220-" [text] CRLF) "220" SP [text]
+    // CRLF`); the product name may legitimately be on a continuation line,
+    // not the first one. This also forces `line_start > 0`, which is what
+    // makes the offset term in `Hit::span` observable at all -- see the
+    // identical point made on the SSH tests above.
+    #[test]
+    fn smtp_postfix_finds_the_product_on_a_continuation_line() {
+        let bytes = b"220-mail.example.com ESMTP\r\n220 Postfix ready\r\n";
+        let hit = smtp_postfix(bytes).unwrap();
+        assert_eq!(hit.product.as_deref(), Some("Postfix"));
+        assert!(
+            hit.span.start > 0,
+            "the matching line is not at offset 0 here"
+        );
+        assert_eq!(&bytes[hit.span.clone()], b"220 Postfix");
+    }
+
     #[test]
     fn smtp_bare_protocol_matches_any_220_greeting() {
-        assert!(smtp_bare_protocol(b"220 mail.example.com ESMTP Sendmail\r\n").is_some());
+        let bytes = b"220 mail.example.com ESMTP Sendmail\r\n";
+        let hit = smtp_bare_protocol(bytes).unwrap();
+        assert_eq!(&bytes[hit.span.clone()], b"220 ");
     }
 
     // --- TLS ---
@@ -1012,7 +1257,11 @@ mod tests {
     #[test]
     fn tls_server_hello_matches_the_structural_header() {
         let reply: &[u8] = &[0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00];
-        assert!(tls_server_hello(reply).is_some());
+        let hit = tls_server_hello(reply).unwrap();
+        assert_eq!(
+            &reply[hit.span.clone()],
+            &[0x16, 0x03, 0x03, 0x00, 0x02, 0x02]
+        );
     }
 
     #[test]

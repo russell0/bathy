@@ -24,14 +24,30 @@
 //! [`bathy_types::ProbeCapture`], [`bathy_types::event::Observation`], and
 //! [`bathy_types::confidence::Confidence`] -- the shapes this crate
 //! consumes and produces) and `regex` (for matching text-shaped protocol
-//! banners). No tokio, no filesystem, no clock, no randomness anywhere in
-//! this crate's own code or its dependency graph -- `cargo tree -p
-//! bathy-interpret --edges normal` is asserted in CI to show only those two
-//! packages and their own transitive dependencies (AC-4.10). This crate
-//! also sits *below* `bathy-probe` in this workspace's layer order
-//! (`xtask`'s `LAYERS`), specifically so `ProbeCapture` fixtures can be
-//! built by hand in a test or fuzz target with no socket anywhere in the
-//! dependency graph at all.
+//! banners). This crate's own code never touches tokio, the filesystem, a
+//! clock, or a random-number generator -- `cargo tree -p bathy-interpret
+//! --edges normal` is asserted in CI to show only `bathy-types`, `regex`,
+//! and their own transitive dependencies (AC-4.10), and no matcher in
+//! `rules.rs` calls anything from either crate except `regex::Regex`
+//! itself and plain byte/string operations.
+//!
+//! (Narrowed claim, M4 Task 3 review round 1: an earlier version of this
+//! paragraph said "no randomness anywhere in ... its dependency graph,"
+//! which overstates what AC-4.10 actually checks. `bathy-types` itself
+//! depends on `ulid`, which depends on `rand`/`getrandom` -- `getrandom`
+//! *is* present in this crate's dependency tree; `bathy_types::clock` is
+//! the sanctioned, sole call site for it in this workspace, and this
+//! crate's own code never calls it. That inheritance is unavoidable and
+//! judged acceptable: it is linkable, not callable, from here, and
+//! removing it would not actually shrink the built artifact -- Cargo's
+//! feature unification means every other crate in the workspace that
+//! depends on `bathy-types` already pulls the same dependency in, so it is
+//! compiled into any binary that links this crate either way.)
+//!
+//! This crate also sits *below* `bathy-probe` in this workspace's layer
+//! order (`xtask`'s `LAYERS`), specifically so `ProbeCapture` fixtures can
+//! be built by hand in a test or fuzz target with no socket anywhere in
+//! the dependency graph at all.
 //!
 //! # Never guess (AC-4.13)
 //!
