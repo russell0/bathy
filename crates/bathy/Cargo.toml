@@ -1,0 +1,15 @@
+[package]
+name = "bathy"
+version = "0.1.0-alpha.1"
+description = "Agent-native network discovery: typed MCP tools, evidence-backed findings, deny-by-default scope enforcement."
+readme = "README.md"
+keywords = ["network", "scanner", "mcp", "security", "discovery"]
+categories = ["network-programming", "command-line-utilities"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Deliberately no dependencies and no [[bin]] yet. This crate becomes the `bathy`
+# command in Milestone 5; until then `cargo install bathy` correctly reports that
+# there is nothing to install, rather than installing a stub that does nothing.

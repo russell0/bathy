@@ -219,10 +219,10 @@ git commit -m "feat(query): differential scanning with confidence noise separate
 ### Task 3: The CLI
 
 **Files:**
-- Create: `crates/bathy-cli/Cargo.toml`, `crates/bathy-cli/src/main.rs`, `crates/bathy-cli/src/commands/*.rs`
+- Create: `crates/bathy/Cargo.toml` (EXISTS — published as a name reservation at 0.1.0-alpha.1; add the binary to it), `crates/bathy/src/main.rs`, `crates/bathy/src/commands/*.rs`
 
 **Interfaces:**
-- Produces: the `bathy` binary with subcommands `scope validate`, `scan preview`, `scan start`, `scan status`, `scan events`, `scan cancel`, `scan resume`, `result query`, `result diff`, `evidence get`, `explain`, `serve mcp`.
+- Produces: the `bathy` binary with subcommands. **The crate is named `bathy`, not `bathy`** — it is already published as a lib-only reservation, so `cargo install bathy` gives users a `bathy` command directly, the way `ripgrep` publishes as `ripgrep`. Adding `[[bin]]` to the existing crate is the whole change `scope validate`, `scan preview`, `scan start`, `scan status`, `scan events`, `scan cancel`, `scan resume`, `result query`, `result diff`, `evidence get`, `explain`, `serve mcp`.
 
 - [ ] **Step 1: Write the failing CLI test**
 
@@ -285,7 +285,7 @@ Use `clap` derive. Rules:
 - [ ] **Step 5: Commit**
 
 ```bash
-git add crates/bathy-cli
+git add crates/bathy
 git commit -m "feat(cli): bathy binary with mandatory scope and documented exit codes"
 ```
 

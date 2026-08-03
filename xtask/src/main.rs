@@ -17,7 +17,7 @@ const LAYERS: &[&str] = &[
     "bathy-packetd",
     "bathy-query",
     "bathy-mcp",
-    "bathy-cli",
+    "bathy",
 ];
 
 /// No workspace crate — ranked or not — may depend on anything resembling a
