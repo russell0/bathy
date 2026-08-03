@@ -374,7 +374,7 @@ Remaining probes, with their exact wire behavior:
 
 | Probe | id | Kind | Sends | Affinity peaks |
 |---|---|---|---|---|
-| TLS | `tls-v1` | SendFirst | A TLS 1.3 ClientHello with SNI omitted and no ALPN; captures the raw ServerHello and certificate bytes | 443, 8443, 993, 995 |
+| TLS | `tls-v1` | SendFirst | A hand-built TLS 1.3 ClientHello per RFC 8446 (no TLS library, no handshake completion, no trust evaluation); captures the raw ServerHello. **NOT certificate bytes** — under TLS 1.3 every record after the plaintext ServerHello is encrypted `application_data`, so the certificate is unreachable without completing a handshake. | 443, 8443, 993, 995 |
 | SSH | `ssh-banner-v1` | ListenFirst | nothing | 22, 2222 |
 | SMTP | `smtp-banner-v1` | ListenFirst | after reading the `220` greeting, sends `EHLO bathy.invalid\r\n` and captures the capability list | 25, 465, 587 |
 | DNS | `dns-version-bind-v1` | SendFirst | a TXT/CHAOS query for `version.bind` over TCP with a fixed transaction id of `0x5344` | 53 |
@@ -397,8 +397,8 @@ git commit -m "feat(probe): eight clean-room protocol probes with identifying us
 
 **Acceptance criteria:**
 - **AC-4.5** The HTTP probe sends `User-Agent: bathy/<version> (+<url>)`. bathy traffic is identifiable to the operators receiving it; there is no anonymous or evasive mode in v0.1.
-- **AC-4.6** Listen-first probes (SSH, MySQL) send nothing before reading; `capture.request` is `None`.
-- **AC-4.7** Every probe stops at `DEFAULT_READ_CAP` against a peer that floods, and sets `truncated`.
+- **AC-4.6** Listen-first probes (SSH, MySQL) send nothing before reading. **Assert at the WIRE level, not on `capture.request.is_none()`** — a probe that writes to the socket but forgets to record it passes the `is_none()` check while corrupting the banner it is reading. Count bytes the stub actually receives.
+- **AC-4.7** Every probe stops at its cap against a flooding peer and sets `truncated` — **including any probe using a fixed-length read**. A `read_at_most(n)` that returns `truncated: false` on reaching `n` contradicts `ProbeCapture::truncated`'s documented meaning ("`false` means the peer closed on its own") and silently exempts that probe from this AC. Peek before concluding the peer is done.
 - **AC-4.8** Every probe against a silent or immediately closed socket returns an error or an empty capture, never hangs past the deadline.
 - **AC-4.9** All probe request bytes are fixed and deterministic — no randomness, no timestamps — so replay corpora are byte-stable.
 
