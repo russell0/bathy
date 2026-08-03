@@ -3,8 +3,10 @@
 //! source: RFC 1035 §4.1.1 (12-byte header: ID, flags, QDCOUNT/ANCOUNT/
 //! NSCOUNT/ARCOUNT), §4.1.2 (question section: length-prefixed labels
 //! terminated by a zero-length root label, then QTYPE, then QCLASS), and
-//! §3.2.4/§3.2.5 for the `TXT` (type 16) and `CH`/Chaos (class 3) values;
-//! RFC 1035 §4.2.2 for DNS-over-TCP's mandatory 2-byte big-endian length
+//! §3.2.2 for the `TXT` (type 16) value and §3.2.4 for the `CH`/Chaos
+//! (class 3) value -- corrected here from an earlier version of this
+//! comment that cited `§3.2.4/§3.2.5` for both; RFC 1035 §4.2.2 for
+//! DNS-over-TCP's mandatory 2-byte big-endian length
 //! prefix. Querying `version.bind`/TXT/CH to learn a nameserver's software
 //! version is a convention documented by BIND's own manual
 //! (<https://bind9.readthedocs.io/en/latest/reference.html>, "Built-in
@@ -141,16 +143,28 @@ mod tests {
         assert_eq!(&cap.response[2..4], &[0x53, 0x44]);
     }
 
-    #[tokio::test]
-    async fn dns_probe_request_bytes_are_fixed_across_two_runs() {
-        let port_a = stub(b"", true).await;
-        let port_b = stub(b"", true).await;
-        // Two independent stub servers -- `stub`'s server side never sends
-        // anything back here, so both calls error, but `build_query`'s
-        // determinism (no clock, no RNG) is what this test actually
-        // pins: it is a pure function, asserted directly.
-        let _ = (port_a, port_b);
+    #[test]
+    fn build_query_is_a_pure_function_of_nothing() {
+        // `build_query` takes no arguments and consults no clock, RNG, or
+        // socket -- so this needs no network double at all to pin AC-4.9;
+        // an earlier version of this test spawned two stub servers and
+        // then discarded both ports (`let _ = (port_a, port_b);`) without
+        // ever using them, which tested nothing extra and just wasted two
+        // ephemeral sockets. Kept as a plain `#[test]`.
         assert_eq!(build_query(), build_query());
+    }
+
+    #[tokio::test]
+    async fn dns_probe_request_bytes_are_identical_across_two_live_connections() {
+        // The end-to-end version of the pure-function check above: two
+        // independent real connections, through the actual `Probe`
+        // (not just calling `build_query` directly), must still produce
+        // byte-identical `request`s.
+        let port_a = stub(b"reply-a", true).await;
+        let cap_a = run_probe(&DnsVersionBindProbe, port_a).await.unwrap();
+        let port_b = stub(b"reply-b", true).await;
+        let cap_b = run_probe(&DnsVersionBindProbe, port_b).await.unwrap();
+        assert_eq!(cap_a.request, cap_b.request);
     }
 
     // --- Beyond the brief: hostile peer (AC-4.7, AC-4.8) ---
@@ -172,6 +186,19 @@ mod tests {
         )
         .await
         .expect("hung past a generous outer bound");
+        assert!(matches!(r, Err(ProbeError::EmptyResponse)));
+    }
+
+    #[tokio::test]
+    async fn dns_probe_against_an_immediately_closed_socket_errors() {
+        // Matches `postgres_probe_against_an_immediately_closed_socket_errors`
+        // and `redis_probe_against_an_immediately_closed_socket_errors`'s own
+        // pattern: for a send-first probe, `stub(b"", false)` accepts,
+        // sends nothing back, and closes shortly after -- so the query
+        // this probe sends is drained and discarded, and the read that
+        // follows sees a clean EOF with nothing in it.
+        let port = stub(b"", false).await;
+        let r = run_probe(&DnsVersionBindProbe, port).await;
         assert!(matches!(r, Err(ProbeError::EmptyResponse)));
     }
 }

@@ -1,9 +1,13 @@
 //! `http-get-v1`: a plain HTTP/1.1 `GET /` sent over the raw socket.
 //!
-//! source: RFC 9112 §3 ("Request Line") and §3.2 ("Host and
-//! :authority") for the request-line and `Host:` header shapes; RFC 9112
-//! §9.5/RFC 9110 §7.6.1 for `Connection: close`; RFC 9110 §10.1.5 for
-//! `User-Agent` being a free-form product token (so
+//! source: RFC 9112 §3 ("Request Line") and §3.2 ("Request Target") for
+//! the request-line shape; RFC 9110 §7.2 ("Host and :authority") for the
+//! `Host:` header field itself -- corrected here from an earlier version
+//! of this comment that mis-cited RFC 9112 §3.2 for `Host:`, which is
+//! actually about request-target forms (origin-form, absolute-form, etc.),
+//! not the `Host` header; RFC 9112 §9.6/RFC 9110 §7.6.1 for
+//! `Connection: close` -- also corrected from an earlier `§9.5`; RFC 9110
+//! §10.1.5 for `User-Agent` being a free-form product token (so
 //! `bathy/<version> (+<url>)` is a conformant value, not a spoof of any
 //! other client). Corroborated against a real server:
 //! `docker.io/library/nginx:1.27-alpine`

@@ -284,10 +284,50 @@ impl ProbeIo {
     /// what the bytes mean, which stays out of this crate entirely (see
     /// this crate's top-level doc comment).
     ///
-    /// Returns `(bytes, truncated)` with the same `truncated` semantics as
-    /// [`Self::read_bounded`]: `false` on a clean EOF or on collecting the
-    /// full `n` bytes requested, `true` if the deadline elapsed first with
-    /// at least one byte already read.
+    /// How long [`Self::read_at_most`] is willing to wait, after collecting
+    /// its full `n` bytes, to find out whether the peer already has *more*
+    /// queued up (see that method's own doc comment for why this exists
+    /// and why it is short rather than `deadline`-length).
+    const BOUNDARY_PEEK_TIMEOUT: Duration = Duration::from_millis(20);
+
+    /// Returns `(bytes, truncated)`. `truncated`'s meaning matches
+    /// [`Self::read_bounded`]'s documented contract (see
+    /// [`bathy_types::ProbeCapture::truncated`]) in the cases this method
+    /// shares with it: `true` if the deadline elapsed with fewer than `n`
+    /// bytes collected, `false` on a clean EOF before `n` bytes arrived.
+    ///
+    /// The one case unique to this method -- collecting the full `n`
+    /// bytes requested -- is *not* automatically `false`. Unlike
+    /// `read_bounded`, which only stops at `n` because it ran out of room
+    /// to buffer more, this method stops at `n` **on purpose**, before it
+    /// has any information about whether the peer is done or has much
+    /// more queued (a flood). Reporting `false` unconditionally there --
+    /// this method's behavior before this fix -- let a flooding peer
+    /// produce `truncated: false`, contradicting
+    /// [`bathy_types::ProbeCapture::truncated`]'s own documented meaning
+    /// ("`false` means the peer closed the connection on its own"), which
+    /// a flooding peer has certainly not done. Measured effect before this
+    /// fix: [`Self::read_at_most`] against an unbounded flood returned
+    /// `(1 byte, truncated: false)` -- see this task's follow-up report
+    /// for the exact reproduction.
+    ///
+    /// The fix is a short, bounded, **non-consuming** [`TcpStream::peek`]
+    /// (see [`Self::BOUNDARY_PEEK_TIMEOUT`]) immediately after collecting
+    /// the `n`th byte: if anything is already sitting in the socket's
+    /// receive buffer (a flood already has bytes queued the instant this
+    /// runs) or the deadline is spent finding out, `truncated` is `true`;
+    /// a clean EOF observed during the peek, or nothing arriving within
+    /// the short window, is `false`. That window is deliberately **not**
+    /// `deadline`-length: this method's entire reason to exist is to avoid
+    /// waiting out the full deadline against a real, well-behaved server
+    /// that has nothing more to send but also never closes (see this
+    /// method's own opening doc comment and `postgres-startup-v1`'s), and
+    /// a full-length peek here would silently reintroduce exactly that
+    /// cost. This makes the check a bounded best-effort, not a hard
+    /// guarantee -- a peer that waits *longer* than
+    /// [`Self::BOUNDARY_PEEK_TIMEOUT`] before flooding would still read as
+    /// `truncated: false`. That tradeoff, and why it is accepted, is
+    /// documented here rather than left implicit.
     pub async fn read_at_most(&mut self, n: usize) -> Result<(Vec<u8>, bool), ProbeError> {
         let target = n.min(self.read_cap);
         let mut out = vec![0u8; target];
@@ -309,7 +349,24 @@ impl ProbeIo {
                 }
             }
         }
-        Ok((out, false)) // got exactly `target` bytes: complete, by definition of this call
+
+        if target == 0 {
+            // Nothing was ever asked for; there is no "more" to speak of.
+            return Ok((out, false));
+        }
+        let mut peek_buf = [0u8; 1];
+        let truncated = match tokio::time::timeout(
+            Self::BOUNDARY_PEEK_TIMEOUT,
+            self.stream.peek(&mut peek_buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => false,     // clean EOF: the peer is done
+            Ok(Ok(_)) => true,      // more was already waiting -- a flood, most likely
+            Ok(Err(_)) => false,    // a peek error tells us nothing new; don't invent truncation
+            Err(_elapsed) => false, // nothing arrived within the short window
+        };
+        Ok((out, truncated))
     }
 }
 
@@ -879,6 +936,208 @@ mod tests {
         );
 
         drop(server); // hold the peer open (never reading) until here
+    }
+
+    // --- read_at_most: direct tests (M4 Task 2 follow-up review) ---
+    //
+    // `read_at_most` is a new public method with its own contract (see its
+    // doc comment): it stops at `n` bytes on purpose, before it can know
+    // whether the peer is done. These tests exercise it directly against
+    // real loopback sockets, the same way every `read_bounded` case above
+    // is exercised, rather than only indirectly through
+    // `postgres-startup-v1`.
+
+    #[tokio::test]
+    async fn read_at_most_returns_exactly_n_bytes_and_is_not_truncated_when_nothing_else_arrives() {
+        let (client, mut server) = loopback_pair().await;
+        server.write_all(b"N").await.unwrap();
+        // Deliberately do not close or send more -- mirrors a real
+        // PostgreSQL server, which keeps the connection open after its
+        // one-byte SSLRequest reply.
+        let mut io = ProbeIo::new(client, 9, Duration::from_millis(300));
+        let start = std::time::Instant::now();
+        let (bytes, truncated) = io.read_at_most(1).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(bytes, b"N".to_vec());
+        assert!(!truncated);
+        assert!(
+            elapsed < Duration::from_millis(150),
+            "must not wait out the full deadline for the ordinary case; took {elapsed:?}"
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn read_at_most_reports_truncated_when_more_is_already_queued_behind_n() {
+        // The exact bug this test exists to catch: before the fix,
+        // `read_at_most` reported `truncated: false` unconditionally once
+        // it had collected its `n` bytes, regardless of how much more the
+        // peer had queued up -- see this method's own doc comment and this
+        // task's follow-up report for the measured `(1 byte, truncated:
+        // false)` result against an actual flood.
+        let (client, mut server) = loopback_pair().await;
+        let flood = tokio::spawn(async move {
+            let chunk = [0x41u8; 4096];
+            loop {
+                if server.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let mut io = ProbeIo::new(client, 9, Duration::from_secs(2));
+        let start = std::time::Instant::now();
+        let (bytes, truncated) = io.read_at_most(1).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(bytes.len(), 1, "must still return exactly `n`, not more");
+        assert!(truncated, "a flood was queued behind the requested byte");
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "the boundary peek must be short, not deadline-length; took {elapsed:?}"
+        );
+        flood.abort();
+    }
+
+    #[tokio::test]
+    async fn read_at_most_reports_not_truncated_when_the_peer_sends_exactly_n_then_closes() {
+        let (client, mut server) = loopback_pair().await;
+        server.write_all(b"N").await.unwrap();
+        drop(server); // clean EOF right behind the one byte
+        let mut io = ProbeIo::new(client, 9, Duration::from_millis(300));
+        let (bytes, truncated) = io.read_at_most(1).await.unwrap();
+        assert_eq!(bytes, b"N".to_vec());
+        assert!(
+            !truncated,
+            "a clean close immediately behind `n` bytes is not truncation"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_at_most_returns_fewer_bytes_on_clean_eof_before_n_arrives() {
+        let (client, mut server) = loopback_pair().await;
+        server.write_all(b"ab").await.unwrap();
+        drop(server);
+        let mut io = ProbeIo::new(client, 9, Duration::from_millis(300));
+        let (bytes, truncated) = io.read_at_most(5).await.unwrap();
+        assert_eq!(bytes, b"ab".to_vec());
+        assert!(!truncated, "the peer closed on its own; this is complete");
+    }
+
+    #[tokio::test]
+    async fn read_at_most_is_truncated_when_the_deadline_elapses_with_a_partial_n() {
+        // The deadline-with-partial-bytes branch, exercised with `n > 1`
+        // so it is reachable at all (with `n == 1`, as `postgres-startup-v1`
+        // uses it, a partial read is impossible -- 0 or 1 byte, nothing
+        // between -- so this branch is otherwise dead code for that call
+        // site).
+        let (client, mut server) = loopback_pair().await;
+        server.write_all(b"ab").await.unwrap();
+        // Hold the connection open, unclosed, sending nothing further, so
+        // the deadline -- not an EOF -- is what ends the call.
+        let mut io = ProbeIo::new(client, 9, Duration::from_millis(150));
+        let start = std::time::Instant::now();
+        let (bytes, truncated) = io.read_at_most(5).await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(bytes, b"ab".to_vec());
+        assert!(truncated, "the deadline elapsed with fewer than n bytes");
+        assert!(elapsed >= Duration::from_millis(150));
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn read_at_most_is_bounded_by_the_overall_deadline_against_a_peer_that_dribbles_forever()
+    {
+        // The postgres-specific answer to the dispatch's dribbling-peer
+        // case: `ssh-banner-v1`'s own dribble test proves `read_bounded`'s
+        // dribble-bound transfers to the six other probes built on it, but
+        // (per this task's follow-up review) that argument does not reach
+        // `postgres-startup-v1`, which is built on the separate
+        // `read_at_most` instead. This is the direct proof for that
+        // method, mirroring
+        // `read_bounded_is_bounded_by_the_overall_deadline_against_a_peer_that_dribbles_forever`
+        // above: a peer sending one byte every 20ms forever, asked for far
+        // more (`n = 4096`) than it will ever deliver, so every individual
+        // read succeeds and only the absolute deadline -- not a naive
+        // per-read timeout -- can end the call.
+        let (client, mut server) = loopback_pair().await;
+        let dribble = tokio::spawn(async move {
+            loop {
+                if server.write_all(&[0xABu8]).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        });
+
+        const DEADLINE: Duration = Duration::from_millis(150);
+        let mut io = ProbeIo::new(client, 9, DEADLINE);
+        let start = std::time::Instant::now();
+        let (bytes, truncated) =
+            tokio::time::timeout(Duration::from_secs(2), io.read_at_most(4096))
+                .await
+                .expect("read_at_most hung against a dribbling peer")
+                .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(
+            !bytes.is_empty() && bytes.len() < 4096,
+            "expected a handful of dribbled bytes, well under n; got {}",
+            bytes.len()
+        );
+        assert!(
+            truncated,
+            "the peer was still sending when the deadline hit"
+        );
+        assert!(elapsed >= DEADLINE);
+        assert!(
+            elapsed < DEADLINE + Duration::from_millis(500),
+            "the overall deadline, not the peer's continued dribbling, must bound this; \
+             took {elapsed:?}"
+        );
+
+        dribble.abort();
+    }
+
+    #[tokio::test]
+    async fn read_at_most_never_hangs_against_a_peer_that_sends_nothing() {
+        let (client, server) = loopback_pair().await;
+        const DEADLINE: Duration = Duration::from_millis(150);
+        let mut io = ProbeIo::new(client, 9, DEADLINE);
+        let start = std::time::Instant::now();
+        let (bytes, truncated) = tokio::time::timeout(Duration::from_secs(2), io.read_at_most(1))
+            .await
+            .expect("read_at_most hung past a generous outer bound")
+            .unwrap();
+        let elapsed = start.elapsed();
+        assert!(bytes.is_empty());
+        assert!(!truncated, "nothing ever arrived, so nothing was cut off");
+        assert!(elapsed >= DEADLINE);
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn read_at_most_of_zero_bytes_returns_immediately() {
+        let (client, server) = loopback_pair().await;
+        let mut io = ProbeIo::new(client, 9, Duration::from_secs(2));
+        let start = std::time::Instant::now();
+        let (bytes, truncated) = io.read_at_most(0).await.unwrap();
+        assert!(bytes.is_empty());
+        assert!(!truncated);
+        assert!(start.elapsed() < Duration::from_millis(50));
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn read_at_most_is_bounded_by_read_cap_not_just_n() {
+        let (client, mut server) = loopback_pair().await;
+        server.write_all(b"abcdef").await.unwrap();
+        let mut io = ProbeIo::with_read_cap(client, 9, 3, Duration::from_millis(300));
+        let (bytes, _truncated) = io.read_at_most(5).await.unwrap();
+        assert_eq!(
+            bytes.len(),
+            3,
+            "read_at_most must not exceed read_cap even if n asks for more"
+        );
+        drop(server);
     }
 
     // --- Beyond the brief: ProbeIo's other accessors ---

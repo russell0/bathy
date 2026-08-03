@@ -23,7 +23,11 @@
 //! byte *means* (`S` vs `N`). [`ProbeIo::read_at_most`] exists precisely
 //! for this: it returns as soon as that one byte has arrived instead of
 //! waiting out the whole deadline the way a generic `read_bounded` call
-//! would.
+//! would, while still reporting `truncated` honestly (see that method's
+//! own doc comment) if a hostile peer had more than one byte queued up
+//! behind the reply -- `postgres_probe_against_a_flood_stops_at_the_cap`
+//! below asserts this directly, the same way every other probe's own
+//! flood test does.
 
 use async_trait::async_trait;
 use bathy_types::ProbeCapture;
@@ -110,8 +114,9 @@ mod tests {
         );
         assert!(
             elapsed < TEST_DEADLINE,
-            "read_at_most must return as soon as the one expected byte arrives, \
-             not wait out the deadline; took {elapsed:?}"
+            "read_at_most must return well within the deadline -- its own byte read \
+             plus a short boundary peek (see ProbeIo::BOUNDARY_PEEK_TIMEOUT), not the \
+             full deadline; took {elapsed:?}"
         );
     }
 
@@ -134,11 +139,20 @@ mod tests {
         // `read_at_most(1)` caps at 1 byte regardless of `read_cap`, so a
         // flooding peer cannot make this probe's *response* exceed one
         // byte either -- a stronger bound than `DEFAULT_READ_CAP`, and
-        // still within it.
+        // still within it. `truncated` must still be `true`: the flood had
+        // far more than one byte queued, so this is not a complete reply
+        // by `ProbeCapture::truncated`'s own documented meaning -- see
+        // `read_at_most`'s doc comment and this task's follow-up report
+        // for the bug this assertion catches (an earlier version of
+        // `read_at_most` always reported `truncated: false` here).
         let port = stub_flood().await;
         let cap = run_probe(&PostgresStartupProbe, port).await.unwrap();
         assert_eq!(cap.response.len(), 1);
         assert!(cap.response.len() <= ProbeIo::DEFAULT_READ_CAP);
+        assert!(
+            cap.truncated,
+            "a flood had far more than one byte queued behind the reply"
+        );
     }
 
     #[tokio::test]

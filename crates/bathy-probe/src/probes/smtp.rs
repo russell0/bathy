@@ -58,13 +58,31 @@
 //! reading its reply does not turn into `Err` here: the greeting was
 //! already fully captured by that point, and discarding real evidence
 //! because a *later*, separate step failed would be a worse outcome than
-//! returning the partial capture. A peer that sends its greeting and then
-//! immediately closes (not hypothetical -- this crate's own test stub
-//! does exactly this to close a connection quickly) is exactly the case
-//! this exists for: `request` is `None` if `EHLO` could not even be sent,
-//! `Some(EHLO)` with `response` still holding only the greeting if it was
-//! sent but nothing usable came back, and the greeting plus the
+//! returning the partial capture. `request` is `None` if `EHLO` could not
+//! even be sent, `Some(EHLO)` with `response` still holding only the
+//! greeting if it was sent but nothing usable came back (proven, not just
+//! asserted: `smtp_probe_survives_an_i_o_error_reading_the_ehlo_reply`
+//! forces a real `ConnectionReset` on the EHLO reply's own read and checks
+//! the greeting is still there -- reverting this handling to a plain `?`
+//! makes that specific test fail, not merely a synthetic one; see this
+//! task's follow-up report for the mutation), and the greeting plus the
 //! capability list in the ordinary case.
+//!
+//! **This protects the greeting only from a failure that happens after
+//! the greeting's own read has already completed successfully** -- an
+//! `EHLO`-phase problem, specifically. It does **not** protect against an
+//! I/O error occurring *during* the greeting's own `read_bounded` call
+//! (e.g. a peer that sends the greeting and then immediately sends a raw
+//! `RST` rather than a clean `FIN`, if the `RST` arrives before that call
+//! has finished draining): `read_bounded` (`framework.rs`) discards
+//! whatever it had already accumulated into `out` when it hits an I/O
+//! error mid-read, rather than returning the partial bytes, so a
+//! greeting-phase `RST` still loses the whole capture. That is a
+//! limitation of `read_bounded` itself, shared by every probe in this
+//! crate that uses it, not something this probe's own fix reaches --
+//! fixing it would mean changing `read_bounded`'s return contract for all
+//! eight probes at once, out of scope for this one probe's fix. Recorded
+//! here rather than left implicit, per this task's root-cause rule.
 
 use async_trait::async_trait;
 use bathy_types::ProbeCapture;
@@ -228,6 +246,94 @@ mod tests {
         assert!(cap.response.starts_with(b"220 closes-immediately.example"));
     }
 
+    #[tokio::test]
+    async fn smtp_probe_survives_an_i_o_error_reading_the_ehlo_reply() {
+        // Unlike the test above (which closes early enough that EHLO is
+        // never attempted at all), this one is built to force the EHLO
+        // phase specifically to fail with a real I/O error, so it
+        // exercises the `Err` arm on `read_bounded` in `execute`'s `match`,
+        // not only the "EHLO was never sent" path.
+        //
+        // Getting a deterministic I/O error here without racing anything
+        // takes two deliberate choices:
+        //
+        // 1. The greeting phase's completion is governed purely by the
+        //    *client's own* short deadline elapsing (the server never
+        //    touches the connection during that window at all), not by
+        //    anything the server does -- so it cannot race against the
+        //    server's close.
+        // 2. The server is scheduled to force-close (`SO_LINGER(0)`, which
+        //    sends a TCP `RST` instead of a graceful `FIN`) at a delay
+        //    chosen to land safely *after* the greeting phase has already
+        //    finished and the `EHLO` write has already gone out, but
+        //    *while* the client is blocked inside the second
+        //    `read_bounded` call waiting for a reply that will now never
+        //    come. That is what turns a generic "the peer went away" into
+        //    a real, observed `Err` from `read_bounded`, on that call
+        //    specifically -- and, per this task's follow-up report, not
+        //    from the *first* `read_bounded` call (the greeting), which is
+        //    important: an RST landing *during* the greeting read instead
+        //    would hit a separate, known `read_bounded` limitation (it
+        //    discards already-read bytes on any I/O error, not just this
+        //    probe's own logic) rather than the EHLO-phase fix this test
+        //    means to prove.
+        //
+        // An earlier version of this test instead used `stub`'s generic
+        // close-shortly-after-writing timing and was intermittently flaky
+        // (an occasional `ConnectionReset` reached `.unwrap()` in the test
+        // itself); a later version tried a plain `drop(sock)` after a
+        // generous fixed delay and never observed a failure at all on this
+        // platform -- a graceful `FIN` closely followed by an `EHLO` write
+        // did not reliably produce a write- or read-side error here. Both
+        // are why this version uses `SO_LINGER(0)` (a guaranteed `RST`,
+        // not relying on OS/timing-dependent close semantics) and pins its
+        // arrival to a specific phase by clock, not by racing a close
+        // against a read.
+        // `ProbeIo`'s `deadline` is a fixed *per-call* budget reused fresh
+        // for every `read_bounded`/`write_all` call (see `ProbeIo`'s own
+        // doc comment), so the second `read_bounded` (the EHLO reply) gets
+        // its own fresh `GREETING_DEADLINE`-long window starting right
+        // after the first one ends: roughly
+        // `[GREETING_DEADLINE, 2 * GREETING_DEADLINE]`. `SERVER_CLOSE_DELAY`
+        // is chosen to land in the middle of that second window, with
+        // margin on both sides, not at either boundary.
+        const GREETING_DEADLINE: std::time::Duration = std::time::Duration::from_millis(80);
+        const SERVER_CLOSE_DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let (mut sock, _) = listener.accept().await.unwrap();
+            sock.write_all(b"220 mail.example.com ESMTP Postfix\r\n")
+                .await
+                .unwrap();
+            // Deliberately idle past `GREETING_DEADLINE` (the client's
+            // greeting-phase read times out on its own) and past when the
+            // EHLO write will have landed, before forcing an RST.
+            tokio::time::sleep(SERVER_CLOSE_DELAY).await;
+            sock.set_zero_linger().unwrap();
+            drop(sock); // SO_LINGER(0): an abortive close -- sends RST
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut io = ProbeIo::new(stream, addr.port(), GREETING_DEADLINE);
+        let cap = SmtpBannerProbe
+            .execute(&mut io)
+            .await
+            .expect("an I/O error reading the EHLO reply must not discard the greeting");
+        assert_eq!(
+            cap.response,
+            b"220 mail.example.com ESMTP Postfix\r\n".to_vec(),
+            "response must be exactly the greeting -- the RST arrived before any EHLO reply"
+        );
+        assert_eq!(
+            cap.request.as_deref(),
+            Some(b"EHLO bathy.invalid\r\n".as_slice()),
+            "EHLO must have actually been sent for this to be the scenario under test"
+        );
+    }
+
     // --- Beyond the brief: hostile peer (AC-4.7, AC-4.8) ---
 
     #[tokio::test]
@@ -252,5 +358,17 @@ mod tests {
         .await
         .expect("hung past a generous outer bound");
         assert!(matches!(r, Err(ProbeError::EmptyResponse)));
+    }
+
+    #[tokio::test]
+    async fn smtp_probe_against_an_immediately_closed_socket_errors() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, accepted) =
+            tokio::join!(tokio::net::TcpStream::connect(addr), listener.accept());
+        drop(accepted.unwrap()); // close before sending anything
+        let mut io = ProbeIo::new(client.unwrap(), addr.port(), TEST_DEADLINE);
+        let result = SmtpBannerProbe.execute(&mut io).await;
+        assert!(matches!(result, Err(ProbeError::EmptyResponse)));
     }
 }

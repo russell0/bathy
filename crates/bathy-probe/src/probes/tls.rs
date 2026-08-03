@@ -20,13 +20,16 @@
 //! `legacy_compression_methods`, `extensions`); §5.1 for the record layer
 //! (content type `0x16` = handshake, and the `0x0301` legacy record
 //! version this document explicitly allows for the first `ClientHello`);
-//! §4.2.1 for `supported_versions`; §4.2.7/RFC 8422 for the `x25519`
-//! (`0x001D`) named group and `key_share`'s wire format; §4.2.3 for
-//! `signature_algorithms` (a server MUST abort the handshake if this
-//! extension is missing, per that section, which is why it -- unlike SNI
-//! and ALPN -- is included even though this probe never needs it for
-//! anything past eliciting a real `ServerHello`); §B.4 for the five
-//! defined TLS 1.3 cipher suite identifiers.
+//! §4.2.1 for `supported_versions`; §4.2.7/RFC 8422 for `supported_groups`
+//! and the `x25519` (`0x001D`) named group; §4.2.8 for `key_share`'s own
+//! wire format (corrected here from an earlier version of this comment
+//! that cited §4.2.7 for both -- §4.2.7 is `supported_groups`, a distinct
+//! extension from `key_share`); §4.2.3 for `signature_algorithms` (a
+//! server MUST abort the handshake if this extension is missing, per that
+//! section, which is why it -- unlike SNI and ALPN -- is included even
+//! though this probe never needs it for anything past eliciting a real
+//! `ServerHello`); §B.4 for the five defined TLS 1.3 cipher suite
+//! identifiers.
 //!
 //! Corroborated against a real server: `docker.io/library/nginx:1.27-alpine`
 //! (digest `sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10`)
@@ -301,12 +304,31 @@ mod tests {
         // `build_client_hello()`'s exact output to a real, locally run
         // `nginx:1.27-alpine` container terminating TLS 1.3 produced a
         // genuine `ServerHello` (content type 0x16, handshake type 0x02)
-        // selecting `TLS_AES_128_GCM_SHA256`. This test pins the request
-        // side of that capture so a future edit changing the wire format
-        // is caught here, without needing Docker to run this test.
+        // selecting `TLS_AES_128_GCM_SHA256`. This test pins **all 147
+        // bytes** of the request side of that capture, not just the
+        // 6-byte record/handshake header -- an earlier version of this
+        // test asserted only `ch.len() == 147` and `ch[0..6]`, which a
+        // corrupted cipher-suite ID (or any other byte past the header)
+        // would pass right through undetected; the array below was
+        // dumped directly from `build_client_hello()` itself (via a
+        // temporary `eprintln!`, removed afterward -- see this task's
+        // follow-up report) rather than retyped by hand, to rule out
+        // transcription error.
         let ch = build_client_hello();
-        assert_eq!(ch.len(), 147);
-        assert_eq!(&ch[0..6], &[0x16, 0x03, 0x01, 0x00, 0x8e, 0x01]);
+        let expected: [u8; 147] = [
+            0x16, 0x03, 0x01, 0x00, 0x8e, 0x01, 0x00, 0x00, 0x8a, 0x03, 0x03, 0x00, 0x01, 0x02,
+            0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+            0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e,
+            0x1f, 0x00, 0x00, 0x0a, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0x13, 0x04, 0x13, 0x05,
+            0x01, 0x00, 0x00, 0x57, 0x00, 0x2b, 0x00, 0x03, 0x02, 0x03, 0x04, 0x00, 0x0a, 0x00,
+            0x08, 0x00, 0x06, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00, 0x0d, 0x00, 0x16, 0x00,
+            0x14, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x04,
+            0x01, 0x05, 0x01, 0x06, 0x01, 0x08, 0x07, 0x00, 0x33, 0x00, 0x26, 0x00, 0x24, 0x00,
+            0x1d, 0x00, 0x20, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+            0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        ];
+        assert_eq!(ch, expected.to_vec());
     }
 
     #[tokio::test]
