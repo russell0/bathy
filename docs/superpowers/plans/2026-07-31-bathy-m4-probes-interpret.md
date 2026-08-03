@@ -675,7 +675,7 @@ git commit -m "feat(interpret): pure rule engine with confidence ladder and cite
 - **AC-4.10** `interpret` is pure: `bathy-interpret`'s dependency tree contains no async runtime, no filesystem access, and no clock. Asserted in CI.
 - **AC-4.11** Confidence comes from a single declared ladder; product+version outranks product-only outranks protocol-only. No magic numbers in match arms.
 - **AC-4.12** Every `Interpretation` carries a `rule_id`, a `matched_span` indexing real bytes of the response, and a rationale. `explain(rule_id)` returns documentation for every rule that can fire. **Assert the cited slice CONTENT for every rule, not just one** — a span-shifting mutation in any rule that lacks a content assertion survives silently, and a property test that only checks `end <= len` cannot catch an off-by-one that still lands in bounds.
-- **AC-4.17** Any property test over arbitrary bytes must be INSTRUMENTED to prove it reaches the code it claims to cover. A naive `any::<u8>()` strategy measured 6 non-empty results in 4096 cases and zero spans past offset 6 — it never reached the offset arithmetic in a single real rule and could not fail. Report the non-empty and deep-span counts.
+- **AC-4.20** Any property test over arbitrary bytes must be INSTRUMENTED to prove it reaches the code it claims to cover. A naive `any::<u8>()` strategy measured 6 non-empty results in 4096 cases and zero spans past offset 6 — it never reached the offset arithmetic in a single real rule and could not fail. Report the non-empty and deep-span counts.
 - **AC-4.13** Unrecognized input yields an empty vector. Interpretation never guesses a service.
 - **AC-4.14** `interpret` returns byte-identical results for identical input, and its output ordering is total and stable.
 - **AC-4.15** `interpret` does not panic on any input: empty, all-zero, all-`0xff`, and non-UTF-8 bytes at multiple lengths. Reinforced by a fuzz target in M7.
@@ -860,5 +860,17 @@ git commit -m "feat(engine): service identification with evidence stored before 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` clean.
 - [ ] AC-4.1 through AC-4.24 each demonstrated by a named passing test.
 - [ ] `cargo tree -p bathy-interpret` shows no async runtime and no I/O crates.
-- [ ] The replay corpus passes with the network interface down (`unshare -rn cargo test -p bathy-interpret` on Linux), proving interpretation needs no network.
+- [ ] The replay corpus passes with the network genuinely denied, proving interpretation needs no network. On Linux: `unshare -rn cargo test -p bathy-interpret`. **On macOS use `sandbox-exec`**, which works and needs no SIP changes, no sudo, and no `dtruss`:
+
+  ```
+  # deny-network.sb
+  (version 1)
+  (allow default)
+  (deny network*)
+  ```
+  ```
+  sandbox-exec -f deny-network.sb <path-to-compiled-replay-test-binary>
+  ```
+
+  **Confirm the profile actually enforces** before trusting a green run — attempt a real outbound connection inside it and check it fails with `Operation not permitted`. A sandbox that silently no-ops turns this into a tautology. A dependency-tree argument alone is not sufficient evidence for this criterion.
 - [ ] An end-to-end run against a local nginx reports `http` / `nginx` / a version, and `evidence.get` on the cited digest returns the exact response bytes that justified it.
