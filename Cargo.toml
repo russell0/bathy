@@ -96,3 +96,17 @@ tokio = { version = "1.53", features = ["time", "sync", "rt", "macros", "net"] }
 # deliberately not `full`, which would also pull in `codec`/`io`/`net`/
 # `time`/`compat`, none of which anything in this workspace uses.
 tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
+# M4 Task 1 (`crates/bathy-probe/src/framework.rs`): the `Probe` trait is
+# used as a trait object -- `ProbeRegistry` holds `Vec<Box<dyn Probe>>`, and
+# `select_probes` returns `Vec<&dyn Probe>` -- so `execute` can't be a
+# native `async fn` in the trait: that desugars to a `-> impl Future`
+# return, and an opaque `impl Trait` return type is not dyn-compatible, so
+# `Box<dyn Probe>` would not compile. `#[async_trait]` rewrites the method
+# to return `Pin<Box<dyn Future<Output = ...> + Send>>` instead, which *is*
+# object-safe, at the cost of one heap allocation per `execute` call --
+# negligible next to the network I/O each call already does. Not a
+# workspace dependency before this task. Pinned at 0.1.91, the latest
+# release as of M4 Task 1 (MIT OR Apache-2.0, `rust-version = "1.71"` --
+# well under this workspace's `1.88` floor, so it does not push
+# `bathy-probe` into a higher MSRV tier; both allowed by `deny.toml`).
+async-trait = "0.1.91"

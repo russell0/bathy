@@ -72,7 +72,12 @@ jobs:
       # which needs a higher floor than `1.88` -- see the MSRV comment on
       # `crates/bathy-engine/Cargo.toml`. It now joins `msrv-bathy-store`
       # below instead.
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p xtask --all-targets
+      #
+      # `bathy-probe` joined this job in M4 Task 1: it depends only on
+      # `bathy-types` (see the MSRV comment on `crates/bathy-probe/Cargo.toml`),
+      # so it stays in the `1.88` tier rather than moving to
+      # `msrv-bathy-store` the way `bathy-engine` did.
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p xtask --all-targets
 
   msrv-bathy-store:
     runs-on: ubuntu-latest

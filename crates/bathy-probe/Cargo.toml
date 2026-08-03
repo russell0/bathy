@@ -1,0 +1,49 @@
+[package]
+name = "bathy-probe"
+version.workspace = true
+edition.workspace = true
+# MSRV tiering: this crate depends on nothing that needs more than the
+# workspace floor (see the MSRV comment on the workspace `Cargo.toml`, and
+# on `bathy-store`'s own `Cargo.toml` for the one dependency in this
+# workspace -- `rusqlite`'s `bundled` feature -- that forces the higher
+# `1.95` tier). `bathy-probe` deliberately does not depend on `bathy-store`
+# or `bathy-engine` (M4 Task 1's own constraint: the probe framework is a
+# pure I/O layer over `bathy-types`, nothing more), so it stays in the
+# `1.88` tier and inherits the workspace value rather than declaring its
+# own. Verified locally against the `1.88` toolchain with
+# `rust-toolchain.toml` moved aside (see this task's report); CI's `msrv`
+# job (`.github/workflows/ci.yml`) now checks this crate alongside
+# `bathy-types`/`bathy-scope`/`bathy-evidence`/`bathy-plan`/`xtask`.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bathy-types = { path = "../bathy-types" }
+# `ProbeIo` (`src/framework.rs`) wraps `tokio::net::TcpStream` and uses
+# `tokio::time::timeout`/`Instant` to bound both `read_bounded` and
+# `write_all` by a deadline -- `net` and `time`. `select_probes`'s and
+# `ProbeRegistry`'s own tests are plain `#[test]`s (no I/O), but the
+# `ProbeIo` tests that drive a real loopback socket need `#[tokio::test]`
+# (`macros`) and a runtime to run it on (`rt`). `sync` is already part of
+# this workspace-pinned feature set (added for `bathy-engine`) and unused
+# here directly; not narrowed further since narrowing it would only remove
+# a feature this crate doesn't reference either way, not one it does.
+#
+# `io-util`, added here on top of the workspace's base feature set: the
+# workspace-level `tokio` entry enables `time, sync, rt, macros, net`, none
+# of which actually provide `AsyncReadExt`/`AsyncWriteExt` -- confirmed by
+# trying to build without it first (`error[E0599]: no method named
+# 'write_all' found for struct 'tokio::net::TcpStream'`, `tokio-1.53.1`'s
+# own `io/mod.rs` re-exports both traits only `#[cfg(feature = "io-util")]`).
+# `net` alone gets you the socket types, not the ability to read or write
+# them asynchronously through the ergonomic trait methods this module uses
+# throughout. Added here rather than to the workspace-level entry, the same
+# way `bathy-engine`'s `[dev-dependencies]` adds `test-util` on top of the
+# shared `tokio` line: this crate is the first (and, as of this task, only)
+# one that needs it, and Cargo features are additive/unified across the
+# build graph, so this does not change what any other crate gets by
+# depending on the plain workspace `tokio` entry.
+tokio = { workspace = true, features = ["io-util"] }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
