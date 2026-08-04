@@ -427,7 +427,19 @@ mod tests {
             probe_id: None,
         };
         let before = ScanFold {
-            endpoints: BTreeMap::from([((ip("10.0.0.1"), tcp(1)), blank.clone())]),
+            endpoints: BTreeMap::from([
+                ((ip("10.0.0.1"), tcp(1)), blank.clone()),
+                // One-sided the *other* way: in the earlier fold and not in
+                // the later one. Without it every one-sided endpoint sits on
+                // the later side, so no `Change` and no `Undetermined` in
+                // this fixture ever carries a null `after`, and
+                // `skip_serializing_if` on `Change::after` or
+                // `Undetermined::after` survives -- which is exactly what the
+                // fix re-review found (S16, S17) against a commit whose
+                // subject said "type-wide". Both sides, or the name is a
+                // claim the fixture cannot support.
+                ((ip("10.0.0.3"), tcp(3)), blank.clone()),
+            ]),
             hosts_up: BTreeSet::new(),
             terminal: None,
             plan_hash: None,
@@ -450,7 +462,29 @@ mod tests {
             plan_hash: None,
         };
 
-        for (label, fold) in [("before", &before), ("after", &after)] {
+        // A fold of a log with nothing in it: the only shape in which
+        // `endpoints` itself is empty, and so the only one that would catch
+        // an `is_empty` skip on the two collection fields.
+        let empty = ScanFold::default();
+
+        // Asserted over the loop's own input, not over a fixture the loop
+        // might no longer use. Deleting a case below is otherwise silent --
+        // it narrows what the loop covers and nothing fails, which is the
+        // defect this whole test was re-opened for.
+        let folds = [("before", &before), ("after", &after), ("empty", &empty)];
+        assert!(
+            folds
+                .iter()
+                .any(|(_, f)| f.endpoints.is_empty() && f.hosts_up.is_empty()),
+            "no fold under test has both collections empty, so an `is_empty` skip on \
+             either would encode a document missing a required property and survive"
+        );
+        assert!(
+            folds.iter().any(|(_, f)| !f.endpoints.is_empty()),
+            "and none has an entry, so `FoldEntry`'s own fields are never reached"
+        );
+
+        for (label, fold) in folds {
             let json = serde_json::to_value(fold).unwrap();
             assert_present(&json, &required(fold_schema, "ScanFold"), label);
             let entry_required = required(&fold_schema["$defs"]["FoldEntry"], "FoldEntry");
@@ -463,15 +497,17 @@ mod tests {
             }
         }
 
-        // Two diffs, because no single one can put every nullable field at
-        // its null: `undecidable` is null only when both scans completed the
+        // Three diffs, because no single one can put every field at its
+        // empty: `undecidable` is null only when both scans completed the
         // same plan, and both terminals are null only when neither did.
         //
         // `incomparable` covers `undecidable: non-null`, both terminals null,
-        // and a populated `undetermined` whose entries each have one null
-        // side. `comparable` covers `undecidable: null` and a `Change` with a
-        // null `before` -- an appearance, which only a comparable pair can
-        // produce.
+        // and a populated `undetermined` carrying a null on *each* side --
+        // one endpoint only the later fold has, one only the earlier fold
+        // has. `comparable` covers `undecidable: null` and a `Change` with a
+        // null `before` (an appearance, which only a comparable pair can
+        // produce) and one with a null `after` (a disappearance).
+        // `nothing_moved` covers both list fields empty.
         let completed = Terminal::Completed {
             probes_sent: 0,
             packets_spent: 0,
@@ -489,9 +525,19 @@ mod tests {
         };
         let incomparable = diff(&before, &after);
         let comparable = diff(&comparable_before, &comparable_after);
+        // Each guard below is a field of the fixture the assertions cannot
+        // otherwise prove they reached. A fixture that stops producing one of
+        // these shapes must fail here, loudly, rather than quietly narrowing
+        // what the loop at the bottom covers.
         assert!(
             incomparable.undecidable.is_some() && !incomparable.undetermined.is_empty(),
             "the incomparable fixture must reach `undetermined`: {incomparable:?}"
+        );
+        assert!(
+            incomparable.undetermined.iter().any(|u| u.before.is_none())
+                && incomparable.undetermined.iter().any(|u| u.after.is_none()),
+            "`undetermined` must carry a null on each side, or `after` is never \
+             exercised: {incomparable:?}"
         );
         assert!(
             comparable.undecidable.is_none()
@@ -501,10 +547,42 @@ mod tests {
                     .any(|c| c.kind == ChangeKind::EndpointAppeared),
             "the comparable fixture must reach an appearance: {comparable:?}"
         );
+        assert!(
+            comparable
+                .changes
+                .iter()
+                .any(|c| c.kind == ChangeKind::EndpointDisappeared),
+            "and a disappearance, which is the only `Change` with a null `after`: \
+             {comparable:?}"
+        );
+
+        // A fold against itself: the only shape with `changes` *and*
+        // `undetermined` both empty, which is what an `is_empty` skip on
+        // either would need to be caught.
+        let nothing_moved = diff(&comparable_before, &comparable_before);
+
+        let diffs = [
+            ("incomparable", &incomparable),
+            ("comparable", &comparable),
+            ("nothing_moved", &nothing_moved),
+        ];
+        assert!(
+            diffs
+                .iter()
+                .any(|(_, d)| d.changes.is_empty() && d.undetermined.is_empty()),
+            "no diff under test has both lists empty, so an `is_empty` skip on either \
+             would survive: {diffs:?}"
+        );
+        assert!(
+            diffs.iter().any(|(_, d)| !d.changes.is_empty())
+                && diffs.iter().any(|(_, d)| !d.undetermined.is_empty()),
+            "and none has entries in both lists, so `Change`'s and `Undetermined`'s own \
+             fields are never reached: {diffs:?}"
+        );
 
         let state_required = required(&diff_schema["$defs"]["EndpointState"], "EndpointState");
         let diff_required = required(diff_schema, "ScanDiff");
-        for (label, d) in [("incomparable", &incomparable), ("comparable", &comparable)] {
+        for (label, d) in diffs {
             let json = serde_json::to_value(d).unwrap();
             assert_present(&json, &diff_required, &format!("{label} ScanDiff"));
             for (list, name) in [("changes", "Change"), ("undetermined", "Undetermined")] {
