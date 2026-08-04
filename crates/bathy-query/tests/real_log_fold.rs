@@ -13,8 +13,11 @@
 //! This file therefore drives the identical stack
 //! `crates/bathy-engine/tests/end_to_end_scan.rs` drives -- `ScopeManifest`
 //! -> `ScanPlan` -> `TaskStore` -> `GroupCommitLog` -> `Scheduler`, against
-//! two REAL bound loopback listeners, one of which serves captured nginx
-//! bytes -- reads the resulting gap-free log back, and folds *that*.
+//! REAL bound loopback listeners serving captured nginx bytes -- reads the
+//! resulting gap-free log back, and folds *that*. The last test runs the
+//! scan twice, either side of shutting a listener down, because a single
+//! scan's log observes each endpoint once and so cannot exercise
+//! supersession or order-dependence at all.
 //!
 //! Everything below `bathy-query` in the layer order is a `[dev-dependencies]`
 //! edge only (see this crate's `Cargo.toml`); the library itself still depends
