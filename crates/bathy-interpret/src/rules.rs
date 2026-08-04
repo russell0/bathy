@@ -877,6 +877,10 @@ static ALL_RULES: &[Rule] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The behavioural half of the dispatch tests below drives the crate's
+    // own public entry point rather than `rules_for` directly.
+    use crate::interpret;
+    use bathy_types::{ProbeCapture, Transport};
 
     // --- known_probe_ids ---
 
@@ -900,6 +904,137 @@ mod tests {
                 "tls-v1",
             ]
         );
+    }
+
+    // --- rules_for: the dispatch itself (M4 whole-branch review,
+    // IMPORTANT-5).
+    //
+    // `rules_for` is this crate's entire routing mechanism -- the single
+    // `r.probe_id == probe_id` comparison that decides which rules a
+    // capture is even offered to -- and nothing tested it. Making it ignore
+    // its argument outright, so every rule ran against every capture
+    // regardless of which probe produced it, survived all 69 tests: the
+    // corpus's inputs are mutually exclusive enough that no rule
+    // false-positives on another protocol's bytes today.
+    //
+    // "Today" is the problem. That property is a coincidence of the current
+    // thirteen rules, not an invariant: a TLS `ServerHello` is a
+    // 6-byte structural header, a MySQL greeting is `int<1> = 10`, and a
+    // redis `+...CRLF` is one leading byte -- all short, all structural,
+    // and any new rule that widened one of them would start silently
+    // claiming another protocol's captures with no test objecting.
+    // Dispatch is what makes that impossible, so dispatch is what gets
+    // asserted, in both a structural and a behavioural form. Together with
+    // `bathy-engine`'s `tests/probe_rule_seam.rs` (CRITICAL-1) this closes
+    // the id-equality seam at both of its ends: that the ids agree across
+    // the two crates, and that this crate actually routes by them. ---
+
+    #[test]
+    fn rules_for_returns_only_rules_belonging_to_the_probe_it_was_asked_about() {
+        for id in known_probe_ids() {
+            let selected: Vec<&str> = rules_for(id).map(|r| r.doc.id).collect();
+            assert!(
+                !selected.is_empty(),
+                "{id} is a known probe id, so it must select at least one rule"
+            );
+            for r in rules_for(id) {
+                assert_eq!(
+                    r.probe_id, id,
+                    "rules_for({id:?}) offered rule {:?}, which belongs to probe {:?} -- \
+                     a capture from one probe must never be matched against another \
+                     probe's rules",
+                    r.doc.id, r.probe_id
+                );
+            }
+            assert!(
+                selected.len() < ALL_RULES.len(),
+                "rules_for({id:?}) returned every rule in the registry ({selected:?}); \
+                 dispatch is not filtering by probe id at all"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_for_partitions_the_registry_leaving_no_rule_unreachable_and_none_duplicated() {
+        // Every rule is selected by exactly one probe id: the union over
+        // all known ids is the whole registry (no rule is unreachable) and
+        // the counts sum without overlap (no rule is offered twice).
+        let mut total = 0usize;
+        let mut seen: Vec<&str> = Vec::new();
+        for id in known_probe_ids() {
+            for r in rules_for(id) {
+                total += 1;
+                seen.push(r.doc.id);
+            }
+        }
+        seen.sort_unstable();
+        let mut deduped = seen.clone();
+        deduped.dedup();
+        assert_eq!(
+            seen, deduped,
+            "a rule was offered by two different probe ids"
+        );
+        assert_eq!(
+            total,
+            ALL_RULES.len(),
+            "the union of rules_for() over every known probe id must be exactly the registry"
+        );
+    }
+
+    #[test]
+    fn a_rule_is_never_offered_a_capture_from_a_different_probe() {
+        // The behavioural half, through the crate's own public entry point
+        // rather than through `rules_for` directly: each of these byte
+        // strings is one this crate genuinely recognizes under its OWN
+        // probe id (every one of them is asserted to match in a test
+        // elsewhere in this module). Delivered under any OTHER probe id,
+        // `interpret` must return nothing at all -- not a lower-confidence
+        // guess, nothing. This is what "the probe that produced these bytes
+        // is part of the evidence" means in practice.
+        let recognized: &[(&'static str, &[u8])] = &[
+            (
+                "http-get-v1",
+                b"HTTP/1.1 200 OK\r\nServer: nginx/1.26.0\r\n\r\n",
+            ),
+            ("ssh-banner-v1", b"SSH-2.0-OpenSSH_10.3\r\n"),
+            ("smtp-banner-v1", b"220 mail.example.com ESMTP Postfix\r\n"),
+            ("redis-ping-v1", b"+PONG\r\n"),
+            ("tls-v1", &[0x16, 0x03, 0x03, 0x00, 0x02, 0x02, 0x00]),
+            ("postgres-startup-v1", b"S"),
+        ];
+        for &(owner, bytes) in recognized {
+            let own = interpret(&ProbeCapture {
+                probe_id: owner,
+                transport: Transport::Tcp,
+                port: 0,
+                request: None,
+                response: bytes.to_vec(),
+                elapsed_micros: 0,
+                truncated: false,
+            });
+            assert!(
+                !own.is_empty(),
+                "test fixture sanity: {owner} must recognize its own bytes, or the \
+                 cross-feeding below proves nothing"
+            );
+            for other in known_probe_ids().filter(|&id| id != owner) {
+                let cross = interpret(&ProbeCapture {
+                    probe_id: other,
+                    transport: Transport::Tcp,
+                    port: 0,
+                    request: None,
+                    response: bytes.to_vec(),
+                    elapsed_micros: 0,
+                    truncated: false,
+                });
+                assert!(
+                    cross.is_empty(),
+                    "bytes only {owner} can produce were interpreted as {:?} when \
+                     delivered under probe id {other}",
+                    cross.iter().map(|i| i.rule_id).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     // --- The ladder ---
