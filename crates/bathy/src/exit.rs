@@ -69,6 +69,19 @@ impl ExitCode {
         }
         s
     }
+
+    /// The same table, machine-readable. Rendered into the `--help`
+    /// document that `--json --help` puts on stdout, so an agent reads the
+    /// exit-code contract by parsing rather than by scraping
+    /// [`Self::help_section`]'s two-space indentation.
+    pub fn table_json() -> serde_json::Value {
+        serde_json::Value::Array(
+            Self::TABLE
+                .iter()
+                .map(|(code, meaning)| serde_json::json!({ "code": code.code(), "meaning": meaning }))
+                .collect(),
+        )
+    }
 }
 
 impl fmt::Display for ExitCode {

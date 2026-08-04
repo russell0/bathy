@@ -572,6 +572,31 @@ fn every_failure_path_still_produces_parseable_json_on_stdout_and_a_diagnostic_o
             ],
             1,
         ),
+        // The four below were missing, and their absence is why a usage
+        // error could exit 0 with an empty stdout for a whole review cycle.
+        // They are the parse-time failures: `clap` never returns a `Cli`, so
+        // none of them reaches `dispatch`, which is exactly the reason the
+        // eight above did not cover them.
+        (
+            "a command group with no sub-subcommand",
+            vec!["--json", "--state-dir", &dir, "scan"],
+            1,
+        ),
+        (
+            "no subcommand at all",
+            vec!["--json", "--state-dir", &dir],
+            1,
+        ),
+        (
+            "a subcommand that does not exist",
+            vec!["--json", "--state-dir", &dir, "frobnicate"],
+            1,
+        ),
+        (
+            "a flag that does not exist",
+            vec!["--json", "--state-dir", &dir, "--frobnicate"],
+            1,
+        ),
     ];
 
     for (label, argv, expected) in cases {
@@ -601,6 +626,153 @@ fn without_json_a_failure_writes_nothing_to_stdout() {
     out.code(1);
     assert_eq!(out.stdout, "", "stdout was {:?}", out.stdout);
     assert!(!out.stderr.trim().is_empty());
+}
+
+/// Every way of naming a command without finishing it, in both modes.
+///
+/// The shape being forbidden is specific: **exit 0 with an empty stdout.**
+/// An agent shells out, sees success, reads no results, and the only
+/// available reading is "the scan found nothing" -- a malformed invocation
+/// impersonating an empty answer. `bathy --json scan` and `bathy --json
+/// scope` did exactly that, while `bathy --json` called the same mistake a
+/// 1: two answers to one question.
+///
+/// `clap` renders help text for these, which is what made them look like
+/// `--help`. They are not: the caller named a command group and stopped.
+#[test]
+fn naming_a_command_without_finishing_it_is_a_usage_error_and_never_exits_zero() {
+    let incomplete: &[&[&str]] = &[
+        &[],               // bare `bathy`
+        &["scan"],         // a group with no sub-subcommand
+        &["scope"],        // ditto, and a second group, so this is a class
+        &["result"],       //
+        &["evidence"],     //
+        &["frobnicate"],   // not a command at all
+        &["scan", "sta"],  // an abbreviation, which this CLI does not infer
+        &["--frobnicate"], // not a flag at all
+    ];
+
+    for argv in incomplete {
+        // Human mode: nonzero, nothing on stdout, a diagnostic on stderr.
+        let human = bathy(argv);
+        assert_ne!(
+            human.status,
+            0,
+            "`bathy {}` exited 0\n--- stdout ---\n{}\n--- stderr ---\n{}",
+            argv.join(" "),
+            human.stdout,
+            human.stderr
+        );
+        human.code(1);
+        assert_eq!(
+            human.stdout,
+            "",
+            "`bathy {}` put a diagnostic on stdout",
+            argv.join(" ")
+        );
+        assert!(
+            !human.stderr.trim().is_empty(),
+            "`bathy {}` failed silently",
+            argv.join(" ")
+        );
+
+        // JSON mode: the same code, and an answer on stdout. The empty
+        // stdout is the half that made this dangerous rather than untidy.
+        let mut json_argv = vec!["--json"];
+        json_argv.extend_from_slice(argv);
+        let json = bathy(&json_argv);
+        json.code(1);
+        let doc = json.json();
+        assert_eq!(doc["error"], "usage", "{doc}");
+        assert_eq!(doc["exit_code"], 1, "{doc}");
+        assert!(
+            doc["detail"].as_str().is_some_and(|d| !d.trim().is_empty()),
+            "a usage document with no detail: {doc}"
+        );
+    }
+
+    // `--json` after the incomplete group, not before it. The flag is read
+    // out of the raw argv precisely because the parse that would have
+    // reported it is the one that just failed, so its position must not
+    // decide whether the caller gets a document.
+    let trailing = bathy(&["scan", "--json"]);
+    trailing.code(1);
+    assert_eq!(trailing.json()["error"], "usage");
+}
+
+/// The same mistake at two depths must get the same answer.
+///
+/// `bathy` reaches `clap` as `DisplayHelpOnMissingArgumentOrSubcommand` and
+/// `bathy --json` as `MissingSubcommand`, purely because the second one has
+/// an argument present. They are one mistake, and before this test they
+/// exited 0 and 1 respectively.
+#[test]
+fn the_same_missing_subcommand_gets_the_same_exit_code_at_every_depth() {
+    let bare = bathy(&[]);
+    let with_a_global_flag = bathy(&["--json"]);
+    assert_eq!(
+        bare.status, with_a_global_flag.status,
+        "`bathy` exited {} and `bathy --json` exited {} for the same mistake",
+        bare.status, with_a_global_flag.status
+    );
+    assert_eq!(bare.status, 1);
+    // And the wording is one wording, not two spellings of one mistake.
+    for out in [&bare, &with_a_global_flag] {
+        assert!(
+            out.stderr.contains("subcommand is required")
+                || out.stderr.contains("requires a subcommand"),
+            "{}",
+            out.stderr
+        );
+    }
+}
+
+/// AC-5.10 with no exception carved out of it.
+///
+/// `--help` is the one place a CLI is expected to print prose, and under
+/// `--json` this one does not: it emits a single document carrying the help
+/// text and the exit-code table as data. The alternative -- exempting
+/// `--help` -- was available and was rejected, because the invariant an
+/// agent can act on ("under `--json`, stdout is JSON, always") is worth more
+/// than prose it would have to scrape anyway.
+#[test]
+fn under_json_help_and_version_are_documents_on_stdout_not_prose() {
+    let help = bathy(&["--json", "--help"]);
+    help.success();
+    let doc = help.json();
+    assert!(
+        doc["help"].as_str().is_some_and(|h| h.contains("Usage:")),
+        "the help document does not carry the help text: {doc}"
+    );
+    assert_eq!(doc["exit_code"], 0, "{doc}");
+    // AC-5.11's table, structured, from the same source the prose is
+    // rendered from -- so an agent reads it without scraping columns.
+    let codes: Vec<i64> = doc["exit_codes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no exit_codes array: {doc}"))
+        .iter()
+        .map(|row| row["code"].as_i64().expect("a numeric code"))
+        .collect();
+    assert_eq!(codes, vec![0, 1, 2, 3, 4], "{doc}");
+    assert!(help.stderr.is_empty(), "--json --help wrote to stderr");
+
+    let version = bathy(&["--json", "--version"]);
+    version.success();
+    let doc = version.json();
+    assert!(
+        doc["version"].as_str().is_some_and(|v| v.contains("bathy")),
+        "{doc}"
+    );
+
+    // The human mode is untouched: prose on stdout, exit 0.
+    let prose = bathy(&["--help"]);
+    prose.success();
+    assert!(prose.stdout.contains("Usage:"), "{}", prose.stdout);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(prose.stdout.lines().next().unwrap_or(""))
+            .is_err(),
+        "human --help emitted JSON"
+    );
 }
 
 #[test]
