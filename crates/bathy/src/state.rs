@@ -41,33 +41,20 @@ pub fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock::default())
 }
 
-/// Path of the file `scan cancel` creates and a running scan polls.
-///
-/// A running scan lives in another process, so `scan cancel` cannot reach
-/// its `CancellationToken` directly. A marker file in the state directory is
-/// the smallest thing that works across processes without a daemon, a socket
-/// or a signal, and it degrades correctly: if no scan is running, the marker
-/// simply sits there, and `start`/`resume` clear it before they begin so it
-/// can never silently cancel a *later* scan.
-pub fn cancel_marker(state_dir: &Path, scan_id: ScanId) -> PathBuf {
-    state_dir.join("cancel").join(format!("{scan_id}.cancel"))
-}
+// The cancel-marker protocol moved to `bathy_engine::cancel` when the MCP
+// server became a second surface that has to speak it. A scan started
+// through one surface and cancelled through the other must actually stop,
+// and that cannot be true of a protocol with two implementations. These are
+// thin adapters onto the shared one, kept so the call sites below read the
+// same as they did.
 
 pub fn request_cancel(state_dir: &Path, scan_id: ScanId) -> Result<(), CliError> {
-    let path = cancel_marker(state_dir, scan_id);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| CliError::operational("state_dir_unwritable", e))?;
-    }
-    std::fs::write(&path, b"cancel\n").map_err(|e| CliError::operational("state_dir_unwritable", e))
+    bathy_engine::cancel::request(state_dir, scan_id)
+        .map_err(|e| CliError::operational("state_dir_unwritable", e))
 }
 
 pub fn clear_cancel(state_dir: &Path, scan_id: ScanId) {
-    let _ = std::fs::remove_file(cancel_marker(state_dir, scan_id));
-}
-
-pub fn cancel_requested(state_dir: &Path, scan_id: ScanId) -> bool {
-    cancel_marker(state_dir, scan_id).exists()
+    bathy_engine::cancel::clear(state_dir, scan_id);
 }
 
 pub fn parse_scan_id(s: &str) -> Result<ScanId, CliError> {

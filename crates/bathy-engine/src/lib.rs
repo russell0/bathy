@@ -42,6 +42,7 @@
 //! in-flight work drained (never dropped) on cancellation, resumption that
 //! neither re-probes nor skips a unit, and four distinct terminal outcomes.
 
+pub mod cancel;
 pub mod connect;
 pub mod discovery;
 pub mod durable_log;

@@ -103,14 +103,27 @@ fn build_request(
     })
 }
 
+/// The same document `scan.preview` returns, field for field.
+///
+/// `estimated_runtime_seconds` is computed by the shared estimator rather
+/// than restated here: the M5 plan's tool contract named the field and this
+/// command did not have it, which would have made the tool surface report
+/// something the command surface could not.
 fn preview_document(authorized: &AuthorizedScan) -> serde_json::Value {
-    serde_json::json!({
-        "plan_hash": authorized.plan().hash().to_string(),
-        "estimated_targets": authorized.estimated_targets(),
-        "estimated_probes": authorized.estimated_probes(),
-        "policy_decision": "approved",
-        "scope_id": authorized.request().authorization_scope_id.to_string(),
-    })
+    let out = bathy_types::tools::ScanPreviewOutput {
+        policy_decision: PolicyDecisionTag::Approved,
+        plan_hash: Some(authorized.plan().hash()),
+        estimated_targets: Some(authorized.estimated_targets()),
+        estimated_probes: Some(authorized.estimated_probes()),
+        estimated_runtime_seconds: Some(bathy_mcp::engine::estimated_runtime_seconds(
+            authorized.estimated_probes(),
+            authorized.request().budgets.maximum_packets_per_second,
+        )),
+        scope_id: Some(authorized.request().authorization_scope_id),
+        reason_code: None,
+        detail: None,
+    };
+    serde_json::to_value(&out).expect("a preview always serializes")
 }
 
 /// AC-5.9. Nothing on this path opens a socket: it loads a document,
@@ -228,21 +241,10 @@ async fn run_to_completion(
     // `scan cancel` runs in a different process and cannot reach this
     // token, so it leaves a marker in the state directory and this task
     // turns the marker into a real cancellation. Aborted below so the
-    // poller cannot outlive the scan it was watching.
+    // poller cannot outlive the scan it was watching. The MCP server speaks
+    // the same protocol, from the same place -- see `bathy_engine::cancel`.
     let token = CancellationToken::new();
-    let watcher = {
-        let token = token.clone();
-        let dir = state_dir.to_path_buf();
-        tokio::spawn(async move {
-            loop {
-                if state::cancel_requested(&dir, scan_id) {
-                    token.cancel();
-                    return;
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-        })
-    };
+    let watcher = bathy_engine::cancel::spawn_watcher(state_dir, scan_id, token.clone());
 
     let summary = scheduler.run(authorized.plan(), from_index, token).await;
     watcher.abort();
