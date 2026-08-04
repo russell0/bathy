@@ -64,3 +64,12 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Test-only. `crates/bathy/tests/mcp.rs` checks every tool result against the
+# `outputSchema` its own tool published, and `pattern` is the keyword every
+# identifier and digest in those schemas is constrained by -- 29 declarations
+# across the 27 committed documents. A hand-rolled matcher for the three
+# forms that exist today would be a guard covering the instances already
+# known, which is the shape this project keeps being bitten by; a real engine
+# covers a fourth pattern nobody has written yet. Already in this workspace's
+# tree via `bathy-interpret` and `xtask`, so it adds no crate to the graph.
+regex.workspace = true

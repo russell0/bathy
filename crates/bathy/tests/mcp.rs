@@ -434,11 +434,78 @@ fn bathy(args: &[&str]) -> (i32, String) {
 
 /// Whether `value` satisfies `schema`, resolving `$ref` against `root`.
 ///
-/// Deliberately small and deliberately strict about the things that matter
-/// here: a declared `outputSchema` is a promise that the structured result
-/// conforms, and the way that promise fails in practice is a field that is
-/// required and absent, or a value of the wrong type.
+/// # Why this exists at all, and why its gaps are written down
+///
+/// `rmcp` does **not** validate a result against the tool's `outputSchema`
+/// when `call_tool` is implemented directly, as it is here. So this function
+/// is the only thing standing behind AC-5.28's promise that a structured
+/// result conforms to the schema its own tool published, and the
+/// specification's "clients **SHOULD** validate structured results against
+/// this schema" means a real client would reject anything this misses.
+///
+/// A validator whose gaps are known is worth more than one assumed complete.
+/// The first version of this function omitted `pattern` -- the one keyword
+/// every identifier and digest in these schemas is constrained by, declared
+/// 29 times -- so `scan_id: "not-an-identifier"` and `digest: "blake3:zzzz"`
+/// both passed as conforming. That is why the list below is written out in
+/// the same spirit as `xtask/src/readme.rs`'s `NOT MECHANICALLY CHECKED`
+/// section: a green conformance test means these keywords agree, never that
+/// the document is valid JSON Schema 2020-12.
+///
+/// ## Implemented
+///
+/// `$ref` (local `#/$defs/` only), `oneOf` (exactly one arm), `anyOf`,
+/// `allOf`, `const`, `enum`, `type` (single and as a list), `pattern`,
+/// `format` for `ip` and `date-time`, `required`, `properties`,
+/// `additionalProperties` (`false` and as a subschema), `items`, `minItems`,
+/// `minimum`, `maximum`, and boolean schemas. Every one of these is
+/// exercised by a violating document in
+/// [`validator`], so removing any single check fails a named test.
+///
+/// ## NOT CHECKED -- written out deliberately
+///
+/// None of these appears in the 27 committed schemas today, which is why
+/// they are absent; each would silently pass if one did.
+///
+///   - `not`, `if`/`then`/`else`, `dependentSchemas`, `dependentRequired`.
+///   - `patternProperties`, `propertyNames`, `minProperties`,
+///     `maxProperties`, `unevaluatedProperties`.
+///   - `prefixItems` (tuple validation), `contains`/`minContains`,
+///     `maxItems`, `uniqueItems`, `unevaluatedItems`.
+///   - `minLength`, `maxLength`, `multipleOf`, `exclusiveMinimum`,
+///     `exclusiveMaximum`.
+///   - `$ref` to anything but `#/$defs/<name>`: no `$id` resolution, no
+///     JSON-Pointer traversal, no remote or recursive references. A
+///     reference this cannot resolve is an error rather than a pass.
+///   - `$dynamicRef`/`$dynamicAnchor`, `$vocabulary`.
+///   - `format` beyond `ip` and `date-time`. The seven `format` values these
+///     schemas use are `uint8`, `uint16`, `uint32`, `uint64`, `double`, `ip`
+///     and `date-time`; the five numeric ones are emitted by `schemars`
+///     alongside a `type` and a `minimum`/`maximum` that say the same thing
+///     and *are* checked, so implementing them would add no coverage.
+///   - `date-time` is checked for **shape**, not for calendar validity:
+///     `2026-02-31T00:00:00.000Z` passes. A real date parser here would be a
+///     second implementation of something `bathy-types` already owns.
+///   - `default`: not applied. A property absent from the value is not
+///     filled in before the rest of the schema is checked.
+///   - Annotation keywords (`title`, `description`, `examples`, `readOnly`)
+///     carry no assertion, which is correct, and are named here so their
+///     absence from the list above is not mistaken for an omission.
 fn conforms(root: &Value, schema: &Value, value: &Value) -> Result<(), String> {
+    // A boolean schema. `true` accepts anything; `false` accepts nothing.
+    if let Some(accepts) = schema.as_bool() {
+        return if accepts {
+            Ok(())
+        } else {
+            Err(format!("{value} is rejected by a `false` schema"))
+        };
+    }
+
+    // `$ref`, and then whatever sits beside it. From draft 2019-09 onward
+    // `$ref` is an ordinary keyword rather than one that replaces its object,
+    // so returning here would skip every sibling keyword -- which is how the
+    // first version of this function came to ignore constraints declared next
+    // to a combinator.
     if let Some(reference) = schema["$ref"].as_str() {
         let name = reference
             .strip_prefix("#/$defs/")
@@ -446,17 +513,36 @@ fn conforms(root: &Value, schema: &Value, value: &Value) -> Result<(), String> {
         let target = root["$defs"]
             .get(name)
             .ok_or_else(|| format!("dangling reference {reference}"))?;
-        return conforms(root, target, value);
+        conforms(root, target, value).map_err(|e| format!("{reference}: {e}"))?;
     }
-    for combinator in ["oneOf", "anyOf"] {
-        if let Some(arms) = schema[combinator].as_array() {
-            return if arms.iter().any(|a| conforms(root, a, value).is_ok()) {
-                Ok(())
-            } else {
-                Err(format!("{value} matches no {combinator} arm of {schema}"))
-            };
+
+    // `oneOf` requires *exactly* one arm to match. Treating it as `anyOf` --
+    // which this did -- accepts a document two disjoint variants both claim,
+    // and in these schemas the arms are discriminated variants, so two
+    // matching means the discriminator has stopped discriminating.
+    if let Some(arms) = schema["oneOf"].as_array() {
+        let matched = arms
+            .iter()
+            .filter(|arm| conforms(root, arm, value).is_ok())
+            .count();
+        if matched != 1 {
+            return Err(format!(
+                "{value} matches {matched} of the {} oneOf arms; oneOf requires exactly one",
+                arms.len()
+            ));
         }
     }
+    if let Some(arms) = schema["anyOf"].as_array()
+        && !arms.iter().any(|arm| conforms(root, arm, value).is_ok())
+    {
+        return Err(format!("{value} matches no anyOf arm of {schema}"));
+    }
+    if let Some(arms) = schema["allOf"].as_array() {
+        for (index, arm) in arms.iter().enumerate() {
+            conforms(root, arm, value).map_err(|e| format!("allOf[{index}]: {e}"))?;
+        }
+    }
+
     if let Some(constant) = schema.get("const")
         && constant != value
     {
@@ -467,30 +553,42 @@ fn conforms(root: &Value, schema: &Value, value: &Value) -> Result<(), String> {
     {
         return Err(format!("{value} is not one of {choices:?}"));
     }
-    if let Some(declared) = schema["type"].as_str() {
-        let actual = match value {
-            Value::Null => "null",
-            Value::Bool(_) => "boolean",
-            Value::Number(n) if n.is_f64() => "number",
-            Value::Number(_) => "integer",
-            Value::String(_) => "string",
-            Value::Array(_) => "array",
-            Value::Object(_) => "object",
-        };
-        let ok = declared == actual
-            || (declared == "number" && actual == "integer")
-            || (declared == "integer" && actual == "number");
-        if !ok {
-            return Err(format!("expected {declared}, got {actual} ({value})"));
-        }
+    if let Some(declared) = schema["type"].as_str()
+        && !is_type(declared, value)
+    {
+        return Err(format!("expected {declared}, got {value}"));
     }
     if let Some(types) = schema["type"].as_array()
         && !types
             .iter()
-            .any(|t| conforms(root, &json!({ "type": t }), value).is_ok())
+            .any(|t| t.as_str().is_some_and(|t| is_type(t, value)))
     {
         return Err(format!("{value} matches none of {types:?}"));
     }
+
+    if let Some(text) = value.as_str() {
+        // The keyword every identifier and digest in these schemas is
+        // constrained by. Compiled per call rather than cached: this runs a
+        // few hundred times in one test, and a `LazyLock` map keyed by
+        // pattern would be a cache to get wrong for no measurable gain.
+        if let Some(pattern) = schema["pattern"].as_str() {
+            let compiled = regex::Regex::new(pattern)
+                .map_err(|e| format!("the schema's own pattern {pattern} does not compile: {e}"))?;
+            if !compiled.is_match(text) {
+                return Err(format!("`{text}` does not match {pattern}"));
+            }
+        }
+        match schema["format"].as_str() {
+            Some("ip") if text.parse::<IpAddr>().is_err() => {
+                return Err(format!("`{text}` is not an IP address"));
+            }
+            Some("date-time") if !is_rfc3339_shaped(text) => {
+                return Err(format!("`{text}` is not an RFC 3339 timestamp"));
+            }
+            _ => {}
+        }
+    }
+
     if let Some(object) = value.as_object() {
         for name in schema["required"].as_array().unwrap_or(&vec![]) {
             let name = name.as_str().unwrap_or_default();
@@ -498,21 +596,28 @@ fn conforms(root: &Value, schema: &Value, value: &Value) -> Result<(), String> {
                 return Err(format!("required property `{name}` is absent from {value}"));
             }
         }
-        if let Some(properties) = schema["properties"].as_object() {
-            if schema["additionalProperties"] == json!(false) {
-                for key in object.keys() {
-                    if !properties.contains_key(key) {
-                        return Err(format!("`{key}` is not a declared property"));
-                    }
-                }
+        // Read outside the `properties` branch on purpose: a schema that
+        // declares `additionalProperties: false` and *no* `properties` at all
+        // permits nothing, and checking it only when `properties` is present
+        // is how a whole document escapes the check.
+        let declared = schema["properties"].as_object();
+        let extra = schema.get("additionalProperties");
+        for (key, present) in object {
+            if let Some(sub) = declared.and_then(|d| d.get(key)) {
+                conforms(root, sub, present).map_err(|e| format!("{key}: {e}"))?;
+                continue;
             }
-            for (key, sub) in properties {
-                if let Some(present) = object.get(key) {
-                    conforms(root, sub, present).map_err(|e| format!("{key}: {e}"))?;
+            match extra {
+                Some(Value::Bool(false)) => {
+                    return Err(format!("`{key}` is not a declared property"));
                 }
+                Some(sub) => conforms(root, sub, present)
+                    .map_err(|e| format!("additional property {key}: {e}"))?,
+                None => {}
             }
         }
     }
+
     if let Some(items) = value.as_array() {
         if let Some(minimum) = schema["minItems"].as_u64()
             && (items.len() as u64) < minimum
@@ -525,6 +630,7 @@ fn conforms(root: &Value, schema: &Value, value: &Value) -> Result<(), String> {
             }
         }
     }
+
     if let Some(number) = value.as_f64() {
         if let Some(minimum) = schema["minimum"].as_f64()
             && number < minimum
@@ -540,11 +646,316 @@ fn conforms(root: &Value, schema: &Value, value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// One `type` keyword against one value.
+///
+/// `integer` accepts a number whose fractional part is zero, which is what
+/// the specification says and what the previous spelling of this -- "an
+/// integer may be a number and a number may be an integer" -- did not: it
+/// accepted `1.5` where `integer` was declared.
+fn is_type(declared: &str, value: &Value) -> bool {
+    match declared {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "string" => value.is_string(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        "number" => value.is_number(),
+        "integer" => match value {
+            Value::Number(n) if n.is_f64() => n.as_f64().is_some_and(|f| f.fract() == 0.0),
+            Value::Number(_) => true,
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fff](Z|±HH:MM)`, by shape.
+///
+/// Shape and not calendar validity: see the NOT CHECKED list on [`conforms`].
+fn is_rfc3339_shaped(text: &str) -> bool {
+    static SHAPE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$",
+        )
+        .expect("a literal pattern")
+    });
+    SHAPE.is_match(text)
+}
+
 fn assert_conforms(tool: &str, schema: &Value, value: &Value) {
     if let Err(e) = conforms(schema, schema, value) {
         panic!(
             "{tool}'s result does not conform to its own published outputSchema: {e}\n\nresult: {value:#}\n\nschema: {schema:#}"
         );
+    }
+}
+
+/// The checker, checked.
+///
+/// `every_real_result_conforms_to_the_output_schema_its_own_tool_published`
+/// can only be as strong as [`conforms`] is, and a validator nothing attacks
+/// is a validator that quietly accepts anything -- which is exactly what
+/// happened: `pattern` was unimplemented and the conformance test passed
+/// documents carrying `"blake3:zzzz"`.
+///
+/// So every keyword [`conforms`] claims to implement has a case here that
+/// violates it and a positive control beside it. Deleting the code for any
+/// one keyword fails a named test in this module rather than silently
+/// widening what the suite accepts.
+mod validator {
+    use super::{conforms, is_rfc3339_shaped};
+    use serde_json::{Value, json};
+
+    fn accepts(schema: Value, value: Value) {
+        if let Err(e) = conforms(&schema, &schema, &value) {
+            panic!("the checker rejected a conforming document: {e}\n{value:#}\n{schema:#}");
+        }
+    }
+
+    fn rejects(keyword: &str, schema: Value, value: Value) {
+        assert!(
+            conforms(&schema, &schema, &value).is_err(),
+            "the checker accepted a document that violates `{keyword}`:\n{value:#}\n{schema:#}"
+        );
+    }
+
+    /// The three patterns these schemas actually declare, and the two
+    /// documents that passed as conforming before `pattern` was implemented.
+    #[test]
+    fn a_pattern_is_enforced_and_these_are_the_three_the_schemas_declare() {
+        let cases = [
+            (
+                "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+                "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "not-an-identifier",
+            ),
+            (
+                "^blake3:[0-9a-f]{64}$",
+                "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                "blake3:zzzz",
+            ),
+            (
+                "^scope_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+                "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+                "scope_lowercase",
+            ),
+        ];
+        for (pattern, good, bad) in cases {
+            let schema = json!({ "type": "string", "pattern": pattern });
+            accepts(schema.clone(), json!(good));
+            rejects("pattern", schema, json!(bad));
+        }
+    }
+
+    /// And through a `$ref`, which is how every one of them is actually
+    /// reached: no result names a pattern inline.
+    #[test]
+    fn a_pattern_behind_a_ref_is_enforced_where_the_result_actually_carries_one() {
+        let schema = json!({
+            "$defs": { "ScanId": { "type": "string", "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$" } },
+            "type": "object",
+            "properties": { "scan_id": { "$ref": "#/$defs/ScanId" } },
+            "required": ["scan_id"],
+            "additionalProperties": false,
+        });
+        accepts(
+            schema.clone(),
+            json!({ "scan_id": "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV" }),
+        );
+        rejects("pattern", schema, json!({ "scan_id": "not-an-identifier" }));
+    }
+
+    #[test]
+    fn a_reference_that_cannot_be_resolved_is_an_error_and_not_a_pass() {
+        let schema = json!({ "$defs": {}, "$ref": "#/$defs/Absent" });
+        rejects("$ref", schema, json!("anything"));
+        let remote = json!({ "$ref": "https://example.invalid/schema.json" });
+        rejects("$ref", remote, json!("anything"));
+    }
+
+    #[test]
+    fn one_of_requires_exactly_one_arm_rather_than_at_least_one() {
+        // Two arms that both accept the same string. `anyOf` says yes;
+        // `oneOf` says no, and these schemas use `oneOf` for discriminated
+        // variants, where two matching means the discriminator failed.
+        let ambiguous = json!({
+            "oneOf": [{ "type": "string" }, { "type": "string", "pattern": "^a" }]
+        });
+        rejects("oneOf", ambiguous, json!("abc"));
+
+        let discriminated = json!({
+            "oneOf": [
+                { "type": "string", "enum": ["pending", "running"] },
+                { "type": "string", "const": "denied" },
+            ]
+        });
+        accepts(discriminated.clone(), json!("denied"));
+        rejects("oneOf", discriminated, json!("cancelled"));
+    }
+
+    #[test]
+    fn any_of_needs_one_arm_and_all_of_needs_every_arm() {
+        let optional = json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] });
+        accepts(optional.clone(), json!(null));
+        rejects("anyOf", optional, json!(7));
+
+        let both = json!({ "allOf": [{ "type": "string" }, { "pattern": "^blake3:" }] });
+        accepts(both.clone(), json!("blake3:x"));
+        rejects("allOf", both, json!("sha256:x"));
+    }
+
+    /// The gap that let a whole family of constraints through: a combinator
+    /// used to `return`, so anything declared beside it was never read.
+    #[test]
+    fn a_keyword_beside_a_combinator_is_still_checked() {
+        let schema = json!({
+            "anyOf": [{ "type": "string" }, { "type": "null" }],
+            "pattern": "^scan_",
+        });
+        accepts(schema.clone(), json!("scan_x"));
+        rejects("pattern beside anyOf", schema, json!("evt_x"));
+
+        let after_ref = json!({
+            "$defs": { "Text": { "type": "string" } },
+            "$ref": "#/$defs/Text",
+            "enum": ["one", "two"],
+        });
+        accepts(after_ref.clone(), json!("one"));
+        rejects("enum beside $ref", after_ref, json!("three"));
+    }
+
+    #[test]
+    fn a_declared_integer_does_not_accept_a_fractional_number() {
+        let schema = json!({ "type": "integer", "format": "uint64", "minimum": 0 });
+        accepts(schema.clone(), json!(3));
+        rejects("type: integer", schema.clone(), json!(1.5));
+        rejects("type: integer", schema, json!("3"));
+        // A whole number written as a float is an integer, which is what the
+        // specification says and what JSON gives no way to distinguish.
+        accepts(json!({ "type": "integer" }), json!(3.0));
+        // And `number` still takes both.
+        accepts(json!({ "type": "number" }), json!(3));
+        accepts(json!({ "type": "number" }), json!(0.75));
+    }
+
+    #[test]
+    fn every_scalar_type_keyword_rejects_the_others() {
+        let cases: &[(&str, Value, Value)] = &[
+            ("null", json!(null), json!(0)),
+            ("boolean", json!(true), json!("true")),
+            ("string", json!("x"), json!(1)),
+            ("array", json!([]), json!({})),
+            ("object", json!({}), json!([])),
+        ];
+        for (declared, good, bad) in cases {
+            let schema = json!({ "type": declared });
+            accepts(schema.clone(), good.clone());
+            rejects("type", schema, bad.clone());
+        }
+        let listed = json!({ "type": ["string", "null"] });
+        accepts(listed.clone(), json!(null));
+        rejects("type list", listed, json!(1));
+    }
+
+    #[test]
+    fn const_and_enum_are_enforced() {
+        rejects(
+            "const",
+            json!({ "const": "scan.completed" }),
+            json!("scan.failed"),
+        );
+        rejects(
+            "enum",
+            json!({ "enum": ["open", "closed"] }),
+            json!("filtered"),
+        );
+    }
+
+    #[test]
+    fn required_and_additional_properties_are_enforced_at_every_depth() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["outer"],
+            "properties": {
+                "outer": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["inner"],
+                    "properties": { "inner": { "type": "string" } },
+                }
+            },
+        });
+        accepts(schema.clone(), json!({ "outer": { "inner": "x" } }));
+        rejects("required", schema.clone(), json!({}));
+        rejects("required (nested)", schema.clone(), json!({ "outer": {} }));
+        rejects(
+            "additionalProperties",
+            schema.clone(),
+            json!({ "outer": { "inner": "x" }, "surprise": 1 }),
+        );
+        rejects(
+            "additionalProperties (nested)",
+            schema,
+            json!({ "outer": { "inner": "x", "surprise": 1 } }),
+        );
+    }
+
+    /// The other half of `additionalProperties`, which the first version of
+    /// this checker read only inside the `properties` branch: a schema that
+    /// declares no properties at all and forbids extras permits nothing.
+    #[test]
+    fn additional_properties_false_without_any_declared_properties_permits_nothing() {
+        let closed = json!({ "type": "object", "additionalProperties": false });
+        accepts(closed.clone(), json!({}));
+        rejects("additionalProperties", closed, json!({ "anything": 1 }));
+
+        // And as a subschema rather than a boolean.
+        let typed = json!({ "type": "object", "additionalProperties": { "type": "string" } });
+        accepts(typed.clone(), json!({ "a": "x" }));
+        rejects("additionalProperties subschema", typed, json!({ "a": 1 }));
+    }
+
+    #[test]
+    fn items_and_min_items_are_enforced() {
+        let schema = json!({ "type": "array", "minItems": 1, "items": { "type": "string" } });
+        accepts(schema.clone(), json!(["x"]));
+        rejects("minItems", schema.clone(), json!([]));
+        rejects("items", schema, json!(["x", 2]));
+    }
+
+    #[test]
+    fn minimum_and_maximum_are_enforced() {
+        let schema = json!({ "type": "number", "minimum": 0.0, "maximum": 1.0 });
+        accepts(schema.clone(), json!(0.5));
+        rejects("minimum", schema.clone(), json!(-0.1));
+        rejects("maximum", schema, json!(1.1));
+    }
+
+    #[test]
+    fn the_two_formats_that_say_something_type_does_not_are_enforced() {
+        let ip = json!({ "type": "string", "format": "ip" });
+        accepts(ip.clone(), json!("10.0.0.1"));
+        accepts(ip.clone(), json!("2001:db8::1"));
+        rejects("format: ip", ip, json!("10.0.0.256"));
+
+        let when = json!({ "type": "string", "format": "date-time" });
+        accepts(when.clone(), json!("2026-08-04T12:00:00.000Z"));
+        rejects("format: date-time", when, json!("yesterday"));
+
+        // And the documented limit of the date-time check, asserted rather
+        // than left as prose: it is a shape, not a calendar.
+        assert!(
+            is_rfc3339_shaped("2026-02-31T00:00:00.000Z"),
+            "the NOT CHECKED list says calendar validity is not checked; if that \
+             stops being true the list is what should change"
+        );
+    }
+
+    #[test]
+    fn a_boolean_schema_means_what_it_says() {
+        accepts(json!(true), json!({ "anything": 1 }));
+        rejects("false schema", json!(false), json!(null));
     }
 }
 
