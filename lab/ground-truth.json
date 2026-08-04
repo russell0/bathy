@@ -1,0 +1,84 @@
+{
+  "subnet": "10.30.0.0/24",
+
+  "derivation": {
+    "method": "lab/verify-ground-truth.py, run from inside labnet via `lab/run.sh verify`. Python standard-library sockets only: it shares no code, no port table and no fingerprint data with bathy, and it consults neither Nmap nor any of its data files. Every `product`/`version` below is transcribed from a banner that script read; `lab/README.md` quotes them.",
+    "swept_ports": "1-65535 TCP on every address listed here, including the absent ones",
+    "observed_at": "2026-08-04T15:55Z"
+  },
+
+  "scanned_ports": [22, 25, 53, 80, 443, 587, 853, 2222, 3306, 5432, 6379, 8080, 33060],
+
+  "hosts": [
+    {
+      "ip": "10.30.0.10", "up": true, "service": "web-nginx",
+      "open": [
+        { "port": 80, "service": "http", "product": "nginx", "version": "1.29.8",
+          "evidence": "HTTP/1.1 200 OK ... Server: nginx/1.29.8" }
+      ]
+    },
+    {
+      "ip": "10.30.0.11", "up": true, "service": "ssh-openssh",
+      "open": [
+        { "port": 2222, "service": "ssh", "product": "OpenSSH", "version": "10.3",
+          "evidence": "SSH-2.0-OpenSSH_10.3" }
+      ]
+    },
+    {
+      "ip": "10.30.0.12", "up": true, "service": "db-postgres",
+      "open": [
+        { "port": 5432, "service": "postgresql", "product": null, "version": null,
+          "evidence": "accepts a connection and volunteers no bytes; PostgreSQL speaks only when spoken to, so the lab establishes that something is listening here and does not establish a product name" }
+      ]
+    },
+    {
+      "ip": "10.30.0.13", "up": true, "service": "db-mysql",
+      "open": [
+        { "port": 3306, "service": "mysql", "product": "MySQL", "version": "9.4.0",
+          "evidence": "\\x49\\x00\\x00\\x00\\x0a 9.4.0 \\x00 ... caching_sha2_password (protocol 10 handshake)" },
+        { "port": 33060, "service": "mysqlx", "product": null, "version": null,
+          "evidence": "\\x05\\x00\\x00\\x00\\x0b\\x08\\x05\\x1a\\x00 -- the X Protocol port the mysql image also opens. Recorded because it is open, not because bathy identifies it: an oracle that omitted it would turn a correct finding into a false positive." }
+      ]
+    },
+    {
+      "ip": "10.30.0.14", "up": true, "service": "cache-redis",
+      "open": [
+        { "port": 6379, "service": "redis", "product": null, "version": null,
+          "evidence": "accepts a connection and volunteers no bytes; RESP is request-response, so the lab establishes a listener and not a product name" }
+      ]
+    },
+    {
+      "ip": "10.30.0.15", "up": true, "service": "mail-postfix",
+      "open": [
+        { "port": 25, "service": "smtp", "product": "Postfix", "version": null,
+          "evidence": "220 mail.lab.invalid ESMTP Postfix (Debian/GNU)" },
+        { "port": 587, "service": "smtp", "product": "Postfix", "version": null,
+          "evidence": "220 mail.lab.invalid ESMTP Postfix (Debian/GNU) -- the submission port the boky/postfix image also opens" }
+      ]
+    },
+    {
+      "ip": "10.30.0.16", "up": true, "service": "dns-bind",
+      "open": [
+        { "port": 53, "service": "dns", "product": null, "version": null,
+          "evidence": "accepts a connection and volunteers no bytes; DNS over TCP is request-response. This image's default configuration does not answer version.bind CHAOS TXT, so the lab does not establish a product name here." },
+        { "port": 443, "service": "dns-over-https", "product": null, "version": null,
+          "evidence": "open; the bind9 image enables DoH by default. Recorded because it is open." },
+        { "port": 853, "service": "dns-over-tls", "product": null, "version": null,
+          "evidence": "open; the bind9 image enables DoT by default. Recorded because it is open." }
+      ]
+    },
+    {
+      "ip": "10.30.0.17", "up": true, "service": "tls-web",
+      "open": [
+        { "port": 443, "service": "tls", "product": null, "version": null,
+          "evidence": "a plaintext GET on this port returns `HTTP/1.1 400 Bad Request ... The plain HTTP request was sent to HTTPS port`, which establishes a TLS listener. The product behind the TLS layer is not established by a plaintext probe, so it is not claimed here." }
+      ]
+    },
+    {
+      "ip": "10.30.0.18", "up": true, "service": "silent",
+      "open": []
+    }
+  ],
+
+  "absent": ["10.30.0.200", "10.30.0.201"]
+}

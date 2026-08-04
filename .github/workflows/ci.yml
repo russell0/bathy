@@ -72,6 +72,26 @@ jobs:
       # `stable` twice) and prints the exact `cargo +<toolchain> check` lines,
       # so the local invocation is derived rather than remembered.
       - run: cargo run -p xtask -- check-msrv
+      # AC-7.1, and the rule the M7 plan states in prose and nothing enforced.
+      #
+      # The integration lab is the oracle every downstream claim rests on --
+      # M6's SYN/connect cross-validation, M7's benchmarks against other
+      # scanners, and the reproducibility claim -- and it is an oracle only
+      # because we know exactly what listens where. A bare tag in
+      # `lab/docker-compose.yml` breaks that silently: the image moves, the
+      # banners `bathy-interpret`'s rules are tested against change, and
+      # nothing goes red. `check-lab` also holds `lab/ground-truth.json` to the
+      # address plan the compose file actually assigns, because a WRONG ground
+      # truth is worse than no lab at all -- it makes every future disagreement
+      # look like our bug, or makes a real bug look like agreement.
+      #
+      # It reads text rather than talking to a daemon, so it runs here whether
+      # or not this runner has Docker. The conformance suite itself (AC-7.2 to
+      # AC-7.6) cannot: those tests are `#[ignore]`d, so `cargo test
+      # --workspace` above lists them as ignored rather than pretending to
+      # have run them, and `lab/run.sh test` is what runs them with
+      # `BATHY_LAB_REQUIRED` set so an absent lab fails instead of skipping.
+      - run: cargo run -p xtask -- check-lab
       # The gate on the gates: every `run:` step in this file must be either a
       # `cargo run -p xtask -- <subcommand>` that exists or one of a small
       # named set of cargo built-ins. Closing five inline gates is not closing

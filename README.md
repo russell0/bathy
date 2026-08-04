@@ -44,7 +44,7 @@ over MCP.
 > What does not exist yet: privileged SYN/ICMP scanning and a packet daemon
 > (Milestone 6), and the verification suite (Milestone 7).
 >
-> Plans for all seven milestones — 212 numbered acceptance criteria — are in
+> Plans for all seven milestones — 213 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
 
 ## What works today

@@ -995,6 +995,256 @@ pub fn check_ci(subcommands: &[&str]) -> Fallible<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AC-7.1 — the integration lab is pinned, and its ground truth describes it.
+// ---------------------------------------------------------------------------
+
+pub const LAB_COMPOSE: &str = "lab/docker-compose.yml";
+pub const LAB_GROUND_TRUTH: &str = "lab/ground-truth.json";
+
+/// Every `image:` reference in a compose file, with its 1-based line number.
+///
+/// Text, not YAML: this check has to run on a machine with no Docker and no
+/// YAML crate in `xtask`'s tree, and the shape it cares about ("the token
+/// after `image:`") survives any formatting the file could take.
+pub fn image_references(compose: &str) -> Vec<(usize, String)> {
+    compose
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim_start().trim_start_matches("- ");
+            let rest = trimmed.strip_prefix("image:")?;
+            let reference = rest.trim();
+            (!reference.is_empty()).then(|| (index + 1, reference.to_string()))
+        })
+        .collect()
+}
+
+/// Whether `reference` names an image by content digest rather than by tag.
+///
+/// A digest is `sha256:` followed by exactly 64 lowercase hex characters.
+/// Uppercase is rejected rather than normalised: `docker` renders digests
+/// lowercase, so an uppercase one is a hand-edit, and a hand-edited digest is
+/// the thing this check exists to notice.
+pub fn is_digest_pinned(reference: &str) -> bool {
+    let Some((name, digest)) = reference.split_once('@') else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Every static address `labnet` assigns, with its 1-based line number.
+fn assigned_addresses(compose: &str) -> Vec<(usize, String)> {
+    compose
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let rest = line.trim_start().strip_prefix("ipv4_address:")?;
+            let address = rest.trim();
+            (!address.is_empty()).then(|| (index + 1, address.to_string()))
+        })
+        .collect()
+}
+
+/// What is wrong with the lab, as text a person can act on.
+///
+/// Two families of finding, and they are here together because they fail the
+/// same way. AC-7.1 is the pinning rule: a moving tag silently changes the
+/// banners `bathy-interpret`'s rules are tested against. The rest is the rule
+/// the milestone plan states in prose and nothing enforced — **a wrong
+/// ground-truth file is worse than no lab at all**, because it makes every
+/// future disagreement look like our bug, or makes a real bug look like
+/// agreement. A service added to the compose file and not to the ground truth
+/// produces exactly that, and produces it silently.
+///
+/// Both texts are parameters so the tests can feed seeded violations rather
+/// than mutating the repository.
+pub fn lab_violations(
+    compose_path: &str,
+    compose: &str,
+    truth_path: &str,
+    truth: &serde_json::Value,
+) -> Vec<String> {
+    let mut found = Vec::new();
+
+    // --- AC-7.1: every image pinned by digest. ---
+    let images = image_references(compose);
+    for (number, reference) in &images {
+        if !is_digest_pinned(reference) {
+            found.push(format!(
+                "{compose_path}:{number}: `{reference}` is not pinned by digest. Use \
+                 `<name>@sha256:<64 lowercase hex>`: a tag moves, and when it moves it \
+                 changes the banners the interpretation rules are tested against, so \
+                 the lab stops being an oracle without anything going red. \
+                 `docker image inspect <name>:<tag> --format '{{{{index .RepoDigests 0}}}}'` \
+                 prints the multi-architecture digest to paste here."
+            ));
+        }
+    }
+    if images.is_empty() {
+        found.push(format!(
+            "{compose_path}: no `image:` line was found, so the pinning check ranged \
+             over nothing"
+        ));
+    }
+
+    // --- The ground truth describes this lab and not some other one. ---
+    let assigned: std::collections::BTreeSet<String> = assigned_addresses(compose)
+        .into_iter()
+        .map(|(_, a)| a)
+        .collect();
+    if assigned.is_empty() {
+        found.push(format!(
+            "{compose_path}: no `ipv4_address:` line was found, so the ground-truth \
+             cross-check ranged over nothing"
+        ));
+    }
+
+    let hosts = truth.get("hosts").and_then(|h| h.as_array());
+    let Some(hosts) = hosts else {
+        found.push(format!("{truth_path}: no `hosts` array"));
+        return found;
+    };
+    let described: std::collections::BTreeSet<String> = hosts
+        .iter()
+        .filter_map(|h| h.get("ip").and_then(|i| i.as_str()).map(str::to_string))
+        .collect();
+
+    for address in assigned.difference(&described) {
+        found.push(format!(
+            "{compose_path}: `labnet` assigns {address} but {truth_path} does not \
+             describe it. A host the oracle does not account for is a false positive \
+             waiting to be blamed on the scanner."
+        ));
+    }
+    for address in described.difference(&assigned) {
+        found.push(format!(
+            "{truth_path}: describes {address}, which `labnet` assigns to nothing in \
+             {compose_path}. The oracle is describing a lab that is not this one."
+        ));
+    }
+
+    let absent: Vec<&str> = truth
+        .get("absent")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if absent.is_empty() {
+        found.push(format!(
+            "{truth_path}: no `absent` address. AC-7.4 has nothing to assert over, so \
+             a scanner that reported every address in the subnet as live would pass."
+        ));
+    }
+    for address in &absent {
+        if assigned.contains(*address) {
+            found.push(format!(
+                "{truth_path}: {address} is listed as absent but {compose_path} assigns \
+                 it to a container."
+            ));
+        }
+    }
+
+    // --- The narrowing controls, per the overview's fixture constraint. ---
+    //
+    // "A fixture that satisfies every branch tests none of them." A ground
+    // truth in which every host has an open port gives AC-7.3 nothing to
+    // catch; one whose scanned port set contains no port that is closed on a
+    // live host gives it nothing either -- a scanner that reported every port
+    // it touched as open would satisfy both.
+    let scanned: Vec<u64> = truth
+        .get("scanned_ports")
+        .and_then(|p| p.as_array())
+        .map(|a| a.iter().filter_map(serde_json::Value::as_u64).collect())
+        .unwrap_or_default();
+    if scanned.is_empty() {
+        found.push(format!(
+            "{truth_path}: no `scanned_ports`. Zero false positives is a claim about a \
+             stated port set; without one it claims nothing."
+        ));
+    }
+
+    let open_of = |host: &serde_json::Value| -> Vec<u64> {
+        host.get("open")
+            .and_then(|o| o.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.get("port").and_then(serde_json::Value::as_u64))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    if !hosts.iter().any(|h| open_of(h).is_empty()) {
+        found.push(format!(
+            "{truth_path}: every described host has an open port, so a scanner that \
+             never reported a host as closed would still pass. The lab needs a live \
+             host that answers nothing."
+        ));
+    }
+    if !hosts.iter().any(|h| !open_of(h).is_empty()) {
+        found.push(format!(
+            "{truth_path}: no described host has an open port, so AC-7.2 ranges over \
+             nothing."
+        ));
+    }
+    if !hosts
+        .iter()
+        .any(|h| scanned.iter().any(|p| !open_of(h).contains(p)))
+    {
+        found.push(format!(
+            "{truth_path}: every scanned port is open on every host, so a scanner that \
+             reported everything it touched as open would pass AC-7.3. The scanned set \
+             needs a port that is closed on a host that is up."
+        ));
+    }
+    for host in hosts {
+        let ip = host.get("ip").and_then(|i| i.as_str()).unwrap_or("?");
+        for port in open_of(host) {
+            if !scanned.contains(&port) {
+                found.push(format!(
+                    "{truth_path}: {ip}:{port} is recorded open but is not in \
+                     `scanned_ports`, so AC-7.2 never looks for it."
+                ));
+            }
+        }
+    }
+
+    found
+}
+
+pub fn check_lab() -> Fallible<()> {
+    let compose = std::fs::read_to_string(Path::new(".").join(LAB_COMPOSE))
+        .map_err(|e| format!("reading {LAB_COMPOSE}: {e}"))?;
+    let truth_text = std::fs::read_to_string(Path::new(".").join(LAB_GROUND_TRUTH))
+        .map_err(|e| format!("reading {LAB_GROUND_TRUTH}: {e}"))?;
+    let truth: serde_json::Value = serde_json::from_str(&truth_text)
+        .map_err(|e| format!("parsing {LAB_GROUND_TRUTH}: {e}"))?;
+    let violations = lab_violations(LAB_COMPOSE, &compose, LAB_GROUND_TRUTH, &truth);
+    if violations.is_empty() {
+        let images = image_references(&compose).len();
+        let addresses = assigned_addresses(&compose).len();
+        println!(
+            "check-lab: ok ({images} image(s), all digest-pinned; {addresses} lab \
+             address(es) accounted for by {LAB_GROUND_TRUTH})"
+        );
+        Ok(())
+    } else {
+        for v in &violations {
+            eprintln!("check-lab: {v}");
+        }
+        Err(format!("{} lab violation(s) (AC-7.1)", violations.len()).into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1432,5 +1682,195 @@ jobs:
         let v = ci_steps_without_a_local_form("ci.yml", "jobs:\n  a:\n    steps: []\n", SUBS);
         assert_eq!(v.len(), 1, "{v:#?}");
         assert!(v[0].contains("ranged over nothing"), "{v:#?}");
+    }
+
+    // --- check-lab (AC-7.1). ---
+
+    const PIN_A: &str = "sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de";
+    const PIN_B: &str = "sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce";
+
+    /// A compose file and a ground truth that agree, so each test below can
+    /// break exactly one thing and see exactly one violation.
+    fn lab_fixture() -> (String, serde_json::Value) {
+        let compose = format!(
+            "services:\n  \
+             web:\n    image: nginx@{PIN_A}\n    networks:\n      labnet:\n        \
+             ipv4_address: 10.30.0.10\n  \
+             quiet:\n    image: alpine@{PIN_B}\n    networks:\n      labnet:\n        \
+             ipv4_address: 10.30.0.18\n"
+        );
+        let truth = serde_json::json!({
+            "scanned_ports": [22, 80],
+            "hosts": [
+                { "ip": "10.30.0.10", "open": [{ "port": 80 }] },
+                { "ip": "10.30.0.18", "open": [] },
+            ],
+            "absent": ["10.30.0.200"],
+        });
+        (compose, truth)
+    }
+
+    fn lab(compose: &str, truth: &serde_json::Value) -> Vec<String> {
+        lab_violations(
+            "lab/docker-compose.yml",
+            compose,
+            "lab/ground-truth.json",
+            truth,
+        )
+    }
+
+    #[test]
+    fn the_fixture_this_checks_seeded_violations_against_is_itself_clean() {
+        // Without this, every test below could be passing for the wrong
+        // reason: a fixture that already violates something reports a
+        // violation no matter what is done to it.
+        let (compose, truth) = lab_fixture();
+        assert!(
+            lab(&compose, &truth).is_empty(),
+            "{:#?}",
+            lab(&compose, &truth)
+        );
+    }
+
+    #[test]
+    fn an_image_pinned_only_by_tag_is_caught_and_its_line_named() {
+        let (compose, truth) = lab_fixture();
+        let tagged = compose.replace(&format!("nginx@{PIN_A}"), "nginx:1.29-alpine");
+        let v = lab(&tagged, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("lab/docker-compose.yml:3"), "{v:#?}");
+        assert!(v[0].contains("nginx:1.29-alpine"), "{v:#?}");
+        assert!(v[0].contains("not pinned by digest"), "{v:#?}");
+    }
+
+    #[test]
+    fn a_digest_that_is_the_wrong_length_or_the_wrong_alphabet_is_not_a_pin() {
+        assert!(is_digest_pinned(&format!("nginx@{PIN_A}")));
+        assert!(
+            !is_digest_pinned("nginx@sha256:5616878291a2eed5"),
+            "too short"
+        );
+        assert!(
+            !is_digest_pinned(&format!("nginx@{}", PIN_A.to_uppercase())),
+            "uppercase hex is a hand-edit, and a hand-edited digest is what this catches"
+        );
+        assert!(
+            !is_digest_pinned(&format!("nginx@md5:{}", &PIN_A[7..])),
+            "wrong algorithm"
+        );
+        assert!(!is_digest_pinned(&format!("@{PIN_A}")), "no image name");
+        assert!(!is_digest_pinned("nginx:latest"), "a tag is not a pin");
+        assert!(
+            !is_digest_pinned(&format!("nginx@sha256:{}g", &PIN_A[7..70])),
+            "`g` is not hex"
+        );
+    }
+
+    #[test]
+    fn a_compose_file_with_no_images_fails_rather_than_passing_over_nothing() {
+        let (_, truth) = lab_fixture();
+        let v = lab("services: {}\n", &truth);
+        assert!(
+            v.iter().any(|m| m.contains("no `image:` line")),
+            "an empty compose file must not read as `every image is pinned`: {v:#?}"
+        );
+    }
+
+    #[test]
+    fn a_service_added_to_the_lab_and_not_to_the_ground_truth_is_caught() {
+        let (compose, truth) = lab_fixture();
+        let extended = format!(
+            "{compose}  new:\n    image: redis@{PIN_B}\n    networks:\n      labnet:\n        \
+             ipv4_address: 10.30.0.14\n"
+        );
+        let v = lab(&extended, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("10.30.0.14"), "{v:#?}");
+        assert!(v[0].contains("does not describe it"), "{v:#?}");
+    }
+
+    #[test]
+    fn a_ground_truth_describing_a_host_the_lab_does_not_run_is_caught() {
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({ "ip": "10.30.0.99", "open": [{ "port": 80 }] }));
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("10.30.0.99"), "{v:#?}");
+        assert!(v[0].contains("not this one"), "{v:#?}");
+    }
+
+    #[test]
+    fn an_absent_address_that_a_container_actually_occupies_is_caught() {
+        let (compose, mut truth) = lab_fixture();
+        truth["absent"] = serde_json::json!(["10.30.0.10"]);
+        let v = lab(&compose, &truth);
+        assert!(v.iter().any(|m| m.contains("listed as absent")), "{v:#?}");
+    }
+
+    #[test]
+    fn a_ground_truth_with_no_absent_address_leaves_ac_7_4_with_nothing_to_assert() {
+        let (compose, mut truth) = lab_fixture();
+        truth["absent"] = serde_json::json!([]);
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("AC-7.4"), "{v:#?}");
+    }
+
+    #[test]
+    fn a_lab_where_every_host_has_an_open_port_gives_ac_7_3_nothing_to_catch() {
+        // The overview's fixture constraint, over the oracle itself: remove
+        // the one live host that answers nothing and a scanner that never
+        // reported a closed host would still pass.
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"][1]["open"] = serde_json::json!([{ "port": 80 }]);
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("answers nothing"), "{v:#?}");
+    }
+
+    #[test]
+    fn a_scanned_port_set_with_no_shut_port_gives_ac_7_3_nothing_to_catch_either() {
+        let (compose, mut truth) = lab_fixture();
+        // Every scanned port open on every host: port 80 only, open on both.
+        truth["scanned_ports"] = serde_json::json!([80]);
+        truth["hosts"][1]["open"] = serde_json::json!([{ "port": 80 }]);
+        let v = lab(&compose, &truth);
+        assert!(
+            v.iter()
+                .any(|m| m.contains("needs a port that is closed on a host that is up")),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
+    fn an_open_port_that_the_conformance_scan_never_touches_is_caught() {
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"][0]["open"] = serde_json::json!([{ "port": 8443 }]);
+        let v = lab(&compose, &truth);
+        assert!(
+            v.iter().any(|m| m.contains("8443") && m.contains("AC-7.2")),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
+    fn this_repositorys_own_lab_is_pinned_and_matches_its_ground_truth() {
+        // The repository itself, not a fixture: `check-lab` passing over a
+        // synthetic compose file says nothing about `lab/docker-compose.yml`.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let compose = std::fs::read_to_string(root.join(LAB_COMPOSE)).unwrap();
+        let truth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(LAB_GROUND_TRUTH)).unwrap())
+                .unwrap();
+        let v = lab_violations(LAB_COMPOSE, &compose, LAB_GROUND_TRUTH, &truth);
+        assert!(v.is_empty(), "{v:#?}");
+        assert!(
+            image_references(&compose).len() >= 8,
+            "the lab is supposed to cover eight protocols; only {} image(s) found",
+            image_references(&compose).len()
+        );
     }
 }

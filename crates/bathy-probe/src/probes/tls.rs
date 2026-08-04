@@ -380,20 +380,44 @@ mod tests {
         assert!(matches!(r, Err(ProbeError::EmptyResponse)));
     }
 
-    // --- Beyond the brief: a real, ignored, Docker-gated integration test ---
+    // --- A real TLS server, from the integration lab ---
     //
-    // Not run by `cargo test` (requires Docker + the locally generated
-    // self-signed cert set up for this task; see this task's report for
-    // the exact commands). Run manually with:
-    //   cargo test -p bathy-probe --features "" -- --ignored tls_probe_against_a_real_nginx_tls_1_3_server
-    // after starting the container described in this task's report.
+    // This test used to dial `127.0.0.1:18543` and depend on a container whose
+    // only description was a paragraph in an M4 task report: an unversioned
+    // image, a locally generated certificate, and a port nothing else in the
+    // repository knew about. It was therefore un-runnable by anyone who did
+    // not have that report open, which is the same defect class as a gate that
+    // lives only in `ci.yml`.
+    //
+    // It now targets the lab's `tls-web` service (M7 Task 1), which is a
+    // digest-pinned nginx with a certificate the lab generates at `up` time.
+    // `lab/run.sh test` runs it along with the rest of the `--ignored` suite,
+    // and `BATHY_LAB_REQUIRED` makes an unreachable lab a failure there rather
+    // than a skip -- so this stopped being a test only its author could run.
+    //
+    // The address is written out rather than read from `lab/ground-truth.json`
+    // because this crate's dependency set is `bathy-types` and nothing else,
+    // which is what keeps it in CI's 1.88 MSRV tier. `xtask check-lab` is what
+    // holds the compose file and the ground truth to the same address plan.
+    const LAB_TLS_WEB: &str = "10.30.0.17:443";
+
     #[tokio::test]
-    #[ignore = "requires a local Docker nginx TLS 1.3 container; see task report"]
-    async fn tls_probe_against_a_real_nginx_tls_1_3_server() {
-        let stream = tokio::net::TcpStream::connect("127.0.0.1:18543")
-            .await
-            .expect("start the nginx-tls container from this task's report first");
-        let mut io = ProbeIo::new(stream, 18543, std::time::Duration::from_secs(3));
+    #[ignore = "requires the lab; run with `lab/run.sh test`"]
+    async fn tls_probe_against_a_real_nginx_tls_server() {
+        let connect = tokio::net::TcpStream::connect(LAB_TLS_WEB).await;
+        let stream = match connect {
+            Ok(stream) => stream,
+            Err(e) if std::env::var_os("BATHY_LAB_REQUIRED").is_some() => {
+                panic!("BATHY_LAB_REQUIRED is set, so this is a failure: {LAB_TLS_WEB}: {e}")
+            }
+            Err(e) => {
+                eprintln!(
+                    "skipping: the lab is not reachable at {LAB_TLS_WEB} ({e}). See lab/README.md."
+                );
+                return;
+            }
+        };
+        let mut io = ProbeIo::new(stream, 443, std::time::Duration::from_secs(3));
         let cap = TlsProbe.execute(&mut io).await.unwrap();
         assert_eq!(cap.response[0], 0x16, "handshake record");
         assert_eq!(cap.response[5], 0x02, "ServerHello");

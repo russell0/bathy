@@ -1,0 +1,159 @@
+# The deterministic integration lab (M7 Task 1).
+#
+# This file is the oracle the scanner is verified against. Its value comes
+# entirely from knowing exactly what listens where, so two rules bind it:
+#
+#   1. Every image is pinned by `sha256:` digest, never by a tag. A tag that
+#      moves silently changes the banners `bathy-interpret`'s rules are tested
+#      against, which turns a green suite red -- or, far worse, a red one green
+#      -- for reasons that have nothing to do with our code. `xtask check-lab`
+#      fails on any bare tag in this file, and runs in CI where there is no
+#      Docker, because it reads text rather than talking to a daemon.
+#
+#      Each digest below is the **multi-architecture index** digest, which is
+#      what `docker pull <ref>:<tag>` records in `RepoDigests`. Pinning the
+#      per-architecture manifest instead would make the lab arm64-only (this
+#      was developed on an M1) or amd64-only (CI). How each was obtained is
+#      recorded in `lab/README.md` alongside the tag it came from, so a
+#      reviewer can re-derive them.
+#
+#   2. Nothing in this tree may hold a private key. The TLS service below
+#      needs one, so `tls-init` generates a throwaway self-signed key inside
+#      a Docker volume at `up` time. The key never touches the repository, so
+#      `xtask publish-check`'s `BEGIN ... PRIVATE KEY` patterns stay honest.
+#      `boky/postfix` is used for that job only because it is the one image
+#      already pinned here that ships an `openssl` binary -- adding a tenth
+#      image to run one command would be a tenth digest to keep current.
+#
+# The address plan, and why it is what it is. `lab/ground-truth.json` is the
+# machine-readable statement of this and is what the tests assert against;
+# this comment is here so the two can be compared by eye.
+#
+#   10.30.0.1    the bridge gateway, created by Docker, not by us
+#   10.30.0.10   web-nginx      80/tcp
+#   10.30.0.11   ssh-openssh    2222/tcp   (NOT 22 -- see lab/README.md)
+#   10.30.0.12   db-postgres    5432/tcp
+#   10.30.0.13   db-mysql       3306/tcp and 33060/tcp
+#   10.30.0.14   cache-redis    6379/tcp
+#   10.30.0.15   mail-postfix   25/tcp and 587/tcp
+#   10.30.0.16   dns-bind       53/tcp
+#   10.30.0.17   tls-web        443/tcp    (and NOT 80)
+#   10.30.0.18   silent         nothing at all
+#   10.30.0.200  no host
+#   10.30.0.201  no host
+#
+# No port is published to the host. The lab is reachable only from inside
+# `labnet`, which is deliberate: a lab that binds 3306 on a developer's
+# machine is a lab that changes that machine's exposure.
+name: bathy-lab
+
+networks:
+  labnet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 10.30.0.0/24
+          gateway: 10.30.0.1
+
+volumes:
+  labtls:
+
+services:
+  # Generates the throwaway TLS key/cert `tls-web` serves. Runs to completion
+  # before `tls-web` starts. See the header for why this image.
+  tls-init:
+    image: boky/postfix@sha256:f3f247fd42528b969e2603ac120d5a5b5db7dfe61f4505c49d438b9ba1822999
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650
+        -subj /CN=tls-web.lab.invalid
+        -keyout /tls/lab.key -out /tls/lab.crt
+        && chmod 0644 /tls/lab.key /tls/lab.crt
+    volumes:
+      - labtls:/tls
+    # Deliberately off `labnet`. It runs to completion and exits, so an
+    # address for it would be occupied while it ran and absent afterwards --
+    # and `check-lab` requires every address `labnet` assigns to be a host the
+    # ground truth accounts for. A generator is not part of the fixture.
+    network_mode: "none"
+    restart: "no"
+
+  web-nginx:
+    image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.10
+
+  ssh-openssh:
+    image: linuxserver/openssh-server@sha256:96b9a4d3b5106746d08d43a6911650d4d21f7d5c7f2ac9660e792bdb5e63157c
+    environment:
+      USER_NAME: labuser
+      # Password login stays off. Nothing in the lab authenticates; the
+      # scanner only ever reads the protocol-version banner.
+      PASSWORD_ACCESS: "false"
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.11
+
+  db-postgres:
+    image: postgres@sha256:742f40ea20b9ff2ff31db5458d127452988a2164df9e17441e191f3b72252193
+    environment:
+      POSTGRES_PASSWORD: labonly
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.12
+
+  db-mysql:
+    image: mysql@sha256:135bc87cce147c3d28cecb9ad270b814cb52805af7ddeea83bfcaf157d05a6b2
+    environment:
+      MYSQL_ROOT_PASSWORD: labonly
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.13
+
+  cache-redis:
+    image: redis@sha256:978f0e01593e65eed801f2402944efcd936d43b5027e4908a7897baf88ed6241
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.14
+
+  mail-postfix:
+    image: boky/postfix@sha256:f3f247fd42528b969e2603ac120d5a5b5db7dfe61f4505c49d438b9ba1822999
+    environment:
+      ALLOWED_SENDER_DOMAINS: lab.invalid
+      HOSTNAME: mail.lab.invalid
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.15
+
+  dns-bind:
+    image: internetsystemsconsortium/bind9@sha256:4592e51108a135cb88c223718cae9720195de74102220a51a25e227c8dd8a569
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.16
+
+  # A second nginx, serving TLS and NOT serving plaintext. Its 80/tcp being
+  # closed while `web-nginx`'s is open is one of the lab's narrowing controls:
+  # a scanner that reported every port open would fail here, not only on the
+  # absent addresses.
+  tls-web:
+    image: nginx@sha256:5616878291a2eed594aee8db4dade5878cf7edcb475e59193904b198d9b830de
+    depends_on:
+      tls-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./tls/nginx-tls.conf:/etc/nginx/conf.d/default.conf:ro
+      - labtls:/etc/nginx/tls:ro
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.17
+
+  # A host that exists and answers nothing. Distinguishes "no host here" from
+  # "a host here with no open ports", which are different findings.
+  silent:
+    image: alpine@sha256:14358309a308569c32bdc37e2e0e9694be33a9d99e68afb0f5ff33cc1f695dce
+    command: ["sleep", "infinity"]
+    networks:
+      labnet:
+        ipv4_address: 10.30.0.18

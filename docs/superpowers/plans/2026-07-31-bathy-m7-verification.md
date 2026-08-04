@@ -16,6 +16,22 @@
 
 **Files:**
 - Create: `lab/docker-compose.yml`, `lab/ground-truth.json`, `lab/README.md`, `lab/run.sh`
+- Create: `lab/scope.json`, `lab/tls/nginx-tls.conf`, `lab/verify-ground-truth.py` (see plan edits #2 and #4)
+- Create: `crates/bathy/tests/lab_conformance.rs` — the plan named no home for Step 3's tests; `crates/bathy` is the top of the layer stack and already depends on every crate a whole-lab scan touches, so it needs no Cargo change
+- Modify: `xtask/src/gates.rs`, `xtask/src/main.rs`, `.github/workflows/ci.yml` — AC-7.1 is a gate, and this project's standing rule is that a gate with no `cargo run -p xtask -- check-<something>` form is a gate that goes red and stays red
+- Modify: `crates/bathy-probe/src/probes/tls.rs` (see plan edit #5)
+
+  **Five corrections to this task, made during Task 1 and flagged as plan edits. The first two are defects in the acceptance surface itself: one AC could not fail, and the checked-in oracle was wrong.**
+
+  1. **AC-7.4's drafted test is a decoration test.** `assert!(!fold.hosts_up.contains(&ip))` cannot fail on any v0.1 tree: `Scheduler` has no call to `discover_host` (unprivileged ICMP is impossible, so host discovery ships with `packetd` in M6 — the overview's Gap Register says so), which means `ScanFold::hosts_up` is empty after *every* scan. As written the criterion passes against a scanner that reports the whole subnet live. The property that is real in v0.1: every endpoint on an address with no host must be `Filtered` — never `Open` (a service we invented) and never `Closed` (a claim that an RST arrived, which is itself evidence a host is there). The shipped test asserts that, and separately asserts `hosts_up` **is** empty, so wiring host discovery in makes it fail and demand the stronger assertion rather than silently going vacuous again. AC-7.4 is restated below.
+
+  2. **Step 2's ground truth was written by reading the compose file, and it is wrong.** Scored against it, a *correct* scanner reports four false positives: `mysql` also opens 33060 (X Protocol), `bind9` also opens 443 and 853 (DoH and DoT), and `boky/postfix` also opens 587. This is the failure the task's own architecture note warns about — a wrong oracle makes a real disagreement look like our bug — and it arrives precisely by asserting the ground truth instead of deriving it. `lab/verify-ground-truth.py` now sweeps all 65535 TCP ports on every lab address from inside `labnet`, using Python standard-library sockets only, and reads a banner from each open port so every `product`/`version` is transcribed from something observed. `lab/run.sh` gains a `verify` subcommand. **Nothing may be added to `ground-truth.json` that was not observed by a run of that sweep.**
+
+  3. **The plan assumes the host can route to the lab subnet. On macOS it cannot,** so Step 5's "Run the suite — `lab/run.sh test`. Expected: 5 passed" is not achievable on a macOS developer machine. Docker Desktop runs the daemon in a VM whose bridges never enter the Mac's routing table; measured, not assumed (a container on a user-defined bridge answers neither ping nor a TCP connect from the host, and loopback aliasing is not a workaround because binding `127.0.0.2` needs root). This is consistent with the overview's "Linux first, macOS best-effort", and the consequence is that the *skip* behaviour is part of the deliverable rather than a nicety: see the restated AC-7.6 note and `lab/README.md`.
+
+  4. **Step 1's `tls-web` cannot start.** It mounts `./tls` as `conf.d` with no certificate anywhere in the tree and no step that creates one. Committing a key is not an option — Task 6's own publish gate greps for `BEGIN … PRIVATE KEY`. A `tls-init` service now generates a throwaway self-signed key into a Docker volume at `up` time, using the one already-pinned image that ships `openssl`; `lab/run.sh down` passes `-v` so the key does not outlive the lab.
+
+  5. **`cargo test --workspace -- --ignored`, which Step 4's `run.sh` runs, was not empty.** `bathy-probe`'s `tls_probe_against_a_real_nginx_tls_1_3_server` dialled `127.0.0.1:18543` and depended on a container described only in an M4 task report — un-runnable by anyone without that report open, and it would have failed `lab/run.sh test` on every machine. It now targets the lab's `tls-web`, with the same skip-or-require semantics.
 
 - [ ] **Step 1: Write the compose file with digest-pinned images**
 
@@ -177,12 +193,15 @@ git commit -m "test(lab): digest-pinned Docker lab with checked-in ground truth"
 ```
 
 **Acceptance criteria:**
-- **AC-7.1** Every lab image is pinned by `sha256:` digest. A test greps the compose file and fails on any bare tag.
+- **AC-7.1** Every lab image is pinned by `sha256:` digest — the multi-architecture index digest, so the lab is not silently single-architecture. `cargo run -p xtask -- check-lab` reads the compose file and fails on any bare tag, on a digest of the wrong length or alphabet, and on a compose file with no `image:` line at all. It runs in CI, where there is no Docker, because it reads text. The same command holds `lab/ground-truth.json` to the address plan the compose file assigns, in both directions: **a wrong ground truth is worse than no lab.**
 - **AC-7.2** Zero false negatives against the ground truth: every known-open port is found.
-- **AC-7.3** Zero false positives: no port is reported open that the ground truth says is not.
-- **AC-7.4** Addresses with no host are reported down.
-- **AC-7.5** Service identification matches ground-truth products at confidence ≥ 0.70.
-- **AC-7.6** Two consecutive scans of the static lab produce a diff containing no substantive changes. This is the reproducibility claim, stated in the only form that is actually true.
+- **AC-7.3** Zero false positives: no port is reported open that the ground truth says is not. The ground truth must be *derived* by sweeping the running containers (plan edit #2), and the scanned port set must contain ports that are shut on hosts that are up — otherwise a scanner reporting everything it touched as open would pass. `check-lab` fails if that narrowing control is removed.
+- **AC-7.4** Addresses with no host are never reported `Open` or `Closed`; every endpoint on one is `Filtered`. *Restated — see plan edit #1.* "Reported down" is not assertable in v0.1: `hosts_up` is empty after every scan because host discovery ships with `packetd` in M6, so the original wording named a test that could not fail.
+- **AC-7.5** Service identification matches ground-truth products *and versions* at confidence ≥ 0.70, over every port whose ground-truth entry names a product. `product: null` in the ground truth means the lab does not establish one (the service volunteers nothing that names it), not that identification failed.
+- **AC-7.6** Two consecutive scans of the static lab produce a diff containing no substantive changes. This is the reproducibility claim, stated in the only form that is actually true. The diff must first be shown *comparable* (`absence_was_evidence()`), or an empty change list means nothing.
+- **AC-7.32** The suite has an honest answer everywhere it cannot run. `cargo test --workspace` lists the five conformance tests as **ignored** — not omitted, not passed — and runs the fixture guards that need no container. Run with `--ignored` against an unreachable lab, each test writes the reason and how to fix it straight to the process's stderr (bypassing libtest's capture, which discards output from a passing test) and returns. `lab/run.sh test` sets `BATHY_LAB_REQUIRED`, which turns that skip into a failure, so the one command whose purpose is to test the lab cannot pass without one.
+
+  *Added during Task 1: the original criteria said nothing about the no-Docker case, and "silently passes on the CI runner" is the failure mode that leaves.* Numbered **7.32**, after this milestone's last published criterion, rather than 7.7 — the ACs are an audit surface that reports already cite by number, and renumbering six tasks' worth of identifiers to insert one is a worse defect than a non-contiguous list.
 
 ---
 
