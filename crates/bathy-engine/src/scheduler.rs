@@ -9,10 +9,25 @@
 //!    unit's probe, never after. A refused reservation ends the scan; it
 //!    never emits "just one more" packet -- see the cancellable-wait/reserve
 //!    ordering in the dispatch loop below for exactly where this happens.
-//! 2. **Cancellation drains in-flight work rather than dropping it.** Once a
-//!    unit has been dispatched (its budget already spent), its result is
-//!    always recorded, even after `cancel` fires -- see the unconditional
-//!    drain loop after the dispatch loop breaks.
+//! 2. **Cancellation drains in-flight work rather than dropping it -- but
+//!    "drain" means finish what was already paid for, never start
+//!    something new.** Once a unit's CONNECT probe has been dispatched
+//!    (its budget already spent), its result is always recorded, even
+//!    after `cancel` fires -- see the unconditional drain loop after the
+//!    dispatch loop breaks. M4 Task 5 fix round 1, CRITICAL-2: that same
+//!    unconditional drain loop calls `record`, which (for an `Open`
+//!    outcome) can itself start BRAND NEW probe traffic via
+//!    `detect_service` -- an earlier version of this had no way to tell
+//!    "finish draining the connect probe" apart from "begin a fresh
+//!    reconnect," so a cancellation landing while a unit's connect probe
+//!    was still in flight let `detect_service` open new sockets and write
+//!    real bytes AFTER cancellation. `cancel` is now threaded through
+//!    `record`/`detect_service` specifically so the connect probe's own
+//!    already-spent packet is still drained (invariant holds), while
+//!    `detect_service` refuses to start any NEW probe attempt once
+//!    cancelled (the invariant's own "never starts something new" half,
+//!    which nothing enforced before this fix) -- see `record`'s and
+//!    `detect_service`'s own doc comments.
 //! 3. **Resumption never re-probes and never skips.** `from_index` alone is
 //!    not sufficient once probes complete out of order under concurrency: a
 //!    previous (interrupted) run can have completed a unit *above* the
@@ -734,7 +749,7 @@ impl Scheduler {
                 });
 
                 while let Some(done) = in_flight.try_join_next() {
-                    self.record(done?, &mut summary, &mut completed_batch)
+                    self.record(done?, &mut summary, &mut completed_batch, &cancel)
                         .await?;
                 }
                 if completed_batch.len() >= STORE_FLUSH_BATCH {
@@ -749,12 +764,24 @@ impl Scheduler {
             }
 
             // Invariant 2: drain, never drop, work already in flight. These
-            // probes were already paid for out of the budget (reserved
-            // before spawn, above), and their results are real observations
-            // -- this loop runs unconditionally, regardless of which branch
-            // above broke the dispatch loop.
+            // CONNECT probes were already paid for out of the budget
+            // (reserved before spawn, above), and their results are real
+            // observations -- this loop runs unconditionally, regardless of
+            // which branch above broke the dispatch loop.
+            //
+            // M4 Task 5 fix round 1, CRITICAL-2: draining the connect
+            // probe's own already-in-flight result is still correct even
+            // after cancellation -- that packet is already on the wire, and
+            // recording its outcome costs nothing further. What is NOT
+            // still correct is `record` treating that as license to start
+            // BRAND NEW probe traffic for it (`detect_service`'s own
+            // reconnects) -- `cancel` is passed through here specifically
+            // so `record`/`detect_service` can tell "finish what was
+            // already paid for" apart from "begin something new," which a
+            // bare `&self` call could not distinguish. See `record`'s own
+            // doc comment.
             while let Some(done) = in_flight.join_next().await {
-                self.record(done?, &mut summary, &mut completed_batch)
+                self.record(done?, &mut summary, &mut completed_batch, &cancel)
                     .await?;
             }
             self.flush_progress(
@@ -892,11 +919,29 @@ impl Scheduler {
     /// that identification for one endpoint blocks the dispatch loop from
     /// advancing to the next unit while it runs -- accepted for this task;
     /// see this task's report.
+    /// M4 Task 5 fix round 1, CRITICAL-2: `cancel` is now threaded through
+    /// from `run` (both call sites below pass their own `cancel`), and
+    /// forwarded to `detect_service`, which is what actually refuses to
+    /// start a NEW probe attempt once cancelled -- see that method's own
+    /// doc comment. This matters specifically because `record` is called,
+    /// unconditionally, from the post-`'drive` drain loop in `run`: that
+    /// loop's whole point (module doc invariant 2) is to finish
+    /// ALREADY-DISPATCHED, already-paid-for work rather than drop it, and
+    /// that is still correct for the connect probe itself -- but before
+    /// this fix, `record` had no way to tell "drain what's already paid
+    /// for" apart from "start brand new work," so a cancellation landing
+    /// while a unit's connect probe was in flight would still let
+    /// `detect_service` open a fresh reconnect and write real probe bytes
+    /// AFTER cancellation, for every unit the drain loop touched --
+    /// `cancellation_stops_new_probe_traffic_not_just_new_units` below
+    /// reproduces this with a real listener and asserts zero bytes land
+    /// post-cancel.
     async fn record(
         &self,
         done: (ScanUnit, ConnectOutcome, bool),
         summary: &mut RunSummary,
         completed_batch: &mut Vec<u64>,
+        cancel: &CancellationToken,
     ) -> Result<(), EngineError> {
         let (unit, outcome, local_failure) = done;
         let state = match outcome {
@@ -917,7 +962,7 @@ impl Scheduler {
             // called, so a disabled detection setting has no path at all to
             // the reconnect it gates, not merely an early return inside it.
             if self.service_detection.enabled
-                && let Some(finding) = self.detect_service(&unit).await?
+                && let Some(finding) = self.detect_service(&unit, cancel).await?
             {
                 self.emit_service_observed(&unit, finding)?;
             }
@@ -976,7 +1021,47 @@ impl Scheduler {
     /// below calls this method directly against a denying manifest and
     /// asserts zero real accepts on a live listener, independent of
     /// whatever the outer dispatch loop's own gate does.
-    async fn detect_service(&self, unit: &ScanUnit) -> Result<Option<ServiceFinding>, EngineError> {
+    ///
+    /// # Pacing (M4 Task 5 fix round 1, CRITICAL-1)
+    ///
+    /// Each probe attempt's own reconnect is paced by
+    /// [`RateLimiter::acquire`] -- the SAME limiter the dispatch loop's own
+    /// connect probes go through (`Scheduler::new` derives it from the
+    /// ledger, M3 whole-branch review IMPORTANT-2, precisely so there is
+    /// only ever one throttle to diverge from). Before this fix, this
+    /// method charged the budget ledger (counted) but never called
+    /// `acquire` (paced), so probe reconnects went out at whatever rate the
+    /// candidate loop could physically execute, up to `intensity` (9)
+    /// times the authorized instantaneous rate per open endpoint --
+    /// invisible to every existing pps test because those scan closed
+    /// ports, where `detect_service` never runs at all.
+    /// `maximum_packets_per_second` is not merely a throughput knob: it is
+    /// an AUTHORIZATION term `bathy_scope::policy::evaluate` checks a
+    /// request's pps against a manifest's ceiling for -- unpaced probe
+    /// traffic is unauthorized traffic, not just impolite traffic.
+    /// `probe_reconnects_are_paced_by_the_rate_limiter_not_only_counted`
+    /// below measures this directly (1 pps, an open endpoint, two required
+    /// packets) and asserts on wall-clock elapsed time, not merely on
+    /// `packets_spent`.
+    ///
+    /// # Cancellation (M4 Task 5 fix round 1, CRITICAL-2)
+    ///
+    /// Checked at the top of every loop iteration, exactly mirroring the
+    /// dispatch loop's own `cancel.is_cancelled()` check at the top of
+    /// `'drive`: once cancelled, this method starts no further probe
+    /// attempts (no budget reservation, no rate-limiter wait, no dial) --
+    /// see `record`'s own doc comment for why this is reachable even from
+    /// `run`'s unconditional post-cancellation drain loop, and
+    /// `cancellation_stops_new_probe_traffic_not_just_new_units` below for
+    /// the test. The rate-limiter wait itself is also cancellable (a
+    /// `tokio::select!`, mirroring the dispatch loop's own), so a
+    /// cancellation arriving while WAITING for a token is not delayed
+    /// behind it.
+    async fn detect_service(
+        &self,
+        unit: &ScanUnit,
+        cancel: &CancellationToken,
+    ) -> Result<Option<ServiceFinding>, EngineError> {
         if !self.manifest.allows(unit.target) {
             return Ok(None);
         }
@@ -988,6 +1073,22 @@ impl Scheduler {
         );
 
         for probe in candidates {
+            // CRITICAL-2: no new probe attempt starts once cancelled.
+            if cancel.is_cancelled() {
+                break;
+            }
+
+            // CRITICAL-1: paced, not merely counted -- cancellable so a
+            // cancellation arriving mid-wait is not delayed behind it.
+            let acquired = tokio::select! {
+                biased;
+                () = cancel.cancelled() => false,
+                () = self.limiter.acquire(1) => true,
+            };
+            if !acquired {
+                break;
+            }
+
             if self.ledger().try_spend_packets(1).is_err() {
                 break;
             }
@@ -1258,6 +1359,47 @@ mod tests {
             budgets,
             config,
             default_manifest(),
+        );
+        (h, counts)
+    }
+
+    /// Like [`harness_with_real_listeners`], but with a caller-chosen
+    /// `service_detection` instead of this module's own default -- what
+    /// `intensity_bounds_how_many_probe_candidates_are_attempted_not_a_hardcoded_value`
+    /// below needs: a real accept counter is the only way to tell "the
+    /// scheduler asked for exactly this many probe candidates" from "it
+    /// asked for some hardcoded number that happens to look similar."
+    async fn harness_with_real_listeners_and_detection(
+        n: u64,
+        budgets: Budgets,
+        config: SchedulerConfig,
+        service_detection: ServiceDetection,
+    ) -> (Harness, HashMap<u16, Arc<AtomicU64>>) {
+        let mut counts: HashMap<u16, Arc<AtomicU64>> = HashMap::new();
+        let mut ports: Vec<u16> = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let counter = Arc::new(AtomicU64::new(0));
+            counts.insert(port, Arc::clone(&counter));
+            ports.push(port);
+            tokio::spawn(async move {
+                while let Ok((s, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    drop(s);
+                }
+            });
+        }
+        let specs: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+        let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &spec_refs,
+            budgets,
+            config,
+            default_manifest(),
+            service_detection,
+            EvidenceLevel::Headers,
         );
         (h, counts)
     }
@@ -2867,6 +3009,7 @@ mod tests {
                 (unit, ConnectOutcome::Filtered, true),
                 &mut summary,
                 &mut completed_batch,
+                &CancellationToken::new(),
             )
             .await
             .unwrap();
@@ -3818,12 +3961,31 @@ mod tests {
     const NGINX_RESPONSE: &[u8] =
         b"HTTP/1.1 200 OK\r\nServer: nginx/1.26.0\r\nConnection: close\r\n\r\n<html></html>";
 
-    async fn spawn_http_stub() -> HttpStub {
+    /// [`NGINX_RESPONSE`]'s own headers, followed by a synthetic `body_len`
+    /// -byte body -- used by the evidence-cap tests below, which need a
+    /// response big enough to actually exercise `emit_service_observed`'s
+    /// own truncation at a KNOWN byte count, not merely "some bytes."
+    fn nginx_response_with_body_len(body_len: usize) -> Vec<u8> {
+        let mut v =
+            b"HTTP/1.1 200 OK\r\nServer: nginx/1.26.0\r\nConnection: close\r\n\r\n".to_vec();
+        v.extend(std::iter::repeat_n(b'A', body_len));
+        v
+    }
+
+    /// Real listener that replies with `response` to any connection that
+    /// sends at least one byte (see [`HttpStub`]'s own doc comment for why
+    /// that -- not accept order -- is what distinguishes a bare connect
+    /// probe from a real probe request). `response` is owned (`Arc`-shared
+    /// into the acceptor task), not `&'static`, so callers can build a
+    /// response at runtime (e.g. [`nginx_response_with_body_len`]) rather
+    /// than being limited to a fixed constant.
+    async fn spawn_http_stub_with_response(response: Vec<u8>) -> HttpStub {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let accepts = Arc::new(AtomicU64::new(0));
         let requests = Arc::new(AtomicU64::new(0));
         let bytes_received = Arc::new(AtomicU64::new(0));
+        let response = Arc::new(response);
         let (a, r, b) = (
             Arc::clone(&accepts),
             Arc::clone(&requests),
@@ -3833,7 +3995,7 @@ mod tests {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             while let Ok((mut sock, _)) = listener.accept().await {
                 a.fetch_add(1, Ordering::SeqCst);
-                let (r, b) = (Arc::clone(&r), Arc::clone(&b));
+                let (r, b, response) = (Arc::clone(&r), Arc::clone(&b), Arc::clone(&response));
                 tokio::spawn(async move {
                     let mut buf = [0u8; 4096];
                     let n = tokio::time::timeout(Duration::from_millis(200), sock.read(&mut buf))
@@ -3844,7 +4006,7 @@ mod tests {
                     if n > 0 {
                         b.fetch_add(n as u64, Ordering::SeqCst);
                         r.fetch_add(1, Ordering::SeqCst);
-                        let _ = sock.write_all(NGINX_RESPONSE).await;
+                        let _ = sock.write_all(&response).await;
                     }
                 });
             }
@@ -3855,6 +4017,10 @@ mod tests {
             requests,
             bytes_received,
         }
+    }
+
+    async fn spawn_http_stub() -> HttpStub {
+        spawn_http_stub_with_response(NGINX_RESPONSE.to_vec()).await
     }
 
     /// `service_detection: ServiceDetection::default()` (enabled, intensity
@@ -4103,7 +4269,11 @@ mod tests {
                 port: stub.port(),
             },
         };
-        let result = h.scheduler.detect_service(&unit).await.unwrap();
+        let result = h
+            .scheduler
+            .detect_service(&unit, &CancellationToken::new())
+            .await
+            .unwrap();
         assert!(
             result.is_none(),
             "a denied target must never be reconnected to for identification"
@@ -4115,47 +4285,22 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn an_observer_polling_concurrently_never_sees_a_dangling_evidence_ref() {
-        // The reviewer technique M3's report credits for actually catching
-        // an ordering inversion: an observer running CONCURRENTLY with the
-        // scan, not a check only after `run_to_completion` returns -- a
-        // `put` that fails must leave no event referencing it, and a
-        // same-thread "check after the fact" cannot distinguish "never
-        // raced" from "got lucky."
-        let (h, _stub) = harness_with_http_stub().await;
-        let log = Arc::clone(&h.log);
-        let evidence = Arc::clone(&h.evidence);
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop_observer = Arc::clone(&stop);
-        let mut dangling_refs_seen: Vec<String> = Vec::new();
-        let observer = tokio::spawn(async move {
-            let mut dangling = Vec::new();
-            while !stop_observer.load(Ordering::SeqCst) {
-                let events = log.lock().unwrap().read_from(0).unwrap();
-                for e in events {
-                    if let EventBody::ServiceObserved { evidence_refs, .. } = &e.body {
-                        for d in evidence_refs.iter() {
-                            if !evidence.contains(d) {
-                                dangling.push(d.to_string());
-                            }
-                        }
-                    }
-                }
-                tokio::task::yield_now().await;
-            }
-            dangling
-        });
-
-        h.run_to_completion().await.unwrap();
-        stop.store(true, Ordering::SeqCst);
-        dangling_refs_seen.extend(observer.await.unwrap());
-
-        assert!(
-            dangling_refs_seen.is_empty(),
-            "observer saw a dangling evidence ref mid-flight: {dangling_refs_seen:?}"
-        );
-    }
+    // NOTE (M4 Task 5 fix round 1, per review): this section used to include
+    // `an_observer_polling_concurrently_never_sees_a_dangling_evidence_ref`,
+    // a `tokio::spawn`ed poller running concurrently with the scan. Deleted:
+    // review measured it catching 0 of 12 real mutations (including the
+    // literal store/log-order inversion it was written for -- see mutation
+    // test 2 in this task's report) and it passed VACUOUSLY whenever
+    // detection found nothing to report, with no `checked > 0` guard to
+    // catch that. `emit_service_observed` has no `.await` between its
+    // `put_capped` and `log` calls (both synchronous), so on this
+    // codebase's `#[tokio::test]` single-threaded runtime nothing can ever
+    // actually interleave between them -- a concurrent poller can only see
+    // "neither yet" or "both already," identically for the correct order
+    // and an inverted one, as long as the store call itself does not fail.
+    // `a_failed_evidence_write_leaves_no_service_observed_event_that_would_have_cited_it`
+    // below (real permission-denied injection) is the one test in this file
+    // that actually discriminates the ordering, and it is kept.
 
     #[tokio::test]
     async fn port_state_precedes_service_observed_for_every_endpoint_and_no_evidence_ref_ever_dangles()
@@ -4297,6 +4442,399 @@ mod tests {
                 .iter()
                 .any(|e| matches!(&e.body, EventBody::PortStateObserved { .. })),
             "port.state should still have been appended before the evidence write was attempted"
+        );
+    }
+
+    // ==================================================================
+    // M4 Task 5 fix round 1 (review): CRITICAL-1 (probe reconnects bypassed
+    // the rate limiter), CRITICAL-2 (cancellation did not stop new probe
+    // traffic), and three IMPORTANTs (evidence content, evidence-level
+    // caps, and intensity were all unverified at the wiring level -- only
+    // their PRESENCE/absence was ever asserted, not their actual values).
+    // ==================================================================
+
+    /// Finds the first `service.observed` event's cited digest. Shared by
+    /// several tests below that need to read back what was actually
+    /// stored, not merely confirm an event of that shape exists.
+    fn first_service_observed_digest(events: &[Event]) -> Digest {
+        events
+            .iter()
+            .find_map(|e| match &e.body {
+                EventBody::ServiceObserved { evidence_refs, .. } => Some(*evidence_refs.first()),
+                _ => None,
+            })
+            .expect("expected at least one service.observed event")
+    }
+
+    #[tokio::test]
+    async fn probe_reconnects_are_paced_by_the_rate_limiter_not_only_counted() {
+        // CRITICAL-1. 1 pps: the connect probe consumes the `RateLimiter`'s
+        // one immediate/burst token ("the first burst is immediate" --
+        // `rate::tests`), so the SECOND real packet -- `http-get-v1`'s own
+        // successful reconnect -- can only leave once the bucket refills,
+        // ~1 real second later, IF (and only if) `detect_service` actually
+        // calls `self.limiter.acquire`. Measured on WALL-CLOCK elapsed
+        // time, not `packets_spent`: the ledger counts spend regardless of
+        // pacing, which is exactly how this defect survived every
+        // pre-existing pps test (all of which scan closed ports, where
+        // `detect_service` never runs at all).
+        let stub = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1),
+            small_config(),
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+        let started = Instant::now();
+        let summary = h.run_to_completion().await.unwrap();
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            summary.packets_spent, 2,
+            "test fixture sanity: connect + one matching probe"
+        );
+        assert_eq!(
+            stub.request_count(),
+            1,
+            "test fixture sanity: identification succeeded on the very first probe candidate"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "2 packets at 1 pps must take ~1s; took {elapsed:?} -- probe packets bypass the \
+             RateLimiter entirely"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "sanity: must not hang well past the expected ~1s, took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_stops_new_probe_traffic_not_just_new_units() {
+        // CRITICAL-2. `concurrency: 1`, `pps: 1`: unit 0's connect probe
+        // consumes the limiter's one immediate token and resolves near
+        // instantly (real loopback); the dispatch loop's very next action
+        // is to try to dispatch unit 1, which genuinely BLOCKS for ~1s
+        // waiting on the rate limiter to refill -- a wide, deterministic
+        // window in which the background task below fires `cancel` well
+        // before that wait would otherwise resolve. By the time `cancel`
+        // lands, unit 0's connect result is already sitting in `in_flight`,
+        // UNHARVESTED (nothing has called `try_join_next` again since
+        // dispatching it) -- so it is exactly the "already-dispatched,
+        // in-flight work" invariant 2 says must still be drained, when the
+        // post-`'drive` unconditional drain loop picks it up and calls
+        // `record`. Before this fix, that meant `detect_service` would
+        // still open a fresh reconnect and write real bytes to `stub_a`
+        // AFTER cancellation; after it, `detect_service`'s own
+        // `cancel.is_cancelled()` check refuses to start anything.
+        let stub_a = spawn_http_stub().await;
+        let stub_b = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub_a.port().to_string(), &stub_b.port().to_string()],
+            budgets(1_000_000, 3_600, 1),
+            SchedulerConfig {
+                concurrency: 1,
+                ..small_config()
+            },
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_after = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_after.cancel();
+        });
+
+        let summary = h.scheduler.run(&h.plan, 0, cancel).await.unwrap();
+        assert!(
+            summary.cancelled,
+            "test fixture sanity: expected a genuine cancellation, got {summary:?}"
+        );
+
+        // Give any (incorrect) post-cancel probe traffic a moment to land
+        // before asserting its absence -- polling-style generous wait, not
+        // a blind assumption that "the run already returned" means every
+        // background acceptor task has caught up.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        assert_eq!(
+            stub_a.accept_count(),
+            1,
+            "unit 0's own connect probe is real, already-paid-for work and must still be \
+             drained -- but nothing beyond it"
+        );
+        assert_eq!(
+            stub_a.bytes_received(),
+            0,
+            "detect_service must not write any probe bytes for a unit whose connect probe only \
+             completed AFTER cancellation was observed -- {} bytes were sent post-cancel",
+            stub_a.bytes_received()
+        );
+        assert_eq!(
+            stub_b.accept_count(),
+            0,
+            "test fixture sanity: unit 1 must never even be dispatched"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_bytes_are_exactly_the_bytes_that_justified_the_finding() {
+        // IMPORTANT: the strongest assertion in this file before this fix
+        // was `!bytes.is_empty()` -- mutating `evidence: capture.response`
+        // to a fixed placeholder survived all 91 tests. AC-4.20's real
+        // property is that the cited bytes JUSTIFY the finding, not merely
+        // that some non-empty blob exists under the digest.
+        let (h, _stub) = harness_with_http_stub().await;
+        h.run_to_completion().await.unwrap();
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+        let digest = first_service_observed_digest(&events);
+        let bytes = h.evidence.get(&digest).unwrap();
+        assert_eq!(
+            bytes, NGINX_RESPONSE,
+            "cited evidence must be the EXACT response bytes that justified the finding, not \
+             merely some non-empty placeholder"
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_level_headers_caps_stored_evidence_at_exactly_eight_kib() {
+        // IMPORTANT: mutating the `Headers`/`Full` cap constants to `1`
+        // survived every existing test -- a 1-byte blob is still
+        // non-empty. A response well over 8 KiB is required to actually
+        // exercise the cap, not just its presence.
+        let stub = spawn_http_stub_with_response(nginx_response_with_body_len(20_000)).await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+        h.run_to_completion().await.unwrap();
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+        let digest = first_service_observed_digest(&events);
+        let bytes = h.evidence.get(&digest).unwrap();
+        assert_eq!(
+            bytes.len(),
+            8 * 1024,
+            "EvidenceLevel::Headers must cap stored evidence at exactly 8 KiB, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn evidence_level_full_caps_stored_evidence_at_exactly_sixty_four_kib() {
+        // IMPORTANT, same shape as the Headers cap test above. Honest
+        // limit, stated rather than glossed over: `ProbeIo::DEFAULT_READ_CAP`
+        // is ALSO 64 KiB, so a response this large is already truncated to
+        // exactly 64 KiB by the probe's own read cap before
+        // `emit_service_observed` ever sees it -- this test cannot, on its
+        // own, distinguish `emit_service_observed`'s cap from
+        // `ProbeIo`'s having already done the truncating. It still pins
+        // the CONSTANT the review flagged as unverified: a mutated
+        // `Full => 1` (or any value other than 65536) still fails this
+        // assertion regardless of which layer's cap "really" produced the
+        // final length.
+        let stub = spawn_http_stub_with_response(nginx_response_with_body_len(100_000)).await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Full,
+        );
+        h.run_to_completion().await.unwrap();
+        let events = h.log.lock().unwrap().read_from(0).unwrap();
+        let digest = first_service_observed_digest(&events);
+        let bytes = h.evidence.get(&digest).unwrap();
+        assert_eq!(
+            bytes.len(),
+            64 * 1024,
+            "EvidenceLevel::Full must cap stored evidence at exactly 64 KiB, got {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn intensity_bounds_how_many_probe_candidates_are_attempted_not_a_hardcoded_value() {
+        // IMPORTANT: replacing `self.service_detection.intensity` with a
+        // hardcoded `9` survived every existing test. A plain
+        // accept-and-drop real listener (never replies to anything, so
+        // EVERY probe candidate fails with `ProbeError::EmptyResponse` and
+        // `detect_service` moves on to the next one) means the number of
+        // real accepts is EXACTLY 1 (connect) + however many candidates
+        // `select_probes` actually returned -- with `intensity: 1`, that
+        // must be exactly 2, never 9 (all 8 registered probes, which is
+        // what a value hardcoded to `9` would produce once `select_probes`
+        // clamps it to the registry's own size).
+        let (h, counts) = harness_with_real_listeners_and_detection(
+            1,
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            ServiceDetection {
+                enabled: true,
+                intensity: 1,
+            },
+        )
+        .await;
+        h.run_to_completion().await.unwrap();
+        settle_accept_counters(&counts, 2).await;
+        // Extra grace beyond `settle_accept_counters`'s own early-break:
+        // every real probe ATTEMPT already happened, synchronously, before
+        // `run_to_completion` returned (each is `.await`ed in sequence
+        // inside `detect_service`) -- what might still be lagging is only
+        // the SERVER side's own bookkeeping for the very last accept.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let total: u64 = counts.values().map(|c| c.load(Ordering::SeqCst)).sum();
+        assert_eq!(
+            total, 2,
+            "intensity: 1 must attempt exactly one probe candidate (1 connect + 1 probe \
+             reconnect), got {total} real accepts -- a hardcoded intensity would ignore the \
+             request's own authorized bound on probes-per-endpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn resuming_a_cancelled_scan_identifies_the_untouched_endpoint_without_re_probing() {
+        // Minor gap noted by review: nothing previously exercised
+        // resumption with `service_detection` enabled at all.
+        //
+        // Deliberately CANCELLATION, not budget exhaustion: `run`'s own
+        // doc comment (and `resuming_a_budget_exhausted_scan_is_a_safe_no_op`
+        // above) establish that a budget/time-exhausted scan already ended
+        // in a terminal `scan.failed` event, and calling `run` again on
+        // that same log is a safe NO-OP by design, not a resume -- a first
+        // draft of this test tried to resume a budget-exhausted run and
+        // measured exactly that (`units_completed: 0` on the "resumed"
+        // call, i.e. no-op). Cancellation is the only scenario this
+        // codebase actually resumes.
+        //
+        // Reuses `cancellation_stops_new_probe_traffic_not_just_new_units`'s
+        // own proven construction (`concurrency: 1`, `pps: 1`, cancel at
+        // 50ms): unit 0's connect resolves and lands in `in_flight`
+        // unharvested while unit 1's own dispatch attempt genuinely blocks
+        // on the rate limiter; cancelling in that window means run1's
+        // unconditional drain loop harvests unit 0 (`Open`, its connect
+        // WAS already paid for) but `detect_service` refuses to identify
+        // it (cancelled), and unit 1 is never even reached.
+        //
+        // Worth recording as an honest, structural observation (not a new
+        // defect this task's own review asked to fix): unit 0's own
+        // identification is now lost FOR GOOD, even across resume --
+        // invariant 3 ("resumption never re-probes") is unconditional on
+        // `already_done` (a unit's CONNECT having completed), which has
+        // no way to distinguish "connected and identified" from
+        // "connected, identification cancelled." A future task could
+        // track per-unit identification status separately if this gap
+        // ever needs closing; out of scope for this fix round.
+        let stub_a = spawn_http_stub().await;
+        let stub_b = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub_a.port().to_string(), &stub_b.port().to_string()],
+            budgets(1_000_000, 3_600, 1),
+            SchedulerConfig {
+                concurrency: 1,
+                ..small_config()
+            },
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_after = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_after.cancel();
+        });
+
+        let summary1 = h.scheduler.run(&h.plan, 0, cancel).await.unwrap();
+        assert!(
+            summary1.cancelled,
+            "test fixture sanity: run1 must be cancelled, got {summary1:?}"
+        );
+        // Give the stub's own acceptor task a moment to catch up before
+        // reading its counter -- see the settle note on other tests in
+        // this section.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            stub_a.accept_count(),
+            1,
+            "test fixture sanity: unit 0's connect ran (paid-for work, correctly drained)"
+        );
+        assert_eq!(
+            stub_a.request_count(),
+            0,
+            "test fixture sanity: unit 0's identification was correctly refused post-cancel"
+        );
+        assert_eq!(
+            stub_b.accept_count(),
+            0,
+            "test fixture sanity: unit 1 must never have been reached by run1"
+        );
+
+        let events1 = h.log.lock().unwrap().read_from(0).unwrap();
+        assert!(
+            !events1
+                .iter()
+                .any(|e| matches!(&e.body, EventBody::ServiceObserved { .. })),
+            "test fixture sanity: nothing identified in run1"
+        );
+
+        // Resume with a fresh, well-funded `Scheduler` over the SAME scan.
+        let from_index = h
+            .store
+            .next_pending_unit(h.scan_id, h.plan.len())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            from_index, 1,
+            "test fixture sanity: unit 0 already marked done (its CONNECT completed), even \
+             though it was never identified"
+        );
+        let scheduler2 = h.resume(small_config(), budgets(1_000_000, 3_600, 1_000_000));
+        let summary2 = scheduler2
+            .run(&h.plan, from_index, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!summary2.budget_exhausted);
+        assert!(!summary2.cancelled);
+
+        let events2 = h.log.lock().unwrap().read_from(0).unwrap();
+        let service_observed_2 = events2
+            .iter()
+            .filter(|e| matches!(&e.body, EventBody::ServiceObserved { .. }))
+            .count();
+        assert_eq!(
+            service_observed_2, 1,
+            "unit 1 -- the only endpoint resumption actually re-drives -- must be identified \
+             exactly once during run2"
+        );
+
+        // No unit's own probe traffic ran twice, across BOTH runs: unit 0
+        // is never touched again (invariant 3), unit 1 is connected AND
+        // identified exactly once, entirely within run2.
+        assert_eq!(
+            stub_a.accept_count(),
+            1,
+            "unit 0 must not be re-probed on resume, in any form"
+        );
+        assert_eq!(
+            stub_b.accept_count(),
+            2,
+            "unit 1 must be fully connected AND identified during run2, exactly once"
         );
     }
 }

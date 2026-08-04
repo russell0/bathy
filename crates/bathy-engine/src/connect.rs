@@ -121,9 +121,20 @@ pub async fn probe_connect(target: IpAddr, port: u16, budget: Duration) -> Conne
             // the end of this arm regardless of this explicit call, so
             // this line alone is not what prevents a leak -- it documents
             // that closing the socket *now*, before returning, is
-            // deliberate: v0.1 connect scanning establishes reachability
-            // only, and service probing owns the socket and reuses it
-            // starting in M4, rather than reconnecting. See
+            // deliberate: connect scanning establishes reachability only,
+            // and service probing (M4 Task 5, `bathy_engine::scheduler::
+            // Scheduler::detect_service`) dials its own, separate
+            // reconnect rather than being handed this socket to reuse.
+            // (An earlier version of this comment said the opposite --
+            // that service probing would take over and reuse this exact
+            // socket "starting in M4" -- which is not what M4 Task 5
+            // actually built, and was wrong regardless: holding this
+            // socket open until a LATER probing phase claimed it would
+            // mean keeping one file descriptor alive per in-flight unit
+            // for the whole scan, the exact unbounded-fd risk
+            // `many_open_probes_in_sequence_do_not_leak_the_socket` below
+            // guards against for the connect-scan phase alone. Reconnecting
+            // is the correct design, not a shortcut.) See
             // `many_open_probes_in_sequence_do_not_leak_the_socket` and
             // `the_open_socket_is_closed_promptly_after_the_probe_returns`
             // below for the tests that actually exercise "does this leak".
