@@ -1,0 +1,581 @@
+//! The forbidden-pattern rules, and why they live here rather than in CI.
+//!
+//! # A check nobody can run locally is a check that goes red and stays red
+//!
+//! These three rules used to exist only as inline `grep` pipelines inside
+//! `.github/workflows/ci.yml`. Every *other* gate in this project is
+//! `cargo run -p xtask -- check-<something>`, so an agent or a contributor
+//! running "the documented gate commands" ran ten of the eleven and never
+//! these. The result was not hypothetical: the AC-2.1 rule exited 1 from
+//! `89142bf` -- the middle of M5 -- through the end of the milestone, and six
+//! task reports plus one milestone review stated that "both phrase-rule greps"
+//! were green. They were not lying about a check they had run; they were
+//! reporting a check that had no local form to run.
+//!
+//! That is a structural defect, not carelessness, and the structural fix is
+//! that the rules have exactly one implementation, it is a program, and CI
+//! calls it. `ci.yml` now has one step where it had three.
+//!
+//! # The sentinel convention, applied to every rule
+//!
+//! A rule enforced by pattern-matching would otherwise fail on its own
+//! statement -- the first CI run in this project's history failed on `ci.yml`
+//! itself. The overview's Global Constraints therefore establish: *any line
+//! that legitimately names a forbidden phrase (to define, test, or enforce the
+//! rule) carries the marker `[phrase-rule]`, and every check excludes marked
+//! lines.*
+//!
+//! "Every check" was not true before this module. Only the determinism rule
+//! honoured the marker; the AC-2.1 and `unsafe` greps did not, and would fail
+//! on any comment that quoted the thing they forbid. That is not academic
+//! either -- [`RULES`] below cannot state the AC-2.1 pattern without one of
+//! its own literals matching itself. The convention is now applied uniformly,
+//! by construction, in [`violations_in_text`].
+//!
+//! The marker is deliberately weak: any line can opt out by carrying it. It is
+//! a convention with an audit trail (`grep -rn '\[phrase-rule\]'` enumerates
+//! every exemption in the repository), not a security boundary. What is *not*
+//! available to a line is silence -- an exempted line says so in its own text.
+//!
+//! # Path exemptions are a separate, narrower thing
+//!
+//! A marker exempts a line of prose that *names* a pattern. A path exemption
+//! ([`Rule::exempt_path_prefixes`]) exempts a file that legitimately *does* the
+//! forbidden thing: `bathy_types::clock` is where system time is read, and
+//! `bathy-packetd` is where `unsafe` is permitted for raw socket syscalls.
+//! Both are listed here, in full, with the criterion that grants them.
+
+use std::path::{Path, PathBuf};
+
+use regex::Regex;
+
+type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
+
+/// One forbidden-pattern rule.
+pub struct Rule {
+    /// Stable identifier, reported with every violation so a failure names
+    /// the rule and not only the line.
+    pub id: &'static str,
+    /// What the rule is for, in one line -- the text a failing build shows.
+    pub headline: &'static str,
+    /// The pattern, as a `regex` crate expression.
+    pub pattern: &'static str,
+    /// Directories to walk, relative to the repository root.
+    pub roots: &'static [&'static str],
+    /// File extensions to consider. `None` means every text file.
+    pub extensions: Option<&'static [&'static str]>,
+    /// Files and directories that may legitimately contain the pattern *as
+    /// code*, by path prefix. Each one is a decision recorded in
+    /// [`Rule::exemption_rationale`].
+    pub exempt_path_prefixes: &'static [&'static str],
+    /// Why those paths are exempt. Printed by `--explain`-less failure too,
+    /// so a contributor who trips the rule reads the reasoning rather than
+    /// guessing at it.
+    pub exemption_rationale: &'static str,
+}
+
+/// Directories that are never scanned.
+///
+/// `target` and `.git` are build and VCS state, and were `--exclude-dir` in
+/// the greps this replaces. `.superpowers` is gitignored scratch space for
+/// plan execution: it is not part of a CI checkout, so scanning it locally
+/// would make the local run *stricter* than CI, which is its own kind of
+/// divergence -- a rule that fails only on one developer's machine gets
+/// disabled rather than obeyed.
+const NEVER_SCANNED: &[&str] = &["target", ".git", ".superpowers"];
+
+pub const RULES: &[Rule] = &[
+    Rule {
+        id: "clock-only-time-and-ids",
+        headline: "no direct time/id generation outside Clock (AC-2.1)",
+        // `Clock` (crates/bathy-types/src/clock.rs) is the only place
+        // permitted to read the system clock or construct a random ULID.
+        // Injecting both through `Clock` is what makes an event log
+        // byte-comparable between a recorded run and a replayed one; any
+        // other call site breaks that guarantee.
+        //
+        // One of the alternatives below is a plain literal that matches
+        // itself in this very file, which is precisely the situation the
+        // sentinel exists for -- hence the marker on the pattern line, and
+        // on this one, which names it: `ulid::Generator`.  [phrase-rule]
+        pattern: r"SystemTime::now\(\)|ulid::Generator|Ulid::new\(", // [phrase-rule]
+        roots: &["crates", "xtask"],
+        extensions: Some(&["rs"]),
+        exempt_path_prefixes: &["crates/bathy-types/src/clock.rs"],
+        exemption_rationale: "`bathy_types::clock` is the injection point itself: SystemClock \
+                              reads the system clock and drives the ULID generator there so that \
+                              nothing else has to. Exempting a second file would mean two answers \
+                              to \"what time is it\" in one process, which is the defect the rule \
+                              exists to prevent.",
+    },
+    Rule {
+        id: "unsafe-only-in-packetd",
+        headline: "no unsafe outside bathy-packetd", // [phrase-rule]
+        // Matches `unsafe` followed by a space, `{`, `(`, or end-of-line, so
+        // `unsafe fn`, `unsafe{`, `unsafe(no_mangle)`, and a bare trailing  // [phrase-rule]
+        // `unsafe` are all caught, not just the space-delimited form. Scans
+        // both crates/ and xtask/ -- the binding constraint is "no crate
+        // outside bathy-packetd", not "no crate under crates/ outside
+        // bathy-packetd".
+        //
+        // The leading `\b` matters: without it, `unsafe` matches as a plain
+        // substring, so `let is_unsafe = true;` (word character `_`
+        // immediately before `unsafe`, then a space) false-positives on
+        // legitimate code. `\b` requires a transition from a non-word
+        // character (or start of line) into `u`, which `is_unsafe` never has.
+        // Pinned by `a_word_ending_in_unsafe_is_not_a_violation` below rather
+        // than by a comment claiming GNU grep supports the escape.
+        pattern: r"\bunsafe([ {(]|$)",
+        roots: &["crates", "xtask"],
+        extensions: Some(&["rs"]),
+        exempt_path_prefixes: &["crates/bathy-packetd/"],
+        exemption_rationale: "The Global Constraint is `#![forbid(unsafe_code)]` in every crate \
+                              except bathy-packetd, which may use `unsafe` only for raw socket \
+                              syscalls and must document every block.",
+    },
+    Rule {
+        id: "no-unscoped-determinism-claim",
+        headline: "forbidden unscoped determinism claim",
+        // The bracket expression matches the phrase without this line
+        // containing it -- the same device the grep this replaces used, kept
+        // because it means the rule's own definition needs no exemption at
+        // all. `(?i)` is the greps' `-i`.
+        pattern: r"(?i)deterministic[ ]results",
+        roots: &["."],
+        extensions: None,
+        exempt_path_prefixes: &[],
+        exemption_rationale: "None. The claim is scoped -- deterministic *planning* and \
+                              reproducible *interpretation* -- and no file in this repository \
+                              may make the unscoped one. A line that must name the phrase to \
+                              define, test or enforce the rule carries the [phrase-rule] marker.",
+    },
+];
+
+/// The marker that exempts a line. See this module's header.
+const SENTINEL: &str = "[phrase-rule]";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Violation {
+    pub rule_id: &'static str,
+    pub path: String,
+    /// 1-based, as every tool that reports a file position uses.
+    pub line: usize,
+    pub text: String,
+}
+
+impl std::fmt::Display for Violation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}] {}:{}: {}",
+            self.rule_id,
+            self.path,
+            self.line,
+            self.text.trim()
+        )
+    }
+}
+
+/// Whether `path` is exempt from `rule` by path.
+///
+/// Compares against the repository-relative path with forward slashes, which
+/// is the form the rules are written in and the form violations are reported
+/// in, so the exemption list reads the same as the output it suppresses.
+pub fn is_exempt_path(rule: &Rule, path: &str) -> bool {
+    rule.exempt_path_prefixes
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(prefix))
+}
+
+/// Every violation of `rule` in `text`, attributed to `path`.
+///
+/// Pure: no filesystem, no subprocess. The walk feeds it; the tests feed it
+/// directly. Lines carrying the sentinel are skipped here, for every rule,
+/// which is where "every check excludes marked lines" is actually true rather
+/// than merely written down.
+pub fn violations_in_text(rule: &Rule, compiled: &Regex, path: &str, text: &str) -> Vec<Violation> {
+    if is_exempt_path(rule, path) {
+        return Vec::new();
+    }
+    text.lines()
+        .enumerate()
+        .filter(|(_, line)| !line.contains(SENTINEL))
+        .filter(|(_, line)| compiled.is_match(line))
+        .map(|(index, line)| Violation {
+            rule_id: rule.id,
+            path: path.to_string(),
+            line: index + 1,
+            text: line.to_string(),
+        })
+        .collect()
+}
+
+/// Repository-relative, forward-slashed.
+fn relative(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Every file under `dir`, depth-first, skipping [`NEVER_SCANNED`].
+fn walk(dir: &Path, into: &mut Vec<PathBuf>) -> Fallible<()> {
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("reading {}: {e}", dir.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    // Sorted so a failure lists violations in the same order on every machine
+    // -- an unstable report is one nobody can diff between two runs.
+    entries.sort_by_key(std::fs::DirEntry::path);
+    for entry in entries {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if path.is_dir() {
+            if NEVER_SCANNED.contains(&name.as_str()) {
+                continue;
+            }
+            walk(&path, into)?;
+        } else if path.is_file() {
+            into.push(path);
+        }
+    }
+    Ok(())
+}
+
+/// `grep -I`: a file that is not valid UTF-8 is binary as far as these rules
+/// are concerned, and is skipped rather than being an error. Returning `None`
+/// rather than lossily decoding means a `.png` whose bytes happen to spell a
+/// forbidden phrase is not a violation, which is the behaviour the greps had.
+fn text_of(path: &Path) -> Fallible<Option<String>> {
+    let bytes = std::fs::read(path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    Ok(String::from_utf8(bytes).ok())
+}
+
+fn has_extension(path: &Path, extensions: Option<&[&str]>) -> bool {
+    match extensions {
+        None => true,
+        Some(allowed) => path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| allowed.contains(&e)),
+    }
+}
+
+/// Run every rule over the tree rooted at `root`, returning what it found.
+pub fn scan(root: &Path) -> Fallible<(Vec<Violation>, usize)> {
+    let mut violations = Vec::new();
+    let mut scanned = 0usize;
+    for rule in RULES {
+        let compiled = Regex::new(rule.pattern)
+            .map_err(|e| format!("rule {} has an invalid pattern: {e}", rule.id))?;
+        let mut files = Vec::new();
+        for r in rule.roots {
+            let dir = root.join(r);
+            if dir.is_dir() {
+                walk(&dir, &mut files)?;
+            }
+        }
+        for file in files {
+            if !has_extension(&file, rule.extensions) {
+                continue;
+            }
+            let Some(text) = text_of(&file)? else {
+                continue;
+            };
+            scanned += 1;
+            violations.extend(violations_in_text(
+                rule,
+                &compiled,
+                &relative(root, &file),
+                &text,
+            ));
+        }
+    }
+    Ok((violations, scanned))
+}
+
+pub fn check_phrases() -> Fallible<()> {
+    let root = Path::new(".");
+    let (violations, scanned) = scan(root)?;
+    if violations.is_empty() {
+        println!(
+            "check-phrases: ok ({} rules, {scanned} file reads, 0 violations)",
+            RULES.len()
+        );
+        return Ok(());
+    }
+    for v in &violations {
+        eprintln!("check-phrases: {v}");
+    }
+    // The rationale is printed with the failure, not filed somewhere the
+    // person reading a red build has to go and find.
+    for rule in RULES {
+        if violations.iter().any(|v| v.rule_id == rule.id) {
+            eprintln!("\ncheck-phrases: rule `{}` -- {}", rule.id, rule.headline);
+            eprintln!("  exemptions: {}", rule.exemption_rationale);
+            eprintln!(
+                "  a line that must name this pattern to define, test or enforce the rule \
+                 carries the {SENTINEL} marker."
+            );
+        }
+    }
+    Err(format!("{} forbidden-pattern violation(s)", violations.len()).into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rule(id: &str) -> &'static Rule {
+        RULES
+            .iter()
+            .find(|r| r.id == id)
+            .expect("no such rule in RULES")
+    }
+
+    fn run(id: &str, path: &str, text: &str) -> Vec<Violation> {
+        let r = rule(id);
+        violations_in_text(r, &Regex::new(r.pattern).unwrap(), path, text)
+    }
+
+    /// The exact line that was in the tree, red, for the whole back half of
+    /// M5. If this rule ever stops matching it, the defect returns silently.
+    #[test]
+    fn the_ac_2_1_rule_catches_the_call_that_was_red_for_half_a_milestone() {
+        let found = run(
+            "clock-only-time-and-ids",
+            "crates/bathy-mcp/src/approval.rs",
+            "fn now_ms() -> u64 {\n    SystemTime::now()\n        .duration_since(UNIX_EPOCH)\n", // [phrase-rule]
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line, 2, "the report must name the line");
+        assert_eq!(found[0].path, "crates/bathy-mcp/src/approval.rs");
+    }
+
+    #[test]
+    fn the_ac_2_1_rule_catches_both_id_spellings_too() {
+        for (source, why) in [
+            ("let mut g = ulid::Generator::new();", "the generator type"), // [phrase-rule]
+            ("let id = Ulid::new();", "the constructor ulid 3.x removed"), // [phrase-rule]
+        ] {
+            assert_eq!(
+                run(
+                    "clock-only-time-and-ids",
+                    "crates/bathy-engine/src/x.rs",
+                    source
+                )
+                .len(),
+                1,
+                "{why} must be caught: a random id minted outside Clock is as unreplayable \
+                 as a timestamp minted outside it"
+            );
+        }
+    }
+
+    #[test]
+    fn the_clock_module_may_read_the_system_clock_and_nothing_else_may() {
+        let source = "        let d = SystemTime::now().duration_since(UNIX_EPOCH)"; // [phrase-rule]
+        assert!(
+            run(
+                "clock-only-time-and-ids",
+                "crates/bathy-types/src/clock.rs",
+                source
+            )
+            .is_empty(),
+            "the injection point itself is exempt"
+        );
+        assert_eq!(
+            run(
+                "clock-only-time-and-ids",
+                "crates/bathy-types/src/ids.rs",
+                source
+            )
+            .len(),
+            1,
+            "a sibling file in the same crate is not exempt -- the exemption is a path, \
+             not a crate"
+        );
+    }
+
+    #[test]
+    fn the_unsafe_rule_catches_every_spelling_the_grep_was_written_for() {
+        for source in [
+            "unsafe fn raw(&self) {}", // [phrase-rule]
+            "    unsafe{ *p }",        // [phrase-rule]
+            "#[unsafe(no_mangle)]",    // [phrase-rule]
+            "        unsafe",
+        ] {
+            assert_eq!(
+                run(
+                    "unsafe-only-in-packetd",
+                    "crates/bathy-engine/src/x.rs",
+                    source
+                )
+                .len(),
+                1,
+                "{source:?} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn a_word_ending_in_unsafe_is_not_a_violation() {
+        // Without the leading `\b` this is a false positive, and a rule that
+        // cries wolf on `let is_unsafe = true;` is a rule someone deletes.
+        assert!(
+            run(
+                "unsafe-only-in-packetd",
+                "crates/bathy-scope/src/policy.rs",
+                "let is_unsafe = true;",
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn packetd_may_use_unsafe_and_its_neighbours_may_not() {
+        assert!(
+            run(
+                "unsafe-only-in-packetd",
+                "crates/bathy-packetd/src/socket.rs",
+                "unsafe { libc::socket(domain, ty, proto) }", // [phrase-rule]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            run(
+                "unsafe-only-in-packetd",
+                "crates/bathy-engine/src/connect.rs",
+                "unsafe { libc::socket(domain, ty, proto) }", // [phrase-rule]
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_determinism_rule_catches_the_unscoped_claim_in_any_case_and_any_file_type() {
+        for (path, source) in [
+            ("README.md", "bathy produces deterministic results."), // [phrase-rule]
+            ("docs/design-paper.md", "DETERMINISTIC RESULTS, always"), // [phrase-rule]
+            ("src/lib.rs", "//! Deterministic Results"),            // [phrase-rule]
+        ] {
+            assert_eq!(
+                run("no-unscoped-determinism-claim", path, source).len(),
+                1,
+                "{path} must be caught"
+            );
+        }
+    }
+
+    #[test]
+    fn the_scoped_claim_this_project_actually_makes_is_not_a_violation() {
+        for source in [
+            "deterministic planning: same request + same manifest -> same plan_hash",
+            "reproducible interpretation: same bytes + same engine version -> same findings",
+        ] {
+            assert!(run("no-unscoped-determinism-claim", "README.md", source).is_empty());
+        }
+    }
+
+    /// The Global Constraint says *every* check excludes marked lines. Before
+    /// this module only one of the three did. This asserts the property over
+    /// `RULES` itself, so a rule added later inherits it or fails here.
+    #[test]
+    fn every_rule_without_exception_honours_the_sentinel() {
+        let offending = [
+            ("clock-only-time-and-ids", "    SystemTime::now()"), // [phrase-rule]
+            ("unsafe-only-in-packetd", "unsafe fn raw() {}"),     // [phrase-rule]
+            ("no-unscoped-determinism-claim", "DETERMINISTIC RESULTS"), // [phrase-rule]
+        ];
+        assert_eq!(
+            offending.len(),
+            RULES.len(),
+            "a rule was added without a sentinel case here"
+        );
+        for (id, source) in offending {
+            let path = "docs/some-note.md";
+            assert_eq!(
+                run(id, path, source).len(),
+                1,
+                "fixture sanity: {id} must catch this line unmarked"
+            );
+            assert!(
+                run(id, path, &format!("{source}  // {SENTINEL}")).is_empty(),
+                "rule {id} does not honour the sentinel"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marked_line_is_exempt_only_on_the_line_that_carries_the_marker() {
+        let text = format!(
+            "let a = 1;  // SystemTime::now() is forbidden {SENTINEL}\nlet b = SystemTime::now();" // [phrase-rule]
+        );
+        let found = run("clock-only-time-and-ids", "crates/bathy/src/main.rs", &text);
+        assert_eq!(found.len(), 1, "the marker must not exempt the whole file");
+        assert_eq!(found[0].line, 2);
+    }
+
+    #[test]
+    fn a_violation_renders_as_rule_file_and_line() {
+        let v = Violation {
+            rule_id: "clock-only-time-and-ids",
+            path: "crates/bathy-mcp/src/approval.rs".into(),
+            line: 286,
+            text: "    SystemTime::now()".into(), // [phrase-rule]
+        };
+        assert_eq!(
+            v.to_string(),
+            "[clock-only-time-and-ids] crates/bathy-mcp/src/approval.rs:286: SystemTime::now()" // [phrase-rule]
+        );
+    }
+
+    #[test]
+    fn extension_filters_are_what_each_rule_declares() {
+        // The two code rules are `--include='*.rs'`; the determinism rule is
+        // every text file, which is why a claim in the README is caught.
+        assert!(has_extension(Path::new("a/b.rs"), Some(&["rs"])));
+        assert!(!has_extension(Path::new("a/b.md"), Some(&["rs"])));
+        assert!(has_extension(Path::new("a/b.md"), None));
+        assert!(has_extension(Path::new("a/LICENSE"), None));
+    }
+
+    /// The rules must hold over the repository, run the way CI runs them.
+    /// This is the one test that would have been red for the whole back half
+    /// of M5, and the reason it can exist at all is that the rules are a
+    /// program now.
+    #[test]
+    fn the_repository_itself_passes_every_rule() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let (violations, scanned) = scan(&root).expect("scanning the repository");
+        assert!(
+            scanned > 0,
+            "a scan that read no files is a check that proves nothing"
+        );
+        assert!(
+            violations.is_empty(),
+            "{} forbidden-pattern violation(s):\n{}",
+            violations.len(),
+            violations
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn every_rule_has_a_pattern_that_compiles_and_a_stated_exemption_rationale() {
+        for rule in RULES {
+            Regex::new(rule.pattern)
+                .unwrap_or_else(|e| panic!("rule {} has an invalid pattern: {e}", rule.id));
+            assert!(
+                !rule.exemption_rationale.trim().is_empty(),
+                "rule {} exempts paths with no stated reason",
+                rule.id
+            );
+        }
+    }
+}

@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod phrases;
 mod prose;
 mod readme;
 
@@ -41,10 +42,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("check-schemas") => emit_schemas(false),
         Some("gen-ports") => gen_ports(),
         Some("check-readme") => readme::check_readme(),
+        Some("check-phrases") => phrases::check_phrases(),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
-        None => Err("usage: xtask \
-             <check-deps|emit-schemas|check-schemas|check-readme|gen-ports --registry <path>>"
-            .into()),
+        None => Err(
+            "usage: xtask <check-deps|check-phrases|emit-schemas|check-schemas\
+             |check-readme|gen-ports --registry <path>>"
+                .into(),
+        ),
     }
 }
 

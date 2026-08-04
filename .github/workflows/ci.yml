@@ -30,34 +30,22 @@ jobs:
       # Constraint requiring a README audit at every milestone exit still
       # stands in full.
       - run: cargo run -p xtask -- check-readme
-      - name: no direct time/id generation outside Clock (AC-2.1)
-        run: |
-          # `Clock` (crates/bathy-types/src/clock.rs) is the only place
-          # permitted to call `SystemTime::now()` or construct a random ULID
-          # (`ulid::Generator`, or `Ulid::new()` should a future `ulid`
-          # version reintroduce it). Injecting both through `Clock` is what
-          # makes an event log byte-comparable between a recorded run and a
-          # replayed one; any other call site breaks that guarantee.
-          ! grep -rnE --include='*.rs' 'SystemTime::now\(\)|ulid::Generator|Ulid::new\(' crates/ xtask/ \
-            | grep -v '^crates/bathy-types/src/clock\.rs:'
-      - name: no unsafe outside packetd
-        run: |
-          # Matches `unsafe` followed by a space, `{`, `(`, or end-of-line, so
-          # `unsafe fn`, `unsafe{`, `unsafe(no_mangle)`, and a bare trailing
-          # `unsafe` are all caught, not just the space-delimited form. Scans
-          # both crates/ and xtask/ — the binding constraint is "no crate
-          # outside bathy-packetd", not "no crate under crates/ outside
-          # bathy-packetd".
-          #
-          # `\b` leading word boundary: without it, `unsafe` matches as a
-          # plain substring, so `let is_unsafe = true;` (word char `_`
-          # immediately before `unsafe`, then a space) false-positives and
-          # trips this check on legitimate code. `\b` requires a transition
-          # from a non-word character (or start of line) into `u`, which
-          # `is_unsafe` never has — GNU grep (this job runs on ubuntu-latest)
-          # supports `\b` as an extension in -E mode.
-          ! grep -rnE --include='*.rs' '\bunsafe([ {(]|$)' crates/ xtask/ \
-            | grep -v '^crates/bathy-packetd/'
+      # The three forbidden-pattern rules -- no time/id generation outside
+      # `Clock` (AC-2.1), no `unsafe` outside `bathy-packetd`, and the
+      # unscoped determinism claim -- used to live here, as inline `grep`
+      # pipelines and nowhere else. That is why the AC-2.1 rule was red from
+      # `89142bf` (mid-M5) to the end of the milestone while six task reports
+      # and a milestone review said it was green: every other gate in this
+      # project is `cargo run -p xtask -- check-<something>`, so running "the
+      # documented gate commands" never ran these. A check nobody can run
+      # locally is a check that goes red and stays red.
+      #
+      # The rules, their patterns, their path exemptions and the reasoning for
+      # each now live in `xtask/src/phrases.rs`, with unit tests that feed each
+      # forbidden pattern in and assert it is caught with its file and line --
+      # so the checker itself is checked, which a shell pipeline in a workflow
+      # never was. This step is the single call site.
+      - run: cargo run -p xtask -- check-phrases
       - name: bathy-interpret's dependency tree is pure (AC-4.10)
         run: |
           # `bathy-interpret` (M4 Task 3) may depend on `bathy-types` and
@@ -90,15 +78,6 @@ jobs:
           #    without anyone noticing.
           ! cargo tree -p bathy-interpret --edges normal --prefix none \
             | grep -iE '^(tokio|tokio-util|mio|async-trait|fs4|rusqlite|libsqlite3-sys|walkdir|tempfile|filetime)( |$)'
-      # Lines that legitimately name the phrase — this rule, its tests, its
-      # enforcement — carry the [phrase-rule] marker and are excluded. Without
-      # that exclusion this step fails on its own source. See the overview's
-      # sentinel convention.
-      - name: forbidden determinism claim
-        run: |
-          # Bracket expression matches the phrase without this line containing it.
-          ! grep -rniIE "deterministic[ ]results" . --exclude-dir=target --exclude-dir=.git \
-            | grep -v '\[phrase-rule\]'
   # The MSRV is a promise to downstream consumers, so it gets its own job.
   # Without this, MSRV rots silently the first time someone uses a newer API.
   #
