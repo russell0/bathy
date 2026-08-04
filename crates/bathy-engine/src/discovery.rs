@@ -266,13 +266,54 @@ mod tests {
         );
     }
 
+    /// The one test in this crate that depends on how the *network* treats
+    /// an address, and the only claim it adds over
+    /// `a_full_backlog_host_is_reported_down_deterministically` below is
+    /// that a genuinely unrouted destination behaves like a silent one.
+    ///
+    /// What would have to be true for this to go red, stated so a future
+    /// reader can judge it instead of re-deriving it:
+    ///
+    /// * something on the path would have to *answer* for TEST-NET-1
+    ///   (RFC 5737) -- a captive portal, a hijacking resolver-cum-proxy, a
+    ///   corporate default route that RSTs unknown destinations. Then the
+    ///   probe is `Open` or `Closed`, `up` is true, and this test is red
+    ///   while `discover_host` is right. The failure messages below say so.
+    ///
+    /// It is NOT at risk from the `method` string, which the class sweep
+    /// flagged: `discover_host` maps `Filtered` and `Unreachable` to the
+    /// same `"no-response"` (see the loop above), so a host that fails fast
+    /// with `ENETUNREACH` and one that drops silently produce identical
+    /// results here. That was the sweep reasoning about the test rather than
+    /// about the function.
+    ///
+    /// It does nothing to its neighbours: two 200 ms probes to an address
+    /// nothing in this binary uses, no bind, no listener, no load.
     #[tokio::test]
     async fn an_unroutable_host_is_reported_down_after_exhausting_probes() {
         let cfg = DiscoveryConfig::new(vec![80, 443], Duration::from_millis(200)).unwrap();
         let r = discover_host("192.0.2.1".parse().unwrap(), &cfg, &limiter()).await;
-        assert!(!r.up);
-        assert_eq!(r.packets_spent, 2);
-        assert_eq!(r.method, "no-response");
+        assert!(
+            !r.up,
+            "192.0.2.1 (TEST-NET-1, RFC 5737: reserved for documentation, routed nowhere) \
+             answered a TCP connect with `{}`. Something on this network path is speaking \
+             for an address that must not route -- a captive portal or a default route that \
+             answers for unknown destinations. `discover_host` is behaving correctly; the \
+             environment is not the one this test assumes. \
+             `a_full_backlog_host_is_reported_down_deterministically` covers the same claim \
+             on loopback and is unaffected.",
+            r.method
+        );
+        assert_eq!(
+            r.packets_spent, 2,
+            "both configured ports must be probed before giving up: an inconclusive answer \
+             is not a stopping condition"
+        );
+        assert_eq!(
+            r.method, "no-response",
+            "`Filtered` and `Unreachable` are both inconclusive and both report \
+             `no-response`; a different string here means the mapping changed"
+        );
     }
 
     // --- Beyond the brief: deterministic silence, no network dependency ---

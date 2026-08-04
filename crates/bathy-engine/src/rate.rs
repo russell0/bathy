@@ -92,22 +92,46 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Instant;
 
     use super::*;
 
     // --- From the brief ---
 
-    #[tokio::test]
+    // The three "this must not wait" tests below run on a PAUSED clock and
+    // assert `Duration::ZERO`, not on the real one against a 50 ms margin.
+    //
+    // A 50 ms wall-clock bound is a claim about the machine, and the machine
+    // is shared: these tests live in a binary whose siblings include
+    // `harness_with_many_units(20_000)` and three real 1.3 s cancel/resume
+    // rounds, all running concurrently on the same runtime and the same
+    // cores. The failure that produces names THIS test while the load comes
+    // from a neighbour -- the same inversion that made
+    // `packet_ceiling_...` red for a port another test had vacated, and
+    // `cli.rs`'s zero-accept listeners red for a scan range that was not
+    // theirs. Neither of those was the test that was wrong.
+    //
+    // `tokio::time::pause()` removes the question. `RateLimiter` reads
+    // `tokio::time::Instant` and sleeps with `tokio::time::sleep`, so on a
+    // paused clock a wait it does not take advances nothing and a wait it
+    // DOES take advances the clock to the exact deadline -- auto-advance
+    // fires when the runtime goes idle. So the assertion becomes exact in
+    // both directions: zero means no wait was taken, and any wait at all is
+    // visible at full size instead of being compared against a margin. It is
+    // strictly stronger than the bound it replaces and cannot be moved by
+    // load.
+
+    #[tokio::test(start_paused = true)]
     async fn the_first_burst_is_immediate() {
         let l = RateLimiter::new(100);
-        let t = Instant::now();
+        let t = tokio::time::Instant::now();
         for _ in 0..100 {
             l.acquire(1).await;
         }
-        assert!(
-            t.elapsed().as_millis() < 50,
-            "initial bucket should be full"
+        assert_eq!(
+            t.elapsed(),
+            Duration::ZERO,
+            "the initial bucket holds a full second's worth, so 100 acquires at 100 pps \
+             must take no time at all; a non-zero wait here is the bucket starting empty"
         );
     }
 
@@ -226,14 +250,15 @@ mod tests {
     // stalling forever (which is what `packets_per_second.max(1)` being
     // removed would do; see the mutation-testing notes in this task's
     // report).
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn zero_pps_is_clamped_to_one_and_the_first_token_is_free() {
         let l = RateLimiter::new(0);
-        let t = Instant::now();
+        let t = tokio::time::Instant::now();
         l.acquire(1).await;
-        assert!(
-            t.elapsed().as_millis() < 50,
-            "the clamped single token should be immediately available"
+        assert_eq!(
+            t.elapsed(),
+            Duration::ZERO,
+            "the clamped single token must be immediately available"
         );
     }
 
@@ -251,14 +276,16 @@ mod tests {
     // fields are computed once, in `new`, from `packets_per_second as
     // f64`), and a subsequent large acquire well within that enormous
     // capacity must still be immediate rather than panicking or hanging.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn u32_max_pps_does_not_overflow_the_f64_arithmetic() {
         let l = RateLimiter::new(u32::MAX);
-        let t = Instant::now();
+        let t = tokio::time::Instant::now();
         l.acquire(1_000_000).await;
-        assert!(
-            t.elapsed().as_millis() < 50,
-            "well within the u32::MAX-token bucket, should be immediate"
+        assert_eq!(
+            t.elapsed(),
+            Duration::ZERO,
+            "1,000,000 tokens is well within a u32::MAX-token bucket, so this must be \
+             immediate; a non-zero wait is the f64 capacity arithmetic having overflowed"
         );
     }
 }
