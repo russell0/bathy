@@ -55,10 +55,18 @@ const SUBCOMMANDS: &[&str] = &[
     "check-msrv",
     "check-deny",
     "check-lab",
+    "check-fuzz",
     "check-ci",
     "publish-check",
     "emit-schemas",
     "gen-ports",
+    // Not a `check-*`: it runs the fuzz targets rather than reading the tree,
+    // takes minutes rather than milliseconds, and needs a nightly toolchain
+    // and `cargo-fuzz` installed. `check-fuzz` is the part that belongs in the
+    // fast gate; this is the part CI's own fuzz job calls, and it exists as a
+    // subcommand so the list of targets lives in exactly one place
+    // (`gates::FUZZ_SURFACES`) instead of being restated in `ci.yml`.
+    "fuzz",
 ];
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -74,11 +82,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("check-msrv") => gates::check_msrv(args.iter().any(|a| a == "--run")),
         Some("check-deny") => gates::check_deny(),
         Some("check-lab") => gates::check_lab(),
+        Some("check-fuzz") => gates::check_fuzz(),
+        Some("fuzz") => {
+            let seconds = flag_value(&args, "--time")
+                .map(|v| {
+                    v.parse::<u64>()
+                        .map_err(|_| format!("--time wants a number of seconds, got `{v}`"))
+                })
+                .transpose()?
+                .unwrap_or(120);
+            gates::run_fuzz(seconds, flag_value(&args, "--target"))
+        }
         Some("check-ci") => gates::check_ci(SUBCOMMANDS),
         Some("publish-check") => gates::publish_check(),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
         None => Err(format!("usage: xtask <{}>", SUBCOMMANDS.join("|")).into()),
     }
+}
+
+/// `--flag value` from an argument list, or `None`.
+fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+    let at = args.iter().position(|a| a == flag)?;
+    args.get(at + 1).map(String::as_str)
 }
 
 /// A workspace package and the names of its direct dependencies, as parsed
@@ -365,6 +390,18 @@ const DEFERRALS: &[Deferral] = &[
     Deferral {
         id: "rmcp-stdio-workaround",
         check: find_rmcp_workaround_staleness,
+    },
+    // AC-7.7's fifth untrusted-input surface: `bathy-packetd`'s IPC protocol.
+    // M7 runs before M6 in this project's execution order, so the crate the
+    // criterion names does not exist while the fuzz targets are being written.
+    // The alternative to registering it was a stub target, which would fuzz
+    // nothing while reading as coverage -- the same shape as the property-test
+    // strategy this milestone measured at 6 non-empty results in 4096 cases.
+    // `gates::packetd_ipc_deferral_violations` fires the day the crate lands
+    // and reports itself stale the day the target does.
+    Deferral {
+        id: "packetd-ipc-fuzz-target",
+        check: gates::packetd_ipc_deferral_violations,
     },
 ];
 
@@ -1078,12 +1115,20 @@ mod tests {
         // honest and this assertion the thing that keeps it non-trivial.
         assert_eq!(
             DEFERRALS.len(),
-            2,
-            "the deferral registry changed size; the two entries are the ops-layer \
-             move (AC-5.39) and the rmcp stdio workaround"
+            3,
+            "the deferral registry changed size; the three entries are the ops-layer \
+             move (AC-5.39), the rmcp stdio workaround, and the `packetd` IPC fuzz \
+             target that AC-7.7 names and M6 has not yet made writable"
         );
         let ids: Vec<&str> = DEFERRALS.iter().map(|d| d.id).collect();
-        assert_eq!(ids, vec!["ops-layer-move", "rmcp-stdio-workaround"]);
+        assert_eq!(
+            ids,
+            vec![
+                "ops-layer-move",
+                "rmcp-stdio-workaround",
+                "packetd-ipc-fuzz-target"
+            ]
+        );
     }
 
     #[test]

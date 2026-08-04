@@ -1,0 +1,61 @@
+{
+  "$defs": {
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "TaskStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "denied",
+          "description": "Refused by policy. Terminal, and carries a `policy.denied` event.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "cancellation_requested": {
+      "type": "boolean"
+    },
+    "resumable": {
+      "description": "True when unfinished units remain, so a later resume has work to do.",
+      "type": "boolean"
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskStatus",
+      "description": "The status at the moment cancellation was requested. A scan that was\nstill running reaches `cancelled` shortly after this returns."
+    },
+    "units_completed": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "scan_id",
+    "status",
+    "units_completed",
+    "resumable",
+    "cancellation_requested"
+  ],
+  "title": "ScanCancelOutput",
+  "type": "object"
+}

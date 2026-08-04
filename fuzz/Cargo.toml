@@ -1,0 +1,100 @@
+# The fuzz crate is its own workspace, deliberately.
+#
+# `[workspace]` here makes this package the root of a *separate* workspace,
+# so `cargo test --workspace`, `cargo clippy --workspace --all-targets` and
+# `cargo metadata --no-deps` at the repository root never see it. That is
+# what keeps three promises intact:
+#
+#   1. The pinned build. `rust-toolchain.toml` pins `stable`; libFuzzer needs
+#      nightly. If this package were a workspace member, every `cargo build`
+#      at the root would try to compile `libfuzzer-sys` and its build script
+#      under stable, and `cargo fuzz`'s `-Z` flags would apply to the whole
+#      workspace.
+#   2. Both MSRV jobs. `xtask check-msrv` enforces "a crate declaring a
+#      `rust-version` appears in exactly one of the two MSRV jobs". It reads
+#      floors from `crates/*/Cargo.toml` and `xtask/Cargo.toml` only, so this
+#      manifest is outside its range by construction -- and this package
+#      declares no `rust-version` at all, because a nightly-only fuzz harness
+#      has no MSRV to promise anyone.
+#   3. `xtask check-deps`. It runs `cargo metadata --no-deps` at the root and
+#      ranks every member against the layer order. A fuzz harness legitimately
+#      depends on five layers at once (it is a consumer of all of them, like
+#      a test binary), which is not a layering violation but would read as
+#      one.
+#
+# The cost is that `cargo fmt --all` and `cargo clippy` at the root do not
+# cover these files. `cargo run -p xtask -- check-fuzz` compensates for the
+# part that matters -- that a target exists for every registered parser
+# surface -- and `fuzz/README.md` documents `cargo +nightly fmt` here.
+[workspace]
+
+[package]
+name = "bathy-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "Apache-2.0 OR MIT"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+# libFuzzer's Rust bindings. `arbitrary` is deliberately NOT enabled as a
+# derive-consuming dependency: every target in this crate takes raw `&[u8]`,
+# so a file in `seeds/` is exactly the bytes the parser sees. That is what
+# lets a real recorded capture, a real event log, or a real manifest be
+# dropped straight into the corpus without a decoder in between -- see
+# `fuzz/README.md`.
+libfuzzer-sys = "0.4"
+
+bathy-types = { path = "../crates/bathy-types" }
+bathy-interpret = { path = "../crates/bathy-interpret" }
+bathy-evidence = { path = "../crates/bathy-evidence" }
+bathy-scope = { path = "../crates/bathy-scope" }
+# The event-log target does not stop at parsing: it folds the events it
+# parsed, because `fold_events` is the first thing every consumer of a log
+# does with it and it is reached only through bytes an older build wrote.
+bathy-query = { path = "../crates/bathy-query" }
+
+serde_json = "1"
+# The manifest target re-derives the allow/deny sets from the raw document so
+# it can assert deny-by-default against `ScopeManifest::allows` rather than
+# assume it. That needs the same CIDR parser the manifest itself uses.
+ipnet = "2"
+
+[lib]
+path = "src/lib.rs"
+# Not a test or doc target: `cargo fuzz` builds this package with sanitizer
+# flags, and there is nothing here to `cargo test`. The counters are asserted
+# by `xtask check-fuzz` reading the sources, not by a unit test that would
+# need a second toolchain to run.
+test = false
+doctest = false
+
+[[bin]]
+name = "interpret"
+path = "fuzz_targets/interpret.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "event_log"
+path = "fuzz_targets/event_log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "canonical_json"
+path = "fuzz_targets/canonical_json.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false

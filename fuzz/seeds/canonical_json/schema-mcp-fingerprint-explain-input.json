@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Explain an interpretation rule: what it looks for, and where the claim\ncomes from.",
+  "properties": {
+    "rule_id": {
+      "description": "The rule identifier an observation cites.",
+      "type": "string"
+    }
+  },
+  "required": [
+    "rule_id"
+  ],
+  "title": "FingerprintExplainInput",
+  "type": "object"
+}

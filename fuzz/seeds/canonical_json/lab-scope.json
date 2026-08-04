@@ -1,0 +1,12 @@
+{
+  "id": "scope_01K2HZ8V5N3QR7BXMC4TDWF9GJ",
+  "description": "bathy integration lab (lab/docker-compose.yml). Authorizes the lab bridge subnet and nothing else. Not valid for any real network.",
+  "not_after": "2099-01-01T00:00:00.000Z",
+  "allowed_cidrs": ["10.30.0.0/24"],
+  "denied_cidrs": ["10.30.0.1/32"],
+  "budget_ceiling": {
+    "maximum_packets": 1000000,
+    "maximum_runtime_seconds": 3600,
+    "maximum_packets_per_second": 100000
+  }
+}

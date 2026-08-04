@@ -908,6 +908,16 @@ const RUNNABLE_WITHOUT_XTASK: &[&str] = &[
     // checkable half is `check-msrv`, which reads these very lines.
     "rm -f rust-toolchain.toml",
     "cargo check -p",
+    // Provisioning again, and the same reason as the toolchain above: a
+    // program that needs `cargo-fuzz` cannot be what provides it, and
+    // `cargo run -p xtask -- install-cargo-fuzz` would be a spelling of
+    // `cargo install`, not a capability. The *checkable* half -- that a fuzz
+    // target exists for every untrusted-input surface, that each has seeds,
+    // that the corpus is cached, that the span assertion is still in the
+    // interpret target -- is `check-fuzz`, and the running of them is
+    // `cargo run -p xtask -- fuzz`, which reads the same registry `check-fuzz`
+    // does. Narrow on purpose: `cargo install` in general is not exempt.
+    "cargo install cargo-fuzz",
     // The local form IS this script, it is in the repository, and it is what
     // `lab/README.md` documents. Re-spelling it as `cargo run -p xtask --
     // check-conformance` would put a Docker Compose driver behind an xtask
@@ -1611,6 +1621,478 @@ pub fn check_lab() -> Fallible<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// AC-7.7 to AC-7.10 — a fuzz target for every parser that eats untrusted bytes.
+// ---------------------------------------------------------------------------
+
+pub const FUZZ_MANIFEST: &str = "fuzz/Cargo.toml";
+
+/// One function that consumes bytes this project did not write, and the fuzz
+/// target that drives it (AC-7.7).
+///
+/// This is a registry for the same reason `DEFERRALS` and `NARROWING_CONTROLS`
+/// are: a list of parsers written in a plan is a list nobody re-reads, and the
+/// failure mode is not a red build, it is a surface that quietly has no
+/// target. `run_fuzz` runs exactly this list and CI calls `run_fuzz`, so a
+/// target added here is fuzzed in CI without anyone editing `ci.yml` — the
+/// drift that a hand-maintained second list in a workflow file guarantees.
+pub struct FuzzSurface {
+    /// The target's name: `fuzz/fuzz_targets/<name>.rs`, and the `[[bin]]`
+    /// that declares it.
+    pub name: &'static str,
+    /// What it drives, named the way a reader would grep for it.
+    pub parser: &'static str,
+    /// `None` when the target exists. `Some(reason)` when the surface is real
+    /// and the code it would fuzz is not in the tree yet — see the
+    /// `packetd-ipc-fuzz-target` entry in `xtask`'s `DEFERRALS`, which is what
+    /// makes the deferral expire on its own rather than by memory.
+    pub deferred: Option<&'static str>,
+}
+
+pub const FUZZ_SURFACES: &[FuzzSurface] = &[
+    FuzzSurface {
+        name: "interpret",
+        parser: "bathy_interpret::interpret — the response side of every probe",
+        deferred: None,
+    },
+    FuzzSurface {
+        name: "event_log",
+        parser: "bathy_evidence::EventLogReader + bathy_query::fold_events — JSONL \
+                 written by an older build, a crashed one, or a hand editor",
+        deferred: None,
+    },
+    FuzzSurface {
+        name: "canonical_json",
+        parser: "bathy_types::canonical::{canonical_json, plan_digest} — every hash \
+                 this project computes",
+        deferred: None,
+    },
+    FuzzSurface {
+        name: "manifest",
+        parser: "bathy_scope::ScopeManifest::load + allows — the authorization boundary",
+        deferred: None,
+    },
+    FuzzSurface {
+        name: "ipc",
+        parser: "bathy-packetd's line protocol between the unprivileged engine and the \
+                 privileged helper",
+        // M7 was resequenced ahead of M6 (see the overview's "Recommended
+        // execution order": M1-M5, M7, M6), so AC-7.7 names a crate that does
+        // not exist while this task runs. A stub target would be worse than
+        // the honest gap: it would fuzz nothing, register as coverage, and be
+        // the exact "reaches nothing" shape this milestone measured and
+        // rejected in a property-test strategy. So the surface stays
+        // registered here and the obligation is mechanical rather than
+        // remembered.
+        deferred: Some(
+            "crates/bathy-packetd does not exist yet — M6 ships after M7 in this \
+             project's execution order. `xtask check-deps` fails the moment the crate \
+             lands without `fuzz/fuzz_targets/ipc.rs`, via the `packetd-ipc-fuzz-target` \
+             deferral.",
+        ),
+    },
+];
+
+/// The crate whose arrival makes the `ipc` target due.
+pub const PACKETD_CRATE: &str = "crates/bathy-packetd";
+/// The target that discharges it.
+pub const IPC_FUZZ_TARGET: &str = "fuzz/fuzz_targets/ipc.rs";
+
+/// The `packetd-ipc-fuzz-target` deferral's condition, in both directions.
+///
+/// Registered in `xtask`'s `DEFERRALS` rather than only in `check-fuzz`
+/// because a deferral that only the thing being deferred knows about is a
+/// note. The second direction is the one that matters most here: when the
+/// target does land, this check reports *itself* as stale, so the registry
+/// does not keep a discharged obligation on the books forever.
+pub fn packetd_ipc_deferral_violations(root: &Path) -> Vec<String> {
+    let crate_exists = root.join(PACKETD_CRATE).join("Cargo.toml").is_file();
+    let target_exists = root.join(IPC_FUZZ_TARGET).is_file();
+    let registered_deferred = FUZZ_SURFACES
+        .iter()
+        .any(|s| s.name == "ipc" && s.deferred.is_some());
+
+    let mut found = Vec::new();
+    if crate_exists && !target_exists {
+        found.push(format!(
+            "{PACKETD_CRATE} now exists, so AC-7.7's `packetd` IPC fuzz target is due: \
+             write {IPC_FUZZ_TARGET}, seed `fuzz/seeds/ipc/`, and clear `deferred` on the \
+             `ipc` entry in `FUZZ_SURFACES`. The IPC protocol is the boundary a \
+             *privileged* process parses across, which is the one surface in this \
+             repository where a parsing bug is a privilege-escalation bug rather than \
+             only a denial of service."
+        ));
+    }
+    if target_exists && registered_deferred {
+        found.push(format!(
+            "{IPC_FUZZ_TARGET} exists but the `ipc` entry in `FUZZ_SURFACES` is still \
+             marked `deferred`, so `run_fuzz` skips the target it has. Clear `deferred` \
+             and delete this deferral's entry from `DEFERRALS` — a check that has \
+             quietly stopped applying reads as coverage while guarding nothing."
+        ));
+    }
+    if !crate_exists && !registered_deferred && !target_exists {
+        found.push(format!(
+            "the `ipc` entry in `FUZZ_SURFACES` is no longer marked `deferred` and no \
+             {IPC_FUZZ_TARGET} exists, so AC-7.7's fifth surface is neither covered nor \
+             recorded as outstanding"
+        ));
+    }
+    found
+}
+
+/// Every `[[bin]]` name declared by the fuzz manifest.
+///
+/// Text, not TOML: `xtask` has no TOML parser in its dependency tree (see
+/// `crate_floors` for the same decision and the same reason), and the shape
+/// this cares about — `name = "x"` under a `[[bin]]` header — survives any
+/// formatting the file could take.
+pub fn fuzz_bin_targets(manifest: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut in_bin = false;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_bin = trimmed == "[[bin]]";
+            continue;
+        }
+        if !in_bin {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("name")
+            && let Some(value) = rest.trim_start().strip_prefix('=')
+        {
+            let value = value.trim().trim_matches('"');
+            if !value.is_empty() {
+                names.push(value.to_string());
+            }
+        }
+    }
+    names
+}
+
+/// The fuzz job in `ci.yml`, checked for the two things AC-7.10 actually
+/// asks for: that it runs, and that the corpus survives between runs.
+///
+/// Split out and pure so the tests can feed it a workflow with each half
+/// removed. `lab_ci_job_violations`' first version asked `ci.contains(...)`
+/// and was satisfied by the comment that documents the step; this one looks
+/// for a `run:` step, for the same reason.
+pub fn fuzz_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
+    let mut found = Vec::new();
+
+    let runs_the_targets = ci.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+            .strip_prefix("- run:")
+            .or_else(|| trimmed.strip_prefix("run:"))
+            .is_some_and(|command| command.trim().starts_with("cargo run -p xtask -- fuzz"))
+    });
+    if !runs_the_targets {
+        found.push(format!(
+            "{ci_path}: no `run:` step invokes `cargo run -p xtask -- fuzz`, so AC-7.10 \
+             is unmet: the targets exist and nothing executes them. A fuzz target that \
+             runs only when someone remembers is a fuzz target that runs once."
+        ));
+    }
+
+    // AC-7.10 says *with a cached corpus*, and the caching is not a
+    // performance nicety: a 60-second run from an empty corpus re-derives the
+    // same shallow inputs every time and never gets past them. Without the
+    // cache the job is a 60-second smoke test wearing a fuzzer's name.
+    let caches_the_corpus = ci
+        .lines()
+        .any(|line| line.contains("fuzz/corpus") && !line.trim_start().starts_with('#'));
+    let has_cache_action = ci.lines().any(|line| line.contains("actions/cache@"));
+    if !(caches_the_corpus && has_cache_action) {
+        found.push(format!(
+            "{ci_path}: the fuzz job does not cache `fuzz/corpus` with `actions/cache@`, \
+             so every run starts from the committed seeds and re-derives the same \
+             shallow inputs. AC-7.10 requires a cached corpus."
+        ));
+    }
+
+    // The workflow must actually fire on pull requests. `on: pull_request` is
+    // already there for the whole file; what would silently remove the fuzz
+    // job from PRs is a job-level `if:` like the `lab-conformance` job's.
+    if let Some(block) = job_block(ci, "fuzz") {
+        if let Some(condition) = block
+            .lines()
+            .find(|l| l.trim_start().starts_with("if:") && l.len() - l.trim_start().len() <= 4)
+        {
+            found.push(format!(
+                "{ci_path}: the `fuzz` job carries a job-level condition ({}), so it does \
+                 not run on every pull request. AC-7.10 is specifically about pull \
+                 requests; if the long nightly run needs a condition, put it on the \
+                 duration rather than on the job.",
+                condition.trim()
+            ));
+        }
+    } else {
+        found.push(format!(
+            "{ci_path}: there is no `fuzz:` job. The targets are then run by whatever \
+             other job happens to mention them, which is not a thing a reviewer can check."
+        ));
+    }
+    found
+}
+
+/// The lines of the named job, from its `  <name>:` header to the next
+/// header at the same indentation.
+fn job_block<'a>(ci: &'a str, job: &str) -> Option<&'a str> {
+    let header = format!("\n  {job}:\n");
+    let start = ci.find(&header)? + 1;
+    let rest = &ci[start..];
+    let end = rest
+        .match_indices("\n  ")
+        .find(|(at, _)| {
+            let line = rest[at + 1..].lines().next().unwrap_or("");
+            line.starts_with("  ")
+                && !line.starts_with("   ")
+                && line.trim_end().ends_with(':')
+                && line.trim_start() != format!("{job}:")
+        })
+        .map_or(rest.len(), |(at, _)| at);
+    Some(&rest[..end])
+}
+
+/// What is wrong with the fuzzing surface, as text a person can act on.
+pub fn fuzz_violations(root: &Path, manifest: &str, ci_path: &str, ci: &str) -> Vec<String> {
+    let mut found = Vec::new();
+
+    // The fuzz package must stay out of the root workspace. If it joins it,
+    // `cargo test --workspace` and both MSRV jobs start building a
+    // nightly-only crate against the pinned stable toolchain, and the failure
+    // reads as a toolchain problem rather than as this.
+    if !manifest.lines().any(|l| l.trim() == "[workspace]") {
+        found.push(format!(
+            "{FUZZ_MANIFEST}: no `[workspace]` table, so this package joins the root \
+             workspace. `rust-toolchain.toml` pins stable and libFuzzer needs nightly; \
+             every `cargo build` at the root would try to compile it."
+        ));
+    }
+
+    let declared = fuzz_bin_targets(manifest);
+    for surface in FUZZ_SURFACES {
+        let source = format!("fuzz/fuzz_targets/{}.rs", surface.name);
+        let seeds = root.join("fuzz/seeds").join(surface.name);
+        if surface.deferred.is_some() {
+            if root.join(&source).is_file() {
+                found.push(format!(
+                    "{source} exists but `{}` is registered as deferred in \
+                     FUZZ_SURFACES, so `run_fuzz` skips it",
+                    surface.name
+                ));
+            }
+            continue;
+        }
+        if !root.join(&source).is_file() {
+            found.push(format!(
+                "{source} is missing, so nothing fuzzes {} (AC-7.7)",
+                surface.parser
+            ));
+            continue;
+        }
+        if !declared.iter().any(|n| n == surface.name) {
+            found.push(format!(
+                "{FUZZ_MANIFEST} declares no `[[bin]] name = \"{}\"`, so {source} is a \
+                 file nothing builds",
+                surface.name
+            ));
+        }
+        // A target with no seeds is the failure this milestone already
+        // measured once: a strategy that produced 6 non-empty results in 4096
+        // cases and never reached the code it claimed to cover. Structured
+        // parsers are not reachable from random bytes in any useful time.
+        let seed_count = std::fs::read_dir(&seeds)
+            .map(|d| {
+                d.filter_map(Result::ok)
+                    .filter(|e| e.path().is_file())
+                    .count()
+            })
+            .unwrap_or(0);
+        if seed_count == 0 {
+            found.push(format!(
+                "fuzz/seeds/{}/ has no seed inputs, so this target starts from random \
+                 bytes and will spend its whole budget failing to guess a valid record. \
+                 Seed it from real recorded data — `testdata/captures/`, a real event \
+                 log, a real manifest.",
+                surface.name
+            ));
+        }
+    }
+
+    // A target present in the manifest but absent from the registry would be
+    // built, never run by `run_fuzz`, and read as covered.
+    for name in &declared {
+        if !FUZZ_SURFACES.iter().any(|s| s.name == *name) {
+            found.push(format!(
+                "{FUZZ_MANIFEST} declares a `[[bin]]` named `{name}` that is not in \
+                 FUZZ_SURFACES, so `cargo run -p xtask -- fuzz` never runs it"
+            ));
+        }
+    }
+
+    // AC-7.9, asserted about the assertion. This is the one criterion in the
+    // task whose subject is a line of test code, and a fuzz assertion nobody
+    // has seen fail is the same shape as a decoration test — so the check is
+    // that the assertion is still there, and the evidence that it *works* is
+    // the recorded mutation run in the task report.
+    let interpret_target = root.join("fuzz/fuzz_targets/interpret.rs");
+    let interpret = std::fs::read_to_string(&interpret_target).unwrap_or_default();
+    for (fragment, why) in [
+        (
+            "i.matched_span.end <= capture.response.len()",
+            "the upper bound: a span running past the response panics any consumer that \
+             slices with it",
+        ),
+        (
+            "i.matched_span.start <= i.matched_span.end",
+            "the range is not inverted",
+        ),
+        (
+            "&capture.response[i.matched_span.clone()]",
+            "the span is actually used to slice the response, which is what a consumer \
+             does and what the seven historical span mutants broke",
+        ),
+    ] {
+        if !interpret.contains(fragment) {
+            found.push(format!(
+                "fuzz/fuzz_targets/interpret.rs no longer asserts `{fragment}` — {why} \
+                 (AC-7.9)"
+            ));
+        }
+    }
+
+    found.extend(fuzz_ci_job_violations(ci_path, ci));
+    found.extend(packetd_ipc_deferral_violations(root));
+    found
+}
+
+pub fn check_fuzz() -> Fallible<()> {
+    let root = Path::new(".");
+    let manifest = std::fs::read_to_string(root.join(FUZZ_MANIFEST))
+        .map_err(|e| format!("reading {FUZZ_MANIFEST}: {e}"))?;
+    let ci_path = ".github/workflows/ci.yml";
+    let ci = std::fs::read_to_string(root.join(ci_path))
+        .map_err(|e| format!("reading {ci_path}: {e}"))?;
+
+    let violations = fuzz_violations(root, &manifest, ci_path, &ci);
+    if violations.is_empty() {
+        let live = FUZZ_SURFACES
+            .iter()
+            .filter(|s| s.deferred.is_none())
+            .count();
+        let deferred = FUZZ_SURFACES.len() - live;
+        let seeds: usize = FUZZ_SURFACES
+            .iter()
+            .filter(|s| s.deferred.is_none())
+            .map(|s| {
+                std::fs::read_dir(root.join("fuzz/seeds").join(s.name))
+                    .map(|d| d.filter_map(Result::ok).count())
+                    .unwrap_or(0)
+            })
+            .sum();
+        println!(
+            "check-fuzz: ok ({live} target(s) over {} untrusted-input surface(s), \
+             {deferred} deferred, {seeds} committed seed input(s), corpus cached in CI)",
+            FUZZ_SURFACES.len(),
+        );
+        Ok(())
+    } else {
+        for v in &violations {
+            eprintln!("check-fuzz: {v}");
+        }
+        Err(format!(
+            "{} fuzzing violation(s) (AC-7.7 to AC-7.10)",
+            violations.len()
+        )
+        .into())
+    }
+}
+
+/// The exact `cargo fuzz` invocation for one target, derived rather than
+/// remembered.
+///
+/// Two corpus directories, in this order and on purpose. libFuzzer writes new
+/// inputs into the **first** one only, so `fuzz/corpus/<name>` is the working,
+/// git-ignored, CI-cached corpus and `fuzz/seeds/<name>` is the committed set
+/// it may read but never grow. Committing the working corpus instead would
+/// make every local run dirty the tree.
+pub fn fuzz_command(name: &str, seconds: u64) -> Vec<String> {
+    [
+        "+nightly".to_string(),
+        "fuzz".to_string(),
+        "run".to_string(),
+        name.to_string(),
+        format!("fuzz/corpus/{name}"),
+        format!("fuzz/seeds/{name}"),
+        "--".to_string(),
+        format!("-max_total_time={seconds}"),
+        "-print_final_stats=1".to_string(),
+    ]
+    .to_vec()
+}
+
+/// Run every registered, non-deferred fuzz target for `seconds` each.
+///
+/// This exists rather than a list of `cargo fuzz run` lines in `ci.yml` for
+/// one reason: the list in the workflow would be a second registry, and the
+/// two would diverge the first time a target was added. `FUZZ_SURFACES` is
+/// the only list, `check-fuzz` holds the tree to it, and this runs it.
+pub fn run_fuzz(seconds: u64, only: Option<&str>) -> Fallible<()> {
+    let targets: Vec<&FuzzSurface> = FUZZ_SURFACES
+        .iter()
+        .filter(|s| s.deferred.is_none())
+        .filter(|s| only.is_none_or(|name| name == s.name))
+        .collect();
+    if targets.is_empty() {
+        return Err(match only {
+            Some(name) => format!(
+                "no runnable fuzz target named `{name}`; registered: {}",
+                FUZZ_SURFACES
+                    .iter()
+                    .map(|s| s.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            None => "every registered fuzz surface is deferred, so this ran nothing".into(),
+        }
+        .into());
+    }
+    for surface in &targets {
+        std::fs::create_dir_all(format!("fuzz/corpus/{}", surface.name))
+            .map_err(|e| format!("creating fuzz/corpus/{}: {e}", surface.name))?;
+        let args = fuzz_command(surface.name, seconds);
+        println!("fuzz: cargo {}", args.join(" "));
+        let status = std::process::Command::new("cargo")
+            .args(&args)
+            .status()
+            .map_err(|e| {
+                format!(
+                    "running `cargo {}`: {e}. `cargo fuzz` needs a nightly toolchain and \
+                     the `cargo-fuzz` binary: `rustup toolchain install nightly` and \
+                     `cargo install cargo-fuzz --locked`.",
+                    args.join(" ")
+                )
+            })?;
+        if !status.success() {
+            return Err(format!(
+                "fuzz target `{}` failed. libFuzzer writes the input that did it to \
+                 `fuzz/artifacts/{}/`; copy it into `fuzz/seeds/{}/` as a regression case \
+                 once the bug is fixed.",
+                surface.name, surface.name, surface.name
+            )
+            .into());
+        }
+    }
+    println!(
+        "fuzz: ok ({} target(s), {seconds}s each, no crash, hang or OOM)",
+        targets.len()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1626,6 +2108,11 @@ mod tests {
             2,
             "AC-4.10 is `bathy-types` and `regex`; a shorter list is not a weaker \
              claim, it is no claim"
+        );
+        assert!(
+            !FUZZ_SURFACES.is_empty(),
+            "`fuzz_violations` and `run_fuzz` both iterate FUZZ_SURFACES; an empty \
+             registry makes check-fuzz pass and `xtask fuzz` run nothing"
         );
         assert!(
             FORBIDDEN_IN_INTERPRET.len() >= 10,
@@ -2531,5 +3018,270 @@ jobs:
         assert!(
             lab_ci_job_violations(".github/workflows/ci.yml", &ci, LAB_RUN_SH, &run_sh).is_empty()
         );
+    }
+
+    // --- AC-7.7 to AC-7.10. ---
+    //
+    // Every test below removes something from a fixture that is otherwise
+    // clean and asserts the removal is what is reported. A checker whose
+    // tests only feed it the real repository passes just as happily when its
+    // predicate is `true`.
+
+    /// A workspace-scoped scratch directory, removed and recreated so a
+    /// previous run cannot leave a file that makes a check pass.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bathy-xtask-fuzz-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A tree that satisfies every non-CI half of `fuzz_violations`.
+    fn clean_fuzz_tree(root: &Path) {
+        std::fs::create_dir_all(root.join("fuzz/fuzz_targets")).unwrap();
+        for surface in FUZZ_SURFACES.iter().filter(|s| s.deferred.is_none()) {
+            std::fs::write(
+                root.join(format!("fuzz/fuzz_targets/{}.rs", surface.name)),
+                // The three fragments AC-7.9 is about, present verbatim.
+                "assert!(i.matched_span.start <= i.matched_span.end);\n\
+                 assert!(i.matched_span.end <= capture.response.len());\n\
+                 let m = &capture.response[i.matched_span.clone()];\n",
+            )
+            .unwrap();
+            let seeds = root.join("fuzz/seeds").join(surface.name);
+            std::fs::create_dir_all(&seeds).unwrap();
+            std::fs::write(seeds.join("seed.bin"), b"seed").unwrap();
+        }
+    }
+
+    fn clean_fuzz_manifest() -> String {
+        let mut manifest = String::from("[workspace]\n[package]\nname = \"bathy-fuzz\"\n");
+        for surface in FUZZ_SURFACES.iter().filter(|s| s.deferred.is_none()) {
+            manifest.push_str(&format!(
+                "\n[[bin]]\nname = \"{}\"\npath = \"fuzz_targets/{}.rs\"\n",
+                surface.name, surface.name
+            ));
+        }
+        manifest
+    }
+
+    const CLEAN_FUZZ_CI: &str = "\
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+      - run: cargo run -p xtask -- fuzz --time 60
+  other:
+    runs-on: ubuntu-latest
+";
+
+    #[test]
+    fn the_fuzz_registry_is_not_empty_and_names_every_surface_the_plan_does() {
+        assert_eq!(
+            FUZZ_SURFACES.len(),
+            5,
+            "AC-7.7 names five surfaces: interpretation, event-log parsing, canonical \
+             JSON, manifest loading and the packetd IPC protocol"
+        );
+        let names: Vec<&str> = FUZZ_SURFACES.iter().map(|s| s.name).collect();
+        assert_eq!(
+            names,
+            vec![
+                "interpret",
+                "event_log",
+                "canonical_json",
+                "manifest",
+                "ipc"
+            ]
+        );
+        assert!(
+            FUZZ_SURFACES.iter().all(|s| !s.parser.is_empty()),
+            "a surface with no named parser is a row nobody can act on"
+        );
+    }
+
+    #[test]
+    fn the_fixture_this_sections_tests_mutate_is_clean_to_begin_with() {
+        // Without this, every assertion below could be reporting the
+        // fixture's own defects and would pass for the wrong reason.
+        let root = scratch("clean");
+        clean_fuzz_tree(&root);
+        let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+        assert!(v.is_empty(), "{v:#?}");
+    }
+
+    #[test]
+    fn a_missing_target_source_is_reported_against_the_surface_it_leaves_unfuzzed() {
+        let root = scratch("missing-target");
+        clean_fuzz_tree(&root);
+        std::fs::remove_file(root.join("fuzz/fuzz_targets/event_log.rs")).unwrap();
+        let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("event_log.rs is missing"), "{}", v[0]);
+        assert!(v[0].contains("AC-7.7"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_target_with_no_seed_inputs_is_reported() {
+        // The whole point of AC-7.8 being 120 seconds is that the target
+        // reaches the parser in 120 seconds. From random bytes it does not.
+        let root = scratch("no-seeds");
+        clean_fuzz_tree(&root);
+        std::fs::remove_file(root.join("fuzz/seeds/interpret/seed.bin")).unwrap();
+        let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("fuzz/seeds/interpret/"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_target_source_that_no_bin_declares_is_reported() {
+        let root = scratch("undeclared");
+        clean_fuzz_tree(&root);
+        let manifest = clean_fuzz_manifest().replace("name = \"manifest\"", "name = \"other\"");
+        let v = fuzz_violations(&root, &manifest, "ci.yml", CLEAN_FUZZ_CI);
+        // Two complaints, and both are real: `manifest` has no `[[bin]]`, and
+        // `other` is a `[[bin]]` no registry entry names.
+        assert_eq!(v.len(), 2, "{v:#?}");
+        assert!(
+            v.iter().any(|m| m.contains("declares no `[[bin]]")),
+            "{v:#?}"
+        );
+        assert!(v.iter().any(|m| m.contains("`other`")), "{v:#?}");
+    }
+
+    #[test]
+    fn a_fuzz_package_that_joins_the_root_workspace_is_reported() {
+        let root = scratch("no-workspace");
+        clean_fuzz_tree(&root);
+        let manifest = clean_fuzz_manifest().replace("[workspace]\n", "");
+        let v = fuzz_violations(&root, &manifest, "ci.yml", CLEAN_FUZZ_CI);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("nightly"), "{}", v[0]);
+    }
+
+    #[test]
+    fn removing_any_of_the_three_span_assertions_is_reported_separately() {
+        // AC-7.9 is the criterion whose subject is a line of test code, so
+        // this is the check that the line is still there. Each fragment is
+        // removed on its own: a check that only fires when all three go is a
+        // check that misses the realistic edit.
+        for fragment in [
+            "i.matched_span.end <= capture.response.len()",
+            "i.matched_span.start <= i.matched_span.end",
+            "&capture.response[i.matched_span.clone()]",
+        ] {
+            let root = scratch("span");
+            clean_fuzz_tree(&root);
+            let path = root.join("fuzz/fuzz_targets/interpret.rs");
+            let weakened = std::fs::read_to_string(&path)
+                .unwrap()
+                .replace(fragment, "true");
+            std::fs::write(&path, weakened).unwrap();
+            let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+            assert_eq!(v.len(), 1, "removing `{fragment}` produced {v:#?}");
+            assert!(v[0].contains("AC-7.9"), "{}", v[0]);
+        }
+    }
+
+    #[test]
+    fn a_workflow_that_never_runs_the_targets_is_reported() {
+        let ci = CLEAN_FUZZ_CI.replace("- run: cargo run -p xtask -- fuzz --time 60", "");
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("AC-7.10"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_workflow_that_does_not_cache_the_corpus_is_reported() {
+        let ci = CLEAN_FUZZ_CI.replace("          path: fuzz/corpus\n", "");
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("cached corpus"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_fuzz_job_gated_by_a_condition_is_reported() {
+        // The realistic mistake: copying `lab-conformance`'s `if:`, which is
+        // correct there and would silently take fuzzing off every pull
+        // request here.
+        let ci = CLEAN_FUZZ_CI.replace(
+            "  fuzz:\n    runs-on",
+            "  fuzz:\n    if: github.event_name == 'schedule'\n    runs-on",
+        );
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("pull request"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_workflow_with_no_fuzz_job_at_all_is_reported() {
+        let v = fuzz_ci_job_violations("ci.yml", "jobs:\n  test:\n    runs-on: ubuntu-latest\n");
+        assert!(v.iter().any(|m| m.contains("no `fuzz:` job")), "{v:#?}");
+    }
+
+    #[test]
+    fn the_packetd_deferral_fires_when_the_crate_lands_and_reports_itself_stale_when_the_target_does()
+     {
+        let root = scratch("packetd");
+        // Neither present: the deferral is registered and silent.
+        assert!(packetd_ipc_deferral_violations(&root).is_empty());
+
+        // The crate lands. The obligation is now due, and it says so without
+        // anyone having to remember AC-7.7.
+        std::fs::create_dir_all(root.join(PACKETD_CRATE)).unwrap();
+        std::fs::write(root.join(PACKETD_CRATE).join("Cargo.toml"), "[package]\n").unwrap();
+        let due = packetd_ipc_deferral_violations(&root);
+        assert_eq!(due.len(), 1, "{due:#?}");
+        assert!(due[0].contains(IPC_FUZZ_TARGET), "{}", due[0]);
+
+        // The target lands too. Now the deferral is the thing that is stale,
+        // and it reports itself rather than sitting on the books as coverage.
+        std::fs::create_dir_all(root.join("fuzz/fuzz_targets")).unwrap();
+        std::fs::write(root.join(IPC_FUZZ_TARGET), "#![no_main]\n").unwrap();
+        let stale = packetd_ipc_deferral_violations(&root);
+        assert_eq!(stale.len(), 1, "{stale:#?}");
+        assert!(stale[0].contains("still marked `deferred`"), "{}", stale[0]);
+    }
+
+    #[test]
+    fn fuzz_bin_targets_reads_names_only_from_bin_tables() {
+        let names = fuzz_bin_targets(
+            "[package]\nname = \"bathy-fuzz\"\n\n[[bin]]\nname = \"a\"\n\n\
+             [dependencies]\nname = \"not-a-bin\"\n\n[[bin]]\nname = \"b\"\n",
+        );
+        assert_eq!(names, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_fuzz_invocation_puts_the_writable_corpus_before_the_committed_seeds() {
+        // libFuzzer writes new inputs into the FIRST corpus directory only.
+        // Reversing these two would have every local run write into
+        // `fuzz/seeds/`, which is committed -- so the tree would go dirty on
+        // every run and the seed set would stop being a curated one.
+        let args = fuzz_command("interpret", 60);
+        let corpus = args
+            .iter()
+            .position(|a| a == "fuzz/corpus/interpret")
+            .unwrap();
+        let seeds = args
+            .iter()
+            .position(|a| a == "fuzz/seeds/interpret")
+            .unwrap();
+        assert!(corpus < seeds, "{args:?}");
+        assert!(args.contains(&"-max_total_time=60".to_string()), "{args:?}");
+        assert_eq!(args.first().map(String::as_str), Some("+nightly"));
+    }
+
+    #[test]
+    fn this_repositorys_fuzzing_surface_is_complete() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let manifest = std::fs::read_to_string(root.join(FUZZ_MANIFEST)).unwrap();
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let v = fuzz_violations(&root, &manifest, ".github/workflows/ci.yml", &ci);
+        assert!(v.is_empty(), "{v:#?}");
     }
 }

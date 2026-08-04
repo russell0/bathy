@@ -1,0 +1,87 @@
+{
+  "subnet": "10.30.0.0/24",
+
+  "derivation": {
+    "method": "lab/verify-ground-truth.py, run from inside labnet via `lab/run.sh verify`. Python standard-library sockets only: it shares no code, no port table and no fingerprint data with bathy, and it consults neither Nmap nor any of its data files. Every `product`/`version` below is transcribed from a banner that script read -- verbatim, which `xtask check-lab` now enforces by requiring each one to appear in its own `evidence` string, or else to declare `product_inference` saying what non-literal basis it rests on. `lab/README.md` quotes the banners in full.",
+    "swept_ports": "1-65535 TCP on every address listed here, including the absent ones",
+    "observed_at": "2026-08-04T17:29Z",
+    "known_to_be_wrong_before": "Until the M7 Task 1 fix round, 10.30.0.17:443 recorded `product: null` while the response it was transcribed from carries `Server: nginx/1.29.8`. AC-7.5's test skips endpoints whose product is null, so the null exempted the one endpoint where bathy also reports nothing -- the oracle recorded what the scanner found rather than what is there. The entry now states the product; see its `identification_gap`."
+  },
+
+  "scanned_ports": [22, 25, 53, 80, 443, 587, 853, 2222, 3306, 5432, 6379, 8080, 33060],
+
+  "hosts": [
+    {
+      "ip": "10.30.0.10", "up": true, "service": "web-nginx",
+      "open": [
+        { "port": 80, "service": "http", "product": "nginx", "version": "1.29.8",
+          "evidence": "HTTP/1.1 200 OK ... Server: nginx/1.29.8" }
+      ]
+    },
+    {
+      "ip": "10.30.0.11", "up": true, "service": "ssh-openssh",
+      "open": [
+        { "port": 2222, "service": "ssh", "product": "OpenSSH", "version": "10.3",
+          "evidence": "SSH-2.0-OpenSSH_10.3" }
+      ]
+    },
+    {
+      "ip": "10.30.0.12", "up": true, "service": "db-postgres",
+      "open": [
+        { "port": 5432, "service": "postgresql", "product": null, "version": null,
+          "evidence": "accepts a connection and volunteers no bytes; PostgreSQL speaks only when spoken to, so the lab establishes that something is listening here and does not establish a product name" }
+      ]
+    },
+    {
+      "ip": "10.30.0.13", "up": true, "service": "db-mysql",
+      "open": [
+        { "port": 3306, "service": "mysql", "product": "MySQL", "version": "9.4.0",
+          "evidence": "\\x49\\x00\\x00\\x00\\x0a 9.4.0 \\x00 ... caching_sha2_password (protocol 10 handshake)",
+          "product_inference": "The bytes name the version (9.4.0) and the default authentication plugin (caching_sha2_password) but never the string `MySQL`. The product name is read off the wire format -- a protocol-10 handshake whose default plugin is caching_sha2_password -- not transcribed from a literal, which is why this is the one entry that cannot satisfy check-lab's product-appears-in-evidence rule and says so instead of being exempted silently. MariaDB, the other protocol-10 speaker, prefixes its version with `5.5.5-` and defaults to mysql_native_password." },
+        { "port": 33060, "service": "mysqlx", "product": null, "version": null,
+          "evidence": "\\x05\\x00\\x00\\x00\\x0b\\x08\\x05\\x1a\\x00 -- the X Protocol port the mysql image also opens. Recorded because it is open, not because bathy identifies it: an oracle that omitted it would turn a correct finding into a false positive." }
+      ]
+    },
+    {
+      "ip": "10.30.0.14", "up": true, "service": "cache-redis",
+      "open": [
+        { "port": 6379, "service": "redis", "product": null, "version": null,
+          "evidence": "accepts a connection and volunteers no bytes; RESP is request-response, so the lab establishes a listener and not a product name" }
+      ]
+    },
+    {
+      "ip": "10.30.0.15", "up": true, "service": "mail-postfix",
+      "open": [
+        { "port": 25, "service": "smtp", "product": "Postfix", "version": null,
+          "evidence": "220 mail.lab.invalid ESMTP Postfix (Debian/GNU)" },
+        { "port": 587, "service": "smtp", "product": "Postfix", "version": null,
+          "evidence": "220 mail.lab.invalid ESMTP Postfix (Debian/GNU) -- the submission port the boky/postfix image also opens" }
+      ]
+    },
+    {
+      "ip": "10.30.0.16", "up": true, "service": "dns-bind",
+      "open": [
+        { "port": 53, "service": "dns", "product": null, "version": null,
+          "evidence": "accepts a connection and volunteers no bytes; DNS over TCP is request-response. This image's default configuration does not answer version.bind CHAOS TXT, so the lab does not establish a product name here." },
+        { "port": 443, "service": "dns-over-https", "product": null, "version": null,
+          "evidence": "open; the bind9 image enables DoH by default. Recorded because it is open." },
+        { "port": 853, "service": "dns-over-tls", "product": null, "version": null,
+          "evidence": "open; the bind9 image enables DoT by default. Recorded because it is open." }
+      ]
+    },
+    {
+      "ip": "10.30.0.17", "up": true, "service": "tls-web",
+      "open": [
+        { "port": 443, "service": "tls", "product": "nginx", "version": "1.29.8",
+          "evidence": "a plaintext GET on this port returns `HTTP/1.1 400 Bad Request\\r\\nServer: nginx/1.29.8\\r\\n ... <hr><center>nginx/1.29.8</center>`. The 400 establishes a TLS listener; the `Server` header names the product and version outright, in cleartext, before any TLS handshake.",
+          "identification_gap": "bathy reports no product here, and this entry records what is on the wire rather than what bathy finds. The cause is not a missing rule: `http.server.nginx.v1` matches these exact bytes (see `the_bytes_a_tls_terminator_returns_to_a_plaintext_request_name_its_product` in crates/bathy-interpret/src/rules.rs). It is Scheduler::detect_service's policy of stopping at the first probe whose capture interprets to anything -- on 443 that is `tls-v1`, which is protocol-only by construction because RFC 8446 encrypts the certificate, so `http-get-v1` never runs. Changing that policy changes per-endpoint packet accounting (AC-4.24), pacing (AC-4.26) and the reported `service` for every TLS port, so it is a scanner change and not a fix-round change. AC-7.5's test holds this endpoint to being UNidentified: the day bathy names it, that test fails and demands this key be deleted." }
+      ]
+    },
+    {
+      "ip": "10.30.0.18", "up": true, "service": "silent",
+      "open": []
+    }
+  ],
+
+  "absent": ["10.30.0.200", "10.30.0.201"]
+}

@@ -1,0 +1,13 @@
+{
+  "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+  "description": "derived edge case: an allow set that is entirely IPv6, unusable in v0.1",
+  "not_after": "2099-01-01T00:00:00.000Z",
+  "allowed_cidrs": ["2001:db8::/32"],
+  "denied_cidrs": [],
+  "budget_ceiling": {
+    "maximum_packets": 1000,
+    "maximum_runtime_seconds": 60,
+    "maximum_packets_per_second": 100
+  },
+  "signature": "not-verified-in-v0.1"
+}

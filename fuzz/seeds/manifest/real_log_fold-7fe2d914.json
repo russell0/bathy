@@ -1,0 +1,11 @@
+{
+              "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+              "description": "M5 Task 1 real-log fold fixture",
+              "not_after": "2099-01-01T00:00:00.000Z",
+              "allowed_cidrs": ["127.0.0.1/32"],
+              "budget_ceiling": {
+                "maximum_packets": 1000000,
+                "maximum_runtime_seconds": 3600,
+                "maximum_packets_per_second": 1000000
+              }
+            }

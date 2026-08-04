@@ -1,0 +1,63 @@
+{
+  "$defs": {
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "TaskStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "denied",
+          "description": "Refused by policy. Terminal, and carries a `policy.denied` event.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "resumed": {
+      "description": "False when the scan had no unfinished units and nothing was started.",
+      "type": "boolean"
+    },
+    "resumed_from_unit": {
+      "description": "The plan index work restarted at.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskStatus"
+    },
+    "units_total": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "scan_id",
+    "status",
+    "resumed_from_unit",
+    "units_total",
+    "resumed"
+  ],
+  "title": "ScanResumeOutput",
+  "type": "object"
+}

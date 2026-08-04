@@ -1,0 +1,27 @@
+# libFuzzer's working corpus. Deliberately NOT committed, and deliberately
+# separate from `seeds/`, which is.
+#
+# libFuzzer writes every newly interesting input into the first corpus
+# directory it is given, so committing that directory would make `cargo fuzz
+# run` dirty the working tree on every invocation and would silently grow the
+# repository by a few megabytes a week. `seeds/` is the curated, committed set
+# and is passed second, where libFuzzer reads but never writes.
+#
+# CI caches this directory across runs (see the `fuzz` job in
+# `.github/workflows/ci.yml`): a 60-second run that starts from a cold corpus
+# re-derives the same shallow inputs every time and never gets past them.
+corpus/
+
+# Where libFuzzer writes the input that crashed. A genuine crash's input
+# belongs in `seeds/<target>/` as a named regression case, committed, with
+# the fix -- not here under a hash nobody can read.
+artifacts/
+
+# Nightly-only build state, and this package's own lock. The lock is not
+# committed because the package is not part of the workspace's dependency
+# promise: nothing downstream builds it, `cargo deny` at the root does not
+# range over it, and pinning it would add a second lockfile to keep current
+# for no consumer's benefit.
+target/
+Cargo.lock
+coverage/

@@ -1,0 +1,38 @@
+{
+  "$defs": {
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "bytes_hex": {
+      "description": "The bytes, lowercase hex, two characters per byte. Hex rather than\nbase64 because a human comparing a short banner against a packet\ncapture can read it, and because the digest that names it is written\nthe same way. The returned bytes were verified against that digest\nbefore this value was built.",
+      "type": "string"
+    },
+    "digest": {
+      "$ref": "#/$defs/Digest"
+    },
+    "length": {
+      "description": "The stored length, before any truncation this call applied.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "truncated": {
+      "description": "True when `max_bytes` cut the returned value short.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "digest",
+    "length",
+    "truncated",
+    "bytes_hex"
+  ],
+  "title": "EvidenceGetOutput",
+  "type": "object"
+}

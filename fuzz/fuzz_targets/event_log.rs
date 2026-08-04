@@ -1,0 +1,219 @@
+#![no_main]
+#![forbid(unsafe_code)]
+
+//! Fuzzes the JSONL event-log reader -- AC-7.7.
+//!
+//! An event log is untrusted input for a reason that is easy to miss: it is
+//! not written by a peer, it is written by *us*, but by a build that may be
+//! months old, may have crashed mid-record, may have been truncated by a
+//! full disk, or may have been edited. `bathy scan events`, `scan status`,
+//! `result query` and `result diff` all read one, and this repository has
+//! already shipped one log-format defect that made a log written last week
+//! unloadable today.
+//!
+//! The target goes through the real reader (`EventLogReader`), not through
+//! `serde_json::from_str::<Event>` directly. Reading the JSONL by hand here
+//! would put a second parser for the source of truth outside the crate that
+//! owns it, which is the thing `EventLogReader`'s own doc comment forbids --
+//! and it would skip the part most likely to be wrong: the offset index
+//! `scan_records` builds and `read_from` then indexes with.
+//!
+//! It does not stop at parsing. `bathy_query::fold_events` is what every
+//! consumer does next, and it only ever sees events that came out of these
+//! bytes, so it is fuzzed in the same execution.
+
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use bathy_evidence::log::EventLogReader;
+use bathy_fuzz::Stats;
+use bathy_query::{diff, fold_events};
+use bathy_types::ids::ScanId;
+use libfuzzer_sys::fuzz_target;
+
+const OPENED: usize = 0;
+const REJECTED: usize = 1;
+const EVENTS: usize = 2;
+const TAIL_READS: usize = 3;
+const FOLDED_ENDPOINTS: usize = 4;
+const FOLDED_OBSERVATIONS: usize = 5;
+
+const LABELS: &[&str] = &[
+    // The number that says whether this target reached the parser at all:
+    // an input that never opens is an input that was rejected by the very
+    // first record.
+    "opened",
+    "rejected",
+    "events_parsed",
+    "tail_reads",
+    "folded_endpoints",
+    "folded_observations",
+];
+
+/// Which outcomes the corpus has actually produced. A run that only ever
+/// reaches `Malformed` has not exercised the sequence-continuity logic, and
+/// the sequence-continuity logic is where the interesting indexing lives.
+///
+/// `LogError::Io` and `LogError::Locked` are deliberately collapsed into
+/// `err:unexpected` rather than given bits of their own: neither is
+/// reachable through this door (the file is written immediately before it is
+/// opened, and `EventLogReader` takes no lock by design), so listing them
+/// would make the denominator a target nothing could ever hit and every
+/// report read as under-covered. If `err:unexpected` ever appears, that is
+/// itself the finding.
+const FLAGS: &[&str] = &[
+    "err:malformed",
+    "err:sequence_gap",
+    "err:unexpected",
+    "ok:empty_log",
+    "ok:single_record",
+    "ok:multi_record",
+];
+
+static STATS: Stats = Stats::new("event_log", LABELS, FLAGS);
+
+/// One directory per process, reused across executions.
+///
+/// A fresh `tempfile::TempDir` per execution would cost two syscalls and a
+/// directory create/remove per input and would dominate the run; the file
+/// itself is rewritten (truncating) every time, so no state carries over.
+fn log_dir() -> &'static PathBuf {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("bathy-fuzz-event-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("fuzz scratch directory");
+        dir
+    })
+}
+
+fn scan_id() -> ScanId {
+    "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV"
+        .parse()
+        .expect("fixed, valid scan id")
+}
+
+fuzz_target!(|data: &[u8]| {
+    let dir = log_dir();
+    let path = dir.join(format!("{}.jsonl", scan_id()));
+    // `write` truncates, so the previous execution's log cannot leak into
+    // this one.
+    if std::fs::write(&path, data).is_err() {
+        STATS.tick();
+        return;
+    }
+
+    let reader = match EventLogReader::open(dir, scan_id()) {
+        Ok(reader) => reader,
+        Err(e) => {
+            STATS.bump(REJECTED);
+            STATS.flag(match e {
+                bathy_evidence::log::LogError::Malformed { .. } => 0,
+                bathy_evidence::log::LogError::SequenceGap { .. } => 1,
+                _ => 2,
+            });
+            STATS.tick();
+            return;
+        }
+    };
+    STATS.bump(OPENED);
+
+    let events = match reader.read_from(0) {
+        Ok(events) => events,
+        // Opening succeeded, so the whole file already parsed once; a
+        // failure on the second pass over the same unchanged bytes would be
+        // a real inconsistency, not merely a rejected input.
+        Err(e) => panic!("a log that opened cleanly failed to read back: {e}"),
+    };
+    STATS.add(EVENTS, events.len() as u64);
+    match events.len() {
+        0 => STATS.flag(3),
+        1 => STATS.flag(4),
+        _ => STATS.flag(5),
+    }
+
+    // The reader's own contract: sequences are exactly 1..=last_sequence,
+    // ascending with no repeats. Everything downstream (resumption cursors,
+    // `scan.events` streaming, the fold below) assumes it.
+    assert_eq!(
+        events.len() as u64,
+        reader.last_sequence(),
+        "read_from(0) returned {} event(s) for a log whose last_sequence is {}",
+        events.len(),
+        reader.last_sequence()
+    );
+    for (i, event) in events.iter().enumerate() {
+        assert_eq!(
+            event.sequence,
+            i as u64 + 1,
+            "event {i} carries sequence {}; a log that opened must be contiguous from 1",
+            event.sequence
+        );
+    }
+
+    // A tail read from a cursor derived from the input, so the offset index
+    // is indexed with something other than 0. `read_records_from` indexes
+    // `offsets[after_sequence]` directly, which is exactly the shape of
+    // out-of-bounds panic this target exists to find.
+    let after = (data.len() as u64) % (reader.last_sequence() + 2);
+    match reader.read_from(after) {
+        Ok(tail) => {
+            STATS.bump(TAIL_READS);
+            assert!(
+                tail.iter().all(|e| e.sequence > after),
+                "read_from({after}) returned an event at or before its cursor"
+            );
+            assert_eq!(
+                tail.len() as u64,
+                reader.last_sequence().saturating_sub(after),
+                "read_from({after}) returned {} of the {} event(s) past its cursor",
+                tail.len(),
+                reader.last_sequence().saturating_sub(after)
+            );
+        }
+        Err(e) => panic!("a log that opened cleanly failed a tail read from {after}: {e}"),
+    }
+
+    // The first thing every consumer does with a parsed log. It sees only
+    // events these bytes produced, so it is part of the same attack
+    // surface.
+    let fold = fold_events(&events);
+    STATS.add(FOLDED_ENDPOINTS, fold.endpoints.len() as u64);
+    STATS.add(
+        FOLDED_OBSERVATIONS,
+        fold.endpoints
+            .values()
+            .filter(|e| e.observation.is_some())
+            .count() as u64,
+    );
+
+    // A fold diffed against itself: every endpoint is present on both sides
+    // with identical content, so there is nothing for the classifier to
+    // find and nothing for it to call one-sided. Any change or
+    // `undetermined` entry here is one the differ invented. (Note what is
+    // deliberately *not* asserted: `absence_was_evidence()`. A fuzz-produced
+    // log usually has no `scan.started`, so both sides carry
+    // `plan_hash: None` and the pair is legitimately undecidable -- which
+    // changes nothing about the two assertions below, because no endpoint is
+    // one-sided in the first place.)
+    let self_diff = diff(&fold, &fold);
+    assert!(
+        self_diff.changes.is_empty(),
+        "diffing a fold against itself invented {} change(s): {:?}",
+        self_diff.changes.len(),
+        self_diff.changes
+    );
+    assert!(
+        self_diff.undetermined.is_empty(),
+        "diffing a fold against itself left {} endpoint(s) undetermined",
+        self_diff.undetermined.len()
+    );
+    assert_eq!(
+        self_diff.unchanged as usize,
+        fold.endpoints.len(),
+        "diffing a fold against itself accounted for {} of its {} endpoint(s)",
+        self_diff.unchanged,
+        fold.endpoints.len()
+    );
+
+    STATS.tick();
+});

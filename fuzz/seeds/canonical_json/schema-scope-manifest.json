@@ -1,0 +1,91 @@
+{
+  "$defs": {
+    "Budgets": {
+      "additionalProperties": false,
+      "description": "Hard ceilings. The scheduler aborts the scan when any is exhausted; these\nare not advisory hints. Every field is mandatory: an unbounded scan is not\nan expressible request.",
+      "properties": {
+        "maximum_packets": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_packets_per_second": {
+          "format": "uint32",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "maximum_runtime_seconds": {
+          "format": "uint64",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "maximum_packets",
+        "maximum_runtime_seconds",
+        "maximum_packets_per_second"
+      ],
+      "type": "object"
+    },
+    "NonEmpty_of_string": {
+      "description": "A vector guaranteed to hold at least one element.\n\nUsed so that a `Finding` cannot be constructed without evidence. The\nguarantee lives in the type system rather than in a validation pass,\nbecause a validation pass can be forgotten.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "ScopeId": {
+      "description": "Identifies an authorization scope manifest.",
+      "pattern": "^scope_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "The on-disk JSON form of a scope manifest: the document that decides which\naddresses a scan is authorized to touch.\n\nThis describes the wire *shape* only. `allowed_cidrs` and `denied_cidrs`\nare plain strings, and a document that validates against this schema may\nstill be refused when it is loaded -- a string that is not a syntactically\nvalid CIDR, a range that is reserved, and an expiry already past are all\ndecided there, not here. Deny always beats allow, regardless of\nspecificity.",
+  "properties": {
+    "allowed_cidrs": {
+      "$ref": "#/$defs/NonEmpty_of_string",
+      "description": "CIDR strings, e.g. `\"10.30.0.0/24\"`. Parsed and validated when the\nmanifest is loaded, not by this schema."
+    },
+    "budget_ceiling": {
+      "$ref": "#/$defs/Budgets"
+    },
+    "denied_cidrs": {
+      "default": [],
+      "description": "CIDR strings. Deny always beats allow, regardless of specificity.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "description": {
+      "type": "string"
+    },
+    "id": {
+      "$ref": "#/$defs/ScopeId"
+    },
+    "not_after": {
+      "description": "RFC 3339 instant after which the manifest is no longer valid.",
+      "format": "date-time",
+      "type": "string"
+    },
+    "signature": {
+      "description": "Reserved for v0.2 detached-signature verification; accepted on the\nwire but NOT cryptographically verified by this version.",
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "id",
+    "description",
+    "not_after",
+    "allowed_cidrs",
+    "budget_ceiling"
+  ],
+  "title": "ScopeManifestDto",
+  "type": "object"
+}

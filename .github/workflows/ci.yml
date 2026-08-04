@@ -99,11 +99,68 @@ jobs:
       # have run them, and `lab/run.sh test` is what runs them with
       # `BATHY_LAB_REQUIRED` set so an absent lab fails instead of skipping.
       - run: cargo run -p xtask -- check-lab
+      # AC-7.7 to AC-7.10, the half that reads text: a fuzz target exists for
+      # every function that consumes untrusted bytes, each has committed seed
+      # inputs, the `interpret` target still carries its `matched_span`
+      # assertions, the fuzz package is still its own workspace (so it cannot
+      # drag nightly into the pinned build or either MSRV job), and the fuzz
+      # job below both runs and caches its corpus.
+      #
+      # It runs here, in the fast job, because it reads files. Actually
+      # *running* the targets needs nightly and `cargo-fuzz` and takes
+      # minutes, so it is the separate `fuzz` job below -- and the seed check
+      # is here rather than there because a target with no seeds does not fail,
+      # it succeeds while reaching nothing, which is the failure mode this
+      # milestone already measured once in a property-test strategy.
+      - run: cargo run -p xtask -- check-fuzz
       # The gate on the gates: every `run:` step in this file must be either a
       # `cargo run -p xtask -- <subcommand>` that exists or one of a small
       # named set of cargo built-ins. Closing five inline gates is not closing
       # the class; this is.
       - run: cargo run -p xtask -- check-ci
+
+  # AC-7.8 and AC-7.10 -- the fuzz targets, actually executed.
+  #
+  # WHY IT HAS NO `if:`. AC-7.10 is specifically "on every pull request", and
+  # a job-level condition is how that requirement gets quietly lost -- see the
+  # `lab-conformance` job below, which legitimately has one and is therefore
+  # exactly the shape to copy by accident. `xtask check-fuzz` fails if this
+  # job grows one. The nightly-vs-PR difference is on the *duration*, not on
+  # whether the job runs: 60 seconds per target on a push or pull request, 600
+  # on the nightly schedule.
+  #
+  # WHY THE CORPUS IS CACHED. Without it every run re-derives the same shallow
+  # inputs from the committed seeds and never gets past them, and a 60-second
+  # run from a cold corpus is a smoke test wearing a fuzzer's name. The cache
+  # key rolls with the seeds so a new seed does not inherit a corpus that
+  # predates it; `restore-keys` still recovers the previous corpus, because
+  # discarding a fuzzer's accumulated inputs is the one thing that makes it
+  # start over.
+  #
+  # WHY `cargo install` IS ALLOWED HERE. A program that needs `cargo-fuzz`
+  # cannot be what provides it -- the same reason the toolchain steps in the
+  # MSRV jobs are not xtask subcommands. `RUNNABLE_WITHOUT_XTASK` in
+  # `xtask/src/gates.rs` names this exact command, narrowly, with that reason.
+  #
+  # WHY IT IS NOT `cargo fuzz run <target>` FOUR TIMES. That would be a second
+  # registry of targets, in a file nobody runs locally, and it would diverge
+  # from `gates::FUZZ_SURFACES` the first time a target was added -- the same
+  # defect as the MSRV membership rule that had no executable form and three
+  # recorded recurrences. `xtask fuzz` iterates the one registry.
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ hashFiles('fuzz/seeds/**') }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ hashFiles('fuzz/seeds/**') }}-
+            fuzz-corpus-
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo run -p xtask -- fuzz --time ${{ github.event_name == 'schedule' && '600' || '60' }}
 
   # AC-7.2 through AC-7.6 -- the conformance suite, against the real lab.
   #

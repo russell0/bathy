@@ -1,0 +1,208 @@
+{
+  "$defs": {
+    "EvidenceLevel": {
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Record only the derived observation. Smallest storage.",
+          "type": "string"
+        },
+        {
+          "const": "headers",
+          "description": "Record protocol banners and response headers. Default.",
+          "type": "string"
+        },
+        {
+          "const": "full",
+          "description": "Record full response bodies up to the per-response cap.",
+          "type": "string"
+        }
+      ]
+    },
+    "NonEmpty_of_string": {
+      "description": "A vector guaranteed to hold at least one element.\n\nUsed so that a `Finding` cannot be constructed without evidence. The\nguarantee lives in the type system rather than in a validation pass,\nbecause a validation pass can be forgotten.",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "Objective": {
+      "description": "What the caller is trying to learn. Objectives are a closed set so the\nplanner can map each to a bounded strategy; free-text goals belong to the\nagent layer, which compiles them into one of these.",
+      "oneOf": [
+        {
+          "const": "host_inventory",
+          "description": "Which hosts are up.",
+          "type": "string"
+        },
+        {
+          "const": "inventory_exposed_services",
+          "description": "Which services are listening and what they are.",
+          "type": "string"
+        },
+        {
+          "const": "change_detection",
+          "description": "Re-observe a previous scan's endpoints to detect change.",
+          "type": "string"
+        },
+        {
+          "const": "confidence_refinement",
+          "description": "Re-probe only endpoints whose prior confidence was low.",
+          "type": "string"
+        }
+      ]
+    },
+    "PortPreset": {
+      "oneOf": [
+        {
+          "const": "top-100",
+          "description": "The 100 most commonly listening TCP ports, from our own dataset.",
+          "type": "string"
+        },
+        {
+          "const": "common-1000",
+          "description": "The 1000 most commonly listening TCP ports, from our own dataset.",
+          "type": "string"
+        },
+        {
+          "const": "all",
+          "description": "All 65535 TCP ports. Requires a budget large enough to cover them.",
+          "type": "string"
+        }
+      ]
+    },
+    "PortSelection": {
+      "anyOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "preset": {
+              "$ref": "#/$defs/PortPreset"
+            }
+          },
+          "required": [
+            "preset"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Explicit ports and inclusive ranges, e.g. `[\"22\", \"80\", \"8000-8100\"]`.",
+          "properties": {
+            "explicit": {
+              "$ref": "#/$defs/NonEmpty_of_string"
+            }
+          },
+          "required": [
+            "explicit"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ScanRequestSpec": {
+      "additionalProperties": false,
+      "description": "A scan request as a caller may state it.\n\nThis is every field of a scan request except the identity of the manifest\nthat authorizes it, which the server fills in from the document it loaded\nat `manifest_path`. The budget fields are optional and default to the\nmanifest's own ceiling: the ceiling is a hard limit an operator already\nwrote down, and the alternative -- a built-in default -- would be a number\nthis program invented for someone else's network.",
+      "properties": {
+        "evidence_level": {
+          "$ref": "#/$defs/EvidenceLevel",
+          "default": "headers"
+        },
+        "idempotency_key": {
+          "description": "Names this attempt. Repeating it with an identical plan returns the\noriginal scan; repeating it with a different plan is refused.",
+          "type": "string"
+        },
+        "max_packets": {
+          "description": "Hard packet ceiling. Defaults to the manifest's own ceiling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_packets_per_second": {
+          "description": "Hard packets-per-second ceiling. Defaults to the manifest's own ceiling.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "max_runtime_seconds": {
+          "description": "Hard runtime ceiling in seconds. Defaults to the manifest's own ceiling.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "objective": {
+          "$ref": "#/$defs/Objective",
+          "description": "What this scan is for."
+        },
+        "ports": {
+          "$ref": "#/$defs/PortSelection",
+          "description": "A named preset, or an explicit list of ports and inclusive ranges."
+        },
+        "service_detection": {
+          "$ref": "#/$defs/ServiceDetection",
+          "default": {
+            "enabled": true,
+            "intensity": 4
+          }
+        },
+        "targets": {
+          "$ref": "#/$defs/NonEmpty_of_string",
+          "description": "CIDRs, single addresses, or inclusive `a.b.c.d-e.f.g.h` ranges."
+        }
+      },
+      "required": [
+        "targets",
+        "objective",
+        "ports",
+        "idempotency_key"
+      ],
+      "type": "object"
+    },
+    "ServiceDetection": {
+      "additionalProperties": false,
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "intensity": {
+          "format": "uint8",
+          "maximum": 9,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "enabled",
+        "intensity"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Admit a scan and begin it. Returns immediately with a handle.",
+  "properties": {
+    "manifest_path": {
+      "description": "Filesystem path to the scope manifest authorizing this scan.",
+      "type": "string"
+    },
+    "request": {
+      "$ref": "#/$defs/ScanRequestSpec"
+    }
+  },
+  "required": [
+    "manifest_path",
+    "request"
+  ],
+  "title": "ScanStartInput",
+  "type": "object"
+}
