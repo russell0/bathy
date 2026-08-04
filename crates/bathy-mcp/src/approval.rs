@@ -41,8 +41,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bathy_types::ids::Digest;
 use rmcp::model::{
-    ElicitRequest, ElicitRequestParams, ElicitationSchema, InputRequest, InputRequiredResult,
-    InputRequests, InputResponses,
+    ElicitRequest, ElicitRequestParams, ElicitationSchema, InputRequest, InputRequests,
+    InputRequiredResult, InputResponses,
 };
 use rmcp::model::{RequestStateCodec, SealOptions};
 use serde::{Deserialize, Serialize};
@@ -232,13 +232,13 @@ impl ApprovalGate {
     ) -> Result<PendingApproval, ApprovalError> {
         let sealed = request_state.ok_or(ApprovalError::Unverifiable)?;
         let binding = Self::binding(principal, arguments_digest);
-        let pending: PendingApproval = self
-            .codec
-            .open_json_with(sealed, &binding)
-            .map_err(|e| match e {
-                rmcp::model::RequestStateError::Expired => ApprovalError::Expired,
-                _ => ApprovalError::Unverifiable,
-            })?;
+        let pending: PendingApproval =
+            self.codec
+                .open_json_with(sealed, &binding)
+                .map_err(|e| match e {
+                    rmcp::model::RequestStateError::Expired => ApprovalError::Expired,
+                    _ => ApprovalError::Unverifiable,
+                })?;
 
         // Single use, enforced before the answer is even read: a replayed
         // token is refused whether or not it carries a valid acceptance.
@@ -323,7 +323,10 @@ mod tests {
     #[test]
     fn the_threshold_is_a_strict_ceiling_not_a_target() {
         let g = gate();
-        assert!(!g.requires_approval(64), "at the threshold is still allowed");
+        assert!(
+            !g.requires_approval(64),
+            "at the threshold is still allowed"
+        );
         assert!(g.requires_approval(65));
     }
 
@@ -362,7 +365,11 @@ mod tests {
 
     #[test]
     fn a_token_sealed_under_a_different_key_does_not_open() {
-        let issuer = ApprovalGate::new(b"a-completely-different-key-here!!".to_vec(), 64, Duration::from_secs(600));
+        let issuer = ApprovalGate::new(
+            b"a-completely-different-key-here!!".to_vec(),
+            64,
+            Duration::from_secs(600),
+        );
         let args = digest("args");
         let state = issue(&issuer, "alice", &args);
         assert_eq!(
@@ -536,7 +543,9 @@ mod tests {
             "elicitation/create"
         );
         assert!(
-            rendered["requestState"].as_str().is_some_and(|s| !s.is_empty()),
+            rendered["requestState"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
             "{rendered:#}"
         );
     }

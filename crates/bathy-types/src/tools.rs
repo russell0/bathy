@@ -541,7 +541,13 @@ mod tests {
                 continue;
             }
             let rendered = serde_json::to_string(&schema).unwrap();
-            for forbidden in ["\"command\"", "\"args\"", "\"flags\"", "\"argv\"", "\"raw\""] {
+            for forbidden in [
+                "\"command\"",
+                "\"args\"",
+                "\"flags\"",
+                "\"argv\"",
+                "\"raw\"",
+            ] {
                 assert!(!rendered.contains(forbidden), "{name} exposes {forbidden}");
             }
         }

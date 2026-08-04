@@ -25,7 +25,10 @@ fn hex(bytes: &[u8]) -> String {
 pub fn get(input: EvidenceGetInput, runtime: &Runtime) -> ToolResult<EvidenceGetOutput> {
     // `get` verifies the bytes against the digest that named them, so what
     // comes back is the evidence or it is an error, never something between.
-    let bytes = runtime.evidence.get(&input.digest).map_err(evidence_error)?;
+    let bytes = runtime
+        .evidence
+        .get(&input.digest)
+        .map_err(evidence_error)?;
     let length = bytes.len() as u64;
 
     let (returned, truncated) = match input.max_bytes {

@@ -119,7 +119,13 @@ fn canonical(value: &serde_json::Value) -> String {
             keys.sort_unstable();
             let body: Vec<String> = keys
                 .into_iter()
-                .map(|k| format!("{}:{}", serde_json::Value::String(k.clone()), canonical(&map[k])))
+                .map(|k| {
+                    format!(
+                        "{}:{}",
+                        serde_json::Value::String(k.clone()),
+                        canonical(&map[k])
+                    )
+                })
                 .collect();
             format!("{{{}}}", body.join(","))
         }
@@ -286,7 +292,10 @@ impl BathyMcpServer {
 
         // 2. The threshold. It is server configuration read from this
         //    process, never a request field: an agent cannot raise its own.
-        if self.approval.requires_approval(authorized.estimated_targets()) {
+        if self
+            .approval
+            .requires_approval(authorized.estimated_targets())
+        {
             let principal = principal_of(context);
             let digest = arguments_digest(&request.arguments);
             let plan_hash = authorized.plan().hash().to_string();

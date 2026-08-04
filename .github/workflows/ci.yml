@@ -211,7 +211,20 @@ jobs:
       # only one floor: its library, its binary and its tests all reach
       # `bathy-store`, so `1.95` is what a `cargo install bathy` user needs
       # too, and it is named here and nowhere else.
-      - run: cargo check -p bathy-store -p bathy-engine -p bathy-query -p bathy --all-targets
+      #
+      # `bathy-mcp` joined this job in M5 Task 4, AGAINST what the plan said.
+      # The plan put it in the `1.88` `msrv` job because `rmcp` declares
+      # `rust-version = "1.88"`, but the SDK's floor is a lower bound on this
+      # crate's rather than its value: `bathy-mcp` is an adapter over the
+      # engine, so it reaches `bathy-store` and needs `1.95`. Verified by
+      # execution before this line was written, in both directions:
+      # `cargo +1.88 check -p bathy-mcp` fails with "bathy-mcp@0.1.0 requires
+      # rustc 1.95", and `cargo +1.95 check -p bathy-mcp --all-targets`
+      # passes. This is the third crate in this project to be given a floor
+      # nothing checked -- M3 found `bathy-plan`, M4 reintroduced it with
+      # `crates/bathy` -- which is why the measurement is recorded rather
+      # than the conclusion.
+      - run: cargo check -p bathy-store -p bathy-engine -p bathy-query -p bathy -p bathy-mcp --all-targets
 
   deny:
     runs-on: ubuntu-latest

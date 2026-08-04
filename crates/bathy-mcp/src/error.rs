@@ -106,7 +106,8 @@ mod tests {
         let result = ToolFailure::new("no_such_scan", "no scan scan_X").into_result();
         assert_eq!(result.is_error, Some(true));
         let text = result.content[0].as_text().unwrap().text.clone();
-        let parsed: ToolFailure = serde_json::from_str(&text).expect("a failure is machine-readable");
+        let parsed: ToolFailure =
+            serde_json::from_str(&text).expect("a failure is machine-readable");
         assert_eq!(parsed.error, "no_such_scan");
     }
 

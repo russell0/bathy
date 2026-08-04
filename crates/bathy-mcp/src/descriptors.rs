@@ -248,7 +248,10 @@ pub fn all() -> Vec<Tool> {
         ),
     ];
     debug_assert!(
-        tools.iter().map(|t| t.name.as_ref()).eq(TOOL_NAMES.iter().copied()),
+        tools
+            .iter()
+            .map(|t| t.name.as_ref())
+            .eq(TOOL_NAMES.iter().copied()),
         "the descriptor list and the advertised order must not disagree"
     );
     tools
@@ -325,7 +328,10 @@ mod tests {
         assert_eq!(cancel.open_world_hint, Some(false));
 
         for tool in &all {
-            if matches!(tool.name.as_ref(), "scan.start" | "scan.resume" | "scan.cancel") {
+            if matches!(
+                tool.name.as_ref(),
+                "scan.start" | "scan.resume" | "scan.cancel"
+            ) {
                 continue;
             }
             let a = tool.annotations.clone().unwrap();
@@ -392,7 +398,8 @@ mod tests {
     fn the_diff_tools_output_schema_is_the_committed_scan_diff_document_itself() {
         let all = all();
         let diff = all.iter().find(|t| t.name == "result.diff").unwrap();
-        let advertised = serde_json::Value::Object((**diff.output_schema.as_ref().unwrap()).clone());
+        let advertised =
+            serde_json::Value::Object((**diff.output_schema.as_ref().unwrap()).clone());
         let committed = &bathy_query::schema::all()["scan-diff"];
         assert_eq!(
             &advertised, committed,
@@ -405,7 +412,13 @@ mod tests {
     fn no_published_input_schema_lets_an_agent_construct_a_command_line() {
         for tool in all() {
             let rendered = serde_json::to_string(&*tool.input_schema).unwrap();
-            for forbidden in ["\"command\"", "\"args\"", "\"flags\"", "\"argv\"", "\"raw\""] {
+            for forbidden in [
+                "\"command\"",
+                "\"args\"",
+                "\"flags\"",
+                "\"argv\"",
+                "\"raw\"",
+            ] {
                 assert!(
                     !rendered.contains(forbidden),
                     "{} exposes {forbidden}; agents must never construct command strings",
@@ -438,7 +451,12 @@ mod tests {
 
     #[test]
     fn every_tool_that_names_a_scope_names_it_the_way_the_command_line_does() {
-        let scope_taking = ["scope.validate", "scan.preview", "scan.start", "scan.resume"];
+        let scope_taking = [
+            "scope.validate",
+            "scan.preview",
+            "scan.start",
+            "scan.resume",
+        ];
         for tool in all() {
             let has = tool
                 .input_schema
