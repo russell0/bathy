@@ -1122,6 +1122,46 @@ mod tests {
         assert_eq!(hit.specificity, Specificity::ProductOnly);
     }
 
+    /// The exact response `10.30.0.17:443` -- the lab's TLS-only nginx --
+    /// returns to a plaintext request, byte for byte as `lab/run.sh verify`
+    /// read it. This is the named test `lab/ground-truth.json`'s
+    /// `identification_gap` at that endpoint points at.
+    ///
+    /// It exists to locate the gap precisely, because "bathy does not identify
+    /// nginx behind TLS" has two possible causes and only one of them is true.
+    /// It is NOT that the rules cannot read these bytes: they can, at full
+    /// `ProductAndVersion` specificity, as this asserts. It is that
+    /// `Scheduler::detect_service` stops at the first probe whose capture
+    /// interprets to anything, and on 443 that is `tls-v1`, which is
+    /// protocol-only by construction -- RFC 8446 §4.4 moves the certificate
+    /// into the encrypted flight -- so `http-get-v1` is never reached and
+    /// these bytes are never captured.
+    ///
+    /// If that policy changes, AC-7.5's conformance test is what goes red and
+    /// demands the ground truth's `identification_gap` key be deleted. This
+    /// test is what says the rule side was never the problem, and it runs with
+    /// no lab, no Docker and no network.
+    #[test]
+    fn the_bytes_a_tls_terminator_returns_to_a_plaintext_request_name_its_product() {
+        let observed: &[u8] = b"HTTP/1.1 400 Bad Request\r\nServer: nginx/1.29.8\r\n\
+                                Date: Tue, 04 Aug 2026 17:29:44 GMT\r\n\
+                                Content-Type: text/html\r\nContent-Length: 255\r\n\
+                                Connection: close\r\n\r\n<html>\r\n\
+                                <head><title>400 The plain HTTP request was sent to \
+                                HTTPS port</title></head>\r\n";
+        let hit = http_nginx(observed).expect(
+            "the `Server` header is in cleartext ahead of any handshake; if this stops \
+             matching, lab/ground-truth.json's claim at 10.30.0.17:443 has lost its basis",
+        );
+        assert_eq!(hit.product.as_deref(), Some("nginx"));
+        assert_eq!(hit.version.as_deref(), Some("1.29.8"));
+        assert_eq!(
+            hit.specificity,
+            Specificity::ProductAndVersion,
+            "a 4xx status is still an HTTP response and still names its server"
+        );
+    }
+
     #[test]
     fn http_nginx_does_not_match_a_non_http_response() {
         assert!(http_nginx(b"Server: nginx/1.27.5\r\n").is_none());

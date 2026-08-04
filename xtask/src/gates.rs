@@ -908,6 +908,15 @@ const RUNNABLE_WITHOUT_XTASK: &[&str] = &[
     // checkable half is `check-msrv`, which reads these very lines.
     "rm -f rust-toolchain.toml",
     "cargo check -p",
+    // The local form IS this script, it is in the repository, and it is what
+    // `lab/README.md` documents. Re-spelling it as `cargo run -p xtask --
+    // check-conformance` would put a Docker Compose driver behind an xtask
+    // subcommand that could only shell out to the same script -- a spelling,
+    // not a capability, which is the criterion this list is for. What must not
+    // be true is that the gate exists only here: `check-lab` asserts that this
+    // step is present and that the script sets `BATHY_LAB_REQUIRED`, so an
+    // absent lab fails the job rather than skipping the suite.
+    "lab/run.sh",
 ];
 
 /// The rule: no gate without a local form. `subcommands` is `xtask`'s actual
@@ -1001,6 +1010,10 @@ pub fn check_ci(subcommands: &[&str]) -> Fallible<()> {
 
 pub const LAB_COMPOSE: &str = "lab/docker-compose.yml";
 pub const LAB_GROUND_TRUTH: &str = "lab/ground-truth.json";
+pub const LAB_RUN_SH: &str = "lab/run.sh";
+/// The one file outside `lab/` that hardcodes a lab address. See
+/// [`probe_lab_address_violations`].
+pub const LAB_TLS_PROBE: &str = "crates/bathy-probe/src/probes/tls.rs";
 
 /// Every `image:` reference in a compose file, with its 1-based line number.
 ///
@@ -1183,13 +1196,6 @@ pub fn lab_violations(
             .unwrap_or_default()
     };
 
-    if !hosts.iter().any(|h| open_of(h).is_empty()) {
-        found.push(format!(
-            "{truth_path}: every described host has an open port, so a scanner that \
-             never reported a host as closed would still pass. The lab needs a live \
-             host that answers nothing."
-        ));
-    }
     if !hosts.iter().any(|h| !open_of(h).is_empty()) {
         found.push(format!(
             "{truth_path}: no described host has an open port, so AC-7.2 ranges over \
@@ -1218,6 +1224,349 @@ pub fn lab_violations(
         }
     }
 
+    // --- The narrowing controls `lab/README.md` names, one by one. ---
+    //
+    // The generic checks above are necessary and were not sufficient: the M7
+    // Task 1 review removed port 22 from `scanned_ports` -- the control
+    // documented as "`ssh-openssh` listens on 2222, not 22, so 22 is shut on
+    // every host and is in the scanned port set on purpose" -- and `check-lab`,
+    // the conformance suite and the fixture guards all stayed green, because
+    // 8080 independently satisfied every generic property. `lab/README.md`
+    // said "`xtask check-lab` fails if any of those controls is removed", and
+    // that sentence was false for at least one of the four. A README claim
+    // that nothing enforces is the exact recurrence pattern the overview's
+    // README constraint was written for, so the sentence is made true here
+    // rather than weakened there.
+    for control in NARROWING_CONTROLS {
+        if let Some(complaint) = (control.check)(&scanned, hosts, &open_of) {
+            found.push(format!(
+                "{truth_path}: the `{}` narrowing control is gone -- {complaint} {}",
+                control.name, control.why
+            ));
+        }
+    }
+
+    found.extend(product_claims_not_backed_by_their_own_evidence(
+        truth_path, hosts,
+    ));
+
+    found
+}
+
+/// The lab address `crates/bathy-probe/src/probes/tls.rs` dials, cross-checked
+/// against the lab it claims to be dialing.
+///
+/// That crate's dependency set is `bathy-types` and nothing else, which is what
+/// keeps it in CI's 1.88 MSRV tier, so the address is a literal rather than a
+/// read of `lab/ground-truth.json`. The literal is the right trade and the
+/// missing half was that nothing tied it to the lab: a re-address would have
+/// left `tls_probe_against_a_real_nginx_tls_server` dialing a dead address, and
+/// -- until this round -- skipping silently when it did.
+pub fn probe_lab_address_violations(
+    probe_path: &str,
+    probe_source: &str,
+    truth_path: &str,
+    truth: &serde_json::Value,
+) -> Vec<String> {
+    let Some(literal) = probe_source.lines().find_map(|line| {
+        line.split_once("LAB_TLS_WEB: &str = \"")?
+            .1
+            .split('"')
+            .next()
+    }) else {
+        return vec![format!(
+            "{probe_path}: no `LAB_TLS_WEB` address literal found. If the constant was \
+             renamed, rename it here too -- this cross-check silently ranging over \
+             nothing is worse than not having it."
+        )];
+    };
+    let Some((ip, port)) = literal.rsplit_once(':') else {
+        return vec![format!("{probe_path}: `{literal}` is not `<ip>:<port>`")];
+    };
+    let open_here = truth
+        .get("hosts")
+        .and_then(|h| h.as_array())
+        .map(|hosts| {
+            hosts.iter().any(|h| {
+                h.get("ip").and_then(|i| i.as_str()) == Some(ip)
+                    && h.get("open")
+                        .and_then(|o| o.as_array())
+                        .is_some_and(|open| {
+                            open.iter().any(|e| {
+                                e.get("port")
+                                    .and_then(serde_json::Value::as_u64)
+                                    .map(|p| p.to_string())
+                                    == Some(port.to_string())
+                            })
+                        })
+            })
+        })
+        .unwrap_or(false);
+    if open_here {
+        Vec::new()
+    } else {
+        vec![format!(
+            "{probe_path}: dials {literal}, which {truth_path} does not record as an open \
+             port. The test would connect to nothing and -- being a test that skips when \
+             the lab is unreachable -- report `ok` for the wrong reason."
+        )]
+    }
+}
+
+/// The conformance suite has a CI job, and the command that job runs is the one
+/// that makes an absent lab a failure.
+///
+/// Five acceptance criteria (AC-7.2 .. AC-7.6) were closed by named tests that
+/// die under mutation, and defended by nobody: nothing ran them on a push, so a
+/// regression would land green and stay green until someone remembered. The
+/// stated reason for deferring the job was not a technical one -- `ubuntu-latest`
+/// ships Docker and, being Linux, routes to `labnet` natively, which is the
+/// single thing that makes this impossible on the macOS machine the lab was
+/// built on.
+pub fn lab_ci_job_violations(
+    ci_path: &str,
+    ci: &str,
+    run_sh_path: &str,
+    run_sh: &str,
+) -> Vec<String> {
+    let mut found = Vec::new();
+    // A `run:` STEP, not an occurrence of the string. The first version of
+    // this check asked `ci.contains("lab/run.sh test")` and survived deleting
+    // the step outright, because the comment block explaining the job names
+    // the command four times -- a guard satisfied by the prose that documents
+    // it. Found by mutating the file, which is the only way that kind of
+    // vacuity ever shows up.
+    let runs_the_suite = ci.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+            .strip_prefix("- run:")
+            .or_else(|| trimmed.strip_prefix("run:"))
+            .is_some_and(|command| command.trim().starts_with("lab/run.sh test"))
+    });
+    if !runs_the_suite {
+        found.push(format!(
+            "{ci_path}: no `run:` step invokes `lab/run.sh test`, so AC-7.2 through \
+             AC-7.6 are closed by tests nothing executes. The job needs Docker and a \
+             Linux runner and nothing else -- `ubuntu-latest` has both, and routes to \
+             `labnet` natively."
+        ));
+    }
+    if !run_sh.contains("BATHY_LAB_REQUIRED=1") {
+        found.push(format!(
+            "{run_sh_path}: does not set BATHY_LAB_REQUIRED, so the conformance tests \
+             would SKIP rather than FAIL when the lab is not reachable -- and a CI job \
+             that silently skips the suite is the same defect as a test that silently \
+             skips itself, one level up."
+        ));
+    }
+    found
+}
+
+/// One control that keeps the lab from being a fixture that satisfies every
+/// branch. Each is named in `lab/README.md`'s bulleted list, and each is here
+/// so that list is a description of enforced behaviour rather than a promise.
+pub struct NarrowingControl {
+    /// The `lab/README.md` bullet this is, by the service or port it turns on.
+    pub name: &'static str,
+    /// What breaks if it goes, printed with the failure.
+    pub why: &'static str,
+    /// `Some(complaint)` when the control is no longer present.
+    #[allow(clippy::type_complexity)]
+    pub check: fn(
+        scanned: &[u64],
+        hosts: &[serde_json::Value],
+        open_of: &dyn Fn(&serde_json::Value) -> Vec<u64>,
+    ) -> Option<String>,
+}
+
+pub const NARROWING_CONTROLS: &[NarrowingControl] = &[
+    NarrowingControl {
+        name: "ssh-on-2222-so-22-is-shut-everywhere",
+        why: "22 is the port a scanner that assumes `ssh => 22` gets wrong, and it is in \
+              `scanned_ports` on purpose so that assuming it costs a false positive.",
+        check: |scanned, hosts, open_of| {
+            if !scanned.contains(&22) {
+                return Some(
+                    "22 is not in `scanned_ports`, so nothing ever asks about it.".to_string(),
+                );
+            }
+            let listening: Vec<String> = hosts
+                .iter()
+                .filter(|h| open_of(h).contains(&22))
+                .map(|h| {
+                    h.get("ip")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect();
+            (!listening.is_empty()).then(|| {
+                format!(
+                    "22 is recorded open on {}, so it is no longer shut on every host.",
+                    listening.join(", ")
+                )
+            })
+        },
+    },
+    NarrowingControl {
+        name: "tls-web-and-web-nginx-serve-opposite-ports",
+        why: "A scanner that reported every port it touched as open fails on both hosts \
+              only while each is open on exactly one of the pair.",
+        check: |scanned, hosts, open_of| {
+            for port in [80u64, 443] {
+                if !scanned.contains(&port) {
+                    return Some(format!("{port} is not in `scanned_ports`."));
+                }
+            }
+            let complementary = hosts.iter().any(|a| {
+                let a_open = open_of(a);
+                a_open.contains(&80)
+                    && !a_open.contains(&443)
+                    && hosts.iter().any(|b| {
+                        let b_open = open_of(b);
+                        b_open.contains(&443) && !b_open.contains(&80)
+                    })
+            });
+            (!complementary).then(|| {
+                "no host serves 80 without 443 while another serves 443 without 80.".to_string()
+            })
+        },
+    },
+    NarrowingControl {
+        name: "a-live-host-that-answers-nothing",
+        why: "`silent` is up and answers nothing, so \"reported down\" and \"reported open\" \
+              are both wrong answers for it. Without it a scanner that never reported a \
+              host as closed would still pass AC-7.3.",
+        check: |_scanned, hosts, open_of| {
+            hosts
+                .iter()
+                .all(|h| !open_of(h).is_empty())
+                .then(|| "every described host has an open port.".to_string())
+        },
+    },
+];
+
+/// Every `product` in the ground truth is either a literal in the `evidence`
+/// string it was transcribed from, or declares the non-literal basis it rests
+/// on in `product_inference`. Same for `version`, with no inference escape:
+/// a version that is not in the observed bytes is a guess.
+///
+/// This is the mechanical half of the fix for the M7 Task 1 review's central
+/// finding. The oracle recorded `product: null` at `10.30.0.17:443` while the
+/// bytes it was transcribed from carried `Server: nginx/1.29.8` -- the
+/// transcription step dropped the line, and a null is what AC-7.5 filters on,
+/// so the loss hid inside the criterion it corrupted. Nothing binds the file
+/// to a sweep run (that is Task 6's `publish-check` and is still open), but
+/// binding each *claim* to the evidence text stored beside it is checkable
+/// today, and it is the step where the error entered.
+/// The product an evidence string names outright, if any.
+///
+/// Three banner shapes, and only three, because these are the ones that carry
+/// a vendor name by protocol definition rather than by luck:
+///
+/// * HTTP's `Server:` response header (RFC 9110 §10.2.4) -- the one that was
+///   elided at `10.30.0.17:443`;
+/// * SSH's identification string, `SSH-2.0-<softwareversion>` (RFC 4253 §4.2);
+/// * SMTP's greeting, where `ESMTP <word>` is the near-universal convention.
+///
+/// Deliberately conservative: a shape not on this list returns `None`, so this
+/// never invents a product. What it must not do is stay quiet about a banner
+/// that plainly names one, which is the failure it exists for.
+pub fn product_named_by(evidence: &str) -> Option<String> {
+    let word = |rest: &str| {
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '+')
+            .collect();
+        (name.len() >= 3).then_some(name)
+    };
+    for (marker, skip) in [("Server: ", 0usize), ("SSH-2.0-", 0), ("ESMTP ", 0)] {
+        if let Some(index) = evidence.find(marker)
+            && let Some(name) = word(&evidence[index + marker.len() + skip..])
+        {
+            return Some(name);
+        }
+    }
+    None
+}
+
+pub fn product_claims_not_backed_by_their_own_evidence(
+    truth_path: &str,
+    hosts: &[serde_json::Value],
+) -> Vec<String> {
+    let mut found = Vec::new();
+    for host in hosts {
+        let ip = host.get("ip").and_then(|i| i.as_str()).unwrap_or("?");
+        let Some(open) = host.get("open").and_then(|o| o.as_array()) else {
+            continue;
+        };
+        for entry in open {
+            let port = entry
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let text = |key: &str| entry.get(key).and_then(|v| v.as_str());
+            let evidence = text("evidence").unwrap_or("").to_lowercase();
+            let inference = text("product_inference");
+
+            if let Some(product) = text("product") {
+                let literal = evidence.contains(&product.to_lowercase());
+                match (literal, inference) {
+                    (false, None) => found.push(format!(
+                        "{truth_path}: {ip}:{port} claims product `{product}`, which does \
+                         not appear in its own `evidence`. Either it is not what the \
+                         sweep saw, or the transcription dropped the line that says so -- \
+                         which is exactly how `10.30.0.17:443` came to record `null` \
+                         against a response carrying `Server: nginx/1.29.8`. Quote the \
+                         bytes, or state the non-literal basis in `product_inference`."
+                    )),
+                    (true, Some(_)) => found.push(format!(
+                        "{truth_path}: {ip}:{port} declares `product_inference` but \
+                         `{product}` is already a literal in its `evidence`. An unused \
+                         escape hatch reads as coverage; delete it."
+                    )),
+                    _ => {}
+                }
+            } else {
+                if inference.is_some() {
+                    found.push(format!(
+                        "{truth_path}: {ip}:{port} declares `product_inference` with no \
+                         `product` to infer."
+                    ));
+                }
+                // The direction that actually went wrong, and the one a
+                // "product must be backed by evidence" rule does not cover at
+                // all: evidence that names a product, recorded as `null`.
+                // A null is self-exempting -- AC-7.5's test filters on
+                // `product.is_some()` -- so this is the only shape of oracle
+                // error that removes its own endpoint from the criterion it
+                // corrupts. It is what `10.30.0.17:443` did.
+                if let Some(named) = product_named_by(text("evidence").unwrap_or("")) {
+                    found.push(format!(
+                        "{truth_path}: {ip}:{port} records `product: null`, but its own \
+                         `evidence` names `{named}`. A null means \"the lab does not \
+                         establish a product here\" and this evidence establishes one. \
+                         AC-7.5 skips null-product endpoints, so a null here does not \
+                         weaken the criterion -- it silently removes this endpoint from \
+                         it, which is how the oracle came to agree with the scanner \
+                         about nothing at the one address where the bytes say \
+                         otherwise. Record the product; if bathy cannot see it, say so \
+                         in `identification_gap`."
+                    ));
+                }
+            }
+
+            if let Some(version) = text("version")
+                && !evidence.contains(&version.to_lowercase())
+            {
+                found.push(format!(
+                    "{truth_path}: {ip}:{port} claims version `{version}`, which does not \
+                     appear in its own `evidence`. A version is read off the wire or it \
+                     is a guess; there is no inference escape for this one."
+                ));
+            }
+        }
+    }
     found
 }
 
@@ -1228,13 +1577,30 @@ pub fn check_lab() -> Fallible<()> {
         .map_err(|e| format!("reading {LAB_GROUND_TRUTH}: {e}"))?;
     let truth: serde_json::Value = serde_json::from_str(&truth_text)
         .map_err(|e| format!("parsing {LAB_GROUND_TRUTH}: {e}"))?;
-    let violations = lab_violations(LAB_COMPOSE, &compose, LAB_GROUND_TRUTH, &truth);
+    let probe = std::fs::read_to_string(Path::new(".").join(LAB_TLS_PROBE))
+        .map_err(|e| format!("reading {LAB_TLS_PROBE}: {e}"))?;
+    let ci_path = ".github/workflows/ci.yml";
+    let ci = std::fs::read_to_string(Path::new(".").join(ci_path))
+        .map_err(|e| format!("reading {ci_path}: {e}"))?;
+    let run_sh = std::fs::read_to_string(Path::new(".").join(LAB_RUN_SH))
+        .map_err(|e| format!("reading {LAB_RUN_SH}: {e}"))?;
+
+    let mut violations = lab_violations(LAB_COMPOSE, &compose, LAB_GROUND_TRUTH, &truth);
+    violations.extend(probe_lab_address_violations(
+        LAB_TLS_PROBE,
+        &probe,
+        LAB_GROUND_TRUTH,
+        &truth,
+    ));
+    violations.extend(lab_ci_job_violations(ci_path, &ci, LAB_RUN_SH, &run_sh));
     if violations.is_empty() {
         let images = image_references(&compose).len();
         let addresses = assigned_addresses(&compose).len();
         println!(
             "check-lab: ok ({images} image(s), all digest-pinned; {addresses} lab \
-             address(es) accounted for by {LAB_GROUND_TRUTH})"
+             address(es) accounted for by {LAB_GROUND_TRUTH}; {} narrowing control(s) \
+             present; the conformance suite has a CI job)",
+            NARROWING_CONTROLS.len(),
         );
         Ok(())
     } else {
@@ -1696,13 +2062,22 @@ jobs:
             "services:\n  \
              web:\n    image: nginx@{PIN_A}\n    networks:\n      labnet:\n        \
              ipv4_address: 10.30.0.10\n  \
+             tls:\n    image: alpine@{PIN_B}\n    networks:\n      labnet:\n        \
+             ipv4_address: 10.30.0.17\n  \
              quiet:\n    image: alpine@{PIN_B}\n    networks:\n      labnet:\n        \
              ipv4_address: 10.30.0.18\n"
         );
+        // Every narrowing control the real lab has, in miniature: 22 scanned
+        // and shut everywhere, 80 and 443 served by different hosts, and a
+        // live host that answers nothing. A fixture missing one of them would
+        // make the seeded-violation test for that control pass vacuously.
         let truth = serde_json::json!({
-            "scanned_ports": [22, 80],
+            "scanned_ports": [22, 80, 443],
             "hosts": [
-                { "ip": "10.30.0.10", "open": [{ "port": 80 }] },
+                { "ip": "10.30.0.10", "open": [
+                    { "port": 80, "product": "nginx", "version": "1.29.8",
+                      "evidence": "Server: nginx/1.29.8" }] },
+                { "ip": "10.30.0.17", "open": [{ "port": 443 }] },
                 { "ip": "10.30.0.18", "open": [] },
             ],
             "absent": ["10.30.0.200"],
@@ -1825,7 +2200,7 @@ jobs:
         // the one live host that answers nothing and a scanner that never
         // reported a closed host would still pass.
         let (compose, mut truth) = lab_fixture();
-        truth["hosts"][1]["open"] = serde_json::json!([{ "port": 80 }]);
+        truth["hosts"][2]["open"] = serde_json::json!([{ "port": 80 }]);
         let v = lab(&compose, &truth);
         assert_eq!(v.len(), 1, "{v:#?}");
         assert!(v[0].contains("answers nothing"), "{v:#?}");
@@ -1834,9 +2209,13 @@ jobs:
     #[test]
     fn a_scanned_port_set_with_no_shut_port_gives_ac_7_3_nothing_to_catch_either() {
         let (compose, mut truth) = lab_fixture();
-        // Every scanned port open on every host: port 80 only, open on both.
+        // Every scanned port open on every host: port 80 only, open on all
+        // three. This necessarily removes the named controls too (they are
+        // defined over ports this leaves unscanned), which is why the
+        // assertion below names the generic property rather than counting.
         truth["scanned_ports"] = serde_json::json!([80]);
         truth["hosts"][1]["open"] = serde_json::json!([{ "port": 80 }]);
+        truth["hosts"][2]["open"] = serde_json::json!([{ "port": 80 }]);
         let v = lab(&compose, &truth);
         assert!(
             v.iter()
@@ -1871,6 +2250,286 @@ jobs:
             image_references(&compose).len() >= 8,
             "the lab is supposed to cover eight protocols; only {} image(s) found",
             image_references(&compose).len()
+        );
+    }
+
+    // --- The narrowing controls, one seeded removal each. ---
+    //
+    // `lab/README.md` names four and states that `check-lab` fails if any is
+    // removed. That sentence was false: the M7 Task 1 review removed port 22
+    // from `scanned_ports` and everything stayed green, because the generic
+    // "some scanned port is shut somewhere" property was independently
+    // satisfied by 8080. Generic properties do not defend named controls.
+
+    #[test]
+    fn removing_port_22_from_the_scanned_set_is_caught_the_way_the_readme_promises() {
+        let (compose, mut truth) = lab_fixture();
+        truth["scanned_ports"] = serde_json::json!([80, 443]);
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(
+            v[0].contains("ssh-on-2222-so-22-is-shut-everywhere"),
+            "{}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn a_lab_where_something_starts_listening_on_22_loses_the_same_control() {
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"][1]["open"] = serde_json::json!([{ "port": 443 }, { "port": 22 }]);
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(
+            v[0].contains("22 is recorded open on 10.30.0.17"),
+            "{}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn a_lab_whose_web_hosts_stop_serving_opposite_ports_is_caught() {
+        let (compose, mut truth) = lab_fixture();
+        // The TLS host starts serving 80 as well, so no host serves 443
+        // without 80 and a scanner that reported everything open is no longer
+        // distinguishable from a correct one on this pair.
+        truth["hosts"][1]["open"] = serde_json::json!([{ "port": 443 }, { "port": 80 }]);
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(
+            v[0].contains("tls-web-and-web-nginx-serve-opposite-ports"),
+            "{}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn every_narrowing_control_the_readme_names_has_a_checker_here() {
+        assert_eq!(
+            NARROWING_CONTROLS.len(),
+            3,
+            "the fourth README bullet -- the absent addresses -- is enforced by the \
+             `absent` checks above rather than by a NarrowingControl. If a bullet is \
+             added to lab/README.md, it needs an entry here or the sentence that says \
+             check-lab enforces them all goes back to being false."
+        );
+    }
+
+    // --- Product claims and the evidence they were transcribed from. ---
+
+    #[test]
+    fn a_product_that_is_not_in_its_own_evidence_is_caught() {
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"][0]["open"][0]["product"] = serde_json::json!("Apache");
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("claims product `Apache`"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_version_that_is_not_in_its_own_evidence_is_caught_with_no_escape_hatch() {
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"][0]["open"][0]["version"] = serde_json::json!("1.28.0");
+        truth["hosts"][0]["open"][0]["product_inference"] = serde_json::json!("a guess");
+        let v = lab(&compose, &truth);
+        // Two: the version has no basis, and the inference note is unused
+        // because the product IS a literal. Both are the point.
+        assert_eq!(v.len(), 2, "{v:#?}");
+        assert!(
+            v.iter().any(|s| s.contains("claims version `1.28.0`")),
+            "{v:#?}"
+        );
+    }
+
+    #[test]
+    fn the_one_product_read_off_a_wire_format_rather_than_a_literal_must_say_so() {
+        let (compose, mut truth) = lab_fixture();
+        // MySQL's shape: the handshake gives a version and an auth plugin and
+        // never the vendor name.
+        truth["hosts"][0]["open"][0] = serde_json::json!({
+            "port": 80, "product": "MySQL", "version": "9.4.0",
+            "evidence": "\\x0a 9.4.0 \\x00 caching_sha2_password",
+        });
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("claims product `MySQL`"), "{}", v[0]);
+
+        truth["hosts"][0]["open"][0]["product_inference"] =
+            serde_json::json!("protocol-10 handshake; the bytes name no vendor");
+        assert!(lab(&compose, &truth).is_empty());
+    }
+
+    /// The mutation that reproduces the review's central finding exactly:
+    /// put `product: null` back at `10.30.0.17:443` and leave the evidence
+    /// alone. Nothing caught this before -- a null claims nothing, so a rule
+    /// that only checks claims against evidence has nothing to check, and
+    /// AC-7.5 skips the endpoint entirely. It is the one oracle error that
+    /// deletes its own witness.
+    #[test]
+    fn evidence_that_names_a_product_may_not_be_recorded_as_null() {
+        let (compose, mut truth) = lab_fixture();
+        truth["hosts"][0]["open"][0]["product"] = serde_json::Value::Null;
+        truth["hosts"][0]["open"][0]["version"] = serde_json::Value::Null;
+        let v = lab(&compose, &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(
+            v[0].contains("its own `evidence` names `nginx`"),
+            "{}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn the_banner_shapes_that_name_a_product_are_recognised_and_others_are_not() {
+        for (evidence, expected) in [
+            (
+                "HTTP/1.1 400 Bad Request\\r\\nServer: nginx/1.29.8",
+                Some("nginx"),
+            ),
+            ("SSH-2.0-OpenSSH_10.3", Some("OpenSSH")),
+            (
+                "220 mail.lab.invalid ESMTP Postfix (Debian/GNU)",
+                Some("Postfix"),
+            ),
+            // Nothing names a product in any of these, and inventing one
+            // would be worse than the silence this check exists to break.
+            ("accepts a connection and volunteers no bytes", None),
+            ("\\x05\\x00\\x00\\x00\\x0b\\x08\\x05\\x1a\\x00", None),
+            ("open; the bind9 image enables DoT by default.", None),
+        ] {
+            assert_eq!(
+                product_named_by(evidence).as_deref(),
+                expected,
+                "{evidence:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_real_ground_truth_backs_every_product_it_claims() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let truth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(LAB_GROUND_TRUTH)).unwrap())
+                .unwrap();
+        let hosts = truth["hosts"].as_array().unwrap();
+        let claims = hosts
+            .iter()
+            .flat_map(|h| h["open"].as_array().unwrap())
+            .filter(|o| !o["product"].is_null())
+            .count();
+        assert!(
+            claims >= 5,
+            "only {claims} product claim(s) in the real ground truth; this check would \
+             range over almost nothing"
+        );
+        assert!(
+            product_claims_not_backed_by_their_own_evidence(LAB_GROUND_TRUTH, hosts).is_empty()
+        );
+    }
+
+    // --- The lab address `bathy-probe` hardcodes (MINOR-5). ---
+
+    fn probe_check(source: &str, truth: &serde_json::Value) -> Vec<String> {
+        probe_lab_address_violations(LAB_TLS_PROBE, source, LAB_GROUND_TRUTH, truth)
+    }
+
+    #[test]
+    fn the_address_the_tls_probe_test_dials_must_be_open_in_the_ground_truth() {
+        let (_, truth) = lab_fixture();
+        assert!(
+            probe_check(
+                "    const LAB_TLS_WEB: &str = \"10.30.0.17:443\";\n",
+                &truth
+            )
+            .is_empty()
+        );
+        for moved in ["10.30.0.99:443", "10.30.0.17:8443", "10.30.0.18:443"] {
+            let v = probe_check(
+                &format!("    const LAB_TLS_WEB: &str = \"{moved}\";\n"),
+                &truth,
+            );
+            assert_eq!(v.len(), 1, "{moved} must be caught: {v:#?}");
+        }
+    }
+
+    #[test]
+    fn a_renamed_constant_fails_rather_than_letting_the_cross_check_range_over_nothing() {
+        let (_, truth) = lab_fixture();
+        let v = probe_check("    const LAB_TLS: &str = \"10.30.0.17:443\";\n", &truth);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(
+            v[0].contains("no `LAB_TLS_WEB` address literal"),
+            "{}",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn this_repositorys_probe_test_dials_this_repositorys_lab() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let source = std::fs::read_to_string(root.join(LAB_TLS_PROBE)).unwrap();
+        let truth: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(root.join(LAB_GROUND_TRUTH)).unwrap())
+                .unwrap();
+        assert!(
+            probe_lab_address_violations(LAB_TLS_PROBE, &source, LAB_GROUND_TRUTH, &truth)
+                .is_empty()
+        );
+    }
+
+    // --- The conformance suite's CI job. ---
+
+    #[test]
+    fn a_workflow_that_never_runs_the_conformance_suite_is_caught() {
+        let v = lab_ci_job_violations(
+            "ci.yml",
+            "jobs:\n  test:\n    steps:\n      - run: cargo test --workspace\n",
+            "lab/run.sh",
+            "BATHY_LAB_REQUIRED=1 cargo test --workspace -- --ignored\n",
+        );
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("lab/run.sh test"), "{}", v[0]);
+    }
+
+    /// The first version of this check was `ci.contains("lab/run.sh test")`,
+    /// and deleting the step did not fail it: the comment block above the job
+    /// names the command four times. A guard satisfied by the prose that
+    /// documents it guards nothing.
+    #[test]
+    fn a_comment_naming_the_command_does_not_count_as_running_it() {
+        let v = lab_ci_job_violations(
+            "ci.yml",
+            "  lab-conformance:\n    # `lab/run.sh test` sets BATHY_LAB_REQUIRED, so an\n\
+             \x20   # absent lab fails rather than skipping. See lab/run.sh test.\n    \
+             steps:\n      - uses: actions/checkout@v4\n",
+            "lab/run.sh",
+            "BATHY_LAB_REQUIRED=1 cargo test --workspace -- --ignored\n",
+        );
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("no `run:` step"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_runner_script_that_stopped_requiring_the_lab_is_caught_too() {
+        // The job would then run, find no lab, skip five criteria and exit 0 --
+        // the AC-7.32 defect one level up.
+        let v = lab_ci_job_violations(
+            "ci.yml",
+            "      - run: lab/run.sh test\n",
+            "lab/run.sh",
+            "cargo test --workspace -- --ignored\n",
+        );
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("BATHY_LAB_REQUIRED"), "{}", v[0]);
+    }
+
+    #[test]
+    fn this_repositorys_workflow_runs_the_conformance_suite_and_requires_the_lab() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let run_sh = std::fs::read_to_string(root.join(LAB_RUN_SH)).unwrap();
+        assert!(
+            lab_ci_job_violations(".github/workflows/ci.yml", &ci, LAB_RUN_SH, &run_sh).is_empty()
         );
     }
 }

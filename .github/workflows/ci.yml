@@ -1,5 +1,12 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  # The lab conformance job below runs on this schedule and on demand, and on
+  # nothing else -- see its own comment for the cost that decides that.
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -97,6 +104,48 @@ jobs:
       # named set of cargo built-ins. Closing five inline gates is not closing
       # the class; this is.
       - run: cargo run -p xtask -- check-ci
+
+  # AC-7.2 through AC-7.6 -- the conformance suite, against the real lab.
+  #
+  # Five acceptance criteria were closed by named tests that die under
+  # mutation and defended by nobody: nothing ran them on a push, so a
+  # regression would land green and stay green until someone remembered to
+  # type `lab/run.sh test`. The overview's constraint says a criterion is
+  # closed by a test that dies when the code it names is removed; closed is
+  # not the same as defended, and the second half is this job.
+  #
+  # There was never a technical obstacle. `ubuntu-latest` ships Docker and,
+  # being Linux, routes to `labnet` natively -- the routing failure
+  # `lab/README.md` documents is a macOS one, caused by Docker Desktop keeping
+  # the daemon in a VM whose bridges the host never learns. `lab/run.sh test`
+  # runs here verbatim.
+  #
+  # WHY NOT ON EVERY PUSH. `lab/run.sh up` pulls eight digest-pinned images,
+  # about 2.8 GiB, and Docker Hub's anonymous pull-rate limit applies to
+  # GitHub's shared egress addresses, so a per-PR run would be both slow and
+  # intermittently rate-limited -- and a job that fails for a reason unrelated
+  # to the change is a job people learn to ignore. Daily plus on-demand keeps
+  # the pull volume at roughly one lab per day, comfortably inside the
+  # anonymous limit, and bounds how long a regression can sit undetected to 24
+  # hours. Caching the images was considered and rejected: `docker save` of
+  # this set is larger than the cache is worth restoring, and the layers would
+  # have to be re-validated against the pinned digests anyway, which is the
+  # pull.
+  #
+  # WHY IT CANNOT PASS VACUOUSLY. `lab/run.sh test` sets BATHY_LAB_REQUIRED,
+  # which turns the suite's "the lab is not reachable, skipping" into a hard
+  # failure -- a CI job that silently skips the conformance suite is the same
+  # defect as a test that silently skips itself, one level up, and that defect
+  # is what AC-7.32 is about. `xtask check-lab` asserts both halves: that this
+  # step exists, and that the script still sets that variable.
+  lab-conformance:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: lab/run.sh test
+
   # The MSRV is a promise to downstream consumers, so it gets its own job.
   # Without this, MSRV rots silently the first time someone uses a newer API.
   #

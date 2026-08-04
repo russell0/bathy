@@ -47,9 +47,21 @@ false-positive assertion means anything:
   the lab and is in the scanned port set on purpose.
 - The two absent addresses are in the scanned set too.
 
-`xtask check-lab` fails if any of those controls is removed — see
-`the_scanned_port_set_contains_ports_that_are_shut_on_hosts_that_are_up` and
-the seeded-violation tests in `xtask/src/gates.rs`.
+`xtask check-lab` fails if any of those controls is removed, and it does so by
+name rather than by a generic property: `NARROWING_CONTROLS` in
+`xtask/src/gates.rs` has one entry per bullet above, each with a seeded-removal
+test beside it. The first three bullets are those entries; the fourth (the
+absent addresses) is enforced by the `absent` checks in the same function.
+`the_scanned_port_set_contains_ports_that_are_shut_on_hosts_that_are_up` in
+`crates/bathy/tests/lab_conformance.rs` asserts the port-22 control a second
+time, in the suite that scans with it.
+
+That sentence used to be a promise rather than a description, and it was false.
+The M7 Task 1 review removed port **22** from `scanned_ports` — the third
+bullet — and `check-lab`, the conformance suite and every fixture guard stayed
+green, because port 8080 independently satisfied the generic "some scanned port
+is shut on some live host" property that was all this actually checked. A
+generic property does not defend a named control.
 
 No port is published to the host. The lab is reachable only from inside
 `labnet`, so bringing it up does not change the exposure of the machine it
@@ -99,15 +111,41 @@ The banners, as read:
 10.30.0.16:53     (nothing)
 10.30.0.16:443    (nothing; TLS)
 10.30.0.16:853    (nothing; TLS)
-10.30.0.17:443    HTTP/1.1 400 Bad Request ... The plain HTTP request was sent to HTTPS port
+10.30.0.17:443    HTTP/1.1 400 Bad Request
+                  Server: nginx/1.29.8
+                  ... <hr><center>nginx/1.29.8</center>
 10.30.0.18        (no port open)
 ```
 
-`product` is deliberately `null` wherever the service volunteers nothing that
-names one. That is a statement that *the lab does not establish a product
-here*, not a note that identification failed — and it is why AC-7.5 asserts
-over the four protocols where a banner does name a product (nginx, OpenSSH,
-MySQL, Postfix) rather than over everything that is open.
+`product` is `null` wherever the service volunteers nothing that names one.
+That is a statement that *the lab does not establish a product here*, not a
+note that identification failed.
+
+**That distinction was violated once, and the transcription above is where it
+happened.** The `10.30.0.17:443` row used to read `HTTP/1.1 400 Bad Request ...
+The plain HTTP request was sent to HTTPS port`, with the `...` eliding the
+`Server: nginx/1.29.8` line the sweep had actually captured — and the ground
+truth recorded `product: null` there. AC-7.5's test filters on
+`product.is_some()`, so the null removed that endpoint from the criterion
+entirely; the oracle and the scanner then agreed, about nothing, at precisely
+the endpoint where the bytes name a product outright. An oracle that records
+what the scanner found rather than what is there is the failure mode this whole
+directory exists to prevent, arriving through the product axis instead of the
+port axis.
+
+So the entry now records `nginx` / `1.29.8`, which is what is on the wire, and
+carries an `identification_gap` saying in full that bathy does not report it and
+why. AC-7.5 holds that endpoint to being *unidentified* and fails the day it
+stops being — so the gap cannot outlive the defect it describes. Two mechanical
+checks were added with it, both in `xtask check-lab`: every non-null `product`
+must appear verbatim in its own `evidence` string (or declare
+`product_inference`, which exactly one entry — MySQL, whose handshake names a
+version and an auth plugin but never the vendor — legitimately needs), and every
+non-null `version` must appear verbatim with no escape at all.
+
+AC-7.5 therefore asserts over the five endpoints where a banner names a product
+*and* bathy is expected to reach it (nginx on `:80`, OpenSSH, MySQL, and Postfix
+on both `:25` and `:587`), rather than over everything that is open.
 
 ## How the digests were obtained
 
@@ -176,7 +214,32 @@ That brings the lab up, runs `cargo test --workspace -- --ignored` with
 | `tls_probe_against_a_real_nginx_tls_server` | — (M4 probe, re-homed here) |
 
 They live in `crates/bathy/tests/lab_conformance.rs`, except the last, which is
-in `crates/bathy-probe/src/probes/tls.rs`.
+in `crates/bathy-probe/src/probes/tls.rs`. Six tests run there, not nine:
+`--ignored` runs *only* ignored tests, and the four fixture guards below are
+deliberately not `#[ignore]`d, so they run under plain `cargo test --workspace`
+instead. (An earlier task report said nine. It was counting both sets.)
+
+### In CI
+
+The `lab-conformance` job in `.github/workflows/ci.yml` runs `lab/run.sh test`
+on `ubuntu-latest`, **daily at 04:17 UTC and on demand** (`workflow_dispatch`),
+and on nothing else. `ubuntu-latest` ships Docker and, being Linux, routes to
+`labnet` natively — the routing failure described below is a macOS one — so the
+command runs there verbatim.
+
+Not on every push, because `lab/run.sh up` pulls about 2.8 GiB of pinned images
+and Docker Hub's anonymous pull-rate limit applies to GitHub's shared egress
+addresses; a per-PR run would be slow and would fail for reasons unrelated to
+the change, which is how a job gets ignored. Daily bounds how long a regression
+can sit undetected to 24 hours at roughly one lab-pull per day. Image caching
+was considered and rejected: `docker save` of this set is larger than the cache
+is worth restoring, and the layers would have to be re-validated against the
+pinned digests anyway — which is the pull.
+
+The job cannot pass vacuously: `lab/run.sh test` sets `BATHY_LAB_REQUIRED`, so a
+lab that fails to come up is a red job rather than five skipped criteria.
+`xtask check-lab` asserts both halves — that the step exists, and that the
+script still sets that variable.
 
 ### Where there is no Docker, and where there is no route
 

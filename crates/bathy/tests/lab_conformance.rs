@@ -100,6 +100,12 @@ struct Derivation {
     swept_ports: String,
     #[allow(dead_code)]
     observed_at: String,
+    /// The one entry this file is known to have got wrong, kept in the file
+    /// rather than only in a review: `10.30.0.17:443` recorded `product: null`
+    /// where the bytes say `Server: nginx/1.29.8`, and a null is what AC-7.5
+    /// filters on, so the error hid inside the criterion it corrupted.
+    #[allow(dead_code)]
+    known_to_be_wrong_before: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -125,9 +131,31 @@ struct TruthPort {
     /// `None` where the service volunteers nothing that names a product. See
     /// `lab/README.md`: leaving it null is a statement that the lab does not
     /// establish a product here, not a note that we failed to identify one.
+    ///
+    /// That convention is load-bearing and it was violated once, at
+    /// `10.30.0.17:443`, in the direction that is hardest to see: a null there
+    /// matched bathy's own output at the one endpoint where the observed bytes
+    /// name a product outright. [`Self::identification_gap`] is the honest
+    /// spelling of that situation and is what this field must never be used
+    /// for again.
     product: Option<String>,
     version: Option<String>,
     evidence: String,
+    /// Set only where `product` is real but is *not* a literal in
+    /// [`Self::evidence`] -- it names the non-literal basis instead. Exactly
+    /// one entry needs it (MySQL, whose handshake gives a version and an auth
+    /// plugin but never the vendor string), and `xtask check-lab` requires
+    /// every other product to appear verbatim in its own evidence.
+    #[allow(dead_code)]
+    product_inference: Option<String>,
+    /// Set where the lab establishes a product that **bathy cannot see**, with
+    /// the reason. This is the opposite of a null: the oracle states the truth
+    /// and separately records that the scanner falls short of it, so the gap
+    /// is a finding on the record rather than an absence that reads as
+    /// agreement. `service_identification_matches_the_ground_truth_products`
+    /// holds every such endpoint to being unidentified *today*, and fails the
+    /// moment one is identified -- so closing the gap is what deletes the key.
+    identification_gap: Option<String>,
 }
 
 impl GroundTruth {
@@ -453,10 +481,19 @@ async fn service_identification_matches_the_ground_truth_products() {
     }
     let fold = scan_the_lab(&truth, "lab-conformance-service-identification").await;
 
+    // The endpoints the lab establishes a product for AND bathy is expected to
+    // reach. An entry carrying `identification_gap` is excluded here and held
+    // to the opposite property below -- see the loop after this one, and
+    // `TruthPort::identification_gap` for why that is not the same thing as
+    // the `product: null` this replaced.
     let mut asserted = 0usize;
     let mut wrong = Vec::new();
     for host in &truth.hosts {
-        for open in host.open.iter().filter(|o| o.product.is_some()) {
+        for open in host
+            .open
+            .iter()
+            .filter(|o| o.product.is_some() && o.identification_gap.is_none())
+        {
             asserted += 1;
             let Some(state) = fold.endpoints.get(&(host.ip, tcp(open.port))) else {
                 wrong.push(format!("{}:{} was not scanned at all", host.ip, open.port));
@@ -495,13 +532,50 @@ async fn service_identification_matches_the_ground_truth_products() {
     }
     // The ground truth deliberately leaves `product` null wherever the
     // service volunteers nothing that names one (PostgreSQL, Redis, the two
-    // TLS-wrapped ports), so this loop must not silently range over an empty
-    // set if that convention is ever misapplied to everything.
+    // TLS-wrapped DNS ports), so this loop must not silently range over an
+    // empty set if that convention is ever misapplied to everything.
     assert!(
         asserted >= 4,
         "only {asserted} product claim(s) in the ground truth; AC-7.5 needs more than \
          one protocol to mean anything"
     );
+
+    // The other direction, and the reason this criterion is honest rather than
+    // merely green. A recorded gap is a claim about bathy -- "the lab
+    // establishes this product and we do not report it" -- and a claim about
+    // bathy is a thing that can become false. If it does, this fails and names
+    // the key to delete, so the exemption cannot outlive the defect it
+    // describes. Without this loop `identification_gap` would be exactly the
+    // self-exempting null it replaced, spelled longer.
+    let mut stale = Vec::new();
+    let mut gaps = 0usize;
+    for host in &truth.hosts {
+        for open in host.open.iter().filter(|o| o.identification_gap.is_some()) {
+            gaps += 1;
+            let found = fold
+                .endpoints
+                .get(&(host.ip, tcp(open.port)))
+                .and_then(|e| e.observation.as_ref())
+                .and_then(|o| o.product.clone());
+            if found.is_some() {
+                stale.push(format!(
+                    "{}:{} is recorded in lab/ground-truth.json as a known identification \
+                     gap, but bathy now reports product {found:?}. The gap is closed: \
+                     delete that endpoint's `identification_gap` key so AC-7.5 asserts \
+                     the product ({:?}) like every other endpoint.",
+                    host.ip, open.port, open.product
+                ));
+            }
+        }
+    }
+    assert!(
+        gaps <= 1,
+        "{gaps} endpoint(s) claim an identification gap. Exactly one is expected \
+         (10.30.0.17:443, the TLS-fronted nginx); a growing list is a scanner \
+         regression being written into the oracle rather than fixed"
+    );
+    assert!(stale.is_empty(), "{}", stale.join("\n"));
+
     assert!(wrong.is_empty(), "misidentified:\n{}", wrong.join("\n"));
 }
 
@@ -611,6 +685,27 @@ fn every_open_port_in_the_ground_truth_carries_the_evidence_it_was_derived_from(
                 host.ip,
                 open.port
             );
+            // `identification_gap` says "the lab establishes a product here
+            // and bathy does not report it". With no product it says nothing
+            // and merely removes the endpoint from AC-7.5 -- which is the
+            // self-exempting null it exists to replace, wearing a longer name.
+            assert!(
+                open.identification_gap.is_none() || open.product.is_some(),
+                "{}:{} declares an identification gap with no product to be missing. \
+                 A gap is a claim about what the lab establishes; without a product \
+                 there is no claim, only an exemption.",
+                host.ip,
+                open.port
+            );
+            // Same shape, the other field: an inference note on an entry with
+            // no product would exempt it from check-lab's product-in-evidence
+            // rule while claiming nothing.
+            assert!(
+                open.product_inference.is_none() || open.product.is_some(),
+                "{}:{} explains where a product was inferred from but records no product",
+                host.ip,
+                open.port
+            );
         }
     }
     assert!(ports >= 10, "only {ports} open port(s) recorded");
@@ -657,11 +752,38 @@ fn the_scanned_port_set_contains_ports_that_are_shut_on_hosts_that_are_up() {
             shut.insert(host.ip, closed);
         }
     }
+    // `shut.len() >= 3` used to stand here alone. It cannot realistically
+    // fail: any non-trivial port set leaves most of nine hosts with something
+    // shut, and the M7 Task 1 review's attempt to kill it survived for exactly
+    // that reason (MINOR-2). It is kept because it is cheap and it is true,
+    // and the two assertions that actually bite were added beside it.
     assert!(
         shut.len() >= 3,
         "only {} live host(s) have a scanned port that is shut: {shut:?}",
         shut.len()
     );
+    // The control `lab/README.md` documents as "`ssh-openssh` listens on 2222,
+    // not 22, so 22 is shut on every host in the lab and is in the scanned
+    // port set on purpose". Removing 22 from `scanned_ports` passed this test,
+    // `xtask check-lab` and the whole workspace suite before this round --
+    // port 8080 independently satisfied every generic property above, so the
+    // named control was defended by nothing. `xtask check-lab` now asserts the
+    // same thing over the file; this asserts it in the suite that scans with
+    // it.
+    assert!(
+        truth.scanned_ports.contains(&22),
+        "22 is not scanned. The lab's SSH server is on 2222 precisely so that a scanner \
+         assuming `ssh => 22` is charged a false positive; that costs nothing if 22 is \
+         never asked about."
+    );
+    for host in &truth.hosts {
+        assert!(
+            !host.open.iter().any(|o| o.port == 22),
+            "{} listens on 22, so 22 is no longer shut on every host and the control \
+             above has quietly become vacuous",
+            host.ip
+        );
+    }
     for open in truth.hosts.iter().flat_map(|h| &h.open) {
         assert!(
             truth.scanned_ports.contains(&open.port),
