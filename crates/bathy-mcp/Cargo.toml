@@ -1,0 +1,81 @@
+[package]
+name = "bathy-mcp"
+version = "0.1.0"
+description = "Agent-native network discovery over the Model Context Protocol: eleven typed tools, no command strings."
+edition.workspace = true
+# MSRV tiering, decided by execution rather than by assumption. The M5 plan
+# said this crate would be a `1.88`-tier crate because `rmcp` declares
+# `rust-version = "1.88"` and belongs in CI's `msrv` job. That was wrong, and
+# for a structural reason rather than a measurement one: this crate is an
+# adapter over the engine, so it depends on `bathy-engine` -> `bathy-store` ->
+# `libsqlite3-sys`, whose build script needs `cfg_select!` (see the MSRV
+# comment on `crates/bathy-store/Cargo.toml`). `rmcp`'s own floor is a lower
+# bound on this crate's, not its value. Verified against real toolchains
+# before this line was written, in both directions:
+#   `cargo +1.88 check -p bathy-mcp` fails with
+#     "bathy-store@0.1.0 requires rustc 1.95"
+#   `cargo +1.95 check -p bathy-mcp --all-targets` passes.
+# So this crate is named in `msrv-bathy-store`, not in `msrv`. This is the
+# third time in this project a crate has been given a floor nothing checked
+# (M3 found `bathy-plan`, M4 reintroduced it with `crates/bathy`), which is
+# why the verification is recorded here rather than assumed.
+rust-version = "1.95"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bathy-types = { path = "../bathy-types" }
+bathy-scope = { path = "../bathy-scope" }
+bathy-evidence = { path = "../bathy-evidence" }
+bathy-store = { path = "../bathy-store" }
+bathy-plan = { path = "../bathy-plan" }
+bathy-interpret = { path = "../bathy-interpret" }
+bathy-probe = { path = "../bathy-probe" }
+bathy-engine = { path = "../bathy-engine" }
+bathy-query = { path = "../bathy-query" }
+# The official Rust MCP SDK, pinned. `default-features = false` because the
+# default set enables `macros`, which this crate does not use: the eleven tool
+# descriptors are built from schemas derived in `bathy-types`/`bathy-query`,
+# and a proc-macro that generates a schema from a function signature would put
+# a second spelling of the contract in the tree.
+#
+# The features that ARE enabled, each with a reason:
+#   `server`             -- the `ServerHandler` trait and the tool model.
+#   `transport-io`       -- stdio. AC-5.32: the shipped server speaks stdio.
+#                           Nothing here enables any HTTP transport feature,
+#                           so the deprecated HTTP+SSE transport, the removed
+#                           `Mcp-Session-Id` header and SSE resumability are
+#                           not merely unused but uncompilable from here.
+#   `request-state`      -- `RequestStateCodec`, the HMAC-SHA256 seal used to
+#                           authenticate the MRTR approval blob. AC-5.30.
+#   `elicitation`        -- the `elicitation/create` request embedded in the
+#                           approval result.
+#   `schemars`           -- so the published schemas are the derived ones.
+#
+# `rmcp` is Apache-2.0 (not the dual Apache-2.0/MIT this project uses); that
+# is on `deny.toml`'s allow list.
+rmcp = { version = "3.1.0", default-features = false, features = [
+    "server",
+    "transport-io",
+    "request-state",
+    "elicitation",
+    "schemars",
+] }
+schemars.workspace = true
+# The operating system's randomness, and nothing else: the per-process key
+# the approval token is sealed under. Deliberately not this project's ULID
+# generator, which is the sanctioned source for *identifiers* and is wrong
+# here -- its generator is monotonic, so four values minted in the same
+# millisecond differ by an increment rather than by 320 fresh bits, and a
+# signing key with 80 bits behind it is not a signing key. MIT OR Apache-2.0.
+getrandom = "0.4.3"
+serde.workspace = true
+serde_json.workspace = true
+# `rt-multi-thread` on top of the workspace set: a started scan keeps running
+# in this process while the server answers further calls, so the scheduler's
+# hundreds of concurrent probes must not share one thread with the transport.
+tokio = { workspace = true, features = ["rt-multi-thread", "io-std"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
