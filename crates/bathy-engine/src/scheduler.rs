@@ -4513,6 +4513,107 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancellation_arriving_while_waiting_for_a_rate_limiter_token_is_not_delayed_behind_it()
+    {
+        // AC-4.26, second half: the rate-limiter acquire in
+        // `detect_service` must sit inside a `select!` against the
+        // cancellation token, "or a cancelled scan blocks waiting for a
+        // token it will never use."
+        //
+        // This test exists because that clause shipped with no test at
+        // all (M4 whole-branch review, IMPORTANT-1). The Task 5 re-review
+        // DID verify the property -- by hand, drainng the burst token,
+        // firing cancel 100ms into a ~1s refill wait and measuring a 0.12s
+        // return -- and that measurement is what the ledger recorded as
+        // the demonstration. It left nothing behind: replacing the whole
+        // `select!` with a plain `self.limiter.acquire(1).await` passed all
+        // 98 engine tests. A one-off manual measurement is not what
+        // "demonstrated by a named passing test" means, and that gap is
+        // the process defect this test closes, not just the code one.
+        //
+        // Shape: 1 pps and a single open endpoint. The connect probe takes
+        // the limiter's one immediate/burst token, so `detect_service`'s
+        // own acquire for the FIRST probe candidate blocks for a full ~1s
+        // refill -- a wide, deterministic window. Cancel fires 150ms in.
+        //
+        // Asserted on the stub's byte counter FIRST, not on the clock. The
+        // timing assertion is what AC-4.26's own wording is about, but it
+        // is the weaker of the two: with a cancellable acquire the probe
+        // reconnect never happens at all, and with a plain acquire it
+        // happens ~1s later and the stub sees a real request. So
+        // `request_count() == 0` distinguishes the two versions on a
+        // discrete, non-timing-dependent fact.
+        let stub = spawn_http_stub().await;
+        let h = make_harness_with_detection(
+            &["127.0.0.1"],
+            &[&stub.port().to_string()],
+            budgets(1_000_000, 3_600, 1),
+            SchedulerConfig {
+                concurrency: 1,
+                ..small_config()
+            },
+            default_manifest(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+        );
+
+        let cancel = CancellationToken::new();
+        let cancel_after = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            cancel_after.cancel();
+        });
+
+        let started = Instant::now();
+        let summary = h.scheduler.run(&h.plan, 0, cancel).await.unwrap();
+        let elapsed = started.elapsed();
+
+        // `summary.cancelled` is deliberately NOT asserted, and is in fact
+        // `false` here: it records why the DISPATCH loop exited, and with a
+        // single unit that loop exits because the work ran out, not because
+        // of the cancel. The cancellation's only effect on this run is the
+        // one under test -- identification was skipped. That asymmetry is
+        // pre-existing scheduler semantics, not something this test
+        // introduces; what matters here is that the unit really was
+        // processed, so `detect_service` really was reached and really was
+        // sitting in the acquire when cancel landed.
+        assert_eq!(
+            summary.units_completed, 1,
+            "test fixture sanity: the one unit must have been recorded, which is what \
+             calls detect_service at all"
+        );
+        assert_eq!(
+            summary.packets_spent, 1,
+            "only the connect probe's packet was ever charged: detect_service broke out of \
+             the cancellable acquire BEFORE its own try_spend_packets. A non-cancellable \
+             acquire finishes the ~1s wait and then charges a second packet."
+        );
+        assert_eq!(
+            stub.accept_count(),
+            1,
+            "test fixture sanity: exactly the connect probe reached the listener, so \
+             detect_service really was blocked on the limiter when cancel arrived (got \
+             {} accepts) -- a second accept means the probe reconnect happened anyway",
+            stub.accept_count()
+        );
+        assert_eq!(
+            stub.request_count(),
+            0,
+            "a cancellation that arrived while detect_service was WAITING for a rate-limiter \
+             token still let a probe reconnect write real bytes to the peer. The acquire is \
+             not cancellable: it finished its ~1s refill wait first and only then noticed the \
+             cancel."
+        );
+        assert!(
+            elapsed < Duration::from_millis(700),
+            "run returned in {elapsed:?}. Cancel fired at 150ms, but detect_service sat out \
+             the rate limiter's ~1s refill before honouring it -- exactly the stall AC-4.26's \
+             select! clause exists to prevent (one refill interval per open endpoint, at a \
+             low authorized pps)."
+        );
+    }
+
+    #[tokio::test]
     async fn cancellation_stops_new_probe_traffic_not_just_new_units() {
         // CRITICAL-2. `concurrency: 1`, `pps: 1`: unit 0's connect probe
         // consumes the limiter's one immediate token and resolves near
