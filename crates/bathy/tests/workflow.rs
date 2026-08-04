@@ -250,7 +250,11 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
     let refused: Vec<String> = refusal
         .list("out_of_scope")
         .iter()
-        .map(|t| t.as_str().expect("a refused target is a string").to_string())
+        .map(|t| {
+            t.as_str()
+                .expect("a refused target is a string")
+                .to_string()
+        })
         .collect();
     assert_eq!(refused, vec![UNAUTHORIZED.to_string()]);
 
@@ -528,12 +532,12 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
 #[test]
 fn the_inventory_workflow_parses_no_prose_and_builds_no_command_line() {
     const FORBIDDEN: &[(&str, &str)] = &[
-        ("quick_xml", "XML parsing"),                          // [forbidden-token]
-        ("from_str::<Xml", "XML parsing"),                     // [forbidden-token]
-        ("split_whitespace", "parsing prose"),                 // [forbidden-token]
-        ("Command::new", "constructing a command line"),       // [forbidden-token]
-        ("first_text", "reading the text mirror"),             // [forbidden-token]
-        ("[\"content\"]", "reading the text mirror"),          // [forbidden-token]
+        ("quick_xml", "XML parsing"),                    // [forbidden-token]
+        ("from_str::<Xml", "XML parsing"),               // [forbidden-token]
+        ("split_whitespace", "parsing prose"),           // [forbidden-token]
+        ("Command::new", "constructing a command line"), // [forbidden-token]
+        ("first_text", "reading the text mirror"),       // [forbidden-token]
+        ("[\"content\"]", "reading the text mirror"),    // [forbidden-token]
         ("server.call(", "the harness reads the mirror there"), // [forbidden-token]
     ];
     let source = include_str!("workflow.rs");

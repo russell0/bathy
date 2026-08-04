@@ -21,7 +21,6 @@ use serde_json::{Value, json};
 mod harness;
 use harness::*;
 
-
 // ---------------------------------------------------------------------------
 // A JSON Schema check, over the constructs these schemas actually use.
 // ---------------------------------------------------------------------------
@@ -1111,7 +1110,6 @@ fn first_rule_id() -> String {
     value["rule_id"].as_str().unwrap().to_string()
 }
 
-
 // ---------------------------------------------------------------------------
 // Behaviour.
 // ---------------------------------------------------------------------------
@@ -1370,7 +1368,6 @@ fn evidence_get_returns_the_exact_bytes_a_finding_cited() {
         "`length` is the stored length, not the returned one"
     );
 }
-
 
 #[test]
 fn fingerprint_explain_returns_a_rationale_and_a_source_for_every_rule_this_build_has() {
