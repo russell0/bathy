@@ -6,11 +6,24 @@
 
 **Architecture:** `bathy-query` folds event logs into a queryable endpoint state and diffs two folds. The CLI and the MCP server are both thin adapters over the same engine API — neither contains scanning logic, and anything the MCP server can do the CLI can do, so the tool surface is testable without an MCP client.
 
-**Tech Stack:** rmcp (official Rust MCP SDK), clap (derive), tokio, serde_json.
+**Tech Stack:** `rmcp` 3.1.0 (official Rust MCP SDK, MSRV 1.88, edition 2024 — pin it; see the protocol gate), clap (derive), tokio, serde_json.
 
 **Read first:** the overview's Global Constraints; M2 Task 3 (`read_from`, the streaming primitive); M3 Task 3 (`plan_hash`).
 
-> **Protocol verification gate.** This plan targets the MCP revision cited in the source design document (2026-07-28). Before implementing Task 4, open `modelcontextprotocol.io/specification` and confirm (a) that this revision exists and is current, (b) the exact tool-result shape for long-running work, and (c) whether human approval is expressed via **elicitation** (MCP) or a task state such as `input_required` (A2A). The design document conflates these two vocabularies. Record what you find in `docs/protocol-notes.md` and adjust Task 4's types to match reality rather than to match this plan.
+> **Protocol verification gate — DISCHARGED 2026-08-03.** Findings and every source URL: `.superpowers/sdd/mcp-spec-research.md`. Re-read that before Task 4; the summary below is not a substitute.
+>
+> The design document's guess of revision **`2026-07-28` was right about the date and wrong about what the date means.** That revision is not an increment on the session-based MCP that most documentation, most tutorials and most model training data describe. It is a rewrite: **MCP dropped the `initialize` handshake and protocol-level sessions and became stateless and per-request.** Anything you already "know" about MCP is probably a description of the `2025-11-25`-and-earlier era, which the spec now calls **Legacy**. Check the spec, not your recall.
+>
+> What this changes for us, each of which lands as an acceptance criterion below:
+>
+> 1. **No handshake.** Protocol version and client capabilities ride in each request's `_meta`. Servers **MUST** implement `server/discover`. An unsupported version is answered with `UnsupportedProtocolVersionError` (`-32022`) carrying `data.supported`.
+> 2. **Transport:** stdio for the local server we ship; Streamable HTTP is for remote. **HTTP+SSE is formally Deprecated**, `Mcp-Session-Id` and the persistent GET stream are **removed**, and SSE resumability (`Last-Event-ID`) is **gone** — a broken stream means the client re-issues the whole request. Do not design anything that depends on stream resume.
+> 3. **Typed output is real and is exactly our premise.** Optional `outputSchema` on the tool definition, `structuredContent` on the `tools/call` result. Binding once declared: "Servers MUST provide structured results that conform to this schema." The spec still asks for a JSON text mirror in `content` for Legacy clients. We declare `outputSchema` on all eleven tools.
+> 4. **Human approval works nothing like this plan assumed** — see Task 4 Step 1. This is the one substantive correction, and it is an implementation change, not a wording change.
+> 5. **Long-running work:** the official `io.modelcontextprotocol/tasks` extension is the spec's own generalized `start`/`poll`/`cancel`, and the spec's "Stateful Tools" guidance explicitly endorses server-minted opaque handles passed as ordinary arguments, "because MCP has no protocol-level session." Our `TaskHandle` triple is therefore validated twice over, not merely tolerated. Progress notifications exist but require holding the response stream open, which the Tasks documentation itself says intermediaries time out past a few seconds — **not** suitable for multi-minute scans.
+> 6. **Deprecated in this revision: Roots, Sampling, Logging.** We use none of them. Log to stderr, not the Logging capability.
+>
+> **SDK:** `rmcp` 3.1.0 (released 2026-07-31), official, MSRV **1.88** and edition 2024 — an exact match for our library tier, so `bathy-mcp` is a **1.88-tier** crate; add it to the `msrv` CI job, not `msrv-bathy-store`, and verify that at creation rather than assuming it (M3 found `bathy-plan` had sat unverified against its claimed floor since creation, and M4 reintroduced the same defect with `crates/bathy`). Caveat to record in `docs/protocol-notes.md`: the official MCP blog rates the Rust SDK's `2026-07-28` support **beta**, against Tier-1 for TypeScript/Python/Go/C#, while the SDK's own README says "stable". Trust the blog. Budget for rough edges specifically around MRTR, `server/discover` and the Tasks extension, and if the SDK cannot express something the spec requires, **report it as a finding rather than working around it silently.**
 
 ---
 
@@ -309,7 +322,13 @@ git commit -m "feat(cli): bathy binary with mandatory scope and documented exit 
 
 - [ ] **Step 1: Complete the protocol verification gate**
 
-Read the current MCP specification. Write `docs/protocol-notes.md` recording: the revision implemented, the tool-result shape used for long-running work, and how human approval is expressed. If the spec's approval mechanism differs from `input_required`, use the spec's mechanism and note the deviation from the source design document — the spec wins.
+The research is done — **do not redo it.** Read `.superpowers/sdd/mcp-spec-research.md`, then write `docs/protocol-notes.md` recording: the revision implemented (`2026-07-28`), the `rmcp` version and its beta caveat, the transport (stdio), the `structuredContent` mechanism, **the MRTR approval flow**, and the deliberate choice not to route through the `io.modelcontextprotocol/tasks` extension — bespoke typed tools instead — so a future reader does not mistake that omission for an oversight.
+
+**The correction that matters.** This plan framed approval as a choice between "elicitation (MCP)" and "`input_required` (A2A)" and called the design document confused for mixing them. Both framings were wrong. **`input_required` IS the current MCP vocabulary**, and it *wraps* elicitation rather than competing with it. Under **Multi Round-Trip Requests (MRTR)**, the standalone server-to-client `elicitation/create` request is gone — it exists only embedded in an `InputRequiredResult`.
+
+So `scan.start` above the approval threshold must return a `tools/call` result with `resultType: "input_required"` whose `inputRequests` map carries an `elicitation/create` describing the scan awaiting approval. **Not** a `resultType: "complete"` carrying a bespoke `{ status: "awaiting_approval", approval_id }` object — that shape matches nothing in the spec and no generic client would act on it. The client resolves the elicitation and **retries `scan.start`** with a new JSON-RPC id, `inputResponses`, and the server's opaque `requestState` echoed back unmodified. The retry is what mints the real `TaskHandle`.
+
+**`requestState` is attacker-controlled.** It round-trips through the client, so treat it exactly as hostile input: authenticate it (HMAC or AEAD under a server-held key), bind it to the principal it was issued to, give it a TTL, and make it single-use against replay. A forgeable `requestState` is a **scope bypass** — it would let a caller hand back a state blob claiming approval for a scan a human never saw, which is the same class of defect as M3's unconsulted scope. Test forgery, cross-principal reuse, expiry and replay as adversarial cases, not as happy-path round-trips.
 
 - [ ] **Step 2: Write the failing test**
 
@@ -399,14 +418,51 @@ async fn fingerprint_explain_returns_the_rule_rationale_and_its_source() {
 }
 
 #[tokio::test]
-async fn a_scan_broader_than_the_approval_threshold_requires_human_confirmation() {
+async fn a_scan_broader_than_the_approval_threshold_returns_input_required_and_starts_nothing() {
     let s = test_server_with_approval_threshold(64);
-    let r = s.call("scan.start", request_covering_targets(256)).await.unwrap();
-    assert_eq!(
-        r["status"], "awaiting_approval",
-        "scans above the threshold must not begin without a human decision"
-    );
-    assert!(s.pending_elicitations() == 1);
+    let before = s.task_count();
+    let r = s.call_raw("scan.start", request_covering_targets(256)).await.unwrap();
+
+    assert_eq!(r["resultType"], "input_required",
+        "the spec's approval mechanism is MRTR, not a bespoke status field");
+    let reqs = r["inputRequests"].as_object().unwrap();
+    assert!(reqs.values().any(|v| v["method"] == "elicitation/create"),
+        "approval must be carried as an embedded elicitation/create");
+    assert!(r["requestState"].as_str().is_some_and(|s| !s.is_empty()));
+
+    assert_eq!(s.task_count(), before, "no task may exist before a human decides");
+    assert_eq!(s.packets_emitted(), 0, "and no packet may be emitted");
+}
+
+#[tokio::test]
+async fn retrying_with_the_approval_response_and_request_state_starts_the_scan() {
+    let s = test_server_with_approval_threshold(64);
+    let pending = s.call_raw("scan.start", request_covering_targets(256)).await.unwrap();
+    let r = s.retry_with_inputs("scan.start", &pending, approval_granted()).await.unwrap();
+    let h: TaskHandle = serde_json::from_value(r["structuredContent"].clone()).unwrap();
+    assert_eq!(h.status, TaskStatus::Running);
+}
+
+#[tokio::test]
+async fn a_forged_or_replayed_request_state_cannot_authorize_a_scan() {
+    let s = test_server_with_approval_threshold(64);
+    let pending = s.call_raw("scan.start", request_covering_targets(256)).await.unwrap();
+
+    // 1. Forgery: flip one byte of the authenticated blob.
+    let mut forged = pending.clone();
+    forged["requestState"] = json!(flip_one_byte(pending["requestState"].as_str().unwrap()));
+    assert!(s.retry_with_inputs("scan.start", &forged, approval_granted()).await.is_err());
+
+    // 2. Replay: the same state used twice.
+    s.retry_with_inputs("scan.start", &pending, approval_granted()).await.unwrap();
+    assert!(s.retry_with_inputs("scan.start", &pending, approval_granted()).await.is_err(),
+        "requestState must be single-use");
+
+    // 3. Cross-principal: a state issued to A must not work for B.
+    let for_a = s.as_principal("A").call_raw("scan.start", request_covering_targets(256)).await.unwrap();
+    assert!(s.as_principal("B").retry_with_inputs("scan.start", &for_a, approval_granted()).await.is_err());
+
+    assert_eq!(s.packets_emitted(), 0, "no rejected path may emit a packet");
 }
 
 #[tokio::test]
@@ -434,7 +490,7 @@ Tool contracts:
 |---|---|---|
 | `scope.validate` | `{ scope_id \| manifest_json, targets[] }` | `{ decision, reason_code?, detail?, in_scope_count, out_of_scope[] }` |
 | `scan.preview` | `ScanRequest` | `{ plan_hash, estimated_targets, estimated_probes, policy_decision, reason_code?, estimated_runtime_seconds }` |
-| `scan.start` | `ScanRequest` | `TaskHandle` or `{ policy_decision: "denied", reason_code, detail }` or `{ status: "awaiting_approval", approval_id }` |
+| `scan.start` | `ScanRequest` | `TaskHandle` (in `structuredContent`) · or `{ policy_decision: "denied", reason_code, detail }` · or an MRTR `InputRequiredResult` (`resultType: "input_required"`) carrying an embedded `elicitation/create` plus an authenticated `requestState` |
 | `scan.status` | `{ scan_id }` | `{ status, units_completed, units_total, packets_spent, last_sequence, plan_hash }` |
 | `scan.events` | `{ scan_id, after_sequence, limit }` | `{ events[], next_cursor, has_more }` |
 | `scan.cancel` | `{ scan_id }` | `{ status, units_completed, resumable: bool }` |
@@ -444,7 +500,7 @@ Tool contracts:
 | `evidence.get` | `{ digest, max_bytes? }` | `{ bytes (base64), length, truncated }` |
 | `fingerprint.explain` | `{ rule_id }` | `{ rule_id, service, specificity, rationale, source }` |
 
-`scan.start` above the configured approval threshold must return `awaiting_approval` and raise an elicitation (or the spec's equivalent) rather than beginning work. The threshold is server configuration, not a request field — an agent cannot raise its own threshold.
+`scan.start` above the configured approval threshold must return an MRTR `InputRequiredResult` rather than beginning work. The threshold is server configuration, not a request field — an agent cannot raise its own threshold. The pending `ScanRequest` and the threshold that was exceeded are carried in the authenticated `requestState`, never in client-writable fields.
 
 - [ ] **Step 5: Run tests to verify they pass** — expected 10 passed.
 
@@ -465,8 +521,19 @@ git commit -m "feat(mcp): eleven typed tools with task handles and human approva
 - **AC-5.19** `scan.events` pages by cursor with non-overlapping pages and a `has_more` indicator.
 - **AC-5.20** `evidence.get` returns the exact bytes a finding cited, verified by digest.
 - **AC-5.21** `fingerprint.explain` returns a rationale and a non-empty source for every rule that can appear in a finding.
-- **AC-5.22** A scan exceeding the server's approval threshold returns `awaiting_approval` and does not begin. The threshold is server-side configuration and is not settable from a request.
-- **AC-5.23** `docs/protocol-notes.md` records the MCP revision actually implemented and any deviation from the source design document.
+- **AC-5.22** A scan exceeding the server's approval threshold returns an MRTR `InputRequiredResult` and does not begin. The threshold is server-side configuration and is not settable from a request.
+- **AC-5.23** `docs/protocol-notes.md` records the MCP revision actually implemented, the `rmcp` beta caveat, the deliberate decision not to route through the `io.modelcontextprotocol/tasks` extension, and any deviation from the source design document.
+
+**Added after the protocol verification gate was discharged (2026-08-03). Every one of these follows from the `2026-07-28` rewrite, not from taste:**
+
+- **AC-5.27** The server implements `server/discover`, advertising its supported protocol versions, capabilities and identity, and answers an unsupported version with `UnsupportedProtocolVersionError` (`-32022`) whose `data.supported` lists what it does support. There is no `initialize` handshake in this revision; a server that waits for one hangs against every Modern client.
+- **AC-5.28** Every one of the eleven tools declares an `outputSchema` generated from its `bathy-types` result struct, and every `tools/call` result populates `structuredContent` conforming to it, with a JSON text mirror in `content` for Legacy clients. Asserted by validating each real result against its own published schema — not by asserting the schema merely exists.
+- **AC-5.29** Every tool carries explicit annotations. `scan.start` is `readOnlyHint: false, destructiveHint: true, openWorldHint: true`; the ten read-only tools are `readOnlyHint: true`. The spec's default for an unannotated tool is already maximally cautious, so a test must prove these are *set*, not merely that the effective posture is safe.
+- **AC-5.30** `requestState` is authenticated, principal-bound, TTL-limited and single-use. Forgery, cross-principal reuse, expiry and replay are each rejected, and no rejected path emits a packet or creates a task. **This is an authorization boundary, not a serialization detail** — a forgeable `requestState` is a scope bypass of the same class as M3's unconsulted emission path.
+- **AC-5.31** `tools/list` returns tools in a stable order across calls and carries `ttlMs`/`cacheScope`. Ordering is intentional (sorted by name), not incidental.
+- **AC-5.32** The shipped server speaks stdio. Nothing in the crate implements the deprecated HTTP+SSE transport, depends on `Mcp-Session-Id`, or assumes SSE resumability.
+
+**Open decision for the implementer to make and justify:** whether to *also* advertise `io.modelcontextprotocol/tasks` alongside the bespoke `scan.status`/`scan.cancel` tools, so an agent host that understands only the standard Tasks extension still gets task semantics. The spec sanctions either. Recommendation: defer to M7 and record the deferral — eleven tools is a published contract and the extension is additive — but say whether shipping without it materially narrows who can drive bathy.
 
 ---
 
@@ -564,7 +631,7 @@ git commit -m "test(mcp): the ten-call authorized inventory workflow, as an exec
 ## Milestone Exit Criteria
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` and `check-schemas` clean.
-- [ ] AC-5.1 through AC-5.26 each demonstrated by a named passing test.
+- [ ] AC-5.1 through AC-5.32 each demonstrated by a named passing test.
 - [ ] `bathy serve mcp` connects to a real MCP client and lists eleven tools.
 - [ ] `docs/protocol-notes.md` exists and names the verified spec revision.
 - [ ] **This milestone ships the agent-facing product.** Tag `v0.1.0-beta.1`.

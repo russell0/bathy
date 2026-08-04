@@ -761,7 +761,7 @@ git commit -m "test(interpret): recorded-capture replay corpus with snapshot ass
 
 **Acceptance criteria:**
 - **AC-4.17** A committed corpus of ≥16 captures covering all eight probes replays to identical findings on every run, with no network access.
-- **AC-4.18** Each fixture records the lab image and digest it was captured from, establishing clean-room provenance for the rule it exercises.
+- **AC-4.18** Every fixture records its provenance honestly, and a test enforces that structurally rather than trusting the author. A fixture claiming to be a real capture must name the lab image and a `sha256:` digest; a fixture that is synthetic must say so and say why. **Negative and no-match cases legitimately have no image** — nine of the seventeen are exactly that, and labelling them `SYNTHETIC (not a container capture)` is strictly more honest than manufacturing a digest for them. The original text said "each fixture records the lab image and digest," which no corpus containing negative cases can satisfy; the implementation made the right call and the AC was never reconciled the way AC-4.17 was in `d509d78`. `captured_from` being a required `String` catches a *missing* field but not an empty one — blanking a real capture's entire provenance record passed the whole suite until the M4 whole-branch review. Non-emptiness and the `sha256:` requirement are the guard.
 - **AC-4.19** Changing any interpretation rule produces a visible snapshot diff rather than a silent behavior change.
 
 ---
