@@ -929,12 +929,70 @@ const RUNNABLE_WITHOUT_XTASK: &[&str] = &[
     "lab/run.sh",
 ];
 
+/// The `- ` steps of a job block, each with the lines nested under it.
+///
+/// A step is what a workflow actually acts on: `uses:`, `with:` and
+/// `working-directory:` mean nothing except relative to the step they sit
+/// in, so a check phrased over the job's lines rather than its steps can be
+/// satisfied by two halves of two different steps.
+fn steps_of(block: &str) -> Vec<Vec<&str>> {
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    let mut marker_indent = usize::MAX;
+    for line in block.lines() {
+        let trimmed = line.trim_start();
+        let indent = line.len() - trimmed.len();
+        if trimmed.starts_with("- ") && indent <= marker_indent {
+            marker_indent = indent;
+            steps.push(vec![line]);
+        } else if let Some(current) = steps.last_mut()
+            && (trimmed.is_empty() || indent > marker_indent)
+        {
+            current.push(line);
+        }
+    }
+    steps
+}
+
+/// The `working-directory:` of the step containing line `at`, if it has one.
+///
+/// A step is the block from a `- ` marker to the next marker at the same
+/// indentation, so a `working-directory:` written above or below the `run:`
+/// key is found either way — YAML mapping keys are unordered and a check
+/// that only looked below would be satisfied by moving one line.
+fn step_working_directory(lines: &[&str], at: usize) -> Option<String> {
+    let indent_of = |line: &str| line.len() - line.trim_start().len();
+    let is_marker = |line: &str| line.trim_start().starts_with("- ");
+    let start = (0..=at).rev().find(|i| is_marker(lines[*i]))?;
+    let marker_indent = indent_of(lines[start]);
+    let end = ((start + 1)..lines.len())
+        .find(|i| {
+            let line = lines[*i];
+            if line.trim().is_empty() {
+                return false;
+            }
+            indent_of(line) < marker_indent || (is_marker(line) && indent_of(line) == marker_indent)
+        })
+        .unwrap_or(lines.len());
+    lines[start..end].iter().find_map(|line| {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            return None;
+        }
+        let rest = trimmed
+            .strip_prefix("- ")
+            .unwrap_or(trimmed)
+            .strip_prefix("working-directory:")?;
+        Some(rest.trim().trim_matches('"').trim_matches('\'').to_string())
+    })
+}
+
 /// The rule: no gate without a local form. `subcommands` is `xtask`'s actual
 /// dispatch list, so a step naming a subcommand that does not exist fails
 /// here — which is what `.publish-deny` needed and did not have.
 pub fn ci_steps_without_a_local_form(ci_path: &str, ci: &str, subcommands: &[&str]) -> Vec<String> {
     let mut found = Vec::new();
     let mut steps = 0usize;
+    let lines: Vec<&str> = ci.lines().collect();
     for (index, line) in ci.lines().enumerate() {
         let number = index + 1;
         let trimmed = line.trim_start();
@@ -945,6 +1003,30 @@ pub fn ci_steps_without_a_local_form(ci_path: &str, ci: &str, subcommands: &[&st
             continue;
         };
         let command = rest.trim();
+        // A `run:` step is not only its command: `working-directory:` changes
+        // which tree the command runs over, and this check read the `run:`
+        // line alone. `cargo fmt --all -- --check` under `working-directory:
+        // fuzz` is a DIFFERENT gate from the root one -- a different
+        // workspace, a different dependency graph -- and it passed here as
+        // the root gate, which is how ~900 lines of Rust came to sit outside
+        // `cargo fmt --all`, `cargo clippy --workspace` and `cargo deny` with
+        // a README sentence as the only control. The allowlist below is a
+        // list of commands that are already runnable *from the repository
+        // root*; a directory-scoped one is not one of them, and the local
+        // form it needs is an xtask subcommand that names the directory
+        // (`check-fuzz-crate` is exactly that).
+        if let Some(directory) = step_working_directory(&lines, index) {
+            steps += 1;
+            found.push(format!(
+                "{ci_path}:{number}: `{command}` runs with `working-directory: \
+                 {directory}`, so it is not the root gate it reads as and there is no \
+                 local form of it -- someone reproducing this run from the repository \
+                 root gets a different answer. Move it into `xtask` (which can `cd` \
+                 where it needs to and be one command anyone can type) and call that \
+                 here."
+            ));
+            continue;
+        }
         if command == "|" {
             found.push(format!(
                 "{ci_path}:{number}: an inline `run: |` block. Every gate this project \
@@ -1333,6 +1415,10 @@ pub fn probe_lab_address_violations(
 /// ships Docker and, being Linux, routes to `labnet` natively, which is the
 /// single thing that makes this impossible on the macOS machine the lab was
 /// built on.
+/// The job in `ci.yml` that runs the conformance suite. Named here so the
+/// check and the failure message cannot drift apart.
+pub const LAB_CI_JOB: &str = "lab-conformance";
+
 pub fn lab_ci_job_violations(
     ci_path: &str,
     ci: &str,
@@ -1346,19 +1432,31 @@ pub fn lab_ci_job_violations(
     // the command four times -- a guard satisfied by the prose that documents
     // it. Found by mutating the file, which is the only way that kind of
     // vacuity ever shows up.
-    let runs_the_suite = ci.lines().any(|line| {
-        let trimmed = line.trim_start();
-        trimmed
-            .strip_prefix("- run:")
-            .or_else(|| trimmed.strip_prefix("run:"))
-            .is_some_and(|command| command.trim().starts_with("lab/run.sh test"))
+    //
+    // And a step in THE JOB, not anywhere in the file -- the same sweep that
+    // job-scoped `fuzz_ci_job_violations`. The reason is narrower here than
+    // there but it is the same reason: this job is deliberately scheduled
+    // rather than per-push (its comment block gives the pull-rate arithmetic),
+    // so "the suite runs daily and on demand" is a claim about which job the
+    // step is in. A `lab/run.sh test` step sitting in the fast `test` job
+    // satisfies a file-scoped check while pulling 2.8 GiB of images on every
+    // pull request; a step in a job that never runs satisfies it while running
+    // nothing at all.
+    let runs_the_suite = job_block(ci, LAB_CI_JOB).is_some_and(|block| {
+        block.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("- run:")
+                .or_else(|| trimmed.strip_prefix("run:"))
+                .is_some_and(|command| command.trim().starts_with("lab/run.sh test"))
+        })
     });
     if !runs_the_suite {
         found.push(format!(
-            "{ci_path}: no `run:` step invokes `lab/run.sh test`, so AC-7.2 through \
-             AC-7.6 are closed by tests nothing executes. The job needs Docker and a \
-             Linux runner and nothing else -- `ubuntu-latest` has both, and routes to \
-             `labnet` natively."
+            "{ci_path}: no `run:` step in the `{LAB_CI_JOB}` job invokes `lab/run.sh \
+             test`, so AC-7.2 through AC-7.6 are closed by tests nothing executes. The \
+             job needs Docker and a Linux runner and nothing else -- `ubuntu-latest` has \
+             both, and routes to `labnet` natively."
         ));
     }
     if !run_sh.contains("BATHY_LAB_REQUIRED=1") {
@@ -1781,7 +1879,23 @@ pub fn fuzz_bin_targets(manifest: &str) -> Vec<String> {
 pub fn fuzz_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
     let mut found = Vec::new();
 
-    let runs_the_targets = ci.lines().any(|line| {
+    // Everything below is asked of the `fuzz` JOB, not of the file. The
+    // review round that found this had both of the first two assertions
+    // file-scoped: moving `cargo run -p xtask -- fuzz` into the
+    // schedule-gated `lab-conformance` job left `check-fuzz` and `check-ci`
+    // green while the targets ran daily instead of per pull request, which is
+    // the literal text of AC-7.10. A criterion about *when* something runs
+    // cannot be checked by asking whether the file mentions it anywhere: in a
+    // workflow, which job a step sits in IS its schedule.
+    let Some(block) = job_block(ci, "fuzz") else {
+        found.push(format!(
+            "{ci_path}: there is no `fuzz:` job. The targets are then run by whatever \
+             other job happens to mention them, which is not a thing a reviewer can check."
+        ));
+        return found;
+    };
+
+    let runs_the_targets = block.lines().any(|line| {
         let trimmed = line.trim_start();
         trimmed
             .strip_prefix("- run:")
@@ -1789,10 +1903,19 @@ pub fn fuzz_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
             .is_some_and(|command| command.trim().starts_with("cargo run -p xtask -- fuzz"))
     });
     if !runs_the_targets {
+        let elsewhere = ci.contains("run: cargo run -p xtask -- fuzz");
         found.push(format!(
-            "{ci_path}: no `run:` step invokes `cargo run -p xtask -- fuzz`, so AC-7.10 \
-             is unmet: the targets exist and nothing executes them. A fuzz target that \
-             runs only when someone remembers is a fuzz target that runs once."
+            "{ci_path}: no `run:` step *in the `fuzz` job* invokes `cargo run -p xtask \
+             -- fuzz`{}, so AC-7.10 is unmet: the targets exist and nothing executes \
+             them on a pull request. A fuzz target that runs only when someone \
+             remembers is a fuzz target that runs once.",
+            if elsewhere {
+                " (there is one in another job, which is worse than none: the other \
+                 job's `if:` decides when the targets run, and AC-7.10 is exactly a \
+                 statement about when)"
+            } else {
+                ""
+            }
         ));
     }
 
@@ -1800,38 +1923,43 @@ pub fn fuzz_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
     // performance nicety: a 60-second run from an empty corpus re-derives the
     // same shallow inputs every time and never gets past them. Without the
     // cache the job is a 60-second smoke test wearing a fuzzer's name.
-    let caches_the_corpus = ci
-        .lines()
-        .any(|line| line.contains("fuzz/corpus") && !line.trim_start().starts_with('#'));
-    let has_cache_action = ci.lines().any(|line| line.contains("actions/cache@"));
-    if !(caches_the_corpus && has_cache_action) {
+    //
+    // One STEP in this job that is both a cache action and about the corpus,
+    // rather than two independent line scans over the job. Two scans are
+    // satisfied by a cache of the cargo registry plus the word `fuzz/corpus`
+    // in any other line -- and a conjunct that no fixture can fail on its own
+    // is a conjunct nothing tests, which is the three-fragment lesson AC-7.9
+    // already taught this file.
+    let caches_the_corpus = steps_of(block).iter().any(|step| {
+        let uncommented = || {
+            step.iter()
+                .filter(|line| !line.trim_start().starts_with('#'))
+        };
+        uncommented().any(|line| line.contains("actions/cache@"))
+            && uncommented().any(|line| line.contains("fuzz/corpus"))
+    });
+    if !caches_the_corpus {
         found.push(format!(
-            "{ci_path}: the fuzz job does not cache `fuzz/corpus` with `actions/cache@`, \
-             so every run starts from the committed seeds and re-derives the same \
-             shallow inputs. AC-7.10 requires a cached corpus."
+            "{ci_path}: the `fuzz` job does not cache `fuzz/corpus` with \
+             `actions/cache@` — a cache step in another job restores nothing here — so \
+             every run starts from the committed seeds and re-derives the same shallow \
+             inputs. AC-7.10 requires a cached corpus."
         ));
     }
 
     // The workflow must actually fire on pull requests. `on: pull_request` is
     // already there for the whole file; what would silently remove the fuzz
     // job from PRs is a job-level `if:` like the `lab-conformance` job's.
-    if let Some(block) = job_block(ci, "fuzz") {
-        if let Some(condition) = block
-            .lines()
-            .find(|l| l.trim_start().starts_with("if:") && l.len() - l.trim_start().len() <= 4)
-        {
-            found.push(format!(
-                "{ci_path}: the `fuzz` job carries a job-level condition ({}), so it does \
-                 not run on every pull request. AC-7.10 is specifically about pull \
-                 requests; if the long nightly run needs a condition, put it on the \
-                 duration rather than on the job.",
-                condition.trim()
-            ));
-        }
-    } else {
+    if let Some(condition) = block
+        .lines()
+        .find(|l| l.trim_start().starts_with("if:") && l.len() - l.trim_start().len() <= 4)
+    {
         found.push(format!(
-            "{ci_path}: there is no `fuzz:` job. The targets are then run by whatever \
-             other job happens to mention them, which is not a thing a reviewer can check."
+            "{ci_path}: the `fuzz` job carries a job-level condition ({}), so it does \
+             not run on every pull request. AC-7.10 is specifically about pull \
+             requests; if the long nightly run needs a condition, put it on the \
+             duration rather than on the job.",
+            condition.trim()
         ));
     }
     found
@@ -1839,6 +1967,15 @@ pub fn fuzz_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
 
 /// The lines of the named job, from its `  <name>:` header to the next
 /// header at the same indentation.
+///
+/// Every job-scoped assertion in this file rests on this, so the end of a
+/// block has to be a *job header* and nothing that merely looks like one.
+/// `ci.yml`'s inter-job prose is two-space indented and several lines of it
+/// end in a colon; treating one of those as the next job would silently
+/// shrink the block, and a shrunk block makes a job-scoped check pass by
+/// seeing less. [`is_job_header`] is the single definition of what a header
+/// is, and `a_two_space_comment_ending_in_a_colon_does_not_end_a_job`
+/// pins it.
 fn job_block<'a>(ci: &'a str, job: &str) -> Option<&'a str> {
     let header = format!("\n  {job}:\n");
     let start = ci.find(&header)? + 1;
@@ -1847,13 +1984,33 @@ fn job_block<'a>(ci: &'a str, job: &str) -> Option<&'a str> {
         .match_indices("\n  ")
         .find(|(at, _)| {
             let line = rest[at + 1..].lines().next().unwrap_or("");
-            line.starts_with("  ")
-                && !line.starts_with("   ")
-                && line.trim_end().ends_with(':')
-                && line.trim_start() != format!("{job}:")
+            is_job_header(line) && line.trim_start() != format!("{job}:")
         })
         .map_or(rest.len(), |(at, _)| at);
     Some(&rest[..end])
+}
+
+/// Whether `line` is a job header: exactly two spaces of indentation, a
+/// name, a colon, and nothing else. Not a comment, not a deeper key, not a
+/// sentence that happens to end in a colon.
+fn is_job_header(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("  ") else {
+        return false;
+    };
+    if rest.starts_with(' ') {
+        return false;
+    }
+    let Some(name) = rest.trim_end().strip_suffix(':') else {
+        return false;
+    };
+    // The name test is what excludes a comment, and it is written as one
+    // test rather than two so that neither can be the dead half of a pair:
+    // `# WHY THE CORPUS IS CACHED:` fails it on the `#` and on the spaces,
+    // and a bare `#cache:` fails it on the `#` alone.
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 /// What is wrong with the fuzzing surface, as text a person can act on.
@@ -2530,6 +2687,43 @@ jobs:
         assert!(v[0].contains("no local form"), "{v:#?}");
     }
 
+    /// The blindness that let `fuzz/` sit outside every root gate: the check
+    /// read the `run:` line and never the sibling key that says which tree it
+    /// runs over. Both orderings, because YAML keys are unordered and a check
+    /// that only looked below the `run:` would be satisfied by swapping two
+    /// lines.
+    #[test]
+    fn a_step_scoped_to_a_subdirectory_is_not_the_root_gate_it_reads_as() {
+        for ci in [
+            "jobs:\n  a:\n    steps:\n      - run: cargo fmt --all -- --check\n        \
+             working-directory: fuzz\n",
+            "jobs:\n  a:\n    steps:\n      - working-directory: fuzz\n        run: cargo fmt \
+             --all -- --check\n",
+        ] {
+            let v = ci_steps_without_a_local_form("ci.yml", ci, SUBS);
+            assert_eq!(v.len(), 1, "{ci}\n{v:#?}");
+            assert!(v[0].contains("working-directory: fuzz"), "{}", v[0]);
+            assert!(v[0].contains("no local form"), "{}", v[0]);
+        }
+    }
+
+    /// ...and the neighbouring step is not dragged into it. A step block ends
+    /// at the next `- ` marker; if it did not, one `working-directory:`
+    /// anywhere would condemn every step after it and the check would be
+    /// noise rather than a gate.
+    #[test]
+    fn a_working_directory_does_not_leak_into_the_next_step() {
+        // The root gate FIRST and the scoped one after it, so a step block
+        // that ran past its own `- ` marker would condemn the root `cargo
+        // test --workspace` for a key belonging to the step below it.
+        let ci = "jobs:\n  a:\n    steps:\n      - run: cargo test --workspace\n      \
+                  - run: cargo fmt --all -- --check\n        working-directory: fuzz\n";
+        let v = ci_steps_without_a_local_form("ci.yml", ci, SUBS);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("ci.yml:5"), "{}", v[0]);
+        assert!(v[0].contains("cargo fmt"), "{}", v[0]);
+    }
+
     #[test]
     fn a_workflow_with_no_run_steps_fails_rather_than_passing_over_nothing() {
         let v = ci_steps_without_a_local_form("ci.yml", "jobs:\n  a:\n    steps: []\n", SUBS);
@@ -2966,16 +3160,60 @@ jobs:
 
     // --- The conformance suite's CI job. ---
 
+    const CLEAN_LAB_CI: &str = "\
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo test --workspace
+  lab-conformance:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - run: lab/run.sh test
+";
+    const REQUIRES_THE_LAB: &str = "BATHY_LAB_REQUIRED=1 cargo test --workspace -- --ignored\n";
+
+    #[test]
+    fn a_clean_lab_workflow_and_runner_pass() {
+        let v = lab_ci_job_violations("ci.yml", CLEAN_LAB_CI, "lab/run.sh", REQUIRES_THE_LAB);
+        assert!(v.is_empty(), "{v:#?}");
+    }
+
     #[test]
     fn a_workflow_that_never_runs_the_conformance_suite_is_caught() {
         let v = lab_ci_job_violations(
             "ci.yml",
-            "jobs:\n  test:\n    steps:\n      - run: cargo test --workspace\n",
+            &CLEAN_LAB_CI.replace("      - run: lab/run.sh test\n", ""),
             "lab/run.sh",
-            "BATHY_LAB_REQUIRED=1 cargo test --workspace -- --ignored\n",
+            REQUIRES_THE_LAB,
         );
         assert_eq!(v.len(), 1, "{v:#?}");
         assert!(v[0].contains("lab/run.sh test"), "{}", v[0]);
+    }
+
+    /// The same defect class as the fuzz job's, in the job next door: a step
+    /// that exists in the *wrong* job satisfies a file-scoped check while
+    /// running on a schedule nobody asked for. Here the move is into the fast
+    /// `test` job, which would pull 2.8 GiB of images on every pull request --
+    /// the exact cost the `lab-conformance` job's comment block exists to
+    /// avoid -- and the file still contains the step, so a `ci.contains` or a
+    /// whole-file line scan sees nothing wrong.
+    #[test]
+    fn a_conformance_step_in_a_neighbouring_job_is_reported() {
+        let moved = CLEAN_LAB_CI
+            .replace("      - run: lab/run.sh test\n", "")
+            .replace(
+                "      - run: cargo test --workspace\n",
+                "      - run: cargo test --workspace\n      - run: lab/run.sh test\n",
+            );
+        assert!(
+            moved.contains("- run: lab/run.sh test"),
+            "the step is still in the file, which is the point"
+        );
+        let v = lab_ci_job_violations("ci.yml", &moved, "lab/run.sh", REQUIRES_THE_LAB);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains(LAB_CI_JOB), "{}", v[0]);
     }
 
     /// The first version of this check was `ci.contains("lab/run.sh test")`,
@@ -2984,14 +3222,12 @@ jobs:
     /// documents it guards nothing.
     #[test]
     fn a_comment_naming_the_command_does_not_count_as_running_it() {
-        let v = lab_ci_job_violations(
-            "ci.yml",
-            "  lab-conformance:\n    # `lab/run.sh test` sets BATHY_LAB_REQUIRED, so an\n\
-             \x20   # absent lab fails rather than skipping. See lab/run.sh test.\n    \
-             steps:\n      - uses: actions/checkout@v4\n",
-            "lab/run.sh",
-            "BATHY_LAB_REQUIRED=1 cargo test --workspace -- --ignored\n",
+        let commented = CLEAN_LAB_CI.replace(
+            "      - run: lab/run.sh test\n",
+            "      # `lab/run.sh test` sets BATHY_LAB_REQUIRED, so an absent lab fails\n\
+             \x20     # rather than skipping. See lab/run.sh test.\n      - uses: actions/checkout@v4\n",
         );
+        let v = lab_ci_job_violations("ci.yml", &commented, "lab/run.sh", REQUIRES_THE_LAB);
         assert_eq!(v.len(), 1, "{v:#?}");
         assert!(v[0].contains("no `run:` step"), "{}", v[0]);
     }
@@ -3002,7 +3238,7 @@ jobs:
         // the AC-7.32 defect one level up.
         let v = lab_ci_job_violations(
             "ci.yml",
-            "      - run: lab/run.sh test\n",
+            CLEAN_LAB_CI,
             "lab/run.sh",
             "cargo test --workspace -- --ignored\n",
         );
@@ -3201,6 +3437,130 @@ jobs:
         let v = fuzz_ci_job_violations("ci.yml", &ci);
         assert_eq!(v.len(), 1, "{v:#?}");
         assert!(v[0].contains("cached corpus"), "{}", v[0]);
+    }
+
+    /// The review's reproduction, made permanent. Both of these assertions
+    /// were file-scoped: moving the run step into the schedule-gated
+    /// `lab-conformance` job left `check-fuzz` and `check-ci` green while the
+    /// targets never ran on a pull request -- which is the literal text of
+    /// AC-7.10 and the exact thing the job-level `if:` check was written to
+    /// prevent. The `if:` check guarded the job it could see; nothing guarded
+    /// the step being somewhere else.
+    #[test]
+    fn a_fuzz_run_step_in_a_neighbouring_job_is_reported() {
+        let ci = CLEAN_FUZZ_CI
+            .replace("      - run: cargo run -p xtask -- fuzz --time 60\n", "")
+            .replace(
+                "  other:\n    runs-on: ubuntu-latest\n",
+                "  other:\n    if: github.event_name == 'schedule'\n    runs-on: ubuntu-latest\n\
+                 \x20   steps:\n      - run: cargo run -p xtask -- fuzz --time 600\n",
+            );
+        assert!(
+            ci.contains("run: cargo run -p xtask -- fuzz"),
+            "the step is still in the file, which is the whole point of this test"
+        );
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("in the `fuzz` job"), "{}", v[0]);
+        assert!(
+            v[0].contains("another job"),
+            "it must say where the step went: {}",
+            v[0]
+        );
+    }
+
+    /// The same hole for the cache: a cache step in the fast job restores
+    /// nothing into the job that fuzzes, and the reported line still said
+    /// "corpus cached in CI".
+    #[test]
+    fn a_corpus_cache_in_a_neighbouring_job_is_reported() {
+        let ci = CLEAN_FUZZ_CI
+            .replace(
+                "      - uses: actions/cache@v4\n        with:\n          path: fuzz/corpus\n",
+                "",
+            )
+            .replace(
+                "  other:\n    runs-on: ubuntu-latest\n",
+                "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@v4\n\
+                 \x20       with:\n          path: fuzz/corpus\n",
+            );
+        assert!(ci.contains("path: fuzz/corpus"), "still in the file");
+        assert!(ci.contains("actions/cache@v4"), "still in the file");
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("the `fuzz` job does not cache"), "{}", v[0]);
+    }
+
+    /// The half of that check which "the whole step moved" cannot pin. The
+    /// fuzz job keeps *a* cache — of the cargo registry, which is the
+    /// realistic edit — and only the corpus path ends up next door, so
+    /// `actions/cache@` is present in the block either way and the corpus
+    /// path is the only thing job-scoping decides. A check whose two
+    /// conjuncts are only ever tested together passes with one of them
+    /// weakened, which is the three-fragment lesson from AC-7.9.
+    #[test]
+    fn a_cache_of_something_other_than_the_corpus_does_not_satisfy_the_corpus_check() {
+        let ci = CLEAN_FUZZ_CI
+            .replace(
+                "          path: fuzz/corpus\n",
+                "          path: ~/.cargo/registry\n",
+            )
+            .replace(
+                "  other:\n    runs-on: ubuntu-latest\n",
+                "  other:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/cache@v4\n\
+                 \x20       with:\n          path: fuzz/corpus\n",
+            );
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("does not cache `fuzz/corpus`"), "{}", v[0]);
+    }
+
+    /// And the other half of the same conjunction: the corpus is named in
+    /// this job, an `actions/cache@` is in this job, and they are not the
+    /// same step -- so nothing is cached and a line-scan check says
+    /// otherwise.
+    #[test]
+    fn a_corpus_named_in_a_different_step_from_the_cache_action_is_not_a_cache() {
+        let ci = CLEAN_FUZZ_CI.replace(
+            "          path: fuzz/corpus\n",
+            "          path: ~/.cargo/registry\n      - run: ls fuzz/corpus\n",
+        );
+        assert!(ci.contains("actions/cache@v4"), "still in the job");
+        assert!(ci.contains("fuzz/corpus"), "still in the job");
+        let v = fuzz_ci_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("does not cache `fuzz/corpus`"), "{}", v[0]);
+    }
+
+    /// `job_block` decides the scope of every job-scoped assertion above, so
+    /// what ends a block has to be a job header and not merely a line that
+    /// looks like one. `ci.yml`'s own inter-job prose is two-space indented
+    /// and runs to paragraphs; a comment ending in a colon that truncated the
+    /// block would make every check inside it pass by seeing less.
+    #[test]
+    fn a_two_space_comment_ending_in_a_colon_does_not_end_a_job() {
+        let ci = "\
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+  # WHY THE CORPUS IS CACHED:
+  # because a cold 60-second run is a smoke test wearing a fuzzer's name.
+  #cache:
+    steps:
+      - uses: actions/cache@v4
+        with:
+          path: fuzz/corpus
+      - run: cargo run -p xtask -- fuzz --time 60
+  other:
+    runs-on: ubuntu-latest
+";
+        let block = job_block(ci, "fuzz").expect("the fuzz job is there");
+        assert!(
+            block.contains("cargo run -p xtask -- fuzz"),
+            "the comment truncated the block: {block}"
+        );
+        assert!(!block.contains("other:"), "the block ran into the next job");
+        assert!(fuzz_ci_job_violations("ci.yml", ci).is_empty());
     }
 
     #[test]
