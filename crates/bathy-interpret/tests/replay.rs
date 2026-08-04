@@ -378,7 +378,6 @@ fn every_fixture_states_its_provenance_and_every_real_capture_names_an_image_dig
             );
             assert!(
                 detail
-                    .trim_start()
                     .split_whitespace()
                     .next()
                     .is_some_and(|w| { !w.starts_with("sha256:") && !w.starts_with("digest") }),
