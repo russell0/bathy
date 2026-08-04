@@ -1270,6 +1270,31 @@ impl Scheduler {
 mod tests {
     use super::*;
     use std::collections::{BTreeSet, HashMap};
+
+    /// The three terminal event kinds, as one definition rather than as a
+    /// `matches!` re-typed at each assertion.
+    ///
+    /// M5 Task 1's review found `bathy-query`'s fold enumerating "terminal"
+    /// as two kinds and dropping `policy.denied`, which made a refused scan
+    /// fold byte-identically to one that never ran. Per the Global Constraint
+    /// "a defect found in one file is a defect class until proven otherwise",
+    /// this file was swept: the production definitions were already correct
+    /// (`durable_log.rs`'s `is_terminal`, `already_terminated` above), but two
+    /// TEST assertions here enumerated the same set by hand and omitted
+    /// `policy.denied` -- so `cancellation_emits_no_terminal_event` would have
+    /// passed on a cancelled run that emitted a denial. They now share this.
+    ///
+    /// The one deliberate exception is in the `target_out_of_scope` test,
+    /// where the denial IS the expected terminal event; it says so at the
+    /// call site.
+    fn is_terminal_body(body: &EventBody) -> bool {
+        matches!(
+            body,
+            EventBody::ScanCompleted { .. }
+                | EventBody::ScanFailed { .. }
+                | EventBody::PolicyDenied { .. }
+        )
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use tokio::net::{TcpListener, TcpStream};
@@ -2856,12 +2881,7 @@ mod tests {
         let terminal = h
             .events()
             .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::ScanCompleted { .. } | EventBody::ScanFailed { .. }
-                )
-            })
+            .filter(|e| is_terminal_body(&e.body))
             .count();
         assert_eq!(terminal, 1);
     }
@@ -2879,16 +2899,12 @@ mod tests {
         let terminal = h
             .events()
             .iter()
-            .filter(|e| {
-                matches!(
-                    &e.body,
-                    EventBody::ScanCompleted { .. } | EventBody::ScanFailed { .. }
-                )
-            })
+            .filter(|e| is_terminal_body(&e.body))
             .count();
         assert_eq!(
             terminal, 0,
-            "cancellation must not emit scan.completed or scan.failed"
+            "cancellation must not emit any terminal event -- scan.completed, \
+             scan.failed or policy.denied"
         );
         // Still exactly one scan.started, even for a scan cancelled before
         // its first unit.
@@ -3331,7 +3347,11 @@ mod tests {
             "expected reason_code target_out_of_scope, got {:?}",
             denials[0].body
         );
-        // No other terminal event alongside it.
+        // No other terminal event alongside it. `policy.denied` is
+        // deliberately NOT in this match: the denial above IS the terminal
+        // event this scan is expected to have, and counting it here would
+        // make the assertion self-contradictory. Everywhere else that
+        // enumerates "terminal", use `is_terminal_body`.
         assert_eq!(
             events
                 .iter()
