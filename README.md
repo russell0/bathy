@@ -4,28 +4,41 @@ An agent-native network discovery engine: turns authorized network questions int
 bounded scan plans, executes them, and returns structured, evidence-backed findings
 over MCP.
 
-> **Status: Milestones 1-3 of 7 landed (contracts; evidence and state; planner
-> and engine).**
+> **Status: Milestones 1-4 of 7 landed (contracts; evidence and state; planner
+> and engine; probes and interpretation).**
 >
-> bathy scans. `bathy-engine`'s scheduler drives real, unprivileged TCP connect
-> scanning against IPv4 targets: budget- and rate-governed, cancellable, and
-> resumable. Every `Scheduler::run` call verifies, before it will ever emit a
-> probe, that its manifest is the one this scan was actually authorized under
-> (not merely *a* manifest), that the manifest is still active (unexpired), and
-> that each individual target is inside its allow set — see
-> `crates/bathy-engine/src/scheduler.rs`'s module doc. That is currently the
-> *only* enforcement point: `bathy_scope::evaluate`, the library function this
-> crate provides for validating a request against a manifest before a plan is
-> even built, has no caller anywhere in this workspace yet — wiring it into an
-> orchestrator is Milestone 5's job, once a CLI/MCP surface exists to call it
-> from. Every observation lands in a durable, gap-free, append-only event log
-> (`bathy-evidence`) before the SQLite state that indexes it is made durable —
-> never the other way around.
+> bathy scans, and identifies what it finds. `bathy-engine`'s scheduler drives
+> real, unprivileged TCP connect scanning against IPv4 targets: budget- and
+> rate-governed, cancellable, and resumable. Every `Scheduler::run` call
+> verifies, before it will ever emit a probe, that its manifest is the one this
+> scan was actually authorized under (not merely *a* manifest), that the
+> manifest is still active (unexpired), and that each individual target is
+> inside its allow set — see `crates/bathy-engine/src/scheduler.rs`'s module
+> doc. That is currently the *only* enforcement point: `bathy_scope::evaluate`,
+> the library function this crate provides for validating a request against a
+> manifest before a plan is even built, has no caller anywhere in this
+> workspace yet — wiring it into an orchestrator is Milestone 5's job, once a
+> CLI/MCP surface exists to call it from. Every observation lands in a durable,
+> gap-free, append-only event log (`bathy-evidence`) before the SQLite state
+> that indexes it is made durable — never the other way around.
 >
-> What does not exist yet: interpretation (service and version identification,
-> Milestone 4), a CLI or an MCP server (Milestone 5), privileged SYN/ICMP
-> scanning and a packet daemon (Milestone 6), and the verification suite
-> (Milestone 7). There is still no way to invoke a scan except as a Rust
+> A port that answers gets one or more *additional* connections, each carrying a
+> single real protocol probe — tried in order of port affinity and stopping at
+> the first response that is recognized, up to an `intensity` bound (4 by
+> default). What comes back is interpreted into a `service.observed` event
+> citing the content-addressed response bytes, stored before the event that
+> references them and capped at the configured evidence level (8 KiB for
+> headers, 64 KiB for full; `EvidenceLevel::None` stores nothing and therefore
+> emits no `service.observed` at all). Eight protocols: HTTP, TLS, SSH, SMTP,
+> DNS, PostgreSQL, MySQL, Redis. Probe traffic is paced by the same rate limiter
+> and charged to the same packet budget as the connect scan, and the manifest is
+> re-checked before each reconnect. Identification can be turned off
+> (`service_detection.enabled = false`), in which case no probe bytes are sent
+> at all.
+>
+> What does not exist yet: a CLI or an MCP server (Milestone 5), privileged
+> SYN/ICMP scanning and a packet daemon (Milestone 6), and the verification
+> suite (Milestone 7). There is still no way to invoke a scan except as a Rust
 > library call — see `crates/bathy-engine/tests/end_to_end_scan.rs` for exactly
 > that, exercised end to end against real sockets.
 >
@@ -41,7 +54,9 @@ over MCP.
 | `bathy-evidence` | The content-addressed blob store and the append-only, gap-free event log that is this project's actual source of truth — SQLite state elsewhere is a derived index rebuildable from it, never the reverse. |
 | `bathy-store` | SQLite-backed scan state: idempotency (a repeated key with an identical plan reuses the scan; a different plan is refused as a conflict), a resumption cursor, and per-scan lifecycle status. A scan starts `pending` and `bathy-engine`'s scheduler transitions it to `completed`, `cancelled`, `failed`, or `denied` on each of its own terminal outcomes; `running`/`paused` are reserved for Milestone 5's pause/resume CLI surface. |
 | `bathy-plan` | Turns a `ScanRequest` into a deterministic, indexable `ScanPlan`: target expansion, port selection, and the content hash idempotency and resumption are built on. |
-| `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
+| `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by an absolute deadline, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
+| `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every finding carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
+| `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — one extra paced, budgeted, scope-checked connection per open port — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
 Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
@@ -56,6 +71,14 @@ caught by reading, including a test that passed with the code it named removed,
 eight distinct IPv4-in-IPv6 embedding schemes that bypassed the authorization
 boundary, and an expiry comparison that reported an expired manifest as valid.
 
+Milestone 4 added more of the same shape: renaming any of seven probe ids
+silently disabled that protocol's identification with all 253 tests in the three
+crates involved still green; the only public-API integration test passed with all
+of service identification deleted; blanking a capture fixture's entire provenance
+record passed the whole suite; and two RFC quotations turned out to be
+fabricated — plausible sentences, in quotation marks, asserting something
+stronger than the document said. Each of those now has a test that dies.
+
 ## Authorized use
 
 bathy is built for scanning networks you are authorized to scan. Every scan requires
@@ -69,10 +92,28 @@ on the actual emission path. Scope identity and expiry are checked once per
 per unit, immediately before each probe. A manifest that expires mid-scan does
 not halt the run in progress. That is the only
 enforcement point that exists today (see the Status note above). Scans carry hard
-packet, rate, and runtime budgets. v0.1 probe traffic is a plain, unprivileged TCP
-connect: it carries no identifying payload — that is a v0.1 limitation, not a claim
-otherwise. Detection evasion and anonymization are permanent non-goals regardless —
-see the design notes before opening a feature request for either.
+packet, rate, and runtime budgets.
+
+**What a scanned third party sees on their wire.** Every port is first touched by
+a plain, unprivileged TCP connect that sends no payload. A port that answers then
+receives one *additional* connection carrying a real protocol request — a `GET /`,
+a TLS `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind` query, a
+PostgreSQL `SSLRequest` — chosen by port affinity. Those bytes are fixed and
+public: they are listed, byte for byte, in each probe's own module in
+`crates/bathy-probe/src/probes/`.
+
+bathy is **deliberately identifiable**, and that is a design commitment, not an
+oversight. The HTTP probe sends
+`User-Agent: bathy/<version> (+https://github.com/russell0/bathy)`, and the SMTP
+probe identifies itself as `bathy.invalid`. An operator who receives this traffic
+can tell what it is and who to contact. There is no anonymous mode, no evasive
+mode, and no flag to remove the identification. Detection evasion and
+anonymization are permanent non-goals — see the design notes before opening a
+feature request for either.
+
+Service identification can be disabled entirely
+(`service_detection.enabled = false`), in which case only the bare connect probe
+is ever sent. It cannot be made anonymous.
 
 Scanning networks without authorization may be unlawful in your jurisdiction and may
 violate your provider's terms of service. That is your responsibility, not the tool's.
