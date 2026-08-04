@@ -244,16 +244,7 @@ fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     // type defined in `bathy-query` (M5: `ScanFold`, `ScanDiff`) cannot be
     // named from `bathy-types` without moving the fold below the layer that
     // owns it.
-    let mut schemas = bathy_types::schema::all();
-    for (name, schema) in bathy_query::schema::all() {
-        if let Some(previous) = schemas.insert(name, schema) {
-            // Two crates claiming one filename would silently overwrite one
-            // published contract with another.
-            return Err(
-                format!("two crates both publish `schemas/{name}.json`: {previous}").into(),
-            );
-        }
-    }
+    let schemas = union_schemas(vec![bathy_types::schema::all(), bathy_query::schema::all()])?;
     let dir = Path::new("schemas");
     let drift = diff_or_write(&schemas, dir, write)?;
 
@@ -283,6 +274,36 @@ fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         Err(problems.join("\n").into())
     }
+}
+
+/// Merge every publishing crate's `schema::all()` into one filename-keyed
+/// set, refusing a filename two crates both claim.
+///
+/// Pure, and separated from [`emit_schemas`] for the same reason
+/// `find_violations` and `diff_or_write` are: the collision path is the one
+/// that matters and it cannot be reached from the real workspace, where no
+/// two crates claim a name. A rule with no way to fail in a test is a rule
+/// nobody knows still works.
+///
+/// Silent overwrite is the failure being prevented. `BTreeMap::insert`
+/// returns the displaced value rather than erroring, so a second crate
+/// publishing `scan-fold` would replace the first crate's contract, the
+/// committed file would follow on the next `emit-schemas`, and every check
+/// would stay green.
+fn union_schemas(
+    sets: Vec<BTreeMap<&'static str, serde_json::Value>>,
+) -> Result<BTreeMap<&'static str, serde_json::Value>, Box<dyn std::error::Error>> {
+    let mut merged: BTreeMap<&'static str, serde_json::Value> = BTreeMap::new();
+    for set in sets {
+        for (name, schema) in set {
+            if let Some(previous) = merged.insert(name, schema) {
+                return Err(
+                    format!("two crates both publish `schemas/{name}.json`: {previous}").into(),
+                );
+            }
+        }
+    }
+    Ok(merged)
 }
 
 /// The pure-ish core of [`emit_schemas`]: given the schema set and a target
@@ -725,6 +746,33 @@ mod tests {
         let mut m = BTreeMap::new();
         m.insert("thing", serde_json::json!({"type": "object"}));
         m
+    }
+
+    #[test]
+    fn union_schemas_merges_disjoint_sets() {
+        let a = BTreeMap::from([("scan-fold", serde_json::json!({"type": "object"}))]);
+        let b = BTreeMap::from([("event", serde_json::json!({"type": "object"}))]);
+        let merged = union_schemas(vec![a, b]).unwrap();
+        assert_eq!(
+            merged.keys().copied().collect::<Vec<_>>(),
+            vec!["event", "scan-fold"]
+        );
+    }
+
+    #[test]
+    fn union_schemas_refuses_a_filename_two_crates_both_claim() {
+        // Unreachable from the real workspace, which is exactly why it needs
+        // a test: `insert` would silently replace one published contract with
+        // another and every check downstream would stay green.
+        let a = BTreeMap::from([("scan-fold", serde_json::json!({"title": "first"}))]);
+        let b = BTreeMap::from([("scan-fold", serde_json::json!({"title": "second"}))]);
+        let err = union_schemas(vec![a, b]).unwrap_err().to_string();
+        assert!(err.contains("scan-fold.json"), "{err}");
+        assert!(err.contains("two crates"), "{err}");
+        assert!(
+            err.contains("first"),
+            "the error must show the contract that would have been overwritten: {err}"
+        );
     }
 
     #[test]
