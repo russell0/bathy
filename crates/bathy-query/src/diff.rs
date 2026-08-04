@@ -709,6 +709,92 @@ mod tests {
         );
     }
 
+    /// `retain_substantive` is the owned half of the same definition, and it
+    /// is the one `bathy_mcp::tools::result::diff_scans` actually calls.
+    ///
+    /// It is asserted here, in this crate, because M5's review scored a
+    /// mutant that makes it retain everything and found it survived `cargo
+    /// test -p bathy-query` -- killed only by the workspace-wide
+    /// cross-surface suite. The guard was real and the crate's own suite did
+    /// not hold it, so a developer iterating with `-p` (which this project
+    /// recommends for speed) saw green on a broken filter.
+    ///
+    /// The fixture carries **both** kinds on purpose: a diff whose every
+    /// change is substantive is satisfied by a filter that retains
+    /// everything, and would test nothing.
+    #[test]
+    fn retain_substantive_drops_the_confidence_wobble_and_keeps_the_real_change() {
+        let before = fold_of(
+            &[
+                svc(
+                    "10.0.0.1",
+                    443,
+                    "https",
+                    Some("nginx"),
+                    Some("1.26.0"),
+                    0.95,
+                ),
+                svc(
+                    "10.0.0.2",
+                    443,
+                    "https",
+                    Some("nginx"),
+                    Some("1.26.0"),
+                    0.95,
+                ),
+            ]
+            .concat(),
+        );
+        let after = fold_of(
+            &[
+                // A confidence wobble only.
+                svc(
+                    "10.0.0.1",
+                    443,
+                    "https",
+                    Some("nginx"),
+                    Some("1.26.0"),
+                    0.88,
+                ),
+                // A genuine product change.
+                svc(
+                    "10.0.0.2",
+                    443,
+                    "https",
+                    Some("apache"),
+                    Some("2.4.0"),
+                    0.95,
+                ),
+            ]
+            .concat(),
+        );
+
+        let mut d = diff(&before, &after);
+        assert_eq!(
+            d.changes.len(),
+            2,
+            "fixture sanity: both a substantive change and a wobble must be present"
+        );
+        assert!(
+            d.changes
+                .iter()
+                .any(|c| c.kind == ChangeKind::ConfidenceOnly),
+            "fixture sanity: something must actually be dropped"
+        );
+
+        d.retain_substantive();
+        assert_eq!(d.changes.len(), 1, "the wobble must be gone");
+        assert_ne!(
+            d.changes[0].kind,
+            ChangeKind::ConfidenceOnly,
+            "and what survives must be the real change, not the other way round"
+        );
+        assert_eq!(
+            d.changes[0].endpoint.port, 443,
+            "fixture sanity: the surviving change is the one on 10.0.0.2"
+        );
+    }
+
     #[test]
     fn every_change_kind_is_produced_by_some_pair_of_folds() {
         // AC-5.4 as one assertion: a classifier missing an arm cannot pass

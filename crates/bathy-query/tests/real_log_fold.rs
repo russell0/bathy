@@ -314,6 +314,17 @@ async fn folding_a_real_scan_log_answers_what_the_scan_actually_found() {
     assert_eq!(observation.product.as_deref(), Some("nginx"));
     assert_eq!(observation.version.as_deref(), Some("1.26.0"));
     assert_eq!(nginx.probe_id.as_deref(), Some("http-get-v1"));
+    // Both namespaces, on the fold and not only in the log. Asserted here,
+    // in this crate's own suite, because M5's review scored a mutant that
+    // drops the fold's `rule_id` write and found it survived `cargo test -p
+    // bathy-query` -- killed only by the cross-surface workspace run. A
+    // behaviour pinned only from another crate is one a developer iterating
+    // locally can break and see green.
+    assert_eq!(
+        nginx.rule_id.as_deref(),
+        Some("http.server.nginx.v1"),
+        "the fold must carry the rule that decided, not only the probe that asked"
+    );
     assert_eq!(
         nginx.evidence_refs.len(),
         1,
@@ -327,6 +338,10 @@ async fn folding_a_real_scan_log_answers_what_the_scan_actually_found() {
     assert_eq!(silent.state, Some(PortState::Open));
     assert!(silent.observation.is_none());
     assert!(silent.probe_id.is_none());
+    assert!(
+        silent.rule_id.is_none(),
+        "and must not borrow the other endpoint's rule either"
+    );
     assert!(silent.evidence_refs.is_empty());
 
     // A completed scan folds to a completed terminal, carrying the counters
