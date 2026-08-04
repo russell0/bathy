@@ -79,6 +79,29 @@ fn manifest() -> Arc<ScopeManifest> {
     )
 }
 
+/// The same manifest with `not_after` already in the past relative to the
+/// `FixedClock` every scan below runs on. Loading it is the one-line change
+/// that turns a good scan into a refused one -- which is the whole point of
+/// CRITICAL-1: this is a *routine* operational state, not an exotic one.
+fn expired_manifest() -> Arc<ScopeManifest> {
+    Arc::new(
+        ScopeManifest::for_tests_allowing_loopback(
+            r#"{
+              "id": "scope_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+              "description": "M5 Task 1 real-log fold fixture, expired",
+              "not_after": "2026-07-01T00:00:00.000Z",
+              "allowed_cidrs": ["127.0.0.1/32"],
+              "budget_ceiling": {
+                "maximum_packets": 1000000,
+                "maximum_runtime_seconds": 3600,
+                "maximum_packets_per_second": 1000000
+              }
+            }"#,
+        )
+        .unwrap(),
+    )
+}
+
 /// A port that accepts and immediately drops every connection: seen `Open`,
 /// but every service-detection candidate gets `ProbeError::EmptyResponse`, so
 /// no `service.observed` can be produced for it. Kept alongside
@@ -173,6 +196,16 @@ async fn closeable_port_serving_nginx() -> (u16, CancellationToken) {
 /// directory, and its own idempotency key, so two calls are two independent
 /// scans rather than one scan resumed.
 async fn scan_real_ports(ports: &[u16], idempotency_key: &str) -> Vec<Event> {
+    scan_real_ports_under(ports, idempotency_key, manifest()).await
+}
+
+/// [`scan_real_ports`] with the scope manifest as a parameter, so the same
+/// real stack can also produce the log of a *refused* scan.
+async fn scan_real_ports_under(
+    ports: &[u16],
+    idempotency_key: &str,
+    manifest: Arc<ScopeManifest>,
+) -> Vec<Event> {
     let dir = tempfile::tempdir().unwrap();
     let clock: Arc<dyn Clock> = Arc::new(FixedClock::new("2026-08-01T15:04:31.182Z", 7).unwrap());
     let store = Arc::new(TaskStore::open(dir.path(), Arc::clone(&clock)).unwrap());
@@ -214,7 +247,7 @@ async fn scan_real_ports(ports: &[u16], idempotency_key: &str) -> Vec<Event> {
     ));
     let scheduler = Scheduler::new(
         BudgetLedger::new(budgets),
-        manifest(),
+        manifest,
         SchedulerConfig::default(),
         Arc::clone(&log),
         Arc::clone(&store),
@@ -420,5 +453,64 @@ async fn a_real_log_truncated_before_its_terminal_event_folds_to_no_terminal() {
         fold.endpoints[&(loopback(), tcp(nginx_port))]
             .observation
             .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_real_log_of_a_policy_denied_scan_folds_to_a_denied_terminal() {
+    // CRITICAL-1 against a real engine log rather than a hand-built one, and
+    // against a real listener that must never be touched.
+    //
+    // The reproduction the fold has to survive: an operator's manifest
+    // expires. `Scheduler::run` refuses before dispatching anything, the
+    // store records `TaskStatus::Denied`, and the log it leaves behind is
+    // exactly one event. If the fold discards that event -- as it did -- the
+    // result is `{endpoints: {}, hosts_up: {}, terminal: None}`, which is
+    // byte-identical to folding an empty log, and M5 Task 2's diff of
+    // yesterday's good scan against it can only classify every endpoint as
+    // having disappeared. No packet was sent.
+    let listener_port = open_port_serving_nginx().await;
+    let good = scan_real_ports(&[listener_port], "m5-task-1-denied-baseline").await;
+    let refused = scan_real_ports_under(
+        &[listener_port],
+        "m5-task-1-denied-expired",
+        expired_manifest(),
+    )
+    .await;
+
+    // Fixture sanity, asserted against the engine rather than assumed: a
+    // scope-validity denial emits exactly one event and no `scan.started`
+    // (`bathy-engine`'s own `a_scope_validity_denial_emits_no_scan_started`).
+    assert_eq!(
+        refused.len(),
+        1,
+        "fixture sanity: a refused scan's log is one event, got {refused:#?}"
+    );
+
+    let yesterday = fold_events(&good);
+    let today = fold_events(&refused);
+    let never_ran = fold_events(&[]);
+
+    assert_eq!(yesterday.endpoints.len(), 1);
+    assert!(matches!(
+        yesterday.terminal,
+        Some(Terminal::Completed { .. })
+    ));
+
+    // The endpoints really are gone from today's fold -- that part is honest,
+    // because nothing was probed. What must NOT be gone is the reason.
+    assert!(today.endpoints.is_empty());
+    match &today.terminal {
+        Some(Terminal::Denied { reason_code, .. }) => assert_eq!(
+            reason_code.code(),
+            "scope_expired",
+            "the engine's typed DenyReason must survive the fold"
+        ),
+        other => panic!("a refused scan must fold to Terminal::Denied, got {other:?}"),
+    }
+    assert_ne!(
+        format!("{today:?}"),
+        format!("{never_ran:?}"),
+        "a refused scan must not be byte-identical to a scan that never ran"
     );
 }

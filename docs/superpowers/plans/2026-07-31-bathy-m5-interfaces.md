@@ -102,6 +102,8 @@ mod tests {
 
 Sort events by `sequence` before folding — never trust caller ordering. For each `port.state`, upsert the endpoint's state; for each `service.observed`, upsert observation, `probe_id`, and evidence refs. Record `hosts_up` from `host.discovered`. Capture the last terminal event.
 
+**"Terminal" means exactly what `bathy-engine` means by it: `scan.completed`, `scan.failed`, *and* `policy.denied`** — the three `durable_log.rs`'s `is_terminal` and `scheduler.rs`'s `already_terminated()` both match, and a refused scan's log is that one `policy.denied` event and nothing else. `Terminal` therefore has three variants, not two. This sentence exists because the first pass read "the last terminal event" as the two obvious ones, discarded `policy.denied`, and made a refused scan fold byte-identically to a scan that never ran — so Task 2's diff could only classify it as every endpoint on the host disappearing, off a one-line manifest expiry. `terminal: None` means "still running or cancelled mid-flight", and must never be reachable from a scan that finished in any way.
+
 - [ ] **Step 4: Run tests to verify they pass** — expected 5 passed.
 
 - [ ] **Step 5: Commit**
@@ -184,13 +186,62 @@ mod tests {
     }
 
     #[test]
-    fn changes_are_ordered_deterministically_by_target_then_port() {
-        let after = fold_of(&[open("10.0.0.2", 80), open("10.0.0.1", 443), open("10.0.0.1", 80)]);
+    fn changes_are_ordered_deterministically_by_target_then_transport_then_port() {
+        // The key is `(c.target, c.endpoint)`, NOT `(c.target,
+        // c.endpoint.port)`. `Endpoint`'s derived `Ord` is
+        // transport-dominant (`bathy-types`, `b852259`), which is the order
+        // Step 3's prose and AC-5.7 both specify and the order the fold's
+        // own `BTreeMap` keys are in. Keying on `port` alone drops the
+        // transport dimension entirely: it passes today only because every
+        // fixture here is TCP, and it becomes a decoration for that
+        // dimension the moment UDP exists. Include a UDP endpoint in the
+        // fixture so the assertion is not vacuous.
+        let after = fold_of(&[
+            open("10.0.0.2", 80),
+            open("10.0.0.1", 443),
+            open("10.0.0.1", 80),
+            open_udp("10.0.0.1", 53),
+        ]);
         let d = diff(&fold_of(&[]), &after);
-        let keys: Vec<_> = d.changes.iter().map(|c| (c.target, c.endpoint.port)).collect();
+        let keys: Vec<_> = d.changes.iter().map(|c| (c.target, c.endpoint)).collect();
         let mut sorted = keys.clone();
         sorted.sort();
         assert_eq!(keys, sorted);
+    }
+
+    #[test]
+    fn a_first_observed_port_state_is_a_state_change_not_an_appearance() {
+        // `EndpointState::state` is `Option<PortState>` (M5 Task 1 shipped it
+        // that way deliberately: a `service.observed` with no preceding
+        // `port.state` leaves reachability genuinely unknown, and neither
+        // `Open` nor `Indeterminate` may impersonate that absence). So
+        // `None -> Some(_)` is a real transition the classifier must decide
+        // on purpose. The endpoint was already present in `before`, so it did
+        // not appear; what changed is its state.
+        let before = fold_of(&[svc_without_port_state("10.0.0.1", 443, "nginx", "1.26.0", 0.95)]);
+        let after = fold_of(&[open("10.0.0.1", 443)]);
+        let d = diff(&before, &after);
+        assert_eq!(d.changes.len(), 1);
+        assert_eq!(
+            d.changes[0].kind,
+            ChangeKind::StateChanged,
+            "an endpoint already in the fold cannot 'appear'; a first-observed \
+             port state is a transition out of unknown"
+        );
+    }
+
+    #[test]
+    fn a_denied_scan_does_not_diff_as_every_endpoint_disappearing() {
+        // `Terminal::Denied` (M5 Task 1 fix round, CRITICAL-1). A refused
+        // scan has zero endpoints because no packet was sent, not because
+        // the services went away. The diff must be able to say so.
+        let monday = fold_of(&[open("10.0.0.1", 80), open("10.0.0.1", 443)]);
+        let tuesday = denied_fold(DenyReason::ScopeExpired);
+        let d = diff(&monday, &tuesday);
+        assert!(
+            !d.changes.iter().all(|c| c.kind == ChangeKind::EndpointDisappeared),
+            "a policy-denied scan must not be diffed as a total disappearance"
+        );
     }
 }
 ```
@@ -212,7 +263,9 @@ pub fn diff(before: &ScanFold, after: &ScanFold) -> ScanDiff { /* … */ }
 
 Classification order, first match wins: absent-then-present → `EndpointAppeared`; present-then-absent → `EndpointDisappeared`; `PortState` differs → `StateChanged`; `product` differs → `ProductChanged`; `version` differs → `VersionChanged`; only `confidence` differs → `ConfidenceOnly`; otherwise unchanged. Iterate over the union of keys from a `BTreeSet` so output order is sorted by `(target, transport, port)`.
 
-- [ ] **Step 4: Run tests to verify they pass** — expected 7 passed.
+`EndpointState::state` is `Option<PortState>`, so "`PortState` differs" includes `None → Some(_)` and `Some(_) → None`. Both are `StateChanged`, never `EndpointAppeared`/`EndpointDisappeared` — appearance and disappearance are decided by the endpoint's presence in `ScanFold::endpoints`, which is a different question. See AC-5.33.
+
+- [ ] **Step 4: Run tests to verify they pass** — expected 9 passed.
 
 - [ ] **Step 5: Commit**
 
@@ -221,11 +274,25 @@ git add crates/bathy-query
 git commit -m "feat(query): differential scanning with confidence noise separated from real change"
 ```
 
+- [ ] **Step 6: Design and commit the wire shape for `ScanFold` and `ScanDiff`**
+
+`ScanFold` is deliberately not `Serialize` today: its `endpoints` field is a `BTreeMap<(IpAddr, Endpoint), _>`, and a derived `Serialize` on that compiles and then fails at runtime for every `serde_json` caller, because JSON object keys must be strings. The fix is an **entry-array encoding** — `endpoints` as a JSON array of `{ target, endpoint: { transport, port }, state, observation, evidence_refs, probe_id }` objects in key order — designed here, alongside the per-entry `Change` shape this task has to invent anyway, and not deferred.
+
+It is designed here rather than in Task 4 because Task 4 must declare `outputSchema` on eleven tools ("Servers MUST provide structured results that conform to this schema") against a beta-rated SDK and a rewritten protocol revision, which is the worst place in this milestone to be inventing a published contract. Both types get a `JsonSchema` impl, both schemas are emitted by `bathy_types::schema::all()`'s equivalent for this crate and committed under `schemas/`, and `xtask check-schemas` drift-checks them like every other published schema.
+
+Two things the encoding must decide explicitly, both inherited from Task 1:
+
+1. `Terminal` has **three** variants (`Completed`, `Failed`, `Denied`) and `terminal: null` means "still running or cancelled mid-flight" — not "refused". A wire shape that cannot distinguish those re-opens CRITICAL-1 one layer up.
+2. Once a `ScanFold` is serializable, two builds can compare rendered folds. `fold_events`'s duplicate-`sequence` tiebreak is keyed on `Debug` output, which Rust does not promise is stable across releases, so the tie path becomes cross-release visible for the first time. It is unreachable from a `bathy-evidence` log (append-only, gap-free, monotonic), but the trade must be re-decided here and stated in the schema's own documentation rather than left in a doc comment in `fold.rs`.
+
 **Acceptance criteria:**
 - **AC-5.4** All six `ChangeKind` variants are produced by the classifier under the appropriate conditions.
 - **AC-5.5** A confidence-only difference is never reported as a product or version change.
 - **AC-5.6** Diffing a fold against itself yields zero changes.
-- **AC-5.7** Change ordering is deterministic, sorted by target then transport then port.
+- **AC-5.7** Change ordering is deterministic, sorted by target then transport then port. Closed by `changes_are_ordered_deterministically_by_target_then_transport_then_port`, whose sort key is `(c.target, c.endpoint)` and whose fixture contains at least one non-TCP endpoint — a fixture that is all TCP makes the transport half of this criterion untested.
+- **AC-5.33** A first-observed port state (`state: None → Some(_)`) is classified as `StateChanged`, and an endpoint present in both folds is never classified as `EndpointAppeared` or `EndpointDisappeared`. Closed by `a_first_observed_port_state_is_a_state_change_not_an_appearance`. This is a criterion rather than a note because M5 Task 1's report identified the requirement and left it in a report file, and per the Global Constraint *manual verification does not close an acceptance criterion*, a requirement that lives only in prose gets re-derived under time pressure.
+- **AC-5.34** A `ScanFold` whose `terminal` is `Terminal::Denied` is not diffed as every endpoint disappearing. Closed by `a_denied_scan_does_not_diff_as_every_endpoint_disappearing`.
+- **AC-5.35** `ScanFold` and `ScanDiff` have a committed JSON Schema under `schemas/`, `xtask check-schemas` drift-checks it, and a round-trip test proves the entry-array encoding of `endpoints` deserializes back to an equal value — a `BTreeMap` with a tuple key serializes only through such an encoding, and a derived `Serialize` would compile and fail at runtime.
 
 ---
 

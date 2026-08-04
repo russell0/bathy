@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
-use bathy_types::event::{Endpoint, Event, EventBody, Observation, PortState};
+use bathy_types::event::{DenyReason, Endpoint, Event, EventBody, Observation, PortState};
 use bathy_types::ids::Digest;
 
 /// How one endpoint is addressed in a fold: the host it lives on, plus the
@@ -25,12 +25,23 @@ pub struct ScanFold {
     /// two are deliberately not collapsed.
     pub endpoints: BTreeMap<EndpointKey, EndpointState>,
     /// Hosts a `host.discovered` event named.
+    ///
+    /// **Unpopulated as of M5, and empty is not evidence that no host is
+    /// up.** No code in `bathy-engine` constructs `EventBody::HostDiscovered`
+    /// -- `discovery.rs` ships unprivileged TCP host discovery as a library
+    /// building block that the scheduler does not yet call, so no real scan
+    /// emits the event and this set is empty for every log the engine
+    /// produces today. It is wired up in M6, when discovery joins the
+    /// scheduler. A consumer must read this as "the log said nothing about
+    /// host liveness", never as "these are all the hosts that were up".
     pub hosts_up: BTreeSet<IpAddr>,
     /// The scan's terminal event, if it reached one.
     ///
     /// `None` is a real and meaningful value: a scan that was cancelled
     /// mid-flight, or is still running, has no terminal state and must not
-    /// fold to something that looks completed.
+    /// fold to something that looks completed. It does **not** mean "refused"
+    /// -- a scan denied by policy is terminal and folds to
+    /// [`Terminal::Denied`].
     pub terminal: Option<Terminal>,
 }
 
@@ -79,12 +90,26 @@ pub struct EndpointState {
     pub probe_id: Option<String>,
 }
 
-/// The two ways a scan's log can end.
+/// The three ways a scan's log can end.
 ///
-/// Mirrors `EventBody::ScanCompleted` / `EventBody::ScanFailed`; there is no
-/// third variant, because "still running" and "cancelled mid-flight" are both
-/// represented by `ScanFold::terminal` being `None` rather than by a value
-/// here.
+/// One variant per terminal `EventBody`, and "terminal" is `bathy-engine`'s
+/// own definition, not this crate's: `durable_log.rs`'s `is_terminal` and
+/// `scheduler.rs`'s `already_terminated()` both match exactly
+/// `ScanCompleted | ScanFailed | PolicyDenied`, and a denial is the *only*
+/// event a refused scan's log contains (`scheduler.rs`'s
+/// `a_scope_validity_denial_emits_no_scan_started`). This enum must mirror
+/// that set: an earlier revision omitted [`Terminal::Denied`], and a refused
+/// scan then folded byte-identically to a scan that had never run -- so a
+/// diff against it reported every endpoint on the host as having disappeared
+/// when no packet had been sent. See
+/// `a_policy_denied_scan_is_terminal_and_is_not_a_scan_that_never_ran`.
+///
+/// "Still running" and "cancelled mid-flight" are the cases represented by
+/// `ScanFold::terminal` being `None` rather than by a value here. Adding a
+/// terminal `EventBody` to `bathy-types` without adding it here is the defect
+/// this doc comment exists to prevent; `fold_events`'s `match` is exhaustive
+/// over `EventBody`, so a new variant there will not compile until it is
+/// decided here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Terminal {
     Completed {
@@ -94,6 +119,20 @@ pub enum Terminal {
     },
     Failed {
         reason_code: String,
+        detail: String,
+    },
+    /// The scan was refused by policy and no packet was emitted under it.
+    ///
+    /// `reason_code` is the typed [`DenyReason`], not a `String`, because
+    /// that is what `EventBody::PolicyDenied` carries and an agent branches
+    /// on `DenyReason::code`'s stable wire strings. Distinct from
+    /// [`Terminal::Failed`], whose `reason_code` is an untyped engine/IO
+    /// string: "we were not allowed to look" and "we tried and it broke" are
+    /// different answers to "what happened to this scan", and M5 Task 2's
+    /// diff must be able to tell them apart before it classifies an empty
+    /// result.
+    Denied {
+        reason_code: DenyReason,
         detail: String,
     },
 }
@@ -137,6 +176,12 @@ impl ScanFold {
 /// Pure: same events in, byte-identical `ScanFold` out, for any permutation
 /// of the input. Nothing here reads a clock, a socket, a database or a file.
 ///
+/// One caveat, attached where it belongs rather than to the claim as a whole:
+/// on a **malformed** log -- one with two events sharing a `sequence`, which
+/// `bathy-evidence` cannot produce -- the tiebreak is keyed on `Debug`
+/// rendering, which is stable within a build but carries no cross-release
+/// guarantee from Rust. See the "Ordering" section.
+///
 /// # Ordering
 ///
 /// The events are put into a total order *before* folding, and the caller's
@@ -155,6 +200,27 @@ impl ScanFold {
 /// the fold and applying either first gives the same result. Rendering is
 /// computed only inside a run of equal sequence numbers, so a well-formed log
 /// never pays for it.
+///
+/// **The scope of that tiebreak's guarantee, stated exactly.** `Debug` is
+/// total, pure and deterministic *within a build*, which is the whole of what
+/// the fold's callers can observe: two folds compared in one process agree
+/// unconditionally. Rust promises nothing about `Debug` output across
+/// releases, so on the tie path -- and only there -- "byte-identical" is
+/// build-relative. Three things bound this. It is unreachable from a real
+/// log: `bathy-evidence`'s log is append-only, gap-free and monotonic in
+/// `sequence` by construction, so no two events can collide. Nothing today
+/// compares a `ScanFold` across builds, because `ScanFold` is not
+/// serializable (deliberately -- see the crate docs). And the alternative
+/// keys were each worse: a canonical-JSON (RFC 8785) rendering *is* stable
+/// across releases and is this project's hashing input, but reaching it means
+/// adding `serde_json` to a crate whose single-dependency graph is what
+/// makes its purity checkable rather than merely asserted; a derived `Ord` on
+/// `Event` is impossible (`Confidence` wraps an `f64`) and would in any case
+/// be silently defined by source order, the exact drift `bathy-types`'
+/// `transport_orders_by_declaration_order` exists to catch. The moment
+/// `ScanFold` gains a wire encoding (M5 Task 2), the tie path becomes
+/// cross-release visible and this trade must be re-decided -- which is why
+/// it is a named obligation on Task 2 in the M5 plan and not a note here.
 ///
 /// # Malformed and contradictory logs
 ///
@@ -187,9 +253,17 @@ pub fn fold_events(events: &[Event]) -> ScanFold {
 
     for event in total_order(events) {
         match &event.body {
-            EventBody::ScanStarted { .. }
-            | EventBody::Progress { .. }
-            | EventBody::PolicyDenied { .. } => {}
+            EventBody::ScanStarted { .. } | EventBody::Progress { .. } => {}
+
+            EventBody::PolicyDenied {
+                reason_code,
+                detail,
+            } => {
+                fold.terminal = Some(Terminal::Denied {
+                    reason_code: *reason_code,
+                    detail: detail.clone(),
+                });
+            }
 
             EventBody::HostDiscovered { target, .. } => {
                 fold.hosts_up.insert(target.ip);
@@ -345,6 +419,16 @@ mod tests {
             EventBody::ScanFailed {
                 reason_code: "io".into(),
                 detail: "socket closed".into(),
+            },
+        )
+    }
+
+    pub(super) fn denied(sequence: u64) -> Event {
+        ev(
+            sequence,
+            EventBody::PolicyDenied {
+                reason_code: DenyReason::ScopeExpired,
+                detail: "scope manifest expired at 2026-07-30T00:00:00.000Z".into(),
             },
         )
     }
@@ -627,6 +711,110 @@ mod tests {
     }
 
     #[test]
+    fn a_policy_denied_scan_is_terminal_and_is_not_a_scan_that_never_ran() {
+        // CRITICAL-1. `policy.denied` is one of `bathy-engine`'s three
+        // terminal event kinds (`durable_log.rs`'s `is_terminal`,
+        // `scheduler.rs`'s `already_terminated()`), and a refused scan's log
+        // is exactly one event: this one. An earlier revision discarded it,
+        // so a refused scan folded to `terminal: None` with no endpoints --
+        // byte-identical to a scan that had never run, and contradicting
+        // `bathy-store`, which had already recorded `TaskStatus::Denied` for
+        // the same scan.
+        let refused = fold_events(&[denied(1)]);
+        let never_ran = fold_events(&[]);
+
+        assert_eq!(
+            refused.terminal,
+            Some(Terminal::Denied {
+                reason_code: DenyReason::ScopeExpired,
+                detail: "scope manifest expired at 2026-07-30T00:00:00.000Z".into(),
+            }),
+            "a denial is a terminal outcome and must be readable as one"
+        );
+        assert_ne!(
+            refused, never_ran,
+            "a refused scan must not be confusable with one that never ran"
+        );
+        assert_ne!(
+            format!("{refused:?}"),
+            format!("{never_ran:?}"),
+            "and must not be confusable byte for byte either"
+        );
+    }
+
+    #[test]
+    fn a_denied_scan_does_not_diff_as_every_endpoint_disappearing() {
+        // Why CRITICAL-1 is critical rather than an interface question. M5
+        // Task 2's diff is a pure function of two folds. Monday's good scan
+        // against Tuesday's expired-manifest scan gives `2 endpoints,
+        // Completed` against `0 endpoints, <terminal>`. If Tuesday's
+        // terminal were `None`, the only classification the diff could reach
+        // is `EndpointDisappeared` for every endpoint -- an agent told every
+        // service on the host went away when no packet was sent. The fold
+        // owes the diff enough to refuse that classification, and this is it.
+        let monday = fold_events(&[
+            port_state(1, "10.0.0.1", 80, PortState::Open),
+            port_state(2, "10.0.0.1", 443, PortState::Open),
+            completed(3),
+        ]);
+        let tuesday = fold_events(&[denied(1)]);
+
+        assert_eq!(monday.endpoints.len(), 2);
+        assert!(tuesday.endpoints.is_empty());
+        assert!(
+            matches!(tuesday.terminal, Some(Terminal::Denied { .. })),
+            "the empty side must carry why it is empty, or the diff cannot \
+             tell a refusal from a disappearance"
+        );
+        assert!(
+            !matches!(tuesday.terminal, None | Some(Terminal::Completed { .. })),
+            "a refused scan is neither unfinished nor completed"
+        );
+    }
+
+    #[test]
+    fn a_denied_terminal_is_superseded_and_supersedes_by_sequence_like_any_other() {
+        // `Denied` is not a special case of the last-terminal-wins rule
+        // (AC-5.2 applied to `terminal`); it participates in it. Both
+        // directions, so an implementation that appends `Denied` outside the
+        // ordinary terminal path fails here.
+        let denial_last = fold_events(&[completed(1), denied(2)]);
+        assert!(matches!(
+            denial_last.terminal,
+            Some(Terminal::Denied { .. })
+        ));
+
+        let denial_first = fold_events(&[denied(1), failed(2)]);
+        assert!(matches!(
+            denial_first.terminal,
+            Some(Terminal::Failed { .. })
+        ));
+    }
+
+    #[test]
+    fn a_denial_is_not_folded_into_a_failure() {
+        // `Terminal::Failed` would also make a denied scan distinguishable
+        // from an empty one, and would still be wrong: `DenyReason` is a
+        // closed set of four wire codes an agent branches on, while
+        // `Failed::reason_code` is an unconstrained engine/IO string. A diff
+        // that reads "refused" as "errored" retries a scan that policy
+        // refused.
+        let f = fold_events(&[denied(1)]);
+        assert!(
+            !matches!(f.terminal, Some(Terminal::Failed { .. })),
+            "a policy denial is not an engine failure"
+        );
+        let Some(Terminal::Denied { reason_code, .. }) = f.terminal else {
+            panic!("expected Terminal::Denied, got {:?}", f.terminal);
+        };
+        assert_eq!(
+            reason_code.code(),
+            "scope_expired",
+            "the typed DenyReason must survive the fold, not be stringified"
+        );
+    }
+
+    #[test]
     fn a_sequence_gap_does_not_stop_the_fold() {
         let f = fold_events(&[
             started(1),
@@ -876,14 +1064,25 @@ mod proptests {
             prop_assert_eq!(folded, mentioned);
         }
 
-        /// The fold never invents a terminal state. Paired with the AC-5.1
-        /// properties above this pins "an unfinished scan has no terminal
-        /// state" over generated logs, not just the one hand-written case.
+        /// The fold never invents a terminal state, and never drops one.
+        /// Paired with the AC-5.1 properties above this pins "an unfinished
+        /// scan has no terminal state" over generated logs, not just the one
+        /// hand-written case.
+        ///
+        /// The `matches!` arm below is the enumeration of terminal event
+        /// kinds *this property depends on*, and it must stay equal to
+        /// `bathy-engine`'s (`durable_log.rs`'s `is_terminal`). It omitted
+        /// `PolicyDenied` while the fold did, which is why this property
+        /// passed over a log whose only event was a denial -- both sides of
+        /// the equality were wrong in the same direction. It is now the test
+        /// that dies if the `PolicyDenied` arm is removed from `fold_events`.
         #[test]
         fn a_log_with_no_terminal_event_folds_to_no_terminal(log in arb_log()) {
             let has_terminal = log.iter().any(|e| matches!(
                 e.body,
-                EventBody::ScanCompleted { .. } | EventBody::ScanFailed { .. }
+                EventBody::ScanCompleted { .. }
+                    | EventBody::ScanFailed { .. }
+                    | EventBody::PolicyDenied { .. }
             ));
             prop_assert_eq!(fold_events(&log).terminal.is_some(), has_terminal);
         }
@@ -970,6 +1169,10 @@ mod proptests {
                 "fold reached Terminal::Failed specifically",
                 matches!(fold.terminal, Some(Terminal::Failed { .. })),
             );
+            bump(
+                "fold reached Terminal::Denied specifically",
+                matches!(fold.terminal, Some(Terminal::Denied { .. })),
+            );
             bump("fold recorded a host as up", !fold.hosts_up.is_empty());
             bump(
                 "log has a duplicated sequence number (tiebreak path)",
@@ -991,8 +1194,16 @@ mod proptests {
         // report for the full printed table): non-empty 3694, permutation
         // reorders 2980, >=1 endpoint 3334, >=2 endpoints 2481, >=1 open 1196,
         // non-open retained 2498, supersession 691, service observation 2391,
-        // observation-without-state 1971, >=2 digests 758, terminal 1998,
-        // Terminal::Failed 705, host up 1530, duplicate sequence 2625.
+        // observation-without-state 1971, >=2 digests 758, terminal 2348,
+        // Terminal::Failed 641, Terminal::Denied 523, host up 1530, duplicate
+        // sequence 2625.
+        //
+        // The terminal counts moved when `Terminal::Denied` was added (M5
+        // Task 1 fix round, CRITICAL-1): "reached a terminal state" rose
+        // 1998 -> 2348 because a denial is now one, and "Terminal::Failed
+        // specifically" fell 705 -> 641 because a denial now sometimes wins
+        // the last-terminal-by-sequence position a failure used to. Nothing
+        // about the strategy changed; the fold's answer did.
         //
         // The two 10% floors (supersession, >=2 digests) are the rarest shapes
         // and were calibrated *downward* after this test failed at 20% on 691
@@ -1031,6 +1242,15 @@ mod proptests {
         floor("fold reached a terminal state", CASES * 30 / 100);
         floor(
             "fold reached Terminal::Failed specifically",
+            CASES * 5 / 100,
+        );
+        // Same generator weight as `ScanFailed` (1 of 18), so the same floor.
+        // Without this bucket the `PolicyDenied` arm could be deleted and
+        // `a_log_with_no_terminal_event_folds_to_no_terminal` would still be
+        // the only thing catching it -- a single property with no evidence
+        // that its generator ever reaches the shape.
+        floor(
+            "fold reached Terminal::Denied specifically",
             CASES * 5 / 100,
         );
         floor("fold recorded a host as up", CASES * 20 / 100);
