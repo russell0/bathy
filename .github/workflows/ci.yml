@@ -114,7 +114,17 @@ jobs:
       # `bathy-types` and `regex` (see the MSRV comment on
       # `crates/bathy-interpret/Cargo.toml`), so -- like `bathy-probe` --
       # it stays in the `1.88` tier rather than `msrv-bathy-store`.
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p xtask --all-targets
+      #
+      # `bathy` joined this job in the M4 whole-branch fix wave (MINOR-1).
+      # It was created in M4 (`508d4f6`) declaring `rust-version.workspace =
+      # true` (1.88) and was named by NEITHER msrv job, so its floor was
+      # claimed and never checked -- the same defect M3's review found in
+      # `bathy-plan` and which was reintroduced here. It has no dependencies
+      # at all, so `1.88` is the correct tier; the point is that a crate
+      # declaring a floor must be in exactly one of these two jobs, and
+      # nothing but this list enforces that today. Adding a crate to the
+      # workspace means adding it here.
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p bathy -p xtask --all-targets
 
   msrv-bathy-store:
     runs-on: ubuntu-latest

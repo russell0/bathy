@@ -94,4 +94,102 @@ mod tests {
             );
         }
     }
+
+    // --- `ProbeKind` gets a reader (M4 whole-branch review).
+    //
+    // The review's production-caller census found that every one of the
+    // eight probes declares `ListenFirst`/`SendFirst` and **nothing ever
+    // reads it** -- `select_probes` does not consult it, `detect_service`
+    // does not consult it -- and asked for a decision: wire it or delete
+    // it, because "a field with no reader is a claim nothing checks."
+    //
+    // Decision: KEEP it, and give it the reader it was missing. Deleting
+    // was the tempting option (the behaviour is implemented in each
+    // `execute` and already pinned at the wire level for SSH and MySQL),
+    // but it is the wrong one. `Probe` is a PUBLIC trait: an out-of-tree
+    // probe is expected to implement it, and `kind()` is the only place its
+    // author declares this property at all. Deleting it would not remove
+    // the concept, only the ability to state it -- and the failure it
+    // guards against is real and silent. A probe that listens first when it
+    // should speak first hangs until its deadline against every endpoint it
+    // touches, producing `EmptyResponse` rather than an error, which is the
+    // same shape of invisible false negative as CRITICAL-1's.
+    //
+    // So `kind()` stays, and the test below reads it -- for all eight
+    // probes, against a real socket. That converts it from an unchecked
+    // assertion into a specification checked against the implementation,
+    // which is what the finding actually asks for. It is not a production
+    // reader and is not claimed to be one; nothing in the scan path has a
+    // decision to make from it. The claim being checked is the contract,
+    // and this is where contracts get checked.
+    //
+    // Note `ListenFirst` means "reads before writing", NOT "never writes":
+    // `smtp-banner-v1` is `ListenFirst` and does send `EHLO`, after the
+    // greeting. The existing `ssh_probe_never_writes_to_the_socket_even_
+    // when_it_would_be_read` and `mysql_probe_never_writes_to_the_socket`
+    // assert the stronger never-writes property for the two probes where it
+    // holds; this asserts the weaker one that holds for all eight, which is
+    // exactly what `kind()` declares.
+
+    use crate::framework::{ProbeIo, ProbeKind, ProbeRegistry};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn every_probe_speaks_or_listens_first_exactly_as_its_probe_kind_declares() {
+        for probe in ProbeRegistry::standard().all() {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            // Set iff the peer sent us bytes BEFORE we sent it any.
+            let wrote_first = Arc::new(AtomicBool::new(false));
+            let observed = Arc::clone(&wrote_first);
+
+            let server = tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let (mut sock, _) = listener.accept().await.unwrap();
+                // Say nothing, and wait. A send-first probe writes its
+                // request here; a listen-first probe is blocked waiting for
+                // us, so this read times out at zero bytes.
+                let mut buf = [0u8; 1024];
+                let first =
+                    tokio::time::timeout(Duration::from_millis(250), sock.read(&mut buf)).await;
+                if matches!(first, Ok(Ok(n)) if n > 0) {
+                    observed.store(true, Ordering::SeqCst);
+                }
+                // Now answer, so a listen-first probe can make progress and
+                // `execute` returns instead of burning its whole deadline.
+                let _ = sock.write_all(b"220 x\r\n").await;
+                // Drain whatever it says next (e.g. SMTP's EHLO) so the
+                // probe's own write cannot block on a full buffer.
+                let mut sink = [0u8; 1024];
+                let _ =
+                    tokio::time::timeout(Duration::from_millis(250), sock.read(&mut sink)).await;
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut io = ProbeIo::new(stream, addr.port(), Duration::from_millis(300));
+            let _ = probe.execute(&mut io).await;
+            drop(io);
+            server.await.unwrap();
+
+            let observed_kind = if wrote_first.load(Ordering::SeqCst) {
+                ProbeKind::SendFirst
+            } else {
+                ProbeKind::ListenFirst
+            };
+            assert_eq!(
+                observed_kind,
+                probe.kind(),
+                "{} declares kind() == {:?} but on a real socket it behaved as {:?}. \
+                 A send-first probe that actually listens first hangs until its deadline \
+                 against every endpoint it touches and reports EmptyResponse rather than an \
+                 error; a listen-first probe that actually speaks first can corrupt a \
+                 server-greets-you protocol's session. Fix whichever of the two is wrong.",
+                probe.id(),
+                probe.kind(),
+                observed_kind
+            );
+        }
+    }
 }

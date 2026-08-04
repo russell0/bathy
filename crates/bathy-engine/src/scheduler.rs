@@ -14,7 +14,7 @@
 //!    something new.** Once a unit's CONNECT probe has been dispatched
 //!    (its budget already spent), its result is always recorded, even
 //!    after `cancel` fires -- see the unconditional drain loop after the
-//!    dispatch loop breaks. M4 Task 5 fix round 1, CRITICAL-2: that same
+//!    dispatch loop breaks. M4 Task 5 fix round 1, AC-4.27: that same
 //!    unconditional drain loop calls `record`, which (for an `Open`
 //!    outcome) can itself start BRAND NEW probe traffic via
 //!    `detect_service` -- an earlier version of this had no way to tell
@@ -769,7 +769,7 @@ impl Scheduler {
             // observations -- this loop runs unconditionally, regardless of
             // which branch above broke the dispatch loop.
             //
-            // M4 Task 5 fix round 1, CRITICAL-2: draining the connect
+            // M4 Task 5 fix round 1, AC-4.27: draining the connect
             // probe's own already-in-flight result is still correct even
             // after cancellation -- that packet is already on the wire, and
             // recording its outcome costs nothing further. What is NOT
@@ -919,7 +919,7 @@ impl Scheduler {
     /// that identification for one endpoint blocks the dispatch loop from
     /// advancing to the next unit while it runs -- accepted for this task;
     /// see this task's report.
-    /// M4 Task 5 fix round 1, CRITICAL-2: `cancel` is now threaded through
+    /// M4 Task 5 fix round 1, AC-4.27: `cancel` is now threaded through
     /// from `run` (both call sites below pass their own `cancel`), and
     /// forwarded to `detect_service`, which is what actually refuses to
     /// start a NEW probe attempt once cancelled -- see that method's own
@@ -1022,7 +1022,8 @@ impl Scheduler {
     /// asserts zero real accepts on a live listener, independent of
     /// whatever the outer dispatch loop's own gate does.
     ///
-    /// # Pacing (M4 Task 5 fix round 1, CRITICAL-1)
+    /// # Pacing (AC-4.26; M4 Task 5 fix round 1, where it was labelled
+    /// CRITICAL-1 before the plan renumbered these in 1d19cae)
     ///
     /// Each probe attempt's own reconnect is paced by
     /// [`RateLimiter::acquire`] -- the SAME limiter the dispatch loop's own
@@ -1044,7 +1045,8 @@ impl Scheduler {
     /// packets) and asserts on wall-clock elapsed time, not merely on
     /// `packets_spent`.
     ///
-    /// # Cancellation (M4 Task 5 fix round 1, CRITICAL-2)
+    /// # Cancellation (AC-4.27; M4 Task 5 fix round 1, where it was
+    /// labelled CRITICAL-2 before the plan renumbered these in 1d19cae)
     ///
     /// Checked at the top of every loop iteration, exactly mirroring the
     /// dispatch loop's own `cancel.is_cancelled()` check at the top of
@@ -1073,12 +1075,12 @@ impl Scheduler {
         );
 
         for probe in candidates {
-            // CRITICAL-2: no new probe attempt starts once cancelled.
+            // AC-4.27: no new probe attempt starts once cancelled.
             if cancel.is_cancelled() {
                 break;
             }
 
-            // CRITICAL-1: paced, not merely counted -- cancellable so a
+            // AC-4.26: paced, not merely counted -- cancellable so a
             // cancellation arriving mid-wait is not delayed behind it.
             let acquired = tokio::select! {
                 biased;
@@ -4446,8 +4448,8 @@ mod tests {
     }
 
     // ==================================================================
-    // M4 Task 5 fix round 1 (review): CRITICAL-1 (probe reconnects bypassed
-    // the rate limiter), CRITICAL-2 (cancellation did not stop new probe
+    // M4 Task 5 fix round 1 (review): AC-4.26 (probe reconnects bypassed
+    // the rate limiter), AC-4.27 (cancellation did not stop new probe
     // traffic), and three IMPORTANTs (evidence content, evidence-level
     // caps, and intensity were all unverified at the wiring level -- only
     // their PRESENCE/absence was ever asserted, not their actual values).
@@ -4468,7 +4470,7 @@ mod tests {
 
     #[tokio::test]
     async fn probe_reconnects_are_paced_by_the_rate_limiter_not_only_counted() {
-        // CRITICAL-1. 1 pps: the connect probe consumes the `RateLimiter`'s
+        // AC-4.26, first half. 1 pps: the connect probe consumes the `RateLimiter`'s
         // one immediate/burst token ("the first burst is immediate" --
         // `rate::tests`), so the SECOND real packet -- `http-get-v1`'s own
         // successful reconnect -- can only leave once the bucket refills,
@@ -4615,7 +4617,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancellation_stops_new_probe_traffic_not_just_new_units() {
-        // CRITICAL-2. `concurrency: 1`, `pps: 1`: unit 0's connect probe
+        // AC-4.27. `concurrency: 1`, `pps: 1`: unit 0's connect probe
         // consumes the limiter's one immediate token and resolves near
         // instantly (real loopback); the dispatch loop's very next action
         // is to try to dispatch unit 1, which genuinely BLOCKS for ~1s
