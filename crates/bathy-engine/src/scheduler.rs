@@ -2074,6 +2074,85 @@ mod tests {
         }
     }
 
+    /// AC-5.40. The same contract, asserted as an **ordering** rather than as
+    /// a presence -- which is a different test, and the one the invariant
+    /// actually needs.
+    ///
+    /// The test above passes whichever order `publish_terminal_status` does
+    /// its two things in, because it looks after both have happened. It kills
+    /// *deleting* the release; it leaves *moving it after the store write*
+    /// completely unguarded, and that is the actual bug shape here and in
+    /// M3's durability inversion (the store committed before the log was
+    /// fsynced). The Global Constraint added at M5 exit says so in general
+    /// terms: if the invariant is "A happens before B", assert the
+    /// interleaving.
+    ///
+    /// The interleaving is made observable by making B fail. `set_status` on
+    /// a scan the store has never heard of is `StoreError::NotFound`, so:
+    ///
+    ///   - release first, then write: the release has already happened when
+    ///     the write fails, and the log is free. What this asserts.
+    ///   - write first, then release: `?` returns on the failed write and the
+    ///     release never runs, so the log is still locked. This test fails.
+    ///   - no release at all: the log is still locked. This test fails too.
+    ///
+    /// A scan whose status could not be published is exactly the case where
+    /// holding the log hostage is worst: nothing will ever mark it terminal,
+    /// so nothing will ever come back to let go.
+    #[test]
+    fn the_log_is_released_before_the_terminal_status_is_written_not_merely_alongside_it() {
+        let h = harness(&["127.0.0.1"], &[9]);
+
+        // A scan this store has never heard of, so its `set_status` fails.
+        // Asserted rather than assumed: if this identifier were in the store,
+        // the write would succeed and the ordering would stop being visible.
+        let orphan: ScanId = "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        assert!(
+            h.store.get(orphan).unwrap().is_none(),
+            "this scan is supposed to be unknown to the store"
+        );
+
+        let log = Arc::new(Mutex::new(
+            GroupCommitLog::open(h._dir.path(), orphan, GroupCommitConfig::default()).unwrap(),
+        ));
+        let scheduler = Scheduler::new(
+            BudgetLedger::new(budgets(1_000, 60, 1_000)),
+            Arc::clone(&h.manifest),
+            small_config(),
+            Arc::clone(&log),
+            Arc::clone(&h.store),
+            Arc::clone(&h.clock),
+            orphan,
+            "0.1.0",
+            h.service_detection,
+            h.evidence_level,
+            Arc::clone(&h.evidence),
+            Arc::clone(&h.probes),
+        );
+
+        let err = scheduler
+            .publish_terminal_status(TaskStatus::Completed)
+            .expect_err("the store write is what this test makes fail");
+        assert!(
+            matches!(err, EngineError::Store(StoreError::NotFound(_))),
+            "the store write failed for some other reason, so this test is not \
+             measuring the ordering any more: {err:?}"
+        );
+
+        // `scheduler` and its log handle are both still alive, so nothing has
+        // been released by a drop.
+        let reopened = bathy_evidence::EventLog::open(h._dir.path(), orphan);
+        assert!(
+            reopened.is_ok(),
+            "the writer still held the log when the status write was attempted: the \
+             release runs after it, or not at all. Either way a scan that cannot \
+             publish its outcome now holds its log forever: {:?}",
+            reopened.err()
+        );
+        drop(reopened);
+        drop(scheduler);
+    }
+
     /// The other half of the same contract, at the layer that enforces it: a
     /// handle that has given up its claim must not keep numbering records,
     /// because a second writer may already be doing so. Without the
