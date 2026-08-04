@@ -75,8 +75,33 @@ const CALL_BUDGET: usize = 10;
 const TYPED_CALLS_BESIDES_POLLING: usize = 6;
 
 /// What the platform's temporary directory is written as in the rendered
-/// transcript. See the substitution at the end of the workflow.
-const TEMP_DIR_PLACEHOLDER: &str = "$TMPDIR/";
+/// transcript. See [`redacted`].
+const TEMP_DIR_PLACEHOLDER: &str = "$TMPDIR";
+
+/// The one substitution made to an otherwise verbatim capture.
+///
+/// The manifest paths in the transcript are real, and on macOS they carry
+/// `DARWIN_USER_TEMP_DIR` -- a token stable per user per machine, and so a
+/// linkable identifier in a way the RFC 1918 address and the two-second
+/// ephemeral ports the document already discloses as local are not. It costs
+/// nothing to remove: the path is meaningless to a reader either way. Done in
+/// the emitter rather than in the rendered document, so a re-render cannot
+/// bring it back.
+///
+/// A free function rather than three lines inline, because inline it was
+/// reachable only with `BATHY_WORKFLOW_TRANSCRIPT` set -- so no test took the
+/// branch, and removing the substitution entirely passed the whole suite.
+fn redacted(rendered: String) -> String {
+    let root = std::env::temp_dir();
+    let root = root.to_str().expect("a printable temp directory");
+    // The trailing separator is trimmed here and supplied by the path itself,
+    // because macOS reports the temporary directory with one and Linux does
+    // not. Without this the same code renders `$TMPDIR/x` on one platform and
+    // `$TMPDIR//x` on the other, so the published document would depend on
+    // which machine happened to render it -- which is the class of defect
+    // this function exists to remove, one level up.
+    rendered.replace(root.trim_end_matches('/'), TEMP_DIR_PLACEHOLDER)
+}
 
 /// A target the lab manifest does not authorize. Naming it costs nothing --
 /// `scope.validate` emits no packet -- and it is what makes the refusal in
@@ -579,20 +604,57 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
                 })
             })
             .collect();
-        // One substitution, and it is the only edit made to a verbatim
-        // capture. The manifest paths in these arguments are real, and on
-        // macOS they carry `DARWIN_USER_TEMP_DIR` -- a token that is stable
-        // per user per machine and is therefore a linkable identifier, unlike
-        // the RFC 1918 address and the two-second ephemeral ports the
-        // document already discloses as local. It costs nothing: the path is
-        // meaningless to a reader either way. Done here rather than in the
-        // rendered document so a re-render cannot reintroduce it.
-        let rendered = serde_json::to_string_pretty(&steps).unwrap().replace(
-            std::env::temp_dir().to_str().expect("a printable temp dir"),
-            TEMP_DIR_PLACEHOLDER,
-        );
+        let rendered = redacted(serde_json::to_string_pretty(&steps).unwrap());
         std::fs::write(path, rendered).expect("transcript");
     }
+}
+
+#[test]
+fn the_rendered_transcript_carries_no_machine_local_temp_directory_token() {
+    // `docs/examples/agent-inventory-workflow.md` is published, and this is
+    // the only thing standing between it and a per-user-per-machine
+    // identifier. The fixture is a real path under the real temporary
+    // directory, so this fails on a platform whose temp root this does not
+    // actually match rather than passing over a string nobody checked.
+    let real = std::env::temp_dir().join(".tmpAbC123").join("scope.json");
+    let real = real.to_str().expect("a printable path");
+    let root = std::env::temp_dir();
+    let root = root.to_str().expect("a printable temporary directory");
+    let root = root.trim_end_matches('/');
+    let transcript =
+        format!(r#"[{{"tool":"scope.validate","arguments":{{"manifest_path":"{real}"}}}}]"#);
+    assert!(
+        transcript.contains(root),
+        "the fixture must contain the token this test is about"
+    );
+
+    let out = redacted(transcript);
+    assert!(
+        !out.contains(root),
+        "the published transcript carries the platform temporary directory: {out}"
+    );
+    assert!(
+        out.contains("$TMPDIR/.tmpAbC123/scope.json"),
+        "the substitution must keep the rest of the path, which is what makes \
+         the transcript readable: {out}"
+    );
+
+    // And the committed document is what this is for, so check that too: a
+    // redaction that works on a string but was never applied to the file is
+    // the same defect one step later.
+    let published = include_str!("../../../docs/examples/agent-inventory-workflow.md");
+    for token in ["/var/folders/", "/private/var/folders/"] {
+        assert!(
+            !published.contains(token),
+            "the published workflow document carries `{token}`"
+        );
+    }
+    assert!(
+        published.contains(TEMP_DIR_PLACEHOLDER),
+        "the published workflow document shows no redacted path at all, so \
+         either it was re-rendered without the substitution or the transcript \
+         no longer carries a manifest path"
+    );
 }
 
 /// AC-5.25, guarded at the source so it cannot rot silently.
