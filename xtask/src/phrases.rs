@@ -149,6 +149,47 @@ pub const RULES: &[Rule] = &[
                               may make the unscoped one. A line that must name the phrase to \
                               define, test or enforce the rule carries the [phrase-rule] marker.",
     },
+    Rule {
+        id: "captured-skip-message",
+        headline: "a skip reason printed through libtest's captured stdio (AC-7.32)",
+        // libtest captures `print!`/`eprintln!` and DISCARDS the capture for a
+        // test that PASSES. A test that skips -- returns early because its
+        // precondition (a lab, a daemon, a fixture) is absent -- passes. So a
+        // skip announced with `eprintln!` announces nothing without
+        // `--nocapture`: the run prints `ok` and the suite reports success
+        // having done nothing. That is strictly worse than no test at all,
+        // because the green is read as coverage.
+        //
+        // This has now happened twice in this repository, and the second time
+        // it was left standing in the same commit that fixed the first:
+        // `crates/bathy/tests/lab_conformance.rs` was converted to
+        // `stderr().write_all` while `crates/bathy-probe/src/probes/tls.rs`
+        // kept its `eprintln!`, so `lab/run.sh test`'s sixth test reported
+        // `ok` on a machine with no lab (M7 Task 1 review, IMPORTANT-1). The
+        // sweep that commit describes was looking for exactly this and missed
+        // it, which is the argument for a pattern rather than another sweep.
+        //
+        // `std::io::stderr().write_all(...)` does not go through the capture
+        // hook, so the reason is always visible. That is the fix; this rule is
+        // what makes forgetting it red.
+        //
+        // Scope, stated honestly: the general class -- "a test that reports
+        // success when its precondition is absent" -- is not decidable by
+        // pattern. This catches the one shape that has actually occurred,
+        // which is a skip message emitted by a print macro. `[^"]{0,200}`
+        // spans newlines, which is what makes it survive `rustfmt` splitting
+        // the macro call across lines.  [phrase-rule]
+        pattern: r#"(?i)\b(?:e?println)!\s*\(\s*"[^"]{0,200}skip"#, // [phrase-rule]
+        roots: &["crates", "xtask"],
+        extensions: Some(&["rs"]),
+        exempt_path_prefixes: &[],
+        exemption_rationale: "None. A skip reason belongs on the process's own stderr via \
+                              `std::io::stderr().write_all` followed by `flush`, which libtest \
+                              does not capture. If a print macro genuinely must carry the word \
+                              (a CLI that reports skipped work to a user, not a test that skips \
+                              itself), mark the line -- an exempted line then says so in its own \
+                              text.",
+    },
 ];
 
 /// The marker that exempts a line. See this module's header.
@@ -187,27 +228,74 @@ pub fn is_exempt_path(rule: &Rule, path: &str) -> bool {
         .any(|prefix| path == *prefix || path.starts_with(prefix))
 }
 
+/// Compiles `rule`'s pattern in multi-line mode.
+///
+/// `(?m)` is prepended rather than written into each pattern so that `^` and
+/// `$` keep meaning "start/end of line" now that matching runs over the whole
+/// file instead of line by line -- `unsafe-only-in-packetd`'s trailing `$`
+/// would otherwise silently become "end of file" and stop catching a bare
+/// trailing `unsafe`. [phrase-rule]
+///
+/// Whole-file matching exists because the defect `captured-skip-message`
+/// catches does not fit on one line: `rustfmt` puts `eprintln!(` and its
+/// message on separate lines, which is exactly how the swallowed skip in
+/// `crates/bathy-probe/src/probes/tls.rs` survived a sweep that was looking
+/// for it (M7 Task 1 review, IMPORTANT-1).
+pub fn compile(rule: &Rule) -> Result<Regex, regex::Error> {
+    Regex::new(&format!("(?m){}", rule.pattern))
+}
+
 /// Every violation of `rule` in `text`, attributed to `path`.
 ///
 /// Pure: no filesystem, no subprocess. The walk feeds it; the tests feed it
 /// directly. Lines carrying the sentinel are skipped here, for every rule,
 /// which is where "every check excludes marked lines" is actually true rather
-/// than merely written down.
+/// than merely written down -- and for a match that spans several lines, the
+/// marker on *any* line it covers exempts it, so a multi-line rule cannot be
+/// made unexemptable by accident.
+///
+/// At most one violation is reported per starting line, per rule: a line
+/// containing two spellings of the same forbidden thing is one place to fix,
+/// not two.
 pub fn violations_in_text(rule: &Rule, compiled: &Regex, path: &str, text: &str) -> Vec<Violation> {
     if is_exempt_path(rule, path) {
         return Vec::new();
     }
-    text.lines()
-        .enumerate()
-        .filter(|(_, line)| !line.contains(SENTINEL))
-        .filter(|(_, line)| compiled.is_match(line))
-        .map(|(index, line)| Violation {
+    // 0-based start offset of every line, so a match offset maps to a line.
+    let mut line_starts = vec![0usize];
+    line_starts.extend(text.match_indices('\n').map(|(i, _)| i + 1));
+    let line_of = |offset: usize| match line_starts.binary_search(&offset) {
+        Ok(index) => index,
+        Err(index) => index - 1,
+    };
+    let line_text = |index: usize| {
+        let start = line_starts[index];
+        let end = text[start..]
+            .find('\n')
+            .map_or(text.len(), |rel| start + rel);
+        &text[start..end]
+    };
+
+    let mut violations: Vec<Violation> = Vec::new();
+    for m in compiled.find_iter(text) {
+        let first = line_of(m.start());
+        // `m.end()` is exclusive; a match ending exactly at a newline covers
+        // the line before it, not the one after.
+        let last = line_of(m.end().saturating_sub(1).max(m.start()));
+        if (first..=last).any(|index| line_text(index).contains(SENTINEL)) {
+            continue;
+        }
+        if violations.last().is_some_and(|v| v.line == first + 1) {
+            continue;
+        }
+        violations.push(Violation {
             rule_id: rule.id,
             path: path.to_string(),
-            line: index + 1,
-            text: line.to_string(),
-        })
-        .collect()
+            line: first + 1,
+            text: line_text(first).to_string(),
+        });
+    }
+    violations
 }
 
 /// Repository-relative, forward-slashed.
@@ -267,8 +355,8 @@ pub fn scan(root: &Path) -> Fallible<(Vec<Violation>, usize)> {
     let mut violations = Vec::new();
     let mut scanned = 0usize;
     for rule in RULES {
-        let compiled = Regex::new(rule.pattern)
-            .map_err(|e| format!("rule {} has an invalid pattern: {e}", rule.id))?;
+        let compiled =
+            compile(rule).map_err(|e| format!("rule {} has an invalid pattern: {e}", rule.id))?;
         let mut files = Vec::new();
         for r in rule.roots {
             let dir = root.join(r);
@@ -336,7 +424,7 @@ mod tests {
 
     fn run(id: &str, path: &str, text: &str) -> Vec<Violation> {
         let r = rule(id);
-        violations_in_text(r, &Regex::new(r.pattern).unwrap(), path, text)
+        violations_in_text(r, &compile(r).unwrap(), path, text)
     }
 
     /// The exact line that was in the tree, red, for the whole back half of
@@ -479,6 +567,69 @@ mod tests {
         }
     }
 
+    /// The exact bytes that were in `crates/bathy-probe/src/probes/tls.rs`
+    /// when `lab/run.sh test`'s sixth test reported `ok` on a machine with no
+    /// lab, having done nothing (M7 Task 1 review, IMPORTANT-1 -- AC-7.32).
+    /// `rustfmt` splits the call across lines, which is how a sweep looking
+    /// for exactly this shape walked past it.
+    #[test]
+    fn the_captured_skip_rule_catches_the_swallowed_skip_that_reported_ok() {
+        let source = "            Err(e) => {\n\
+                      \x20               eprintln!(\n\
+                      \x20                   \"skipping: the lab is not reachable at \
+                      {LAB_TLS_WEB} ({e}). See lab/README.md.\"\n\
+                      \x20               );\n\
+                      \x20               return;\n\
+                      \x20           }";
+        let found = run(
+            "captured-skip-message",
+            "crates/bathy-probe/src/probes/tls.rs",
+            source,
+        );
+        assert_eq!(
+            found.len(),
+            1,
+            "the swallowed skip must be caught even though `eprintln!(` and its \
+             message are on different lines"
+        );
+        assert_eq!(
+            found[0].line, 2,
+            "the report must name the macro's own line"
+        );
+    }
+
+    #[test]
+    fn the_captured_skip_rule_catches_the_single_line_spelling_too() {
+        for source in [
+            r#"    eprintln!("skipping: no docker");"#, // [phrase-rule]
+            r#"    println!("Skipping: no docker");"#,  // [phrase-rule]
+            r#"    eprintln!("SKIPPED (no lab): {reason}");"#, // [phrase-rule]
+        ] {
+            assert_eq!(
+                run("captured-skip-message", "crates/bathy/tests/x.rs", source).len(),
+                1,
+                "{source:?} must be caught"
+            );
+        }
+    }
+
+    /// The fix, as it stands in `crates/bathy/tests/lab_conformance.rs`. A
+    /// rule that also fired on the correct form would be a rule someone turns
+    /// off rather than obeys.
+    #[test]
+    fn the_uncaptured_skip_the_rule_asks_for_is_not_a_violation() {
+        for source in [
+            r#"            let _ = err.write_all(format!("\nSKIPPED (no lab): {reason}\n\n").as_bytes());"#,
+            r#"    /// `false` means "skip"; a panic means "you asked for the lab"."#,
+            r#"    println!("check-lab: ok ({images} image(s))");"#,
+        ] {
+            assert!(
+                run("captured-skip-message", "crates/bathy/tests/x.rs", source).is_empty(),
+                "{source:?} must not be caught"
+            );
+        }
+    }
+
     /// The Global Constraint says *every* check excludes marked lines. Before
     /// this module only one of the three did. This asserts the property over
     /// `RULES` itself, so a rule added later inherits it or fails here.
@@ -488,6 +639,7 @@ mod tests {
             ("clock-only-time-and-ids", "    SystemTime::now()"), // [phrase-rule]
             ("unsafe-only-in-packetd", "unsafe fn raw() {}"),     // [phrase-rule]
             ("no-unscoped-determinism-claim", "DETERMINISTIC RESULTS"), // [phrase-rule]
+            ("captured-skip-message", r#"eprintln!("skipping: no lab");"#), // [phrase-rule]
         ];
         assert_eq!(
             offending.len(),
@@ -516,6 +668,47 @@ mod tests {
         let found = run("clock-only-time-and-ids", "crates/bathy/src/main.rs", &text);
         assert_eq!(found.len(), 1, "the marker must not exempt the whole file");
         assert_eq!(found[0].line, 2);
+    }
+
+    /// Whole-file matching would break `unsafe-only-in-packetd` silently if
+    /// `(?m)` were dropped: its `$` would mean end-of-*file*, so a bare
+    /// trailing `unsafe` anywhere but the last line would stop being caught.
+    /// [phrase-rule]
+    #[test]
+    fn end_of_line_anchors_still_mean_end_of_line_and_not_end_of_file() {
+        let text = "        unsafe\nfn later() {}\n";
+        let found = run(
+            "unsafe-only-in-packetd",
+            "crates/bathy-engine/src/x.rs",
+            text,
+        );
+        assert_eq!(found.len(), 1, "a bare trailing `unsafe` on line 1"); // [phrase-rule]
+        assert_eq!(found[0].line, 1);
+    }
+
+    /// A marker on any line a multi-line match covers exempts that match --
+    /// otherwise a rule that spans lines would be unexemptable by whichever
+    /// line the author happened to mark.
+    #[test]
+    fn the_sentinel_exempts_a_multi_line_match_from_any_line_it_covers() {
+        let with_marker_on_the_message = format!(
+            "eprintln!(\n    \"skipping: illustrative only {SENTINEL}\"\n);\n" // [phrase-rule]
+        );
+        assert!(
+            run(
+                "captured-skip-message",
+                "crates/bathy/tests/x.rs",
+                &with_marker_on_the_message
+            )
+            .is_empty(),
+            "the marker on the second line of the match must exempt it"
+        );
+        let unmarked = "eprintln!(\n    \"skipping: illustrative only\"\n);\n"; // [phrase-rule]
+        assert_eq!(
+            run("captured-skip-message", "crates/bathy/tests/x.rs", unmarked).len(),
+            1,
+            "fixture sanity: without the marker this is a violation"
+        );
     }
 
     #[test]
@@ -569,7 +762,7 @@ mod tests {
     #[test]
     fn every_rule_has_a_pattern_that_compiles_and_a_stated_exemption_rationale() {
         for rule in RULES {
-            Regex::new(rule.pattern)
+            compile(rule)
                 .unwrap_or_else(|e| panic!("rule {} has an invalid pattern: {e}", rule.id));
             assert!(
                 !rule.exemption_rationale.trim().is_empty(),

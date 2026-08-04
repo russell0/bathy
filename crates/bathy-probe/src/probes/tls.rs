@@ -401,19 +401,59 @@ mod tests {
     // holds the compose file and the ground truth to the same address plan.
     const LAB_TLS_WEB: &str = "10.30.0.17:443";
 
+    /// How long to wait for the lab before deciding it is not there.
+    ///
+    /// `TcpStream::connect` with no bound was the previous behaviour, and it
+    /// is wrong for exactly the case this test skips on: a path that
+    /// blackholes rather than refuses -- the common firewall shape, and the
+    /// shape of the macOS situation `lab/README.md` documents -- stalls for
+    /// the OS connect timeout instead of skipping promptly.
+    /// `crates/bathy/tests/lab_conformance.rs` bounds its own reachability
+    /// check at the same three seconds.
+    const LAB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
     #[tokio::test]
     #[ignore = "requires the lab; run with `lab/run.sh test`"]
     async fn tls_probe_against_a_real_nginx_tls_server() {
-        let connect = tokio::net::TcpStream::connect(LAB_TLS_WEB).await;
+        let connect = match tokio::time::timeout(
+            LAB_CONNECT_TIMEOUT,
+            tokio::net::TcpStream::connect(LAB_TLS_WEB),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("no answer within {LAB_CONNECT_TIMEOUT:?}"),
+            )),
+        };
         let stream = match connect {
             Ok(stream) => stream,
             Err(e) if std::env::var_os("BATHY_LAB_REQUIRED").is_some() => {
                 panic!("BATHY_LAB_REQUIRED is set, so this is a failure: {LAB_TLS_WEB}: {e}")
             }
             Err(e) => {
-                eprintln!(
-                    "skipping: the lab is not reachable at {LAB_TLS_WEB} ({e}). See lab/README.md."
+                // Written straight to the process's stderr rather than through
+                // `eprintln!`, which libtest captures and then DISCARDS for a
+                // test that passes: without `--nocapture` this skip printed
+                // nothing at all and libtest reported `ok`, so the test
+                // announced success having done nothing (M7 Task 1 review,
+                // IMPORTANT-1 -- AC-7.32). `crates/bathy/tests/lab_conformance.rs`
+                // had this fixed in the same commit that left it standing
+                // here, which is why `check-phrases`' `captured-skip-message`
+                // rule now catches the shape rather than a sweep having to
+                // remember it.
+                use std::io::Write as _;
+                let mut err = std::io::stderr().lock();
+                let _ = err.write_all(
+                    format!(
+                        "\nSKIPPED (no lab): the lab is not reachable at {LAB_TLS_WEB} ({e}). \
+                         Bring it up with `lab/run.sh up`, or run the whole suite with \
+                         `lab/run.sh test`. See lab/README.md.\n\n"
+                    )
+                    .as_bytes(),
                 );
+                let _ = err.flush();
                 return;
             }
         };
