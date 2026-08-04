@@ -18,18 +18,20 @@ use crate::request::Budgets;
 /// deny-beats-allow policy `ScopeManifestDto` deliberately says nothing
 /// about, live in `bathy_scope::manifest::ScopeManifest::load`, which is the
 /// only code path that may ever decide whether a packet is authorized).
-///
-/// `allowed_cidrs` still uses `NonEmpty<String>` rather than `Vec<String>`,
-/// for the same reason `ScanRequest::targets` and
-/// `PortSelection::Explicit::explicit` do (see `request.rs`): a
-/// `#[schemars(length(min = 1))]` attribute alone only shows up in the
-/// *published* schema, it does not stop `{"allowed_cidrs": []}` from
-/// deserializing through this type. `bathy_scope::manifest::Raw` (a
-/// separate, unrelated deserialization target) enforces the same "at least
-/// one allowed CIDR" rule independently via its own explicit empty check,
-/// since `ScopeManifest::load` does not deserialize through this DTO at
-/// all -- keep both in sync by hand if the rule ever changes.
-///
+// Deliberately a `//` comment, not a `///` one: schemars copies doc
+// comments on a wire type into `schemas/*.json` as `description`, and
+// that file is the contract agents read. How the Rust type enforces
+// non-emptiness is a maintainer's concern, not a caller's.
+// `allowed_cidrs` still uses `NonEmpty<String>` rather than `Vec<String>`,
+// for the same reason `ScanRequest::targets` and
+// `PortSelection::Explicit::explicit` do (see `request.rs`): a
+// `#[schemars(length(min = 1))]` attribute alone only shows up in the
+// *published* schema, it does not stop `{"allowed_cidrs": []}` from
+// deserializing through this type. `bathy_scope::manifest::Raw` (a
+// separate, unrelated deserialization target) enforces the same "at least
+// one allowed CIDR" rule independently via its own explicit empty check,
+// since `ScopeManifest::load` does not deserialize through this DTO at
+// all -- keep both in sync by hand if the rule ever changes.
 /// This type is a schema/documentation artifact, not part of any runtime
 /// authorization path. `bathy_scope::manifest::ScopeManifest` is the sole
 /// authority on what a manifest means; this mirror must be kept in sync

@@ -6,36 +6,40 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// Used so that a `Finding` cannot be constructed without evidence. The
 /// guarantee lives in the type system rather than in a validation pass,
 /// because a validation pass can be forgotten.
-///
-/// `NonEmpty<T>` is instantiated at more than one `T` in this crate (e.g.
-/// `NonEmpty<String>` in `request.rs`, `NonEmpty<Digest>` in `event.rs`), so
-/// each instantiation needs its own name in the generated JSON Schema's
-/// `$defs`. Without `#[schemars(rename = ...)]`, schemars_derive 1.2.2 names
-/// every generic struct after its bare Rust identifier
-/// (`schemars_derive-1.2.2/src/lib.rs`'s `derive_json_schema`: `let name =
-/// cont.name();` is just the struct ident when no `rename` is set, with no
-/// reference to the type parameter) and disambiguates collisions by
-/// *declaration order* within a `SchemaGenerator` run, appending "2", "3",
-/// etc. That makes `$defs` key names depend on unrelated field-ordering
-/// decisions elsewhere in the crate -- reordering or adding a field renames
-/// them, producing spurious diffs against the schemas committed under
-/// `schemas/` (checked by `xtask check-schemas`).
-///
-/// The fix uses the format-string form of `#[schemars(rename = "...")]`,
-/// which is schemars' own built-in mechanism for this: "If set on a struct
-/// or enum with generic type parameters, then the given name may contain
-/// them enclosed in curly braces (e.g. `{T}`) and they will be replaced with
-/// the concrete type names when the schema is generated"
-/// (`schemars_derive-1.2.2/attributes.md`, the `rename` section). This is
-/// also exactly the pattern schemars uses for its own builtin generic
-/// impls, e.g. `Vec<T>`'s `schema_name()` is
-/// `format!("Array_of_{}", T::schema_name())`
-/// (`schemars-1.2.2/src/json_schema_impls/sequences.rs`) -- `_of_`, not
-/// `_for_`. Confirmed empirically with a throwaway probe crate against this
-/// workspace's exact schemars 1.2.2: a struct holding `NonEmpty<String>` and
-/// `NonEmpty<u8>` emits `$defs` keys `NonEmpty_of_string` and
-/// `NonEmpty_of_uint8` regardless of the two fields' declaration order, each
-/// still carrying its own `minItems: 1`.
+// Rationale below is deliberately a `//` comment, not a `///` one:
+// schemars copies doc comments on a wire type into `schemas/*.json` as
+// `description`, and that file is the contract agents read. Notes about
+// serde/schemars internals are for maintainers, not for a caller
+// deciding what to put on the wire.
+// `NonEmpty<T>` is instantiated at more than one `T` in this crate (e.g.
+// `NonEmpty<String>` in `request.rs`, `NonEmpty<Digest>` in `event.rs`), so
+// each instantiation needs its own name in the generated JSON Schema's
+// `$defs`. Without `#[schemars(rename = ...)]`, schemars_derive 1.2.2 names
+// every generic struct after its bare Rust identifier
+// (`schemars_derive-1.2.2/src/lib.rs`'s `derive_json_schema`: `let name =
+// cont.name();` is just the struct ident when no `rename` is set, with no
+// reference to the type parameter) and disambiguates collisions by
+// *declaration order* within a `SchemaGenerator` run, appending "2", "3",
+// etc. That makes `$defs` key names depend on unrelated field-ordering
+// decisions elsewhere in the crate -- reordering or adding a field renames
+// them, producing spurious diffs against the schemas committed under
+// `schemas/` (checked by `xtask check-schemas`).
+//
+// The fix uses the format-string form of `#[schemars(rename = "...")]`,
+// which is schemars' own built-in mechanism for this: "If set on a struct
+// or enum with generic type parameters, then the given name may contain
+// them enclosed in curly braces (e.g. `{T}`) and they will be replaced with
+// the concrete type names when the schema is generated"
+// (`schemars_derive-1.2.2/attributes.md`, the `rename` section). This is
+// also exactly the pattern schemars uses for its own builtin generic
+// impls, e.g. `Vec<T>`'s `schema_name()` is
+// `format!("Array_of_{}", T::schema_name())`
+// (`schemars-1.2.2/src/json_schema_impls/sequences.rs`) -- `_of_`, not
+// `_for_`. Confirmed empirically with a throwaway probe crate against this
+// workspace's exact schemars 1.2.2: a struct holding `NonEmpty<String>` and
+// `NonEmpty<u8>` emits `$defs` keys `NonEmpty_of_string` and
+// `NonEmpty_of_uint8` regardless of the two fields' declaration order, each
+// still carrying its own `minItems: 1`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent, rename = "NonEmpty_of_{T}")]

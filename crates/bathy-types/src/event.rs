@@ -203,38 +203,42 @@ impl EventBody {
 ///
 /// `sequence` is gap-free and monotonic per scan; resumption replays from the
 /// last persisted sequence, so a gap means data loss and is a hard error.
-///
-/// Deliberately **not** `#[serde(deny_unknown_fields)]` on this struct, even
-/// though every other wire type in this crate carries that attribute.
-/// Combining `#[serde(deny_unknown_fields)]` on a container with
-/// `#[serde(flatten)]` on one of its fields is a known sharp edge in serde:
-/// flatten forces the derived `Deserialize` impl to buffer the document
-/// through a generic content map to figure out which keys belong to the
-/// flattened field, and `deny_unknown_fields` on that *same* container runs
-/// its "is this key one of my own fields" check against that buffering step
-/// -- which doesn't know about the flattened type's fields at all. The
-/// practical effect, confirmed empirically with a throwaway probe crate
-/// against this workspace's exact serde version: it does not merely fail to
-/// reject unknown fields, it rejects *every* input, including fully valid
-/// ones, with `unknown field `event_type``. `deny_unknown_fields` and
-/// `flatten` cannot both live here.
-///
-/// The guarantee is not weakened, only relocated: `#[serde(deny_unknown_fields)]`
-/// is on `EventBody` (below) instead. Every field of a wire document that
-/// isn't one of `Event`'s own four direct fields (`scan_id`, `sequence`,
-/// `timestamp`, `engine_version`) is, by construction of `#[serde(flatten)]`,
-/// exactly the set of fields handed to `EventBody`'s deserializer -- so
-/// `EventBody`'s `deny_unknown_fields` rejects anything that isn't the
-/// `event_type` discriminator or one of the matched variant's own fields,
-/// which is the same "no unrecognized field anywhere in the document"
-/// guarantee `Event`'s own `deny_unknown_fields` would have provided, had it
-/// been usable. Confirmed with the same probe crate: an unrelated top-level
-/// field (not part of `Event`'s direct fields, not part of any `EventBody`
-/// variant) is still rejected. What's lost is only where the guarantee is
-/// enforced, not whether it is enforced. See `event::tests::
-/// unknown_top_level_field_is_rejected_via_event_body` and `event::tests::
-/// unknown_field_inside_a_variant_is_rejected` below for the two concrete
-/// cases this covers.
+// Rationale below is deliberately a `//` comment, not a `///` one:
+// schemars copies doc comments on a wire type into `schemas/*.json` as
+// `description`, and that file is the contract agents read. Notes about
+// serde/schemars internals are for maintainers, not for a caller
+// deciding what to put on the wire.
+// Deliberately **not** `#[serde(deny_unknown_fields)]` on this struct, even
+// though every other wire type in this crate carries that attribute.
+// Combining `#[serde(deny_unknown_fields)]` on a container with
+// `#[serde(flatten)]` on one of its fields is a known sharp edge in serde:
+// flatten forces the derived `Deserialize` impl to buffer the document
+// through a generic content map to figure out which keys belong to the
+// flattened field, and `deny_unknown_fields` on that *same* container runs
+// its "is this key one of my own fields" check against that buffering step
+// -- which doesn't know about the flattened type's fields at all. The
+// practical effect, confirmed empirically with a throwaway probe crate
+// against this workspace's exact serde version: it does not merely fail to
+// reject unknown fields, it rejects *every* input, including fully valid
+// ones, with `unknown field `event_type``. `deny_unknown_fields` and
+// `flatten` cannot both live here.
+//
+// The guarantee is not weakened, only relocated: `#[serde(deny_unknown_fields)]`
+// is on `EventBody` (below) instead. Every field of a wire document that
+// isn't one of `Event`'s own four direct fields (`scan_id`, `sequence`,
+// `timestamp`, `engine_version`) is, by construction of `#[serde(flatten)]`,
+// exactly the set of fields handed to `EventBody`'s deserializer -- so
+// `EventBody`'s `deny_unknown_fields` rejects anything that isn't the
+// `event_type` discriminator or one of the matched variant's own fields,
+// which is the same "no unrecognized field anywhere in the document"
+// guarantee `Event`'s own `deny_unknown_fields` would have provided, had it
+// been usable. Confirmed with the same probe crate: an unrelated top-level
+// field (not part of `Event`'s direct fields, not part of any `EventBody`
+// variant) is still rejected. What's lost is only where the guarantee is
+// enforced, not whether it is enforced. See `event::tests::
+// unknown_top_level_field_is_rejected_via_event_body` and `event::tests::
+// unknown_field_inside_a_variant_is_rejected` below for the two concrete
+// cases this covers.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Event {
     pub scan_id: ScanId,
