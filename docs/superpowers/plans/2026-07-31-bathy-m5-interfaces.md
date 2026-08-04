@@ -6,6 +6,10 @@
 
 **Architecture:** `bathy-query` folds event logs into a queryable endpoint state and diffs two folds. The CLI and the MCP server are both thin adapters over the same engine API — neither contains scanning logic, and anything the MCP server can do the CLI can do, so the tool surface is testable without an MCP client.
 
+  **M5 Task 4's fix round found that second clause false and fixed it at the cause.** Driving all eleven tools and all their subcommands against one state directory found six documents that differed and four capabilities the tools had that the commands could not express at all — including `result.query`'s filter, which let an agent ask "endpoints identified with confidence at least 0.8 on ports 1–1024" and left an operator no way to reproduce the question. The structural cause was that "thin adapters over the same engine API" was satisfied at the level of the *engine* and not of the *answer*: each surface rendered its own document from the same data, and the only two whole-document comparisons in the suite covered exactly the two divergences that had already been found by hand.
+
+  What holds now, and is what this sentence should be read as claiming: **each command renders the corresponding tool's own typed output**, so the field sets are one Rust type and cannot drift; and the comparison is **generated from the tool list the server advertises**, so a twelfth tool fails the suite until somebody writes down how its subcommand answers the same question. Where the two genuinely differ in shape — `scan events` streams line-delimited events where the tool returns a paging envelope, and `scan start`/`scan resume` print the tool's document and then a run summary because this surface runs the work the tool detaches — the difference is declared and asserted rather than skipped.
+
 **Tech Stack:** `rmcp` 3.1.0 (official Rust MCP SDK, MSRV 1.88, edition 2024 — pin it; see the protocol gate), clap (derive), tokio, serde_json.
 
 **Read first:** the overview's Global Constraints; M2 Task 3 (`read_from`, the streaming primitive); M3 Task 3 (`plan_hash`).

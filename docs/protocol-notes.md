@@ -48,6 +48,39 @@ both would have produced a plausible-looking server that was quietly Legacy.
    relies on" into "an old client is told `-32022` and the one version it can
    use instead".
 
+### Five more SDK defaults, found by sweeping rather than by report
+
+M5 Task 4's review found a third — `server/discover` advertising `ttlMs: 0,
+cacheScope: "private"` — and asked whether there was a fourth rather than for
+that one to be fixed. There were four more, and the sweep is recorded here
+because the class is "a value the SDK chose and nobody read", which is not a
+class a reader can see the boundary of from any one instance.
+
+3. **`DiscoverResult::from_server_info` hard-codes `ttlMs: 0` and
+   `cacheScope: private`.** Spec-legal; `0` means immediately stale. A
+   discovery answer here is one protocol version, one capability and eleven
+   compiled-in tools, so it is published on the same terms as `tools/list`,
+   from the same constant.
+4-7. **`complete`, `list_prompts`, `list_resources` and
+   `list_resource_templates` default to a *successful empty result*.** A server
+   declaring only `tools` answered `prompts/list` with `{"prompts": []}` —
+   "I have prompts and there are none", where the truth is "I do not implement
+   prompts". The SDK is already inconsistent about this: `prompts/get`,
+   `resources/read` and `logging/setLevel` default to `-32601`, so five of the
+   nine undeclared methods told the truth and four did not. All nine now do,
+   and `a_capability_this_server_does_not_declare_is_answered_as_absent_not_as_empty`
+   asserts it over the list.
+
+### `_meta` server identity
+
+The specification says a server **SHOULD** include
+`io.modelcontextprotocol/serverInfo` in every result's `_meta`. `rmcp` puts it
+on `server/discover` and on nothing else; `tools/list` and `tools/call`
+returned `_meta: null`. Both carry it now, including on a refusal — which is
+the result a client is most likely to be holding when it wants to know whose
+server said no — and a client that caches a tool list for an hour benefits
+most from knowing whose list it cached.
+
 ---
 
 ## The SDK: `rmcp` 3.1.0, and its beta caveat
@@ -78,7 +111,9 @@ TTL. Two caveats worth writing down rather than discovering later:
   `outputSchema`** when `call_tool` is implemented directly on `ServerHandler`
   rather than through the macro-generated router. Conformance is therefore
   asserted by this project's own tests, against the advertised schema, over
-  real results from every tool.
+  real results from every tool — and that checker is the *only* thing behind
+  the declaration on this side of the wire. See "Structured results" below for
+  what it checks and what it cannot.
 
 ### Why this crate does not use `rmcp`'s tool macros
 
@@ -129,6 +164,18 @@ Every successful `tools/call` returns:
 shape re-derived in the server crate. A test compares the advertised schema
 against the committed file, so the two cannot drift apart.
 
+**`rmcp` does not validate a result against `outputSchema`** when `call_tool`
+is implemented directly, as it is here. Nothing in the SDK stands behind the
+declaration, and the specification asks *clients* to validate — so the only
+thing behind AC-5.28 on this side of the wire is `conforms` in
+`crates/bathy/tests/mcp.rs`, and it is only as strong as its own coverage. It
+was weaker than the schemas it enforced until M5 Task 4's fix round: `pattern`
+was unimplemented and these documents declare it 29 times, on every scan id,
+scope id and digest, so `digest: "blake3:zzzz"` passed as a conforming result.
+That function now carries a written-out list of the keywords it implements and
+the ones it does not, and a test module that violates each keyword it claims.
+A validator whose gaps are known is worth more than one assumed complete.
+
 ### Refusals
 
 A refusal an agent can act on — an unknown scan, a digest that names nothing, a
@@ -138,8 +185,21 @@ JSON-RPC error. Clients render protocol errors opaquely, so a protocol error
 tells the caller "it failed" and not why. The codes are the ones the
 command-line surface already publishes for the same conditions.
 
-The one exception is an unknown tool name, which genuinely cannot be routed and
-gets `-32602` with the list of tools that do exist.
+There are two exceptions, and both are conditions the specification names a
+protocol error for:
+
+- an unknown tool name, which genuinely cannot be routed, gets `-32602` with
+  the list of tools that do exist;
+- a `scan.start` above the approval threshold from a client that declared no
+  `elicitation` capability gets **`-32021`** with
+  `data.requiredCapabilities`. MRTR's Server Requirements say a server
+  **MUST NOT** send an `inputRequests` the client has not declared support
+  for, and the base protocol says a request that cannot be processed without
+  an undeclared capability **MUST** be answered `-32021` naming it. The scan
+  does not start: the threshold has been crossed and no human has approved,
+  so refusing is the answer rather than a fallback. The check sits where the
+  challenge would be minted, not at the top of the call, because a scan at or
+  below the threshold asks nobody and requires no capability.
 
 A **policy denial is not a refusal of this kind**. It is a correct answer from
 an authorization system, so it keeps its structured slot — the output shapes
@@ -208,6 +268,43 @@ when it would otherwise be forgotten.
 --approval-threshold-targets N`, default 64 — and there is no tool argument for
 it. Not a check that a caller did not set it: there is no field to set, and
 `deny_unknown_fields` on every input type refuses one.
+
+---
+
+## "Anything the server can do, the CLI can do"
+
+The premise that makes this surface auditable from a shell, and the one M5
+Task 4's review found false: six documents differed between the two surfaces,
+and four things the tools could do had no command-line spelling at all.
+`result.query` took a filter (`state`, `service`, `min_confidence`,
+`port_range`) that `bathy result query` could not express, so an agent could
+ask a question an operator could not reproduce.
+
+What holds now is stronger than the sentence was:
+
+- **Each subcommand renders the corresponding tool's own typed output.** The
+  documents are one Rust type, so their field sets cannot drift. `scan status`,
+  `scan cancel`, `scan events`, `scan preview`, `result query`, `result diff`,
+  `evidence get`, `explain` and both halves of `scan start`/`scan resume` that
+  decide anything are one function each, in `bathy_mcp::tools`.
+- **The comparison is generated from the advertised tool list.**
+  `every_advertised_tool_and_its_subcommand_answer_the_same_question_the_same_way`
+  iterates `tools/list` and matches on the name with no wildcard that passes,
+  so a twelfth tool fails the suite until somebody writes down how its
+  subcommand answers the same question.
+- **Two differences are intended, declared and asserted.** `scan events`
+  streams line-delimited events where the tool returns
+  `{events, next_cursor, has_more}` — a JSON-RPC result is one value and needs
+  a cursor; the command's contract is line-delimited JSON on stdout and
+  `--follow` has no last page to attach one to. The test asserts the events are
+  equal *and* that the envelope is exactly those two extra keys, so a new field
+  fails rather than passes. `scan start` and `scan resume` print the tool's
+  document and then a run summary, because this surface runs to completion the
+  work the tool detaches.
+
+Refusals differ in *envelope* on purpose and not in *code*: the tool marks a
+policy denial `isError` with a structured result, the command exits 2 with a
+failure document, and both carry the engine's own reason code.
 
 ---
 
