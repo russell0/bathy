@@ -52,3 +52,17 @@ regex = { workspace = true }
 # no entry in `LAYERS` and no exemption from `check-deps`'s forbidden-
 # substring rule (it isn't a model/inference client).
 csv = "1"
+
+[dev-dependencies]
+# Scratch directories for the gate tests that build a fake repository tree
+# and walk it. Hand-built `std::env::temp_dir().join(format!("...-{pid}"))`
+# names were used here until two of them collided: `gates.rs` and
+# `phrases.rs` each have a `walk`, each had a test for it with the same
+# name, and both computed the identical path and both `remove_dir_all`'d it
+# -- concurrently, in this one test binary. A pid is unique per process, and
+# the thing that has to be unique here is a test. `tempfile` makes the name
+# unique by construction rather than by inspection, and removes the tree on
+# the panic paths too. Already in this workspace's tree (six crates use it),
+# so this adds no crate to the graph, and it is a `[dev-dependencies]` edge:
+# nothing `xtask` ships to CI links it.
+tempfile = { workspace = true }

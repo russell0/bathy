@@ -2659,12 +2659,18 @@ mod tests {
     /// by three times between two checkouts of the same commit.
     #[test]
     fn the_fuzzers_working_state_is_not_walked_and_a_real_corpus_directory_still_is() {
-        let root = std::env::temp_dir().join(format!(
-            "bathy-walk-{}-{}",
-            std::process::id(),
-            NEVER_SCANNED_PATHS.len()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        // `tempfile::tempdir()`, not a name built out of the process id.
+        // This test and its namesake in `phrases.rs` (`walk` exists in both
+        // modules, and both need the same fixture) used to compute the
+        // byte-identical path `<tmp>/bathy-walk-<pid>-2` --
+        // `NEVER_SCANNED_PATHS.len()` is 2 in both -- and both began and
+        // ended by `remove_dir_all`-ing it. They live in the same `xtask`
+        // test binary and libtest runs them concurrently, so either could
+        // delete the other's tree mid-walk. A process id is unique per
+        // *process*; what a scratch path has to be unique per is *test*, and
+        // nothing but a comment was making it so.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path().to_path_buf();
         for dir in [
             "fuzz/corpus/interpret",
             "fuzz/artifacts/interpret",
@@ -2700,7 +2706,9 @@ mod tests {
             names.contains(&"crates/corpus/a.txt".to_string()),
             "{names:?}"
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        // No explicit removal: `scratch` deletes the tree when it drops,
+        // which also happens on the panic paths above. The hand-rolled
+        // version leaked its tree on every failure.
     }
 
     // --- The registries themselves. See the M5 residual wave: a loop over an

@@ -435,12 +435,12 @@ mod tests {
     /// by three times between two checkouts of the same commit.
     #[test]
     fn the_fuzzers_working_state_is_not_walked_and_a_real_corpus_directory_still_is() {
-        let root = std::env::temp_dir().join(format!(
-            "bathy-walk-{}-{}",
-            std::process::id(),
-            NEVER_SCANNED_PATHS.len()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
+        // `tempfile::tempdir()`, not a name built out of the process id --
+        // see the same comment on the namesake in `gates.rs`. The two
+        // computed the identical path, in one test binary, and each began
+        // and ended by deleting it.
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path().to_path_buf();
         for dir in [
             "fuzz/corpus/interpret",
             "fuzz/artifacts/interpret",
@@ -476,7 +476,7 @@ mod tests {
             names.contains(&"crates/corpus/a.txt".to_string()),
             "{names:?}"
         );
-        std::fs::remove_dir_all(&root).unwrap();
+        // `scratch` removes the tree on drop, including on the panic paths.
     }
 
     fn rule(id: &str) -> &'static Rule {
