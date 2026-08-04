@@ -155,7 +155,21 @@ jobs:
   # key rolls with the seeds so a new seed does not inherit a corpus that
   # predates it; `restore-keys` still recovers the previous corpus, because
   # discarding a fuzzer's accumulated inputs is the one thing that makes it
-  # start over.
+  # start over. `xtask fuzz` minimises a corpus that has grown past the bound
+  # in `corpus_needs_minimisation`, so the cache rolling forward for ever does
+  # not eventually turn this job red for a reason that is not a bug.
+  #
+  # WHAT 60 SECONDS BUYS, STATED PLAINLY. It replays every committed seed and
+  # every cached input before it mutates anything, so any input that has ever
+  # found something is re-run on every pull request, and it explores shallowly
+  # around them. It does NOT reliably find a bug that needs a deep or narrowly
+  # shaped input: a one-byte span corruption in `dns.version_bind.txt_chaos.v1`
+  # survived 120 s and 2.96M executions and was caught only at 600 s / 6.56M,
+  # while a hand-built 33-byte input caught it instantly. That gap is closed by
+  # `fuzz/seeds/interpret/span-edge-*.bin` and the workspace test over them
+  # (`crates/bathy-interpret/tests/span_edge_corpus.rs`), which runs in the
+  # fast job above in about a millisecond -- not by making every PR wait ten
+  # minutes per target. See `fuzz/README.md` for the measurements.
   #
   # WHY `cargo install` IS ALLOWED HERE. A program that needs `cargo-fuzz`
   # cannot be what provides it -- the same reason the toolchain steps in the

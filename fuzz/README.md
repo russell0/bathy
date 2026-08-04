@@ -118,6 +118,51 @@ in the source rather than left to be discovered:
   guess. It is now a scanner over the raw document (`bathy_fuzz::
   has_duplicate_keys`) with unit tests, that input among them.
 
+## What a 60-second pull-request run does and does not cover
+
+CI runs every target for **60 seconds on a push or pull request** and **600
+seconds on the nightly schedule**, from the cached corpus. Be precise about
+what the short run buys, because "the fuzz targets run on every PR" is easy to
+read as more than it is:
+
+**It does cover.** Every committed seed and every cached corpus input, replayed
+before mutation begins — so any input that has *ever* found something is
+re-run on every PR. Shallow new inputs around the corpus. Panics, hangs and
+OOMs on any of that.
+
+**It does not cover** a bug that needs a deep or narrowly-shaped input to
+reach. Measured, in M7 Task 2's review, against a one-byte span corruption in
+`dns.version_bind.txt_chaos.v1`:
+
+| Run | Outcome |
+|---|---|
+| seed replay | not caught |
+| 120 s, 2,964,533 executions | **not caught** |
+| 600 s, 6,560,722 executions | caught, at roughly 276 s |
+| one hand-built 33-byte input | **caught instantly** |
+
+The DNS rule needs a two-byte length prefix, an RDLENGTH and a
+character-string length to agree with the input's total length before the
+faulty arithmetic is even reachable. HTTP's `Server:` header, by contrast,
+falls out of a seeded response in 22 seconds. **The assertion covers every
+rule; the 60-second run demonstrably does not.**
+
+So the gap is closed where it is cheap, not by making every PR wait ten
+minutes per target:
+
+- **`fuzz/seeds/interpret/span-edge-*.bin`** — one input per rule whose match
+  ends at the last byte the rule's grammar allows. `crates/bathy-interpret/
+  tests/span_edge_corpus.rs` asserts every one of them on every
+  `cargo test --workspace`, in about a millisecond, and it dies on a one-byte
+  span change in *any* rule (verified by mutation against five of them,
+  including the reviewer's own DNS corruption, which a 120-second fuzz run
+  missed). A rule added without an edge input fails that test by name.
+- **The 600-second nightly** stays, for the depth a short run cannot buy.
+- **The 60-second PR run** stays at 60 seconds. Raising it to 600 would add
+  ~40 minutes to every pull request and still would not be a guarantee — the
+  DNS mutant needed 276 of those seconds on one machine, which is a
+  measurement, not a bound.
+
 ## When a target finds something
 
 libFuzzer writes the input to `fuzz/artifacts/<target>/crash-<hash>`. Fix the

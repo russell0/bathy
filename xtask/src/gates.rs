@@ -2432,6 +2432,41 @@ pub fn fuzz_command(name: &str, seconds: u64) -> Vec<String> {
     .to_vec()
 }
 
+/// When a working corpus is large enough to be minimised before the next
+/// run, and the reason each bound is where it is.
+///
+/// Nothing bounded the corpus before this. The CI cache rolls forward
+/// through `restore-keys: fuzz-corpus-`, so every run inherits the last
+/// one's inputs and adds to them, and libFuzzer holds the whole corpus in
+/// memory alongside its coverage tables — the observed 475–556 MB against
+/// libFuzzer's default 2048 MB `-rss_limit_mb` is mostly that, not the
+/// targets, which allocate a few kilobytes per execution. Left alone, the
+/// eventual failure of the fuzz job is a red build that is not a bug, which
+/// is the kind of failure people learn to ignore.
+///
+/// `cargo fuzz cmin` re-runs the corpus and keeps one input per coverage
+/// feature, so it is bounded work proportional to what is already there.
+/// The thresholds are set above this repository's measured corpora
+/// (2,289–9,642 files, 8.9–38 MB per target after several full runs) so an
+/// ordinary run does not pay for a minimisation it does not need.
+pub fn corpus_needs_minimisation(files: usize, bytes: u64) -> bool {
+    const MAX_FILES: usize = 20_000;
+    const MAX_BYTES: u64 = 256 * 1024 * 1024;
+    files > MAX_FILES || bytes > MAX_BYTES
+}
+
+/// The file count and total size of one working corpus directory.
+fn corpus_size(name: &str) -> (usize, u64) {
+    let Ok(entries) = std::fs::read_dir(format!("fuzz/corpus/{name}")) else {
+        return (0, 0);
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|e| e.metadata().ok())
+        .filter(std::fs::Metadata::is_file)
+        .fold((0, 0), |(files, bytes), m| (files + 1, bytes + m.len()))
+}
+
 /// Run every registered, non-deferred fuzz target for `seconds` each.
 ///
 /// This exists rather than a list of `cargo fuzz run` lines in `ci.yml` for
@@ -2482,6 +2517,30 @@ pub fn run_fuzz(seconds: u64, only: Option<&str>) -> Fallible<()> {
                 surface.name, surface.name, surface.name
             )
             .into());
+        }
+
+        let (files, bytes) = corpus_size(surface.name);
+        if corpus_needs_minimisation(files, bytes) {
+            println!(
+                "fuzz: fuzz/corpus/{} is {files} file(s), {} MiB — minimising, because \
+                 libFuzzer holds the corpus in memory and the CI cache rolls it forward \
+                 for ever otherwise",
+                surface.name,
+                bytes / (1024 * 1024),
+            );
+            let status = std::process::Command::new("cargo")
+                .args(["+nightly", "fuzz", "cmin", surface.name])
+                .status()
+                .map_err(|e| format!("running `cargo fuzz cmin {}`: {e}", surface.name))?;
+            if !status.success() {
+                return Err(format!(
+                    "`cargo fuzz cmin {}` failed. The corpus is over the bound in \
+                     `corpus_needs_minimisation`, so the next runs get slower and \
+                     hungrier until the job goes red for a reason that is not a bug.",
+                    surface.name
+                )
+                .into());
+            }
         }
     }
     println!(
@@ -3587,6 +3646,20 @@ jobs:
     // clean and asserts the removal is what is reported. A checker whose
     // tests only feed it the real repository passes just as happily when its
     // predicate is `true`.
+
+    /// The bound exists to keep the fuzz job's eventual failure a bug rather
+    /// than a corpus. Both halves are asserted, at the boundary: a check
+    /// with only one live conjunct is a check with a dead one.
+    #[test]
+    fn a_corpus_is_minimised_by_count_or_by_size_and_not_before() {
+        assert!(!corpus_needs_minimisation(20_000, 256 * 1024 * 1024));
+        assert!(corpus_needs_minimisation(20_001, 0));
+        assert!(corpus_needs_minimisation(0, 256 * 1024 * 1024 + 1));
+        // This repository's largest measured corpus after several full runs
+        // (`manifest`: 9,642 files, 38 MB) is well inside both, so an
+        // ordinary run pays nothing.
+        assert!(!corpus_needs_minimisation(9_642, 38 * 1024 * 1024));
+    }
 
     /// A workspace-scoped scratch directory, removed and recreated so a
     /// previous run cannot leave a file that makes a check pass.
