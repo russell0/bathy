@@ -1359,16 +1359,36 @@ pub const BENCH_SUBJECTS: &[BenchSubject] = &[
 
 /// The rule, pure: everything `check-bench` asserts about a tree, with the
 /// tree's contents passed in.
-pub fn bench_violations(
-    doc: &str,
-    results: &Results,
-    lab: &Lab,
-    scheduler_source: &str,
-    scope_json: &str,
-    subjects: &[(BenchSubject, bool, Option<String>)],
-    compare_script_present: bool,
-    ci: &str,
-) -> Vec<String> {
+/// Everything `check-bench` reads out of the tree, gathered into one value.
+///
+/// A struct rather than eight positional parameters, and not only because
+/// clippy says so: `bench_violations` is the rule, and a rule with eight
+/// same-typed `&str` arguments is one transposition away from checking the
+/// scope manifest against the scheduler and reporting nothing.
+pub struct TreeState<'a> {
+    /// `docs/benchmarks.md`, whole.
+    pub doc: &'a str,
+    /// `crates/bathy-engine/src/scheduler.rs`, for the connect-timeout default.
+    pub scheduler_source: &'a str,
+    /// `lab/scope.json`, for the rate ceiling.
+    pub scope_json: &'a str,
+    /// `.github/workflows/ci.yml`, for the step that executes the benchmarks.
+    pub ci: &'a str,
+    pub compare_script_present: bool,
+    /// Each registered criterion subject, whether its file exists, and its
+    /// crate's manifest.
+    pub subjects: &'a [(BenchSubject, bool, Option<String>)],
+}
+
+pub fn bench_violations(results: &Results, lab: &Lab, tree: &TreeState<'_>) -> Vec<String> {
+    let TreeState {
+        doc,
+        scheduler_source,
+        scope_json,
+        ci,
+        compare_script_present,
+        subjects,
+    } = *tree;
     let mut found = Vec::new();
 
     // 0. The document tells a reader to reproduce this by running one
@@ -1585,14 +1605,16 @@ pub fn check_bench() -> Fallible<()> {
         })
         .collect();
     let violations = bench_violations(
-        &doc,
         &results,
         &lab,
-        &read(SCHEDULER_PATH)?,
-        &read(SCOPE_PATH)?,
-        &subjects,
-        Path::new(COMPARE_SCRIPT).exists(),
-        &read(crate::visibility::CI_PATH)?,
+        &TreeState {
+            doc: &doc,
+            scheduler_source: &read(SCHEDULER_PATH)?,
+            scope_json: &read(SCOPE_PATH)?,
+            ci: &read(crate::visibility::CI_PATH)?,
+            compare_script_present: Path::new(COMPARE_SCRIPT).exists(),
+            subjects: &subjects,
+        },
     );
     if violations.is_empty() {
         println!(
@@ -2153,17 +2175,28 @@ jobs:
             .collect()
     }
 
-    fn violations_of(doc: &str, results: &Results, lab: &Lab) -> Vec<String> {
-        bench_violations(
+    const SCHEDULER_FIXTURE: &str =
+        "impl Default for SchedulerConfig {\n connect_timeout: Duration::from_secs(2),\n}";
+    const SCOPE_FIXTURE: &str = r#"{"budget_ceiling":{"maximum_packets_per_second":100000}}"#;
+
+    /// A tree in the state `check-bench` demands, which each test below then
+    /// breaks in exactly one place.
+    fn clean_tree<'a>(
+        doc: &'a str,
+        subjects: &'a [(BenchSubject, bool, Option<String>)],
+    ) -> TreeState<'a> {
+        TreeState {
             doc,
-            results,
-            lab,
-            "impl Default for SchedulerConfig {\n connect_timeout: Duration::from_secs(2),\n}",
-            r#"{"budget_ceiling":{"maximum_packets_per_second":100000}}"#,
-            &subjects_all_present(),
-            true,
-            CI_FIXTURE,
-        )
+            scheduler_source: SCHEDULER_FIXTURE,
+            scope_json: SCOPE_FIXTURE,
+            ci: CI_FIXTURE,
+            compare_script_present: true,
+            subjects,
+        }
+    }
+
+    fn violations_of(doc: &str, results: &Results, lab: &Lab) -> Vec<String> {
+        bench_violations(results, lab, &clean_tree(doc, &subjects_all_present()))
     }
 
     // -----------------------------------------------------------------
@@ -2580,15 +2613,15 @@ jobs:
         )]);
         let lab = lab();
         let doc = document_for(&results, &lab);
+        let subjects = subjects_all_present();
         let found = bench_violations(
-            &doc,
             &results,
             &lab,
-            "impl Default for SchedulerConfig {\n connect_timeout: Duration::from_secs(5),\n}",
-            r#"{"budget_ceiling":{"maximum_packets_per_second":100000}}"#,
-            &subjects_all_present(),
-            true,
-            CI_FIXTURE,
+            &TreeState {
+                scheduler_source: "impl Default for SchedulerConfig {\n connect_timeout: \
+                     Duration::from_secs(5),\n}",
+                ..clean_tree(&doc, &subjects)
+            },
         );
         assert!(found.iter().any(|v| v.contains("stale")), "{found:?}");
     }
@@ -2794,15 +2827,14 @@ jobs:
         )]);
         let lab = lab();
         let doc = document_for(&results, &lab);
+        let subjects = subjects_all_present();
         let found = bench_violations(
-            &doc,
             &results,
             &lab,
-            "impl Default for SchedulerConfig {\n connect_timeout: Duration::from_secs(2),\n}",
-            r#"{"budget_ceiling":{"maximum_packets_per_second":100000}}"#,
-            &subjects_all_present(),
-            true,
-            "jobs:\n  test:\n    steps:\n      - run: cargo test --workspace\n",
+            &TreeState {
+                ci: "jobs:\n  test:\n    steps:\n      - run: cargo test --workspace\n",
+                ..clean_tree(&doc, &subjects)
+            },
         );
         assert!(found.iter().any(|v| v.contains("--benches")), "{found:?}");
     }
@@ -2831,16 +2863,7 @@ jobs:
         let doc = document_for(&results, &lab);
         let mut subjects = subjects_all_present();
         subjects[0].1 = false;
-        let found = bench_violations(
-            &doc,
-            &results,
-            &lab,
-            "impl Default for SchedulerConfig {\n connect_timeout: Duration::from_secs(2),\n}",
-            r#"{"budget_ceiling":{"maximum_packets_per_second":100000}}"#,
-            &subjects,
-            true,
-            CI_FIXTURE,
-        );
+        let found = bench_violations(&results, &lab, &clean_tree(&doc, &subjects));
         assert!(
             found.iter().any(|v| v.contains("does not exist")),
             "{found:?}"
@@ -2861,16 +2884,7 @@ jobs:
         let mut subjects = subjects_all_present();
         subjects[1].2 =
             Some("[package]\nname = \"x\"\n\n[[bench]]\nname = \"canonical_json\"\n".into());
-        let found = bench_violations(
-            &doc,
-            &results,
-            &lab,
-            "impl Default for SchedulerConfig {\n connect_timeout: Duration::from_secs(2),\n}",
-            r#"{"budget_ceiling":{"maximum_packets_per_second":100000}}"#,
-            &subjects,
-            true,
-            CI_FIXTURE,
-        );
+        let found = bench_violations(&results, &lab, &clean_tree(&doc, &subjects));
         assert!(
             found.iter().any(|v| v.contains("harness = false")),
             "{found:?}"

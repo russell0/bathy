@@ -282,7 +282,22 @@ git commit -m "test(fuzz): libFuzzer targets for every untrusted-input parser"
 ### Task 3: Reproducible benchmarks
 
 **Files:**
-- Create: `benches/lab_scan.rs`, `bench/compare.sh`, `docs/benchmarks.md`
+- Create: `bench/compare.sh`, `docs/benchmarks.md`, `bench/results.json`
+- Create: `crates/bathy-interpret/benches/interpret.rs`, `crates/bathy-types/benches/canonical_json.rs`, `crates/bathy-plan/benches/plan_construction.rs`, `crates/bathy-evidence/benches/log_append.rs` — **not** `benches/lab_scan.rs`, see plan edit #1
+- Create: `xtask/src/bench.rs` — the harness's rules, where they can be unit-tested; `compare.sh` is the driver and holds none of them
+- Modify: `xtask/src/main.rs`, `.github/workflows/ci.yml` — see plan edits #4 and #5
+
+  **Five corrections to this task, made during Task 3 and flagged as plan edits. The first names a file that cannot exist and the second an acceptance criterion that cannot be satisfied on the machine it runs on.**
+
+  1. **`benches/lab_scan.rs` is not a path Cargo compiles.** The root `Cargo.toml` is a virtual manifest, so a root `benches/` directory belongs to no package and nothing ever builds it. AC-7.15's four subjects also live in four different crates — `interpret` in `bathy-interpret`, `canonical_json` in `bathy-types`, plan construction in `bathy-plan`, log append in `bathy-evidence` — and a criterion benchmark has to be a `[[bench]]` target of the crate whose code it measures. They ship one per owning crate. The *name* is wrong too: a benchmark of a lab scan is a network measurement, which is what `bench/compare.sh` is for, and criterion is the wrong instrument for it.
+
+  2. **AC-7.11 says "all four scanners" and two of them are not installed here, deliberately.** `masscan` and `rustscan` are absent from the machine this ran on and installing network scanners on someone's machine is their decision, not the harness's. A criterion that can only be met by installing software is a criterion that gets met by lying about it. **AC-7.11 is restated below**: all four are registered, all four are given identical targets, ports, timeout and rate ceiling by one function, and each either runs or produces a named "NOT RUN — not installed" row carrying the command that would make it present. `check-bench` fails if a scanner loses its row. Installing one and re-running `bench/compare.sh` fills the row in with no code change.
+
+  3. **One row for bathy compares two different operations.** `nmap -sT` performs port discovery and nothing else; bathy's default identifies services on every open port. Scoring those against each other and publishing "17.8x slower" would be the kind of comparison this task's own rules forbid. bathy therefore contributes two runs (`--no-service-detection` and the default) and Nmap three (`-sT`, `-sS`, `-sT -sV`), and every loss row names *both* operations. Measured: the like-for-like port-discovery gap is 1.4x, and the like-for-like identification gap is 1.5x.
+
+  4. **"Packets emitted (from `/proc/net/snmp` deltas)" is not portable and is not always meaningful.** There is no `/proc` on macOS, and on a Linux host the counters are the whole namespace's, so they include every other process. It is recorded as the `Tcp: ActiveOpens` delta over the final repetition, inside the runner container where the namespace is the benchmark's own, and reported as `unavailable` otherwise. It turns out to be the clearest statement in the table that a SYN scan is a different operation: `nmap-syn` reads **0**, because it never completes a connection.
+
+  5. **Step 3 says "publish the real numbers" and nothing holds the document to them.** This repository has three recorded instances of `README.md` asserting things the code did not do, and a benchmark document is worse, because its numbers cannot be checked by reading the code at all. `docs/benchmarks.md` therefore carries a generated block rendered from the committed `bench/results.json`, and `cargo run -p xtask -- check-bench` re-renders it in CI and fails on drift — the same arrangement as `emit-schemas`/`check-schemas`. It additionally fails on a dropped scanner row, a command line not published verbatim, a timing with no accuracy beside it, a loss omitted from the prose, a stale connect-timeout default, and a criterion benchmark that has disappeared or lost `harness = false`. **A sixth thing it checks was found by writing this document wrong first:** the prose claimed `cargo test --workspace` executed the criterion benchmarks. It does not — Cargo's default target selection for `test` excludes bench targets entirely — so four benchmarks were compiled by `clippy --all-targets` and executed by nobody. `cargo test --workspace --benches` is now a CI step and `check-bench` asserts it exists.
 
 - [ ] **Step 1: Write the comparison harness**
 
@@ -312,11 +327,11 @@ git commit -m "bench: reproducible cross-scanner comparison with accuracy report
 ```
 
 **Acceptance criteria:**
-- **AC-7.11** The comparison runs all four scanners against the identical lab, ports, timeout, and rate, on one machine in one run.
-- **AC-7.12** Accuracy against ground truth is reported for every scanner, next to its timing.
-- **AC-7.13** Every tool's version and full command line appears in the published output.
-- **AC-7.14** `docs/benchmarks.md` reports at least one category where bathy loses, including service-identification breadth.
-- **AC-7.15** Criterion benchmarks cover `interpret`, `canonical_json`, plan construction, and log append.
+- **AC-7.11** All four scanners are registered, are given the identical lab, ports, timeout and rate ceiling — built by one function from `lab/ground-truth.json` and `lab/scope.json`, with the timeout *read out of* `SchedulerConfig::default` rather than restated — and each either runs on the one machine in the one run or produces a named "not run, tool absent" row. *Restated — see plan edit #2.* The original wording could only be met by installing software on someone else's machine, which the harness must not do; a benchmark that hides an absent tool is worse than one that names it. `cargo run -p xtask -- check-bench` fails if a scanner loses its row, and the per-tool argument-vector tests fail if any tool is given a different port set, target set, timeout or rate.
+- **AC-7.12** Accuracy against ground truth is reported for every scanner **in the same table row as its timing**, and a run carries both or neither. Accuracy is scored against `lab/ground-truth.json` only; no tool is ever scored against another tool's output. A tool that exits successfully and parses to zero open ports is a harness failure, not a score of zero.
+- **AC-7.13** Every tool's version and full command line appears in the published output, verbatim, including the command lines of the tools that did not run.
+- **AC-7.14** `docs/benchmarks.md` reports every category where bathy loses, computed from the results rather than chosen by an author — per endpoint as well as in aggregate, because two tools naming five products each and disagreeing about which five is a loss in both directions that a count reports as a tie. Service-identification breadth is one of them: the lab's `identification_gap` at `10.30.0.17:443` is published whether or not any competitor ran.
+- **AC-7.15** Criterion benchmarks cover `interpret`, `canonical_json`, plan construction, and log append, one per owning crate (plan edit #1), and CI **executes** them rather than only compiling them (plan edit #5).
 
 ---
 
