@@ -6,10 +6,55 @@ readme = "README.md"
 keywords = ["network", "scanner", "mcp", "security", "discovery"]
 categories = ["network-programming", "command-line-utilities"]
 edition.workspace = true
-rust-version.workspace = true
+# MSRV tiering, moved in M5 Task 3 and verified by execution in both
+# directions (not asserted): this crate had no dependencies at all until
+# this task and correctly sat in CI's `1.88` `msrv` job. It now depends on
+# `bathy-engine` -> `bathy-store` -> `libsqlite3-sys`, whose build script
+# needs `cfg_select!` (see the MSRV comment on `crates/bathy-store/Cargo.toml`
+# for the exact floor and how `1.95` was measured), so it declares the same
+# literal `rust-version = "1.95"` `bathy-engine` does and has moved OUT of
+# the `msrv` job into `msrv-bathy-store`.
+#
+# This crate is where the "declared floor that nothing checks" defect was
+# introduced a second time -- M3 found it in `bathy-plan`, and M4
+# reintroduced it here at creation by naming this crate in neither job. A
+# crate that declares a floor must appear in exactly one of the two jobs,
+# and moving a crate's floor means moving its job in the same commit.
+rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 
-# Deliberately no dependencies and no [[bin]] yet. This crate becomes the `bathy`
-# command in Milestone 5; until then `cargo install bathy` correctly reports that
-# there is nothing to install, rather than installing a stub that does nothing.
+# M5 Task 3. Until this task the crate deliberately shipped no binary, so
+# `cargo install bathy` reported there was nothing to install rather than
+# installing a stub. The name was reserved as a lib so that `cargo install
+# bathy` gives users a `bathy` command directly -- publishing as `bathy-cli`
+# would have made the install command and the installed command disagree.
+[[bin]]
+name = "bathy"
+path = "src/main.rs"
+
+[dependencies]
+bathy-types = { path = "../bathy-types" }
+bathy-scope = { path = "../bathy-scope" }
+bathy-evidence = { path = "../bathy-evidence" }
+bathy-store = { path = "../bathy-store" }
+bathy-plan = { path = "../bathy-plan" }
+bathy-interpret = { path = "../bathy-interpret" }
+bathy-probe = { path = "../bathy-probe" }
+bathy-engine = { path = "../bathy-engine" }
+bathy-query = { path = "../bathy-query" }
+# `derive` for the command tree. `wrap_help` deliberately NOT enabled: it
+# reflows help text to the terminal it is rendered in, and `--help` is where
+# this CLI's exit-code table lives (AC-5.11) -- a documented contract a test
+# reads back must not depend on the width of the window it was printed in.
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `rt-multi-thread` on top of the workspace's shared feature set: the
+# scheduler runs hundreds of probes concurrently and `#[tokio::main]`
+# without it would put every one of them on one thread.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tokio-util.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

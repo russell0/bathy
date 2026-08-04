@@ -315,7 +315,21 @@ Two things the encoding must decide explicitly, both inherited from Task 1:
 - Create: `crates/bathy/Cargo.toml` (EXISTS — published as a name reservation at 0.1.0-alpha.1; add the binary to it), `crates/bathy/src/main.rs`, `crates/bathy/src/commands/*.rs`
 
 **Interfaces:**
-- Produces: the `bathy` binary with subcommands. **The crate is named `bathy`, not `bathy`** — it is already published as a lib-only reservation, so `cargo install bathy` gives users a `bathy` command directly, the way `ripgrep` publishes as `ripgrep`. Adding `[[bin]]` to the existing crate is the whole change `scope validate`, `scan preview`, `scan start`, `scan status`, `scan events`, `scan cancel`, `scan resume`, `result query`, `result diff`, `evidence get`, `explain`, `serve mcp`.
+- Produces: the `bathy` binary, with subcommands `scope validate`, `scan preview`, `scan start`, `scan status`, `scan events`, `scan cancel`, `scan resume`, `result query`, `result diff`, `evidence get`, `explain`.
+
+  **The crate is named `bathy`, not `bathy-cli`.** (This line previously read "named `bathy`, not `bathy`" — leftover from the crate's rename, and unreadable as written; corrected during Task 3.) It is already published as a lib-only reservation, so `cargo install bathy` gives users a `bathy` command directly, the way `ripgrep` publishes as `ripgrep`. Adding `[[bin]]` to the existing crate is the whole change.
+
+  **Four further corrections to this line and to Step 3, made during Task 3 and flagged as plan edits.**
+
+  1. **`serve mcp` is Task 4's, not Task 3's.** It cannot be implemented before `bathy-mcp` exists, and a subcommand that parses and then reports "not implemented" is a stub of exactly the kind this crate spent a milestone deliberately not shipping (see the `[[bin]]` note in its own `Cargo.toml`). Task 4 adds it, in the commit that adds the server it fronts.
+  2. **`--scope` takes a PATH, not `PATH|ID`.** v0.1 has no manifest registry for an id to be resolved against — `ScopeManifest::load` reads a document and nothing indexes documents by `ScopeId`. Accepting an id-shaped string would open it as a filename and fail with a confusing I/O error. This becomes `PATH|ID` when a registry exists, not before.
+  3. **A usage error must not exit 2.** `clap`'s own `Error::exit` uses status 2, which this plan assigns to *policy denial* — so a typo would be indistinguishable from an authorization refusal to the agent this exit-code table exists for. The CLI therefore parses with `try_parse` and maps usage errors to 1 (operational), and `--help`/`--version` to 0. Any future argument parser has to make the same choice; it is a property of the exit-code table, not of `clap`.
+  4. **`scan start` prints the handle and then keeps running.** AC-5.12 says it "returns a `TaskHandle` immediately and does not block until completion". A CLI process has nowhere to leave a running scan — there is no daemon in v0.1 — so "immediately" is discharged as: the handle is written and flushed to stdout before the scheduler is constructed, and the scan then continues in the same process until it finishes. `scan status`, `scan events --follow` and `scan cancel` all work against it from other processes meanwhile. The alternative reading (print a handle, exit, leave the scan unstarted) would make `scan start` not scan.
+
+  Two supporting changes this task needed outside the CLI, both root-cause rather than local workarounds:
+
+  - **`bathy-evidence` gained `EventLogReader`.** `EventLog::open` takes an exclusive advisory writer lock for its whole lifetime, so `scan events --follow`, `scan status` and `result query` against a *running* scan — a second process reading a log the scanning process still holds — all failed with `LogError::Locked`. The reader takes no lock, cannot append, tolerates a record caught mid-write at the tail, and still rejects a sequence gap. Reading the JSONL directly from the CLI was the alternative and was rejected: it would put a second parser for the source of truth outside the crate that owns it.
+  - **`running` became a real task status.** Nothing in the workspace ever wrote it; the README called it "reserved for Milestone 5". A `TaskHandle` reporting `running` while `scan status` reported `pending` would be two answers to one question, so `scan start`/`scan resume` set it before the first probe.
 
 - [ ] **Step 1: Write the failing CLI test**
 

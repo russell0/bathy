@@ -120,3 +120,11 @@ tokio-util = { version = "0.7", default-features = false, features = ["rt"] }
 # well under this workspace's `1.88` floor, so it does not push
 # `bathy-probe` into a higher MSRV tier; both allowed by `deny.toml`).
 async-trait = "0.1.91"
+# M5 Task 3 (`crates/bathy`, the `bathy` binary): the command tree, its
+# argument types, and the `--help` text that carries the exit-code contract
+# (AC-5.11). `derive` only. `wrap_help` is deliberately not enabled -- see
+# the note on the dependency in `crates/bathy/Cargo.toml`. MIT OR
+# Apache-2.0, `rust-version = "1.74"`, well under this workspace's floor,
+# so it does not push `bathy` into a higher MSRV tier (`bathy-engine` does
+# that; see `crates/bathy/Cargo.toml`).
+clap = { version = "4.6", features = ["derive"] }

@@ -132,16 +132,23 @@ jobs:
       # `crates/bathy-interpret/Cargo.toml`), so -- like `bathy-probe` --
       # it stays in the `1.88` tier rather than `msrv-bathy-store`.
       #
-      # `bathy` joined this job in the M4 whole-branch fix wave (MINOR-1).
-      # It was created in M4 (`508d4f6`) declaring `rust-version.workspace =
-      # true` (1.88) and was named by NEITHER msrv job, so its floor was
-      # claimed and never checked -- the same defect M3's review found in
-      # `bathy-plan` and which was reintroduced here. It has no dependencies
-      # at all, so `1.88` is the correct tier; the point is that a crate
-      # declaring a floor must be in exactly one of these two jobs, and
-      # nothing but this list enforces that today. Adding a crate to the
-      # workspace means adding it here.
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p bathy -p xtask --all-targets
+      # `bathy` joined this job in the M4 whole-branch fix wave (MINOR-1)
+      # and LEFT it again in M5 Task 3. It was created in M4 (`508d4f6`)
+      # declaring `rust-version.workspace = true` (1.88) and was named by
+      # NEITHER msrv job, so its floor was claimed and never checked -- the
+      # same defect M3's review found in `bathy-plan`. It had no
+      # dependencies at all then, so `1.88` was the correct tier. M5 Task 3
+      # added the `[[bin]]` and with it a dependency on `bathy-engine` ->
+      # `bathy-store` -> `libsqlite3-sys`, so its floor is now `1.95` and it
+      # is checked in `msrv-bathy-store` below. Verified against real
+      # toolchains in both directions before this line was moved: `cargo
+      # +1.88 check -p bathy` fails with "bathy-store@0.1.0 requires rustc
+      # 1.95" and `cargo +1.95 check -p bathy --all-targets` passes.
+      #
+      # The standing rule this is the second instance of: a crate declaring
+      # a floor must appear in exactly one of these two jobs, and changing a
+      # crate's dependencies means re-deciding which one in the same commit.
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p xtask --all-targets
       # `bathy-query` joined this job in M5 Task 1 -- and it is the first
       # crate whose floor these two jobs, as previously written, could not
       # express. Its `[dependencies]` are `bathy-types`, `schemars`, `serde`,
@@ -198,7 +205,13 @@ jobs:
       # `bathy-query` is here for its TEST targets only; its library floor is
       # `1.88` and is checked in the `msrv` job above. See the longer note
       # there for why one crate is named in both jobs.
-      - run: cargo check -p bathy-store -p bathy-engine -p bathy-query --all-targets
+      #
+      # `bathy` joined this job in M5 Task 3, when it gained a `[[bin]]` and
+      # with it a dependency on `bathy-engine`. Unlike `bathy-query` it has
+      # only one floor: its library, its binary and its tests all reach
+      # `bathy-store`, so `1.95` is what a `cargo install bathy` user needs
+      # too, and it is named here and nowhere else.
+      - run: cargo check -p bathy-store -p bathy-engine -p bathy-query -p bathy --all-targets
 
   deny:
     runs-on: ubuntu-latest

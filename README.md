@@ -5,7 +5,8 @@ bounded scan plans, executes them, and returns structured, evidence-backed findi
 over MCP.
 
 > **Status: Milestones 1-4 of 7 landed (contracts; evidence and state; planner
-> and engine; probes and interpretation).**
+> and engine; probes and interpretation); Milestone 5 in progress — the `bathy`
+> CLI runs.**
 >
 > bathy scans, and identifies what it finds. `bathy-engine`'s scheduler drives
 > real, unprivileged TCP connect scanning against IPv4 targets: budget- and
@@ -14,11 +15,14 @@ over MCP.
 > scan was actually authorized under (not merely *a* manifest), that the
 > manifest is still active (unexpired), and that each individual target is
 > inside its allow set — see `crates/bathy-engine/src/scheduler.rs`'s module
-> doc. That is currently the *only* enforcement point: `bathy_scope::evaluate`,
-> the library function this crate provides for validating a request against a
-> manifest before a plan is even built, has no caller anywhere in this
-> workspace yet — wiring it into an orchestrator is Milestone 5's job, once a
-> CLI/MCP surface exists to call it from. Every observation lands in a durable,
+> doc. Since Milestone 5's CLI landed there is a second, earlier enforcement
+> point: `bathy_scope::evaluate` is called by `bathy scan preview`, `bathy scan
+> start` and `bathy scan resume` over the plan's fully expanded target list,
+> before any scan record is written and before the scheduler exists. The two are
+> not redundant — the CLI's is the *upfront* refusal (nothing is created, no
+> packet is possible), the scheduler's is the check on the actual emission path
+> that holds for any caller, including one that does not go through the CLI.
+> Every observation lands in a durable,
 > gap-free, append-only event log (`bathy-evidence`) before the SQLite state
 > that indexes it is made durable — never the other way around.
 >
@@ -37,11 +41,9 @@ over MCP.
 > (`service_detection.enabled = false`), in which case no probe bytes are sent
 > at all.
 >
-> What does not exist yet: a CLI or an MCP server (Milestone 5), privileged
+> What does not exist yet: an MCP server (the rest of Milestone 5), privileged
 > SYN/ICMP scanning and a packet daemon (Milestone 6), and the verification
-> suite (Milestone 7). There is still no way to invoke a scan except as a Rust
-> library call — see `crates/bathy-engine/tests/end_to_end_scan.rs` for exactly
-> that, exercised end to end against real sockets.
+> suite (Milestone 7).
 >
 > Plans for all seven milestones — 209 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
@@ -53,13 +55,13 @@ over MCP.
 | `bathy-types` | Every type crossing a public boundary: `ScanRequest`, the immutable `Event` model, `Digest`, prefixed ULID identifiers, `NonEmpty`, `Confidence`, `TaskHandle`, canonical JSON and `plan_digest`. Zero internal dependencies, no async runtime. |
 | `bathy-scope` | Deny-by-default authorization: scope manifests with expiry, policy evaluation with stable machine-readable deny codes, and a hard budget ledger. |
 | `bathy-evidence` | The content-addressed blob store and the append-only, gap-free event log that is this project's actual source of truth — SQLite state elsewhere is a derived index rebuildable from it, never the reverse. |
-| `bathy-store` | SQLite-backed scan state: idempotency (a repeated key with an identical plan reuses the scan; a different plan is refused as a conflict), a resumption cursor, and per-scan lifecycle status. A scan starts `pending` and `bathy-engine`'s scheduler transitions it to `completed`, `cancelled`, `failed`, or `denied` on each of its own terminal outcomes; `running`/`paused` are reserved for Milestone 5's pause/resume CLI surface. |
+| `bathy-store` | SQLite-backed scan state: idempotency (a repeated key with an identical plan reuses the scan; a different plan is refused as a conflict), a resumption cursor, and per-scan lifecycle status. A scan starts `pending` and `bathy-engine`'s scheduler transitions it to `completed`, `cancelled`, `failed`, or `denied` on each of its own terminal outcomes. `bathy scan start` and `bathy scan resume` set `running` before the first probe, so a handle that says `running` and a `scan status` read from another process agree; `paused` is still written by nothing. |
 | `bathy-plan` | Turns a `ScanRequest` into a deterministic, indexable `ScanPlan`: target expansion, port selection, and the content hash idempotency and resumption are built on. |
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by a deadline that covers the whole read rather than each individual `recv`, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. The deadline is per call, not per probe: a probe that writes and then reads can take up to twice it, deliberately, since the hostile case being defended against is on the read path. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
 | `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every finding carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
 | `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
-| `bathy-query` | Milestone 5, in progress. Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Diffs two of those folds into a classified list of what changed, and refuses to call an endpoint appeared or disappeared unless both scans ran the same plan to completion — a refused, cancelled or budget-exhausted scan is not a scan that found less. Both types are published schemas. Nothing calls it yet; the CLI and the MCP server are the rest of Milestone 5. |
-| `bathy` | Nothing yet, deliberately. It reserves the name on crates.io and will become the CLI binary in Milestone 5; it ships no `[[bin]]`, so `cargo install bathy` correctly reports there is nothing to install rather than installing a stub. |
+| `bathy-query` | Milestone 5, in progress. Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Diffs two of those folds into a classified list of what changed, and refuses to call an endpoint appeared or disappeared unless both scans ran the same plan to completion — a refused, cancelled or budget-exhausted scan is not a scan that found less. Both types are published schemas, and `bathy result query` / `bathy result diff` are this crate, called through the CLI with no second fold anywhere. The MCP server is the rest of Milestone 5. |
+| `bathy` | The `bathy` command: `scope validate`, `scan preview/start/status/events/cancel/resume`, `result query/diff`, `evidence get`, `explain`. A translator over the engine API and nothing else — it contains no scanning logic. Every subcommand that can emit a packet takes `--scope` as a required argument with no default and no skip flag, so omitting it fails inside argument parsing, before a state directory is opened or a request exists. `--json` puts line-delimited JSON on stdout and every diagnostic on stderr, including on the failure paths; exit codes 0-4 have distinct documented meanings and are listed in `--help`. |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
 Six schemas are committed under [`schemas/`](schemas/) and CI fails if a type
@@ -93,9 +95,14 @@ falls outside its allow set. `bathy-engine`'s scheduler enforces all three direc
 on the actual emission path. Scope identity and expiry are checked once per
 `Scheduler::run`, before any probe is dispatched; the allow/deny set is checked
 per unit, immediately before each probe. A manifest that expires mid-scan does
-not halt the run in progress. That is the only
-enforcement point that exists today (see the Status note above). Scans carry hard
-packet, rate, and runtime budgets.
+not halt the run in progress. The CLI adds an earlier refusal in front of that:
+`bathy scan preview`, `scan start` and `scan resume` each call
+`bathy_scope::evaluate` over the fully expanded target list before anything is
+written and before a scheduler exists, and each takes `--scope` as a required
+argument, so a scan with no manifest fails during argument parsing rather than
+reaching any code that could open a socket. `scan resume` is re-evaluated
+against the manifest handed to it, not against the decision the original `scan
+start` got. Scans carry hard packet, rate, and runtime budgets.
 
 **What a scanned third party sees on their wire.** Every port is first touched by
 a plain, unprivileged TCP connect that sends no payload. A port that answers then
@@ -136,18 +143,18 @@ a poor fit for typed tool calling. bathy targets the gap:
 - **Typed operations.** Every action has JSON Schema inputs and outputs. No agent
   constructs a command line.
 - **Task handles.** Scans start, poll, stream, cancel, pause, and resume. Nothing
-  blocks. *Today the engine supports cancel and resume as library calls; start,
-  poll, stream and pause arrive with the CLI and MCP surface in Milestone 5.*
+  blocks. *`bathy scan start` prints a `TaskHandle` before the scan runs and
+  keeps running until it finishes; `scan status`, `scan events --follow`, `scan
+  cancel` and `scan resume` all work from a separate process against a live
+  scan. `pause` is not implemented.*
 - **Evidence.** Every finding cites content-addressed response bytes. `evidence.get`
   returns exactly what justified a claim; `fingerprint.explain` says which rule fired
-  and why. *Both are Milestone 5 tool names; the evidence store and the rule
-  documentation they will read are built and tested today, but neither is a
-  callable operation yet.*
+  and why. *Callable today as `bathy evidence get` and `bathy explain`; the MCP
+  tool names arrive with the server.*
 - **Scope enforcement.** Deny-by-default manifests with expiry, checked against
   scope identity, expiry, and per-target authorization on the actual emission
-  path — see "Authorized use" above for exactly what runs today versus what is
-  still planned (an upfront, pre-plan check via `bathy_scope::evaluate`, wired
-  in once Milestone 5 has an orchestrator to call it from).
+  path, and again as an upfront, pre-plan check in the CLI before anything is
+  written — see "Authorized use" above for exactly what each of the two does.
 - **Differential scanning.** "What changed since Monday" is a first-class query, with
   confidence noise separated from substantive change.
 
