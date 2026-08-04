@@ -39,8 +39,9 @@ use std::sync::Arc;
 
 use bathy_types::ids::Digest;
 use rmcp::model::{
-    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, Implementation,
-    ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo,
+    CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
+    Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
+    ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -49,7 +50,7 @@ use crate::approval::{ApprovalGate, UNIDENTIFIED_PRINCIPAL};
 use crate::config::ServerConfig;
 use crate::descriptors;
 use crate::engine::Runtime;
-use crate::error::{ToolFailure, ToolResult};
+use crate::error::{Refusal, ToolFailure};
 use crate::tools;
 
 /// The one protocol version this server implements.
@@ -188,11 +189,26 @@ impl ServerHandler for BathyMcpServer {
                 Some(serde_json::json!({ "tools": descriptors::TOOL_NAMES })),
             ));
         }
-        Ok(match self.dispatch(request, &context).await {
-            Ok(response) => response,
-            Err(failure) => CallToolResponse::Complete(failure.into_result()),
-        })
+        match self.dispatch(request, &context).await {
+            Ok(response) => Ok(response),
+            Err(Refusal::Tool(failure)) => Ok(CallToolResponse::Complete(failure.into_result())),
+            // The one condition the specification names a protocol error for.
+            Err(Refusal::Protocol(error)) => Err(*error),
+        }
     }
+}
+
+/// Whether the caller declared that it can answer an `elicitation/create`.
+///
+/// There is no handshake in this revision, so the answer is per request: the
+/// capabilities ride in each request's own `_meta`. A client that declared
+/// nothing is treated as declaring nothing -- an absent capability is not a
+/// capability, and assuming otherwise is precisely the assumption the
+/// specification's `MUST NOT` forbids.
+fn declares_elicitation(context: &RequestContext<RoleServer>) -> bool {
+    context
+        .client_capabilities()
+        .is_some_and(|capabilities| capabilities.elicitation.is_some())
 }
 
 impl BathyMcpServer {
@@ -200,7 +216,7 @@ impl BathyMcpServer {
         &self,
         request: CallToolRequestParams,
         context: &RequestContext<RoleServer>,
-    ) -> ToolResult<CallToolResponse> {
+    ) -> Result<CallToolResponse, Refusal> {
         let runtime = Arc::clone(&self.runtime);
         let name = request.name.clone();
         let arguments = request.arguments.clone();
@@ -258,10 +274,9 @@ impl BathyMcpServer {
                 tools::complete(&tools::fingerprint::explain(input)?)?
             }
             other => {
-                return Err(ToolFailure::new(
-                    "no_such_tool",
-                    format!("no tool named `{other}`"),
-                ));
+                return Err(
+                    ToolFailure::new("no_such_tool", format!("no tool named `{other}`")).into(),
+                );
             }
         };
         Ok(CallToolResponse::Complete(result))
@@ -274,11 +289,36 @@ impl BathyMcpServer {
     /// then a human decides, and only then is a scan record created and a
     /// scheduler built. Every early return leaves the store untouched and the
     /// network unaddressed.
+    ///
+    /// # The client that cannot be asked
+    ///
+    /// Step 3a asks a human by embedding an `elicitation/create` in the
+    /// result. Two normative sentences govern that:
+    ///
+    /// * MRTR §Server Requirements: a server **MUST NOT** send an
+    ///   `inputRequests` the client has not declared support for, naming
+    ///   `elicitation` as the example.
+    /// * The base protocol: if processing a request requires a capability the
+    ///   client did not declare, the server **MUST** answer
+    ///   `-32021` with `data.requiredCapabilities`.
+    ///
+    /// So a client with no `elicitation` capability is refused with `-32021`
+    /// and **the scan does not start**. That is the answer, not a fallback:
+    /// the threshold has been crossed, no human has approved, and starting
+    /// anyway would be a scope bypass dressed as leniency. The refusal names
+    /// the capability the host would have to gain, which is a thing an
+    /// operator can act on; an `input_required` such a host structurally
+    /// cannot answer is not.
+    ///
+    /// The check is here rather than at the top of the call because it is only
+    /// *here* that the capability is needed: a scan at or below the threshold
+    /// asks nobody, and refusing it for want of a capability it never uses
+    /// would deny work the specification does not require a capability for.
     async fn start(
         &self,
         request: CallToolRequestParams,
         context: &RequestContext<RoleServer>,
-    ) -> ToolResult<CallToolResponse> {
+    ) -> Result<CallToolResponse, Refusal> {
         let input: bathy_types::tools::ScanStartInput =
             tools::parse_input(request.arguments.clone())?;
 
@@ -301,7 +341,15 @@ impl BathyMcpServer {
             let plan_hash = authorized.plan().hash().to_string();
 
             let Some(state) = request.request_state.as_deref() else {
-                // 3a. Nobody has been asked yet. Ask, and start nothing.
+                // 3a. Nobody has been asked yet, so somebody must be. A client
+                //     that cannot be asked is told exactly that, and nothing
+                //     starts. See this function's doc comment.
+                if !declares_elicitation(context) {
+                    return Err(McpError::missing_required_client_capability(
+                        ClientCapabilities::builder().enable_elicitation().build(),
+                    )
+                    .into());
+                }
                 let message = format!(
                     "bathy is asking permission to scan {} address(es) with {} probe(s). \
                      This server requires a human decision above {} address(es). \
@@ -321,7 +369,7 @@ impl BathyMcpServer {
                         authorized.estimated_targets(),
                         message,
                     )
-                    .map_err(|e| ToolFailure::new("approval_unissuable", e))?;
+                    .map_err(|e| Refusal::from(ToolFailure::new("approval_unissuable", e)))?;
                 return Ok(CallToolResponse::InputRequired(challenge));
             };
 
@@ -334,7 +382,7 @@ impl BathyMcpServer {
                     &digest,
                     &plan_hash,
                 )
-                .map_err(|e| ToolFailure::new(e.code(), e.detail()))?;
+                .map_err(|e| Refusal::from(ToolFailure::new(e.code(), e.detail())))?;
         }
 
         // 4. Only now.

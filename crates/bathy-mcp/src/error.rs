@@ -57,6 +57,39 @@ impl ToolFailure {
 
 pub type ToolResult<T> = Result<T, ToolFailure>;
 
+/// A refusal on the `tools/call` path, which is one of two things.
+///
+/// Almost everything is a [`ToolFailure`] -- a successful JSON-RPC response
+/// carrying an error document an agent can branch on, for the reasons above.
+/// The exception is a condition the specification names a *protocol* error
+/// for, where returning a tool result would be a second spelling of an answer
+/// the protocol already defines. There is exactly one such condition here:
+/// `-32021`, the client that lacks a capability the request cannot be
+/// processed without (see [`crate::server::BathyMcpServer::start`]).
+///
+/// It is an enum rather than a `ToolFailure` field so the two cannot be
+/// confused at a call site: `?` on a `ToolFailure` still produces the tool
+/// result it always did, and reaching the protocol arm takes naming it.
+#[derive(Debug)]
+pub enum Refusal {
+    /// An answer, marked as an error, with a stable code in its document.
+    Tool(ToolFailure),
+    /// A JSON-RPC error, because the specification requires one here.
+    Protocol(Box<rmcp::ErrorData>),
+}
+
+impl From<ToolFailure> for Refusal {
+    fn from(failure: ToolFailure) -> Self {
+        Self::Tool(failure)
+    }
+}
+
+impl From<rmcp::ErrorData> for Refusal {
+    fn from(error: rmcp::ErrorData) -> Self {
+        Self::Protocol(Box::new(error))
+    }
+}
+
 pub fn manifest_error(path: &str, e: ManifestError) -> ToolFailure {
     ToolFailure::new("scope_invalid", format!("{path}: {e}"))
 }

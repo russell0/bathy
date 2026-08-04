@@ -230,10 +230,16 @@ impl Server {
     /// in this revision: the version and the client's capabilities ride in
     /// every request.
     fn meta(client: &str) -> Value {
+        Self::meta_declaring(client, json!({ "elicitation": {} }))
+    }
+
+    /// The same, with the client's capability declaration spelled out — for
+    /// the tests about what a server may and may not ask a client to do.
+    fn meta_declaring(client: &str, capabilities: Value) -> Value {
         json!({
             "io.modelcontextprotocol/protocolVersion": PROTOCOL,
             "io.modelcontextprotocol/clientInfo": { "name": client, "version": "0.0.0" },
-            "io.modelcontextprotocol/clientCapabilities": { "elicitation": {} },
+            "io.modelcontextprotocol/clientCapabilities": capabilities,
         })
     }
 
@@ -1608,6 +1614,88 @@ fn a_scan_above_the_threshold_asks_a_human_and_starts_nothing() {
     );
 
     assert_nothing_happened(&mut server, &listener);
+}
+
+#[test]
+fn a_client_that_declared_no_elicitation_is_refused_with_32021_rather_than_asked_anyway() {
+    // Two normative sentences meet here. MRTR §Server Requirements: a server
+    // MUST NOT send an `inputRequests` the client has not declared support
+    // for. The base protocol: a request that cannot be processed without a
+    // capability the client lacks MUST be answered `-32021` naming it.
+    //
+    // The safe answer is also the required one. The threshold has been
+    // crossed and nobody has approved, so the scan must not begin -- and the
+    // host is told the one thing it could change, rather than handed an
+    // `input_required` it structurally cannot answer.
+    let (mut server, scope, listener, ip) = approval_fixture();
+    let reply = server.request(
+        "tools/call",
+        json!({
+            "_meta": Server::meta_declaring("no-elicitation", json!({})),
+            "name": "scan.start",
+            "arguments": start_arguments(&scope, ip, &listener, "cannot-be-asked"),
+        }),
+    );
+
+    assert_eq!(
+        reply["error"]["code"],
+        json!(-32021),
+        "a client that cannot answer an elicitation must be told so, not sent one: {reply:#}"
+    );
+    assert!(
+        reply["error"]["data"]["requiredCapabilities"]["elicitation"].is_object(),
+        "the refusal must name the capability that is missing: {reply:#}"
+    );
+    assert!(
+        reply.get("result").is_none(),
+        "an error and a result are not both answers to one call: {reply:#}"
+    );
+
+    // And nothing was started: no packet, no scan record. A refusal that
+    // began the scan anyway would be the scope bypass this gate exists to
+    // prevent, wearing an error code.
+    assert_nothing_happened(&mut server, &listener);
+
+    // The connection survives it, and a client that *can* be asked still is.
+    let asked = server.call_raw(
+        "scan.start",
+        start_arguments(&scope, ip, &listener, "can-be-asked"),
+    );
+    assert_eq!(asked["resultType"], json!("input_required"), "{asked:#}");
+}
+
+#[test]
+fn a_scan_that_needs_no_approval_is_not_refused_for_want_of_a_capability_it_never_uses() {
+    // The mirror image of the test above, and the reason the capability check
+    // sits at the point the challenge would be minted rather than at the top
+    // of the call: below the threshold nobody is asked, so nothing requires
+    // the client to be askable. A blanket refusal of `scan.start` would pass
+    // the test above and deny work the specification does not require a
+    // capability for.
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, false);
+    let mut server = Server::start(64);
+
+    let reply = server.request(
+        "tools/call",
+        json!({
+            "_meta": Server::meta_declaring("no-elicitation", json!({})),
+            "name": "scan.start",
+            "arguments": start_arguments(&scope, ip, &listener, "under-threshold-no-elicitation"),
+        }),
+    );
+    assert!(reply.get("error").is_none(), "{reply:#}");
+    assert_eq!(
+        reply["result"]["resultType"],
+        json!("complete"),
+        "{reply:#}"
+    );
+    assert_eq!(
+        reply["result"]["structuredContent"]["policy_decision"],
+        json!("approved"),
+        "{reply:#}"
+    );
 }
 
 #[test]
