@@ -282,9 +282,17 @@ pub struct ScanStatusInput {
 pub struct ScanStatusOutput {
     pub scan_id: ScanId,
     pub status: TaskStatus,
+    /// Addresses the plan expands to.
+    ///
+    /// Here because the command-line surface reported it and this document
+    /// did not, and the two surfaces publish one document. Removing it from
+    /// the command instead would have made an operator's answer narrower to
+    /// make two answers match, which is the wrong direction.
+    pub estimated_targets: u64,
     /// Probe units whose result has been durably written.
     pub units_completed: u64,
-    /// Probe units the plan contains.
+    /// Probe units the plan contains. This is the estimate recorded when the
+    /// scan was admitted, so it does not move.
     pub units_total: u64,
     pub packets_spent: u64,
     pub elapsed_seconds: u64,

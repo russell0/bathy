@@ -226,10 +226,16 @@ fn state_dir() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
 }
 
+/// The scan a `scan start` names.
+///
+/// The first document is the same `ScanStartOutput` the `scan.start` tool
+/// returns -- policy decision, handle, and whether the key was reused --
+/// rather than a bare `TaskHandle`, which was this surface's own second
+/// spelling of the tool's answer.
 fn scan_id_of(out: &Output) -> String {
-    out.json_lines()[0]["task_id"]
+    out.json_lines()[0]["handle"]["task_id"]
         .as_str()
-        .unwrap_or_else(|| panic!("first stdout line is not a TaskHandle: {}", out.stdout))
+        .unwrap_or_else(|| panic!("first stdout line is not a ScanStartOutput: {}", out.stdout))
         .to_string()
 }
 
@@ -969,19 +975,21 @@ fn scan_start_prints_a_task_handle_long_before_a_large_scan_could_finish() {
     let line = first_line_within(&mut child, Duration::from_secs(10));
     let elapsed = started.elapsed();
 
-    let handle: serde_json::Value =
-        serde_json::from_str(&line).unwrap_or_else(|e| panic!("not a TaskHandle ({e}): {line:?}"));
+    let started_doc: serde_json::Value = serde_json::from_str(&line)
+        .unwrap_or_else(|e| panic!("not a ScanStartOutput ({e}): {line:?}"));
+    let handle = &started_doc["handle"];
+    assert_eq!(started_doc["policy_decision"], "approved", "{started_doc}");
+    assert_eq!(started_doc["reused"], false, "{started_doc}");
     assert!(
         handle["task_id"].as_str().unwrap().starts_with("scan_"),
-        "{handle}"
+        "{started_doc}"
     );
     assert!(
         handle["plan_hash"].as_str().unwrap().starts_with("blake3:"),
-        "{handle}"
+        "{started_doc}"
     );
-    assert_eq!(handle["status"], "running", "{handle}");
-    assert_eq!(handle["policy_decision"], "approved", "{handle}");
-    assert_eq!(handle["estimated_targets"], 1, "{handle}");
+    assert_eq!(handle["status"], "running", "{started_doc}");
+    assert_eq!(handle["estimated_targets"], 1, "{started_doc}");
     assert!(
         elapsed < Duration::from_secs(10),
         "the handle took {elapsed:?} to appear"
@@ -1067,8 +1075,9 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
         .spawn()
         .expect("spawn bathy");
 
-    let handle: serde_json::Value =
+    let started_doc: serde_json::Value =
         serde_json::from_str(&first_line_within(&mut child, Duration::from_secs(10))).unwrap();
+    let handle = &started_doc["handle"];
     let id = handle["task_id"].as_str().unwrap().to_string();
 
     // `scan status` reads the same live state from a second process, while
@@ -1146,7 +1155,16 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
         &id,
     ]);
     resumed.success();
-    let summary = resumed.json();
+    // Two documents, and which is which is the intended difference between
+    // this surface and the tool surface: the first is the same
+    // `ScanResumeOutput` `scan.resume` returns, and the second is the run
+    // summary the tool has no equivalent of because it detaches the
+    // scheduler and this command runs it.
+    let documents = resumed.json_lines();
+    assert_eq!(documents.len(), 2, "{documents:#?}");
+    assert_eq!(documents[0]["resumed"], serde_json::json!(true));
+    assert_eq!(documents[0]["scan_id"], serde_json::json!(id));
+    let summary = documents[1].clone();
     assert_eq!(
         summary["cancelled"],
         serde_json::json!(false),
@@ -1217,8 +1235,9 @@ fn following_a_scan_whose_writer_died_gives_up_by_a_deadline_instead_of_waiting_
         .spawn()
         .expect("spawn bathy");
 
-    let handle: serde_json::Value =
+    let started_doc: serde_json::Value =
         serde_json::from_str(&first_line_within(&mut child, Duration::from_secs(10))).unwrap();
+    let handle = &started_doc["handle"];
     let id = handle["task_id"].as_str().unwrap().to_string();
 
     // Let a few events land, then kill the writer outright. No terminal

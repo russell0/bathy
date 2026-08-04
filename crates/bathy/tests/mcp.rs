@@ -1788,73 +1788,616 @@ fn cancel_and_resume_round_trip_through_the_tool_surface() {
 
 // ---------------------------------------------------------------------------
 // The two surfaces answer the same question the same way.
+//
+// The plan's architecture says anything the MCP server can do, the CLI can
+// do. That premise is what makes this surface auditable from a shell, and
+// M5 Task 4's review found it false: six documents differed and four things
+// the tools could do had no command-line spelling at all. The structural
+// cause was that the only two whole-document comparisons covered exactly the
+// two tools that had already been fixed, and every other comparison was
+// field-by-field over the fields that happened to agree -- `evidence.get`
+// compared `bytes_hex` and `length` and not `truncated`, which is the field
+// that differed. A guard covering the instances already known.
+//
+// So the comparison below is **generated from the advertised tool list**.
+// `parity_cases` matches on the name and has no wildcard arm that passes: a
+// twelfth tool fails this test until somebody writes down how its
+// subcommand answers the same question. And where the two surfaces differ on
+// purpose, the difference is *declared* and asserted -- a field that stops
+// differing fails just as loudly as one that starts.
 // ---------------------------------------------------------------------------
 
+/// How a tool's document and its subcommand's document are meant to relate.
+enum Parity {
+    /// Byte-for-byte the same JSON value.
+    Identical,
+    /// The command emits one JSON document per line where the tool returns a
+    /// paging envelope. `array` names the tool field holding the same
+    /// documents in the same order, and `envelope` is the exact set of extra
+    /// top-level keys the tool's document is allowed to carry.
+    LineStream {
+        array: &'static str,
+        envelope: &'static [&'static str],
+    },
+}
+
+/// One question, asked of both surfaces.
+struct Case {
+    /// What the question is, for a failure message.
+    what: &'static str,
+    arguments: Value,
+    argv: Vec<String>,
+    parity: Parity,
+}
+
+/// Everything the cases below need to name a real scan in a real state
+/// directory that both surfaces can read.
+struct Fixture {
+    state_dir: String,
+    scope: String,
+    scan_id: String,
+    digest: String,
+    rule_id: String,
+    /// A second scan whose fold differs from `scan_id`'s only in confidence.
+    /// See [`confidence_variant`].
+    diff_after: String,
+    request: Value,
+    targets: String,
+    ports: String,
+    key: String,
+}
+
+impl Fixture {
+    fn cli(&self, tail: &[&str]) -> Vec<String> {
+        let mut argv = vec![
+            "--json".to_string(),
+            "--state-dir".to_string(),
+            self.state_dir.clone(),
+        ];
+        argv.extend(tail.iter().map(|s| s.to_string()));
+        argv
+    }
+}
+
+/// The command line that asks the same question as `name`, and how the two
+/// answers are meant to relate.
+///
+/// Returns more than one case where a tool takes an argument the command has
+/// to be able to express: the filtered `result.query`, the capped
+/// `evidence.get`, the bounded `scan.events`. Each of those is one of the
+/// four things the tool surface could do and the command surface could not.
+///
+/// There is no wildcard arm. That is the whole structural point.
+fn parity_cases(name: &str, f: &Fixture) -> Vec<Case> {
+    let scan = json!({ "scan_id": f.scan_id });
+    match name {
+        "scope.validate" => vec![Case {
+            what: "what a manifest authorizes",
+            arguments: json!({ "manifest_path": f.scope, "targets": [f.targets] }),
+            argv: f.cli(&[
+                "scope",
+                "validate",
+                "--scope",
+                &f.scope,
+                "--targets",
+                &f.targets,
+            ]),
+            parity: Parity::Identical,
+        }],
+        "scan.preview" => vec![Case {
+            what: "what a request would do, without doing it",
+            arguments: json!({
+                "manifest_path": f.scope,
+                "request": scan_request(&f.targets, &f.ports, "preview-not-an-attempt"),
+            }),
+            argv: f.cli(&[
+                "scan",
+                "preview",
+                "--scope",
+                &f.scope,
+                "--targets",
+                &f.targets,
+                "--ports",
+                &f.ports,
+            ]),
+            parity: Parity::Identical,
+        }],
+        // Asked with the fixture's own key and request, so both surfaces take
+        // the reuse branch and neither starts anything. A *fresh* start mints
+        // an identifier, so two fresh starts cannot be compared as documents
+        // at all -- what makes them agree is that both call
+        // `tools::scan::admit_into_store`, which is one implementation rather
+        // than a claim. The reuse document exercises every field of
+        // `ScanStartOutput` including the `reused` flag this command surface
+        // used to report only as a sentence on standard error.
+        "scan.start" => vec![Case {
+            what: "an already-named scan, re-started",
+            arguments: json!({ "manifest_path": f.scope, "request": f.request }),
+            argv: f.cli(&[
+                "scan",
+                "start",
+                "--scope",
+                &f.scope,
+                "--idempotency-key",
+                &f.key,
+                "--targets",
+                &f.targets,
+                "--ports",
+                &f.ports,
+            ]),
+            parity: Parity::Identical,
+        }],
+        "scan.status" => vec![Case {
+            what: "a scan's stored lifecycle record",
+            arguments: scan,
+            argv: f.cli(&["scan", "status", "--scan", &f.scan_id]),
+            parity: Parity::Identical,
+        }],
+        "scan.events" => vec![
+            Case {
+                what: "a scan's event log",
+                arguments: json!({ "scan_id": f.scan_id, "after_sequence": 0, "limit": 1000 }),
+                argv: f.cli(&["scan", "events", "--scan", &f.scan_id, "--limit", "1000"]),
+                parity: Parity::LineStream {
+                    array: "events",
+                    envelope: &["has_more", "next_cursor"],
+                },
+            },
+            // `limit: 1` against a log with more than one event, so the bound
+            // binds: a surface that ignored `--limit` would emit the rest and
+            // the comparison would fail rather than agree for want of data.
+            Case {
+                what: "a bounded page of a scan's event log",
+                arguments: json!({ "scan_id": f.scan_id, "after_sequence": 0, "limit": 1 }),
+                argv: f.cli(&[
+                    "scan", "events", "--scan", &f.scan_id, "--after", "0", "--limit", "1",
+                ]),
+                parity: Parity::LineStream {
+                    array: "events",
+                    envelope: &["has_more", "next_cursor"],
+                },
+            },
+        ],
+        "scan.cancel" => vec![Case {
+            what: "stopping a scan, and whether there is anything left to resume",
+            arguments: scan,
+            argv: f.cli(&["scan", "cancel", "--scan", &f.scan_id]),
+            parity: Parity::Identical,
+        }],
+        // The fixture scan has run its plan out, so both surfaces take the
+        // "nothing left to resume" branch and neither starts work. The branch
+        // that *does* start work is the one the command runs to completion,
+        // and it prints this document first -- see `Parity::FirstLine`, which
+        // the round-trip test above exercises.
+        "scan.resume" => vec![Case {
+            what: "resuming a scan with no unfinished units",
+            arguments: json!({ "manifest_path": f.scope, "scan_id": f.scan_id }),
+            argv: f.cli(&["scan", "resume", "--scope", &f.scope, "--scan", &f.scan_id]),
+            parity: Parity::Identical,
+        }],
+        "result.query" => vec![
+            Case {
+                what: "a scan's fold",
+                arguments: json!({ "scan_id": f.scan_id }),
+                argv: f.cli(&["result", "query", "--scan", &f.scan_id]),
+                parity: Parity::Identical,
+            },
+            // The question the review singled out: "endpoints identified with
+            // confidence at least 0.8 on ports 1-1024". Every field of the
+            // filter at once, so a field reachable from only one surface
+            // fails here.
+            Case {
+                what: "a scan's fold, filtered on every field the filter has",
+                arguments: json!({
+                    "scan_id": f.scan_id,
+                    "filter": {
+                        "state": "open",
+                        "service": "http",
+                        "min_confidence": 0.8,
+                        "port_range": { "low": 1, "high": 65535 },
+                    },
+                }),
+                argv: f.cli(&[
+                    "result",
+                    "query",
+                    "--scan",
+                    &f.scan_id,
+                    "--state",
+                    "open",
+                    "--service",
+                    "http",
+                    "--min-confidence",
+                    "0.8",
+                    "--port-range",
+                    "1-65535",
+                ]),
+                parity: Parity::Identical,
+            },
+        ],
+        "result.diff" => vec![
+            Case {
+                what: "two scans compared",
+                arguments: json!({
+                    "before_scan_id": f.scan_id,
+                    "after_scan_id": f.diff_after,
+                }),
+                argv: f.cli(&[
+                    "result",
+                    "diff",
+                    "--before",
+                    &f.scan_id,
+                    "--after",
+                    &f.diff_after,
+                ]),
+                parity: Parity::Identical,
+            },
+            Case {
+                what: "two scans compared, keeping confidence-only changes",
+                arguments: json!({
+                    "before_scan_id": f.scan_id,
+                    "after_scan_id": f.diff_after,
+                    "include_confidence_only": true,
+                }),
+                argv: f.cli(&[
+                    "result",
+                    "diff",
+                    "--before",
+                    &f.scan_id,
+                    "--after",
+                    &f.diff_after,
+                    "--include-confidence-only",
+                ]),
+                parity: Parity::Identical,
+            },
+        ],
+        "evidence.get" => vec![
+            Case {
+                what: "the bytes a finding cited",
+                arguments: json!({ "digest": f.digest }),
+                argv: f.cli(&["evidence", "get", "--digest", &f.digest]),
+                parity: Parity::Identical,
+            },
+            Case {
+                what: "a capped read of the bytes a finding cited",
+                arguments: json!({ "digest": f.digest, "max_bytes": 4 }),
+                argv: f.cli(&["evidence", "get", "--digest", &f.digest, "--max-bytes", "4"]),
+                parity: Parity::Identical,
+            },
+        ],
+        "fingerprint.explain" => vec![Case {
+            what: "what a rule looks for and where the claim comes from",
+            arguments: json!({ "rule_id": f.rule_id }),
+            argv: f.cli(&["explain", &f.rule_id]),
+            parity: Parity::Identical,
+        }],
+        other => panic!(
+            "`{other}` is advertised as a tool and has no command-line comparison. \
+             The plan's architecture says anything the MCP server can do the CLI can \
+             do; a tool nobody wrote a comparison for is a tool nobody checked that \
+             for. Add a case to `parity_cases`."
+        ),
+    }
+}
+
+/// The top-level keys on which two documents disagree, including keys present
+/// in only one of them.
+fn differing_keys(a: &Value, b: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = a
+        .as_object()
+        .into_iter()
+        .flat_map(|m| m.keys().cloned())
+        .chain(b.as_object().into_iter().flat_map(|m| m.keys().cloned()))
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    keys.into_iter().filter(|k| a[k] != b[k]).collect()
+}
+
+/// A second event log, identical to `scan_id`'s except that every
+/// observation is less confident.
+///
+/// `result.diff` calls the difference between the two `confidence_only`,
+/// which is the change class `include_confidence_only` decides the fate of.
+/// Without it the two diff comparisons would be asked about a scan diffed
+/// against itself, which has no changes at all -- so they would agree
+/// whether or not the command surface passed the flag along, and the
+/// comparison would prove nothing. It is written as a file in the same state
+/// directory because that file is exactly what both surfaces read.
+fn confidence_variant(state_dir: &str, scan_id: &str) -> String {
+    let path = PathBuf::from(state_dir).join(format!("{scan_id}.jsonl"));
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("the fixture scan wrote no log at {path:?}: {e}"));
+    let head = &scan_id[..scan_id.len() - 1];
+    let last = scan_id.chars().last().unwrap();
+    let variant = format!("{head}{}", if last == 'Z' { 'Y' } else { 'Z' });
+
+    let mut rewritten = String::new();
+    let mut observations = 0;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let mut event: Value = serde_json::from_str(line).expect("the log is JSONL");
+        event["scan_id"] = json!(variant);
+        if event["event_type"] == json!("service.observed") {
+            event["observation"]["confidence"] = json!(0.5);
+            observations += 1;
+        }
+        rewritten.push_str(&event.to_string());
+        rewritten.push('\n');
+    }
+    assert!(
+        observations > 0,
+        "the fixture scan identified nothing, so there is no confidence to vary"
+    );
+    std::fs::write(
+        PathBuf::from(state_dir).join(format!("{variant}.jsonl")),
+        rewritten,
+    )
+    .expect("write the variant log");
+    variant
+}
+
+fn json_lines(stdout: &str) -> Vec<Value> {
+    stdout
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("stdout line is not JSON ({e}): {line:?}"))
+        })
+        .collect()
+}
+
 #[test]
-fn the_preview_tool_and_the_preview_subcommand_return_the_same_document() {
+fn every_advertised_tool_and_its_subcommand_answer_the_same_question_the_same_way() {
     let ip = local_ipv4();
     let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, true);
     let mut server = Server::start(64);
 
-    let from_tool = server.call(
-        "scan.preview",
-        json!({
-            "manifest_path": scope.path(),
-            "request": scan_request(&ip.to_string(), "22,80", "preview-not-an-attempt"),
-        }),
+    // One scan, run to completion, that every case below asks about. Both
+    // surfaces read the same state directory, so a difference in the answer
+    // is a difference in the surface and not in the question.
+    let key = "parity";
+    let request = json!({
+        "targets": [ip.to_string()],
+        "objective": "inventory_exposed_services",
+        "ports": { "explicit": [listener.port()] },
+        "idempotency_key": key,
+        // The command surface's own defaults, spelled out: `plan_hash` covers
+        // service detection, and the `scan.start` case below reaches the reuse
+        // branch on both surfaces only if both describe the same plan.
+        "service_detection": { "enabled": true, "intensity": 4 },
+        "evidence_level": "headers",
+    });
+    let started = server.call(
+        "scan.start",
+        json!({ "manifest_path": scope.path(), "request": request }),
+    );
+    let scan_id = started["handle"]["task_id"].as_str().unwrap().to_string();
+    wait_for_terminal(&mut server, &scan_id);
+
+    let fixture = Fixture {
+        diff_after: confidence_variant(&server.state_dir(), &scan_id),
+        state_dir: server.state_dir(),
+        scope: scope.path(),
+        digest: first_evidence_digest(&mut server, &scan_id),
+        rule_id: first_rule_id(),
+        request: request.clone(),
+        targets: ip.to_string(),
+        ports: listener.port(),
+        key: key.to_string(),
+        scan_id,
+    };
+
+    let advertised: Vec<String> = server
+        .tools()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    // Deliberately no assertion on the *count* here: the count is pinned by
+    // `exactly_eleven_tools_with_exactly_the_designed_names_are_advertised`,
+    // and if this test failed on the number first, the guard below -- that
+    // every advertised tool has a comparison -- would never be the thing that
+    // reported a twelfth tool nobody compared.
+
+    let mut compared = 0;
+    for name in &advertised {
+        for case in parity_cases(name, &fixture) {
+            let from_tool = server.call(name, case.arguments.clone());
+            let argv: Vec<&str> = case.argv.iter().map(String::as_str).collect();
+            let (code, stdout) = bathy(&argv);
+            assert_eq!(code, 0, "{name} ({}): {argv:?}\n{stdout}", case.what);
+            let lines = json_lines(&stdout);
+
+            match case.parity {
+                Parity::Identical => {
+                    assert_eq!(
+                        lines.len(),
+                        1,
+                        "{name} ({}): the command emitted {} documents where the tool \
+                         returns one: {lines:#?}",
+                        case.what,
+                        lines.len()
+                    );
+                    assert_eq!(
+                        from_tool,
+                        lines[0],
+                        "{name} and `{}` were asked {} against the same state and \
+                         answered differently on {:?}. The premise that anything the \
+                         server can do the CLI can do is what makes this surface \
+                         auditable from a shell, and it decays silently.\n  \
+                         tool: {from_tool:#}\n  cli:  {:#}",
+                        argv.join(" "),
+                        case.what,
+                        differing_keys(&from_tool, &lines[0]),
+                        lines[0],
+                    );
+                }
+                Parity::LineStream { array, envelope } => {
+                    // The envelope is the *declared* difference, and it is
+                    // asserted in both directions: an extra field appearing on
+                    // the tool's document fails here, and a declared field
+                    // that stops existing fails here too.
+                    let mut extra: Vec<&str> = from_tool
+                        .as_object()
+                        .expect("a paging document")
+                        .keys()
+                        .map(String::as_str)
+                        .filter(|k| *k != array)
+                        .collect();
+                    extra.sort_unstable();
+                    assert_eq!(
+                        extra, envelope,
+                        "{name} ({}): the paging envelope this command deliberately does \
+                         not reproduce is declared as {envelope:?}; the tool's document \
+                         carries {extra:?}. A new field is a new divergence, and it has \
+                         to be decided rather than discovered.",
+                        case.what
+                    );
+                    assert_eq!(
+                        from_tool[array],
+                        Value::Array(lines.clone()),
+                        "{name} and `{}` disagree about the documents themselves, not \
+                         merely their envelope ({})",
+                        argv.join(" "),
+                        case.what
+                    );
+                }
+            }
+            compared += 1;
+        }
+    }
+    assert!(
+        compared >= advertised.len(),
+        "{compared} comparisons for {} tools",
+        advertised.len()
     );
 
-    let (code, stdout) = bathy(&[
-        "--json",
-        "--state-dir",
-        &server.state_dir(),
-        "scan",
-        "preview",
-        "--scope",
-        &scope.path(),
-        "--targets",
-        &ip.to_string(),
-        "--ports",
-        "22,80",
-    ]);
-    assert_eq!(code, 0, "{stdout}");
-    let from_cli: Value = serde_json::from_str(stdout.trim()).unwrap();
+    // A control for the two `result.diff` cases above: the flag has to change
+    // the tool's own answer, or the pair would agree whether or not the
+    // command surface passed it along. It did not, when this was first
+    // written -- both cases diffed a scan against itself, which has no
+    // changes at all, and a mutation that dropped `--include-confidence-only`
+    // on the floor survived.
+    let dropped = server.call(
+        "result.diff",
+        json!({ "before_scan_id": fixture.scan_id, "after_scan_id": fixture.diff_after }),
+    );
+    let kept = server.call(
+        "result.diff",
+        json!({
+            "before_scan_id": fixture.scan_id,
+            "after_scan_id": fixture.diff_after,
+            "include_confidence_only": true,
+        }),
+    );
+    assert_ne!(
+        dropped, kept,
+        "`include_confidence_only` changed nothing about the tool's own answer, so \
+         the two comparisons above prove nothing about the command that passes it"
+    );
 
+    // A control for the filtered `result.query` case above. If neither
+    // surface filtered anything, the two would agree for the wrong reason --
+    // which is exactly how a field-by-field comparison over the fields that
+    // happen to agree passes. So: a filter the tool's own answer visibly
+    // narrows, asked of both.
+    let all = server.call("result.query", json!({ "scan_id": fixture.scan_id }));
+    assert!(
+        all["total"].as_u64().unwrap() > 0,
+        "the fixture scan folded to no endpoints, so nothing below can be narrowed: {all:#}"
+    );
+    let narrowed = server.call(
+        "result.query",
+        json!({
+            "scan_id": fixture.scan_id,
+            "filter": { "port_range": { "low": 1, "high": 1 } },
+        }),
+    );
     assert_eq!(
-        from_tool, from_cli,
-        "the tool surface and the command surface previewed the same request and \
-         answered differently. That premise is what makes this tool surface auditable \
-         from a shell, and it decays silently"
+        narrowed["total"],
+        json!(0),
+        "the filter narrowed nothing, so the comparison below proves nothing: {narrowed:#}"
+    );
+    let argv = fixture.cli(&[
+        "result",
+        "query",
+        "--scan",
+        &fixture.scan_id,
+        "--port-range",
+        "1-1",
+    ]);
+    let (code, stdout) = bathy(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+    assert_eq!(code, 0, "{stdout}");
+    assert_eq!(
+        json_lines(&stdout)[0],
+        narrowed,
+        "the command could not express the filter that narrowed the tool's answer"
+    );
+
+    // The one intended difference in *shape*, asserted rather than skipped.
+    //
+    // A fresh `scan.start` mints an identifier, so two fresh starts cannot be
+    // compared as documents at all. What can be compared is the shape: the
+    // command emits the tool's document first -- conforming to the schema the
+    // tool published for it -- and then a run summary the tool has no
+    // equivalent of, because the tool detaches a scheduler and this command
+    // runs it to completion in its own process (AC-5.12).
+    let tools = server.tools();
+    let (code, stdout) = bathy(
+        &fixture
+            .cli(&[
+                "scan",
+                "start",
+                "--scope",
+                &fixture.scope,
+                "--idempotency-key",
+                "parity-fresh",
+                "--targets",
+                &fixture.targets,
+                "--ports",
+                &fixture.ports,
+            ])
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(code, 0, "{stdout}");
+    let lines = json_lines(&stdout);
+    assert_eq!(
+        lines.len(),
+        2,
+        "a fresh start emits the tool's document and then its own run summary, \
+         and nothing else: {lines:#?}"
+    );
+    assert_conforms(
+        "scan.start",
+        &tool_named(&tools, "scan.start")["outputSchema"],
+        &lines[0],
+    );
+    assert_eq!(
+        lines[0]["policy_decision"],
+        json!("approved"),
+        "{:#}",
+        lines[0]
+    );
+    assert_eq!(lines[0]["reused"], json!(false), "{:#}", lines[0]);
+    assert!(
+        lines[1].get("units_completed").is_some() && lines[1].get("cancelled").is_some(),
+        "the second document must be the run summary, which is the whole of what \
+         this surface adds: {:#}",
+        lines[1]
     );
 }
 
 #[test]
-fn the_scope_tool_and_the_scope_subcommand_return_the_same_document() {
+fn a_policy_denial_is_the_same_answer_and_the_exit_code_the_table_promises() {
     let ip = local_ipv4();
     let scope = Scope::for_local(ip);
     let mut server = Server::start(64);
 
-    let from_tool = server.call(
-        "scope.validate",
-        json!({ "manifest_path": scope.path(), "targets": [ip.to_string()] }),
-    );
-    let (code, stdout) = bathy(&[
-        "--json",
-        "--state-dir",
-        &server.state_dir(),
-        "scope",
-        "validate",
-        "--scope",
-        &scope.path(),
-        "--targets",
-        &ip.to_string(),
-    ]);
-    assert_eq!(code, 0, "{stdout}");
-    let from_cli: Value = serde_json::from_str(stdout.trim()).unwrap();
-    assert_eq!(from_tool, from_cli);
-
-    // And a target the manifest does not cover is refused by both, with the
-    // same code and the same exit status the exit-code table promises.
+    // A target the manifest does not cover is refused by both, with the same
+    // code -- and on the command surface with the exit status the exit-code
+    // table publishes, which is the half a document comparison cannot see.
     let refused = server.call_raw(
         "scope.validate",
         json!({ "manifest_path": scope.path(), "targets": ["8.8.8.8"] }),
@@ -1864,7 +2407,7 @@ fn the_scope_tool_and_the_scope_subcommand_return_the_same_document() {
         refused["structuredContent"]["reason_code"],
         json!("target_out_of_scope")
     );
-    let (code, _) = bathy(&[
+    let (code, stdout) = bathy(&[
         "--json",
         "--state-dir",
         &server.state_dir(),
@@ -1876,6 +2419,53 @@ fn the_scope_tool_and_the_scope_subcommand_return_the_same_document() {
         "8.8.8.8",
     ]);
     assert_eq!(code, 2, "a policy denial is exit 2 on the command surface");
+    let failure = json_lines(&stdout)
+        .pop()
+        .unwrap_or_else(|| panic!("a refusal must still be machine-readable: {stdout:?}"));
+    // The two surfaces carry the code in different envelopes on purpose --
+    // this one signals refusal with an exit status and a failure document,
+    // that one with `isError` and a structured result -- but the code itself
+    // is the engine's, on both, which is what an operator reproducing an
+    // agent's refusal actually reads.
+    assert_eq!(failure["error"], json!("policy_denied"), "{failure}");
+    assert_eq!(
+        failure["reason_code"], refused["structuredContent"]["reason_code"],
+        "the two surfaces refused the same request with different codes"
+    );
+
+    // And the same for a start the manifest does not authorize: exit 2, the
+    // engine's own code, on both.
+    let elsewhere = Scope::new(&["10.30.0.0/24"]);
+    let denied = server.call_raw(
+        "scan.preview",
+        json!({
+            "manifest_path": elsewhere.path(),
+            "request": scan_request(&ip.to_string(), "80", "denied-preview"),
+        }),
+    );
+    assert_eq!(
+        denied["structuredContent"]["reason_code"],
+        json!("target_out_of_scope"),
+        "{denied:#}"
+    );
+    let (code, stdout) = bathy(&[
+        "--json",
+        "--state-dir",
+        &server.state_dir(),
+        "scan",
+        "preview",
+        "--scope",
+        &elsewhere.path(),
+        "--targets",
+        &ip.to_string(),
+        "--ports",
+        "80",
+    ]);
+    assert_eq!(code, 2, "{stdout}");
+    assert_eq!(
+        json_lines(&stdout).pop().unwrap()["reason_code"],
+        json!("target_out_of_scope")
+    );
 }
 
 // ---------------------------------------------------------------------------

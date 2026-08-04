@@ -14,7 +14,6 @@
 //! forces this crate's own tests to spawn the binary, which is where a CLI
 //! is actually used.
 
-mod authorize;
 mod cli;
 mod commands;
 mod emit;
@@ -239,13 +238,13 @@ fn dispatch(cli: &Cli, emitter: &Emitter) -> Result<ExitCode, CliError> {
             commands::scan::events(args, &state_dir, emitter)
         }
         Command::Result(ResultCommand::Query(args)) => {
-            commands::result::query(&args.scan, &state_dir, emitter)
+            commands::result::query(args, &state_dir, emitter)
         }
         Command::Result(ResultCommand::Diff(args)) => {
-            commands::result::diff_scans(&args.before, &args.after, &state_dir, emitter)
+            commands::result::diff_scans(args, &state_dir, emitter)
         }
         Command::Evidence(EvidenceCommand::Get(args)) => {
-            commands::evidence::get(&args.digest, &state_dir, emitter)
+            commands::evidence::get(args, &state_dir, emitter)
         }
         Command::Explain(args) => {
             commands::explain::run(args.rule_id.as_deref(), args.list, emitter)

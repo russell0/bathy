@@ -121,6 +121,36 @@ impl CliError {
         }
     }
 
+    /// A tool refusal, rendered as this surface's own failure.
+    ///
+    /// The *codes* need no translation: `bathy-mcp`'s error module publishes
+    /// the command surface's codes on purpose, so an operator reproducing an
+    /// agent's refusal reads the same word. The only decision here is which
+    /// exit status a code maps to, and it is made in one place so the two
+    /// surfaces cannot disagree about whether a manifest saying no is a
+    /// policy denial (2) or an operational error (1).
+    pub fn from_tool(failure: bathy_mcp::error::ToolFailure) -> Self {
+        if failure.error == "idempotency_conflict" {
+            return Self::Conflict {
+                detail: failure.detail,
+            };
+        }
+        for reason in [
+            bathy_types::DenyReason::ScopeMismatch,
+            bathy_types::DenyReason::ScopeExpired,
+            bathy_types::DenyReason::TargetOutOfScope,
+            bathy_types::DenyReason::BudgetExceedsCeiling,
+        ] {
+            if reason.code() == failure.error {
+                return Self::Denied {
+                    reason_code: reason.code(),
+                    detail: failure.detail,
+                };
+            }
+        }
+        Self::operational(failure.error, failure.detail)
+    }
+
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Operational { .. } => ExitCode::Operational,

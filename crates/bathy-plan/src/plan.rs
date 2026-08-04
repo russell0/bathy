@@ -216,10 +216,43 @@ impl ScanPlan {
     }
 }
 
+/// A lower bound on how long a plan takes: the probe count divided by the
+/// packets-per-second ceiling, rounded up. Probe latency and connection
+/// limits can only make a real run slower.
+///
+/// It lives here, beside the plan whose length is one of its two inputs,
+/// because it is a fact about a plan and a budget and about nothing else.
+/// It was first written in `bathy-mcp`, which made the command-line surface
+/// reach up into the MCP adapter for it -- legal under the layer table and
+/// still the wrong shape: an estimator that lives in the server is one that
+/// disappears if the server is ever feature-gated out, taking `scan preview`
+/// with it.
+pub fn estimated_runtime_seconds(probes: u64, packets_per_second: u32) -> u64 {
+    let pps = u64::from(packets_per_second).max(1);
+    probes.div_ceil(pps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use bathy_types::ids::ScopeId;
+
+    // --- estimated_runtime_seconds, moved from `bathy-mcp` with its tests ---
+
+    #[test]
+    fn a_runtime_estimate_rounds_up_rather_than_reporting_zero_seconds() {
+        assert_eq!(estimated_runtime_seconds(1, 100), 1);
+        assert_eq!(estimated_runtime_seconds(0, 100), 0);
+        assert_eq!(estimated_runtime_seconds(201, 100), 3);
+    }
+
+    #[test]
+    fn a_zero_rate_does_not_divide_by_zero() {
+        // Budgets refuse zero at parse time, so this is unreachable from a
+        // request; it is here because the arithmetic must not be the thing
+        // that turns a future validation gap into a panic on either surface.
+        assert_eq!(estimated_runtime_seconds(5, 0), 5);
+    }
     use bathy_types::nonempty::NonEmpty;
     use bathy_types::request::{
         Budgets, EvidenceLevel, Objective, PortPreset, PortSelection, ServiceDetection,

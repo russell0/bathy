@@ -1,29 +1,64 @@
 //! `bathy scan preview|start|status|events|cancel|resume`.
 //!
-//! The emission path in this crate is [`run_to_completion`], and it takes an
-//! [`AuthorizedScan`] -- see `crate::authorize` for why that is a type and
-//! not a check.
+//! # One implementation of each answer
+//!
+//! Every subcommand here calls the same function the corresponding tool
+//! calls and renders the same typed document. That is not tidiness: M5 Task
+//! 4's review drove all eleven tools and all their subcommands against one
+//! state directory and found **six** documents that differed and four
+//! questions the tool surface could ask that this one could not. Two of the
+//! six had already been found and fixed one at a time, which is the tell --
+//! the divergences were not a bug, they were a *shape*: two implementations
+//! of one answer, corrected wherever somebody happened to look.
+//!
+//! So the shape is gone. `scan.status`, `scan.cancel`, `scan.events`,
+//! `scan.preview` and the two halves of `scan.start`/`scan.resume` that
+//! decide anything all live once, in `bathy_mcp::tools::scan`, and
+//! `crates/bathy/tests/mcp.rs` compares the two surfaces as whole documents
+//! for every tool the server advertises.
+//!
+//! # What genuinely differs, and why
+//!
+//! The tool surface **detaches** a scheduler and returns a handle; this one
+//! **runs to completion** in the caller's own process, because a command that
+//! returned while its scan kept running in a process the shell is about to
+//! reap would scan nothing (AC-5.12 requires the handle be printed first, not
+//! that the process exit). So `scan start` and `scan resume` print the tool's
+//! document *and then* a run summary the tool has no equivalent of. That is
+//! the only intended difference, and the parity test asserts it rather than
+//! skipping the fields it touches.
+//!
+//! # The emission path
+//!
+//! [`run_to_completion`] is the only function in this crate that builds a
+//! `Scheduler`, and it takes a `bathy_mcp::engine::AuthorizedScan` -- a type
+//! whose only constructor evaluates a real manifest over the plan's fully
+//! expanded target list. This crate used to carry a second type of the same
+//! name and the same discipline; two spellings of "authorized" is the defect
+//! class above wearing its most expensive hat, so there is now one. The
+//! engine still re-checks scope identity, expiry and each target immediately
+//! before dispatch: that is the backstop and it stays.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bathy_engine::{GroupCommitConfig, GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
-use bathy_evidence::{EventLogReader, EvidenceStore};
-use bathy_probe::ProbeRegistry;
-use bathy_scope::{BudgetLedger, ScopeManifest};
-use bathy_store::{StartOutcome, StartRequest, StoreError, TaskStore};
+use bathy_mcp::engine::{AuthorizedScan, Runtime};
+use bathy_mcp::tools;
 use bathy_types::clock::Clock;
-use bathy_types::event::{Event, EventBody};
+use bathy_types::event::Event;
 use bathy_types::ids::ScanId;
 use bathy_types::nonempty::NonEmpty;
-use bathy_types::request::{Budgets, PortSelection, ScanRequest, ServiceDetection};
-use bathy_types::task::{PolicyDecisionTag, TaskHandle, TaskStatus};
+use bathy_types::request::{EvidenceLevel, PortSelection, ServiceDetection};
+use bathy_types::task::TaskStatus;
+use bathy_types::tools::{
+    ScanCancelInput, ScanEventsInput, ScanPreviewInput, ScanRequestSpec, ScanResumeInput,
+    ScanStartInput, ScanStatusInput,
+};
 use tokio_util::sync::CancellationToken;
 
-use crate::authorize::AuthorizedScan;
 use crate::cli::{EventsArgs, PreviewArgs, RequestArgs, ResumeArgs, StartArgs};
-use crate::commands::scope::load_manifest;
 use crate::emit::Emitter;
 use crate::exit::{CliError, ExitCode};
 use crate::state;
@@ -34,19 +69,15 @@ use crate::state;
 /// serialized into a log is identifiable.
 const PREVIEW_KEY: &str = "preview-not-an-attempt";
 
-/// Turn the request-shaping flags into a real [`ScanRequest`].
+/// Turn the request-shaping flags into the request *spec* the tool surface
+/// declares.
 ///
-/// Budgets left unspecified default to the manifest's own ceiling. That is
-/// not "unbounded": the ceiling is a hard limit an operator already wrote
-/// down, `bathy_scope::evaluate` refuses anything above it, and the
-/// alternative -- a built-in default -- would be a number this program
-/// invented for someone else's network.
-fn build_request(
-    args: &RequestArgs,
-    manifest: &ScopeManifest,
-    idempotency_key: String,
-) -> Result<ScanRequest, CliError> {
-    let ceiling = manifest.ceiling();
+/// A spec, not a `ScanRequest`: the scope identity and the budget defaults
+/// are filled in from the manifest by `ScanRequestSpec::into_request`, which
+/// is also where the intensity and budget bounds are checked. Doing it here
+/// as well would be a second copy of the validation the published schema
+/// promises, and the two would eventually say different things.
+fn build_spec(args: &RequestArgs, idempotency_key: String) -> Result<ScanRequestSpec, CliError> {
     let targets = NonEmpty::try_from(args.targets.clone())
         .map_err(|e| CliError::operational("no_targets", e))?;
     let ports = match (&args.port_preset, args.ports.is_empty()) {
@@ -64,92 +95,66 @@ fn build_request(
             ));
         }
     };
-    if args.intensity > 9 {
-        return Err(CliError::operational(
-            "bad_intensity",
-            format!("--intensity must be 0-9, got {}", args.intensity),
-        ));
-    }
-    let budgets = Budgets {
-        maximum_packets: args.max_packets.unwrap_or(ceiling.maximum_packets),
-        maximum_runtime_seconds: args
-            .max_runtime_seconds
-            .unwrap_or(ceiling.maximum_runtime_seconds),
-        maximum_packets_per_second: args
-            .max_packets_per_second
-            .unwrap_or(ceiling.maximum_packets_per_second),
-    };
-    if budgets.maximum_packets == 0
-        || budgets.maximum_runtime_seconds == 0
-        || budgets.maximum_packets_per_second == 0
-    {
-        return Err(CliError::operational(
-            "bad_budget",
-            "every budget must be greater than zero",
-        ));
-    }
-    Ok(ScanRequest {
+    Ok(ScanRequestSpec {
         targets,
-        authorization_scope_id: manifest.id(),
         objective: args.objective.into(),
         ports,
         service_detection: ServiceDetection {
             enabled: !args.no_service_detection,
             intensity: args.intensity,
         },
-        budgets,
-        evidence_level: args.evidence_level.into(),
+        evidence_level: EvidenceLevel::from(args.evidence_level),
+        max_packets: args.max_packets,
+        max_runtime_seconds: args.max_runtime_seconds,
+        max_packets_per_second: args.max_packets_per_second,
         idempotency_key,
     })
 }
 
-/// The same document `scan.preview` returns, field for field.
-///
-/// `estimated_runtime_seconds` is computed by the shared estimator rather
-/// than restated here: the M5 plan's tool contract named the field and this
-/// command did not have it, which would have made the tool surface report
-/// something the command surface could not.
-fn preview_document(authorized: &AuthorizedScan) -> serde_json::Value {
-    let out = bathy_types::tools::ScanPreviewOutput {
-        policy_decision: PolicyDecisionTag::Approved,
-        plan_hash: Some(authorized.plan().hash()),
-        estimated_targets: Some(authorized.estimated_targets()),
-        estimated_probes: Some(authorized.estimated_probes()),
-        estimated_runtime_seconds: Some(bathy_mcp::engine::estimated_runtime_seconds(
-            authorized.estimated_probes(),
-            authorized.request().budgets.maximum_packets_per_second,
-        )),
-        scope_id: Some(authorized.request().authorization_scope_id),
-        reason_code: None,
-        detail: None,
-    };
-    serde_json::to_value(&out).expect("a preview always serializes")
+fn runtime(state_dir: &Path) -> Result<Runtime, CliError> {
+    Runtime::open(state_dir).map_err(|e| CliError::operational("state_unavailable", e))
 }
 
-/// AC-5.9. Nothing on this path opens a socket: it loads a document,
-/// expands a plan and evaluates a policy, and the emission path is not
-/// reachable from here at all.
+fn document<T: serde::Serialize>(value: &T) -> Result<serde_json::Value, CliError> {
+    serde_json::to_value(value).map_err(|e| CliError::operational("encode_failed", e))
+}
+
+/// AC-5.9. Nothing on this path opens a socket, and nothing on it opens the
+/// state directory either: it loads a document, expands a plan and evaluates
+/// a policy.
 pub fn preview(
     args: &PreviewArgs,
-    clock: &dyn Clock,
+    clock: &dyn bathy_types::clock::Clock,
     emitter: &Emitter,
 ) -> Result<ExitCode, CliError> {
-    let manifest = load_manifest(&args.scope)?;
-    let request = build_request(&args.request, &manifest, PREVIEW_KEY.to_string())?;
-    let authorized = AuthorizedScan::authorize(manifest, request, &clock.now_rfc3339())?;
-    let doc = preview_document(&authorized);
-    let human = format!(
-        "approved  plan {}\n  {} target(s), {} probe(s)",
-        authorized.plan().hash(),
-        authorized.estimated_targets(),
-        authorized.estimated_probes()
-    );
-    emitter.result(doc, human);
-    Ok(ExitCode::Success)
-}
+    let out = tools::scan::preview(
+        ScanPreviewInput {
+            manifest_path: args.scope.display().to_string(),
+            request: build_spec(&args.request, PREVIEW_KEY.to_string())?,
+        },
+        &clock.now_rfc3339(),
+    )
+    .map_err(CliError::from_tool)?;
 
-fn handle_document(handle: &TaskHandle) -> serde_json::Value {
-    serde_json::to_value(handle).expect("TaskHandle always serializes")
+    // A denial is exit 2 and carries the engine's own reason code, the same
+    // way the tool marks the result as an error rather than a success with a
+    // discouraging field in it.
+    if out.policy_decision == bathy_types::task::PolicyDecisionTag::Denied {
+        return Err(CliError::from_tool(bathy_mcp::error::ToolFailure::new(
+            out.reason_code.unwrap_or_default(),
+            out.detail.unwrap_or_default(),
+        )));
+    }
+
+    let human = format!(
+        "approved  plan {}\n  {} target(s), {} probe(s), ~{}s",
+        out.plan_hash.map(|h| h.to_string()).unwrap_or_default(),
+        out.estimated_targets.unwrap_or_default(),
+        out.estimated_probes.unwrap_or_default(),
+        out.estimated_runtime_seconds.unwrap_or_default(),
+    );
+    emitter.result(document(&out)?, human);
+    Ok(ExitCode::Success)
 }
 
 fn summary_document(summary: &RunSummary) -> serde_json::Value {
@@ -175,51 +180,19 @@ fn exit_for(summary: &RunSummary) -> ExitCode {
     }
 }
 
-/// Everything the engine needs, opened once against one state directory.
-struct Runtime {
-    store: Arc<TaskStore>,
-    evidence: Arc<EvidenceStore>,
-    probes: Arc<ProbeRegistry>,
-    clock: Arc<dyn Clock>,
-}
-
-impl Runtime {
-    fn open(state_dir: &Path, clock: Arc<dyn Clock>) -> Result<Self, CliError> {
-        std::fs::create_dir_all(state_dir)
-            .map_err(|e| CliError::operational("state_dir_unwritable", e))?;
-        let store = Arc::new(
-            TaskStore::open(state_dir, Arc::clone(&clock))
-                .map_err(|e| CliError::operational("store_unavailable", e))?,
-        );
-        let evidence = Arc::new(
-            EvidenceStore::open(state_dir)
-                .map_err(|e| CliError::operational("evidence_unavailable", e))?,
-        );
-        Ok(Self {
-            store,
-            evidence,
-            probes: Arc::new(ProbeRegistry::standard()),
-            clock,
-        })
-    }
-}
-
 /// The only place in this crate that builds a [`Scheduler`], and therefore
-/// the only place a packet can originate. It takes an [`AuthorizedScan`]
-/// because that is the only type in this crate that can prove a manifest
-/// approved this request.
-#[allow(clippy::too_many_arguments)]
+/// the only place a packet can originate. See the module doc for why it
+/// takes an [`AuthorizedScan`].
 async fn run_to_completion(
     authorized: &AuthorizedScan,
     runtime: &Runtime,
-    state_dir: &Path,
     scan_id: ScanId,
     from_index: u64,
-    ledger: BudgetLedger,
+    ledger: bathy_scope::BudgetLedger,
     emitter: &Emitter,
 ) -> Result<ExitCode, CliError> {
     let log = Arc::new(Mutex::new(
-        GroupCommitLog::open(state_dir, scan_id, GroupCommitConfig::default())
+        GroupCommitLog::open(&runtime.state_dir, scan_id, GroupCommitConfig::default())
             .map_err(|e| CliError::operational("log_unavailable", e))?,
     ));
 
@@ -238,13 +211,13 @@ async fn run_to_completion(
         Arc::clone(&runtime.probes),
     );
 
-    // `scan cancel` runs in a different process and cannot reach this
-    // token, so it leaves a marker in the state directory and this task
-    // turns the marker into a real cancellation. Aborted below so the
-    // poller cannot outlive the scan it was watching. The MCP server speaks
-    // the same protocol, from the same place -- see `bathy_engine::cancel`.
+    // `scan cancel` runs in a different process and cannot reach this token,
+    // so it leaves a marker in the state directory and this task turns the
+    // marker into a real cancellation. Aborted below so the poller cannot
+    // outlive the scan it was watching. The MCP server speaks the same
+    // protocol, from the same place -- see `bathy_engine::cancel`.
     let token = CancellationToken::new();
-    let watcher = bathy_engine::cancel::spawn_watcher(state_dir, scan_id, token.clone());
+    let watcher = bathy_engine::cancel::spawn_watcher(&runtime.state_dir, scan_id, token.clone());
 
     let summary = scheduler.run(authorized.plan(), from_index, token).await;
     watcher.abort();
@@ -275,59 +248,40 @@ pub async fn start(
     state_dir: &Path,
     emitter: &Emitter,
 ) -> Result<ExitCode, CliError> {
+    let input = ScanStartInput {
+        manifest_path: args.scope.display().to_string(),
+        request: build_spec(&args.request, args.idempotency_key.clone())?,
+    };
+
+    // Authorization happens before the state directory is opened: a denied
+    // scan must leave no trace, not a `pending` row someone later mistakes
+    // for work that was attempted. `admit` opens nothing.
     let clock = state::clock();
-    let manifest = load_manifest(&args.scope)?;
-    let request = build_request(&args.request, &manifest, args.idempotency_key.clone())?;
-    // Authorization happens before the state directory is even opened: a
-    // denied scan must leave no trace, not a `pending` row someone later
-    // mistakes for work that was attempted.
-    let authorized = AuthorizedScan::authorize(manifest, request, &clock.now_rfc3339())?;
+    let authorized =
+        match tools::scan::admit(&input, &clock.now_rfc3339()).map_err(CliError::from_tool)? {
+            tools::scan::StartAdmission::Denied(out) => {
+                return Err(CliError::from_tool(bathy_mcp::error::ToolFailure::new(
+                    out.reason_code.clone().unwrap_or_default(),
+                    out.detail.clone().unwrap_or_default(),
+                )));
+            }
+            tools::scan::StartAdmission::Authorized(scan) => *scan,
+        };
 
-    let runtime = Runtime::open(state_dir, Arc::clone(&clock))?;
-    let request_json = serde_json::to_string(authorized.request())
-        .map_err(|e| CliError::operational("request_unserializable", e))?;
+    let runtime = runtime(state_dir)?;
+    let admission =
+        tools::scan::admit_into_store(&authorized, &runtime).map_err(CliError::from_tool)?;
+    let handle = admission
+        .output
+        .handle
+        .as_ref()
+        .expect("an approved admission always carries a handle");
+    let (scan_id, status) = (handle.task_id, handle.status);
 
-    let outcome = runtime
-        .store
-        .start_or_reuse(&StartRequest {
-            idempotency_key: args.idempotency_key.clone(),
-            plan_hash: authorized.plan().hash(),
-            scope_id: authorized.request().authorization_scope_id,
-            request_json,
-            estimated_targets: authorized.estimated_targets(),
-            estimated_probes: authorized.estimated_probes(),
-        })
-        .map_err(map_store_error)?;
-
-    let (scan_id, status, fresh) = match outcome {
-        StartOutcome::Started { scan_id } => (scan_id, TaskStatus::Running, true),
-        StartOutcome::Reused { scan_id, status } => (scan_id, status, false),
-    };
-
-    // `running` is a real state, not a label on the handle. Before this
-    // task nothing in the workspace ever wrote it, and a `TaskHandle` that
-    // said `running` while `scan status` said `pending` would be two
-    // answers to one question. Written before the handle is printed, so a
-    // second process that reads the handle and immediately asks for status
-    // cannot see the earlier value.
-    if fresh {
-        runtime
-            .store
-            .set_status(scan_id, TaskStatus::Running)
-            .map_err(|e| CliError::operational("store_unavailable", e))?;
-    }
-
-    let handle = TaskHandle {
-        task_id: scan_id,
-        plan_hash: authorized.plan().hash(),
-        policy_decision: PolicyDecisionTag::Approved,
-        estimated_targets: authorized.estimated_targets(),
-        status,
-    };
     // AC-5.12: printed and flushed *before* the scheduler is built, so the
     // handle is on the pipe regardless of how long the scan then takes.
     emitter.result(
-        handle_document(&handle),
+        document(&admission.output)?,
         format!(
             "{scan_id}  {}  plan {}",
             status_word(status),
@@ -335,7 +289,7 @@ pub async fn start(
         ),
     );
 
-    if !fresh {
+    let Some(work) = admission.work else {
         emitter.note(format!(
             "idempotency key `{}` already names scan {scan_id} ({}); \
              nothing was started. Use `bathy scan resume` to continue it.",
@@ -343,17 +297,14 @@ pub async fn start(
             status_word(status)
         ));
         return Ok(ExitCode::Success);
-    }
+    };
 
-    state::clear_cancel(state_dir, scan_id);
-    let ledger = BudgetLedger::new(authorized.request().budgets);
     run_to_completion(
         &authorized,
         &runtime,
-        state_dir,
-        scan_id,
-        0,
-        ledger,
+        work.scan_id,
+        work.from_index,
+        work.ledger,
         emitter,
     )
     .await
@@ -364,133 +315,85 @@ pub async fn resume(
     state_dir: &Path,
     emitter: &Emitter,
 ) -> Result<ExitCode, CliError> {
-    let clock = state::clock();
-    let scan_id = state::parse_scan_id(&args.scan)?;
-    let manifest = load_manifest(&args.scope)?;
-    let runtime = Runtime::open(state_dir, Arc::clone(&clock))?;
+    let input = ScanResumeInput {
+        manifest_path: args.scope.display().to_string(),
+        scan_id: state::parse_scan_id(&args.scan)?,
+    };
+    let runtime = runtime(state_dir)?;
+    let resumption = tools::scan::prepare_resume(&input, &runtime).map_err(CliError::from_tool)?;
 
-    let record = runtime
-        .store
-        .get(scan_id)
-        .map_err(|e| CliError::operational("store_unavailable", e))?
-        .ok_or_else(|| CliError::operational("no_such_scan", format!("no scan {scan_id}")))?;
+    let human = if resumption.output.resumed {
+        format!(
+            "{} resuming at unit {} of {}",
+            resumption.output.scan_id,
+            resumption.output.resumed_from_unit,
+            resumption.output.units_total
+        )
+    } else {
+        format!("{} is already complete", resumption.output.scan_id)
+    };
+    emitter.result(document(&resumption.output)?, human);
 
-    let request: ScanRequest = serde_json::from_str(&record.request_json)
-        .map_err(|e| CliError::operational("stored_request_unreadable", e))?;
-
-    // Re-authorized, not trusted: the manifest may have expired, been
-    // narrowed, or been swapped for a different one since this scan was
-    // admitted. A resume is new network activity and gets a new decision.
-    let authorized = AuthorizedScan::authorize(manifest, request, &clock.now_rfc3339())?;
-
-    if authorized.plan().hash() != record.plan_hash {
-        return Err(CliError::operational(
-            "plan_mismatch",
-            format!(
-                "scan {scan_id} was started against plan {} but this scope and request \
-                 produce {}",
-                record.plan_hash,
-                authorized.plan().hash()
-            ),
-        ));
-    }
-
-    let total = authorized.plan().len();
-    let from_index = runtime
-        .store
-        .next_pending_unit(scan_id, total)
-        .map_err(|e| CliError::operational("store_unavailable", e))?;
-    let Some(from_index) = from_index else {
-        emitter.note(format!("scan {scan_id} has no unfinished units"));
-        emitter.result(
-            serde_json::json!({ "scan_id": scan_id.to_string(), "resumed": false }),
-            format!("{scan_id} is already complete"),
-        );
+    let Some((authorized, work)) = resumption.work else {
         return Ok(ExitCode::Success);
     };
-
-    state::clear_cancel(state_dir, scan_id);
-    runtime
-        .store
-        .set_status(scan_id, TaskStatus::Running)
-        .map_err(|e| CliError::operational("store_unavailable", e))?;
-    let ledger = BudgetLedger::resumed(
-        authorized.request().budgets,
-        record.packets_spent,
-        record.elapsed_seconds,
-    );
-    emitter.note(format!(
-        "resuming {scan_id} at unit {from_index} of {total}"
-    ));
     run_to_completion(
         &authorized,
         &runtime,
-        state_dir,
-        scan_id,
-        from_index,
-        ledger,
+        work.scan_id,
+        work.from_index,
+        work.ledger,
         emitter,
     )
     .await
 }
 
 pub fn status(scan: &str, state_dir: &Path, emitter: &Emitter) -> Result<ExitCode, CliError> {
-    let scan_id = state::parse_scan_id(scan)?;
-    let runtime = Runtime::open(state_dir, state::clock())?;
-    let record = runtime
-        .store
-        .get(scan_id)
-        .map_err(|e| CliError::operational("store_unavailable", e))?
-        .ok_or_else(|| CliError::operational("no_such_scan", format!("no scan {scan_id}")))?;
+    let out = tools::scan::status(
+        ScanStatusInput {
+            scan_id: state::parse_scan_id(scan)?,
+        },
+        &runtime(state_dir)?,
+    )
+    .map_err(CliError::from_tool)?;
 
-    let doc = serde_json::json!({
-        "scan_id": record.scan_id.to_string(),
-        "status": status_word(record.status),
-        "plan_hash": record.plan_hash.to_string(),
-        "scope_id": record.scope_id.to_string(),
-        "idempotency_key": record.idempotency_key,
-        "estimated_targets": record.estimated_targets,
-        "estimated_probes": record.estimated_probes,
-        "packets_spent": record.packets_spent,
-        "elapsed_seconds": record.elapsed_seconds,
-        "last_sequence": record.last_sequence,
-        "created_at": record.created_at,
-        "updated_at": record.updated_at,
-    });
     let human = format!(
         "{}  {}  {}/{} probe(s), {} packet(s), {}s",
-        record.scan_id,
-        status_word(record.status),
-        record.last_sequence,
-        record.estimated_probes,
-        record.packets_spent,
-        record.elapsed_seconds
+        out.scan_id,
+        status_word(out.status),
+        out.units_completed,
+        out.units_total,
+        out.packets_spent,
+        out.elapsed_seconds
     );
-    emitter.result(doc, human);
+    emitter.result(document(&out)?, human);
     Ok(ExitCode::Success)
 }
 
 pub fn cancel(scan: &str, state_dir: &Path, emitter: &Emitter) -> Result<ExitCode, CliError> {
-    let scan_id = state::parse_scan_id(scan)?;
-    // The scan must exist. Writing a marker for a scan id that was never
-    // started would sit in the state directory forever waiting to cancel
-    // something that has not happened yet.
-    let runtime = Runtime::open(state_dir, state::clock())?;
-    runtime
-        .store
-        .get(scan_id)
-        .map_err(|e| CliError::operational("store_unavailable", e))?
-        .ok_or_else(|| CliError::operational("no_such_scan", format!("no scan {scan_id}")))?;
+    let out = tools::scan::cancel(
+        ScanCancelInput {
+            scan_id: state::parse_scan_id(scan)?,
+        },
+        &runtime(state_dir)?,
+    )
+    .map_err(CliError::from_tool)?;
 
-    state::request_cancel(state_dir, scan_id)?;
-    emitter.result(
-        serde_json::json!({ "scan_id": scan_id.to_string(), "cancellation_requested": true }),
-        format!("{scan_id}: cancellation requested; in-flight probes will be drained"),
+    let human = format!(
+        "{}: cancellation requested; in-flight probes will be drained ({})",
+        out.scan_id,
+        if out.resumable {
+            "resumable"
+        } else {
+            "nothing left to resume"
+        }
     );
+    emitter.result(document(&out)?, human);
     Ok(ExitCode::Success)
 }
 
 fn is_terminal(event: &Event) -> bool {
+    use bathy_types::event::EventBody;
     matches!(
         &event.body,
         EventBody::ScanCompleted { .. }
@@ -499,58 +402,92 @@ fn is_terminal(event: &Event) -> bool {
     )
 }
 
+/// `bathy scan events`, which is the one place the two surfaces render the
+/// same answer in different *shapes*, on purpose.
+///
+/// The tool returns one paging document -- `{events, next_cursor, has_more}`
+/// -- because a JSON-RPC result is one value and a client needs the cursor to
+/// ask for the next page. This command emits one event per line, because
+/// AC-5.10's contract is line-delimited JSON on stdout and because `--follow`
+/// has no last page to attach a cursor to. The events themselves are the same
+/// documents in the same order, which is what the parity test asserts; the
+/// envelope is the declared difference.
+///
+/// `--limit` exists so the *question* is expressible from a shell even though
+/// the answer is shaped differently. Without it the tool could ask for a
+/// bounded page and an operator could not.
 pub fn events(
     args: &EventsArgs,
     state_dir: &Path,
     emitter: &Emitter,
 ) -> Result<ExitCode, CliError> {
     let scan_id = state::parse_scan_id(&args.scan)?;
+    let runtime = runtime(state_dir)?;
     let mut cursor = args.after;
     // A follower's only stopping condition used to be a terminal event, and
     // a scan whose process was killed never writes one -- so `--follow`
     // polled forever against a log nothing would ever append to. An agent
-    // that shelled out has no interrupt to send, so it hangs. `0` restores
-    // the old behaviour, but only when a caller asks for it in writing.
-    let idle_limit = if args.idle_timeout_seconds == 0 {
-        None
-    } else {
-        Some(Duration::from_secs(args.idle_timeout_seconds))
-    };
+    // that shelled out has no interrupt to send. `0` restores the old
+    // behaviour, but only when a caller asks for it in writing.
+    let idle_limit =
+        (args.idle_timeout_seconds != 0).then(|| Duration::from_secs(args.idle_timeout_seconds));
     let mut last_event = Instant::now();
     loop {
-        // Reopened on each poll rather than held: `EventLogReader`'s
-        // `last_sequence` is a snapshot, and reopening is how a follower
-        // advances past it (see that type's doc comment).
-        let reader = EventLogReader::open(state_dir, scan_id)
-            .map_err(|e| CliError::operational("no_such_scan_log", e))?;
-        let batch = reader
-            .read_from(cursor)
-            .map_err(|e| CliError::operational("log_unreadable", e))?;
+        let page = tools::scan::events(
+            ScanEventsInput {
+                scan_id,
+                after_sequence: cursor,
+                limit: args.limit,
+            },
+            &runtime,
+        )
+        .map_err(CliError::from_tool)?;
+
         let mut saw_terminal = false;
-        if !batch.is_empty() {
+        if !page.events.is_empty() {
             last_event = Instant::now();
         }
-        for event in &batch {
-            cursor = event.sequence;
+        for event in &page.events {
             saw_terminal |= is_terminal(event);
-            let doc = serde_json::to_value(event).expect("Event always serializes");
             let human = format!(
                 "{:>6}  {}  {}",
                 event.sequence,
                 event.timestamp,
                 serde_json::to_string(&event.body).expect("EventBody always serializes")
             );
-            emitter.result(doc, human);
+            emitter.result(document(event)?, human);
         }
-        if !args.follow || saw_terminal {
+        cursor = page.next_cursor;
+
+        // `--limit` bounds a read, exactly as the tool's `limit` bounds a
+        // page: one read, one page, the same events. A caller that wants the
+        // rest asks for it, and is told on stderr that there is a rest --
+        // stdout stays line-delimited JSON and nothing else (AC-5.10).
+        if !args.follow {
+            if page.has_more {
+                emitter.note(format!(
+                    "more events remain; re-run with --after {cursor}, or raise \
+                     --limit (currently {})",
+                    args.limit
+                ));
+            }
             return Ok(ExitCode::Success);
+        }
+        if saw_terminal {
+            return Ok(ExitCode::Success);
+        }
+        // Following, and the log is already ahead of us: read the next page
+        // immediately rather than sleeping through work that is already
+        // written.
+        if page.has_more {
+            continue;
         }
         if let Some(limit) = idle_limit
             && last_event.elapsed() >= limit
         {
-            // Operational, not success: the caller asked to be followed to
-            // a terminal event and is not getting one, and the events
-            // already on stdout are a prefix, not an answer.
+            // Operational, not success: the caller asked to be followed to a
+            // terminal event and is not getting one, and the events already
+            // on stdout are a prefix, not an answer.
             return Err(CliError::operational(
                 "follow_idle_timeout",
                 format!(
@@ -561,15 +498,6 @@ pub fn events(
             ));
         }
         std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn map_store_error(e: StoreError) -> CliError {
-    match e {
-        StoreError::IdempotencyConflict { .. } => CliError::Conflict {
-            detail: e.to_string(),
-        },
-        other => CliError::operational("store_unavailable", other),
     }
 }
 
@@ -636,23 +564,28 @@ mod tests {
         );
     }
 
+    /// The exit codes a tool refusal maps to, which is the only part of a
+    /// refusal this surface decides for itself.
     #[test]
-    fn an_idempotency_conflict_is_the_only_store_error_that_is_not_operational() {
-        let conflict = StoreError::IdempotencyConflict {
-            key: "k".into(),
-            existing: format!("blake3:{}", "0".repeat(64)).parse().unwrap(),
-            incoming: format!("blake3:{}", "1".repeat(64)).parse().unwrap(),
-        };
-        assert_eq!(
-            map_store_error(conflict).exit_code(),
-            ExitCode::IdempotencyConflict
-        );
-        assert_eq!(
-            map_store_error(StoreError::NotFound(
-                "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
-            ))
-            .exit_code(),
-            ExitCode::Operational
-        );
+    fn a_tool_refusal_keeps_its_code_and_gets_this_surfaces_exit_status() {
+        use bathy_mcp::error::ToolFailure;
+
+        let conflict = CliError::from_tool(ToolFailure::new("idempotency_conflict", "x"));
+        assert_eq!(conflict.exit_code(), ExitCode::IdempotencyConflict);
+
+        for code in [
+            "scope_mismatch",
+            "scope_expired",
+            "target_out_of_scope",
+            "budget_exceeds_ceiling",
+        ] {
+            let denied = CliError::from_tool(ToolFailure::new(code, "x"));
+            assert_eq!(denied.exit_code(), ExitCode::PolicyDenied, "{code}");
+            assert_eq!(denied.to_json()["reason_code"], serde_json::json!(code));
+        }
+
+        let other = CliError::from_tool(ToolFailure::new("no_such_scan", "x"));
+        assert_eq!(other.exit_code(), ExitCode::Operational);
+        assert_eq!(other.to_json()["error"], serde_json::json!("no_such_scan"));
     }
 }

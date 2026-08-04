@@ -35,6 +35,8 @@ pub fn query(input: ResultQueryInput, runtime: &Runtime) -> ToolResult<ResultQue
         total: endpoints.len() as u64,
         total_before_filter,
         endpoints,
+        hosts_up: wire.hosts_up,
+        plan_hash: wire.plan_hash,
         terminal: wire.terminal,
     })
 }

@@ -245,6 +245,25 @@
       },
       "type": "array"
     },
+    "hosts_up": {
+      "description": "Hosts a `host.discovered` event named. Never narrowed by the filter,\nwhich selects endpoints.\n\n**Empty is not evidence that no host is up.** No scan emits\n`host.discovered` in v0.1.\n\nThis and `plan_hash` are here because the command-line surface\nreported them and this document did not. Both surfaces publish one\ndocument, and the way to make two answers agree is not to delete a\nfact from the one that had it.",
+      "items": {
+        "format": "ip",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "plan_hash": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Digest"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The plan the scan announced when it started, or null if it never\nstarted. Two scans of the same plan cover the same work, which is what\nmakes an endpoint missing from one of them meaningful."
+    },
     "terminal": {
       "anyOf": [
         {
@@ -272,7 +291,8 @@
   "required": [
     "endpoints",
     "total",
-    "total_before_filter"
+    "total_before_filter",
+    "hosts_up"
   ],
   "title": "ResultQueryOutput",
   "type": "object"

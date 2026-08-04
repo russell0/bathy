@@ -21,6 +21,6 @@ pub mod plan;
 pub mod ports;
 pub mod targets;
 
-pub use plan::{PlanError, ScanPlan, ScanUnit};
+pub use plan::{PlanError, ScanPlan, ScanUnit, estimated_runtime_seconds};
 pub use ports::{PortError, resolve_ports};
 pub use targets::{TargetError, expand_targets};

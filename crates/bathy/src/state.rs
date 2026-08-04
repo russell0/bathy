@@ -1,7 +1,7 @@
 //! Where a scan's durable state lives, and the small amount of cross-process
 //! signalling the CLI needs on top of it.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bathy_types::clock::{Clock, SystemClock};
@@ -41,21 +41,14 @@ pub fn clock() -> Arc<dyn Clock> {
     Arc::new(SystemClock::default())
 }
 
-// The cancel-marker protocol moved to `bathy_engine::cancel` when the MCP
-// server became a second surface that has to speak it. A scan started
-// through one surface and cancelled through the other must actually stop,
-// and that cannot be true of a protocol with two implementations. These are
-// thin adapters onto the shared one, kept so the call sites below read the
-// same as they did.
-
-pub fn request_cancel(state_dir: &Path, scan_id: ScanId) -> Result<(), CliError> {
-    bathy_engine::cancel::request(state_dir, scan_id)
-        .map_err(|e| CliError::operational("state_dir_unwritable", e))
-}
-
-pub fn clear_cancel(state_dir: &Path, scan_id: ScanId) {
-    bathy_engine::cancel::clear(state_dir, scan_id);
-}
+// The cancel-marker protocol lives in `bathy_engine::cancel`, and both
+// surfaces now reach it through the same tool functions rather than through
+// adapters here: `scan cancel` writes the marker inside
+// `bathy_mcp::tools::scan::cancel`, and `scan start`/`scan resume` clear it
+// inside `admit_into_store`/`prepare_resume`. A protocol with two
+// implementations is a protocol that will eventually have two answers, and
+// a scan started through one surface and cancelled through the other must
+// actually stop.
 
 pub fn parse_scan_id(s: &str) -> Result<ScanId, CliError> {
     s.parse::<ScanId>()

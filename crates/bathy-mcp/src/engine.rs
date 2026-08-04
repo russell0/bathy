@@ -161,14 +161,6 @@ impl AuthorizedScan {
     }
 }
 
-/// A lower bound on how long a plan takes: the probe count divided by the
-/// packets-per-second ceiling, rounded up. Probe latency and connection
-/// limits can only make a real run slower.
-pub fn estimated_runtime_seconds(probes: u64, packets_per_second: u32) -> u64 {
-    let pps = u64::from(packets_per_second).max(1);
-    probes.div_ceil(pps)
-}
-
 /// The only place in this crate that builds a scheduler, and therefore the
 /// only place a packet can originate.
 ///
@@ -244,21 +236,6 @@ fn report(scan_id: ScanId, summary: Result<RunSummary, bathy_engine::EngineError
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_runtime_estimate_rounds_up_rather_than_reporting_zero_seconds() {
-        assert_eq!(estimated_runtime_seconds(1, 100), 1);
-        assert_eq!(estimated_runtime_seconds(0, 100), 0);
-        assert_eq!(estimated_runtime_seconds(201, 100), 3);
-    }
-
-    #[test]
-    fn a_zero_rate_does_not_divide_by_zero() {
-        // Budgets refuse zero at parse time, so this is unreachable from a
-        // request; it is here because the arithmetic must not be the thing
-        // that turns a future validation gap into a panic on the tool path.
-        assert_eq!(estimated_runtime_seconds(5, 0), 5);
-    }
 
     #[test]
     fn a_manifest_that_is_not_there_is_a_distinct_answer_from_one_that_is_malformed() {

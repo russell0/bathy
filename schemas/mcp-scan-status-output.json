@@ -47,6 +47,12 @@
       "minimum": 0,
       "type": "integer"
     },
+    "estimated_targets": {
+      "description": "Addresses the plan expands to.\n\nHere because the command-line surface reported it and this document\ndid not, and the two surfaces publish one document. Removing it from\nthe command instead would have made an operator's answer narrower to\nmake two answers match, which is the wrong direction.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
     "idempotency_key": {
       "type": "string"
     },
@@ -80,7 +86,7 @@
       "type": "integer"
     },
     "units_total": {
-      "description": "Probe units the plan contains.",
+      "description": "Probe units the plan contains. This is the estimate recorded when the\nscan was admitted, so it does not move.",
       "format": "uint64",
       "minimum": 0,
       "type": "integer"
@@ -92,6 +98,7 @@
   "required": [
     "scan_id",
     "status",
+    "estimated_targets",
     "units_completed",
     "units_total",
     "packets_spent",

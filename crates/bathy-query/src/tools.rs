@@ -104,6 +104,21 @@ pub struct ResultQueryOutput {
     pub total: u64,
     /// How many endpoints the fold held before the filter was applied.
     pub total_before_filter: u64,
+    /// Hosts a `host.discovered` event named. Never narrowed by the filter,
+    /// which selects endpoints.
+    ///
+    /// **Empty is not evidence that no host is up.** No scan emits
+    /// `host.discovered` in v0.1.
+    ///
+    /// This and `plan_hash` are here because the command-line surface
+    /// reported them and this document did not. Both surfaces publish one
+    /// document, and the way to make two answers agree is not to delete a
+    /// fact from the one that had it.
+    pub hosts_up: Vec<std::net::IpAddr>,
+    /// The plan the scan announced when it started, or null if it never
+    /// started. Two scans of the same plan cover the same work, which is what
+    /// makes an endpoint missing from one of them meaningful.
+    pub plan_hash: Option<bathy_types::ids::Digest>,
     /// How the scan ended, or null if it is still running or was stopped
     /// mid-flight. A scan that was refused by policy ends `denied` and has
     /// no endpoints because no packet was sent, not because nothing is

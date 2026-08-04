@@ -233,7 +233,7 @@ impl BathyMcpServer {
             }
             "scan.preview" => {
                 let input = tools::parse_input(arguments)?;
-                let out = tools::scan::preview(input, &runtime)?;
+                let out = tools::scan::preview(input, &runtime.now())?;
                 if out.policy_decision == bathy_types::task::PolicyDecisionTag::Denied {
                     tools::refused(&out)?
                 } else {
@@ -323,7 +323,7 @@ impl BathyMcpServer {
             tools::parse_input(request.arguments.clone())?;
 
         // 1. The manifest. A refusal here creates no task and sends nothing.
-        let authorized = match tools::scan::admit(&input, &self.runtime)? {
+        let authorized = match tools::scan::admit(&input, &self.runtime.now())? {
             tools::scan::StartAdmission::Denied(out) => {
                 return Ok(CallToolResponse::Complete(tools::refused(&*out)?));
             }

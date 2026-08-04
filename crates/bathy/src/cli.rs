@@ -245,6 +245,14 @@ pub struct EventsArgs {
     /// Return only events after this sequence number.
     #[arg(long, value_name = "SEQUENCE", default_value_t = 0)]
     pub after: u64,
+    /// How many events to read at most, 1-1000.
+    ///
+    /// The same bound the `scan.events` tool takes, and here for the same
+    /// reason `--targets` is on `scope validate`: a question the tool
+    /// surface can ask and this one cannot is a question an operator cannot
+    /// reproduce from a shell. Under `--follow` it bounds each poll.
+    #[arg(long, value_name = "N", default_value_t = 200)]
+    pub limit: u32,
     /// Keep reading as the scan writes, until it reaches a terminal event.
     #[arg(long)]
     pub follow: bool,
@@ -265,9 +273,38 @@ pub struct EventsArgs {
 #[derive(Debug, Subcommand)]
 pub enum ResultCommand {
     /// Fold a scan's event log into per-endpoint state.
-    Query(ScanRefArgs),
+    Query(QueryArgs),
     /// Compare two scans' folds.
     Diff(DiffArgs),
+}
+
+/// `bathy result query`, including the whole of the `result.query` filter.
+///
+/// The filter is the largest of the four things the tool surface could
+/// express and this one could not: an agent could ask "endpoints identified
+/// with confidence at least 0.8 on ports 1-1024" and an operator had no way
+/// to reproduce the question. Every field of `bathy_query::EndpointFilter`
+/// has a flag here, and the parity test compares the two answers as whole
+/// documents so a field added to the filter cannot be reachable from only
+/// one surface.
+#[derive(Debug, Args)]
+pub struct QueryArgs {
+    #[arg(long, value_name = "SCAN_ID")]
+    pub scan: String,
+    /// Keep only endpoints in this reachability state.
+    #[arg(long, value_enum, value_name = "STATE")]
+    pub state: Option<PortStateArg>,
+    /// Keep only endpoints whose identified service matches this exactly.
+    #[arg(long, value_name = "NAME")]
+    pub service: Option<String>,
+    /// Keep only endpoints identified with at least this confidence, 0.0-1.0.
+    /// An endpoint carrying no identification at all is dropped by this.
+    #[arg(long, value_name = "FLOAT")]
+    pub min_confidence: Option<f64>,
+    /// Keep only endpoints whose port is inside this inclusive range,
+    /// written `LOW-HIGH` or as a single port.
+    #[arg(long, value_name = "LOW-HIGH")]
+    pub port_range: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -278,6 +315,11 @@ pub struct DiffArgs {
     /// The later scan.
     #[arg(long, value_name = "SCAN_ID")]
     pub after: String,
+    /// Keep changes where only the confidence moved. Confidence wobbles
+    /// between runs, so these are separated from substantive change and
+    /// dropped by default.
+    #[arg(long)]
+    pub include_confidence_only: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -291,6 +333,11 @@ pub struct EvidenceGetArgs {
     /// A `blake3:<64 hex>` digest, as cited by an event's evidence_refs.
     #[arg(long, value_name = "DIGEST")]
     pub digest: String,
+    /// Return at most this many bytes, and say so. Absent returns all of
+    /// them. Under `--json` the document reports `truncated`; in human mode
+    /// the bytes are simply cut short, so the flag is how you know.
+    #[arg(long, value_name = "N")]
+    pub max_bytes: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -325,6 +372,25 @@ pub enum EvidenceLevelArg {
     None,
     Headers,
     Full,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum PortStateArg {
+    Open,
+    Closed,
+    Filtered,
+    Indeterminate,
+}
+
+impl From<PortStateArg> for bathy_types::event::PortState {
+    fn from(s: PortStateArg) -> Self {
+        match s {
+            PortStateArg::Open => Self::Open,
+            PortStateArg::Closed => Self::Closed,
+            PortStateArg::Filtered => Self::Filtered,
+            PortStateArg::Indeterminate => Self::Indeterminate,
+        }
+    }
 }
 
 impl From<PortPresetArg> for bathy_types::PortPreset {

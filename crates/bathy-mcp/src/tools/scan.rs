@@ -13,10 +13,9 @@ use bathy_types::tools::{
     ScanStatusInput, ScanStatusOutput,
 };
 
-use crate::engine::{
-    Authorization, AuthorizedScan, Denial, Runtime, estimated_runtime_seconds, load_manifest,
-    spawn_scan,
-};
+use bathy_plan::estimated_runtime_seconds;
+
+use crate::engine::{Authorization, AuthorizedScan, Denial, Runtime, load_manifest, spawn_scan};
 use crate::error::{ToolFailure, ToolResult, log_error, no_such_log, no_such_scan, store_error};
 
 // ---------------------------------------------------------------------------
@@ -25,7 +24,11 @@ use crate::error::{ToolFailure, ToolResult, log_error, no_such_log, no_such_scan
 
 /// Nothing on this path opens a socket: it loads a document, expands a plan
 /// and evaluates a policy. The emission path is not reachable from here.
-pub fn preview(input: ScanPreviewInput, runtime: &Runtime) -> ToolResult<ScanPreviewOutput> {
+///
+/// It takes the time rather than a [`Runtime`] because it needs nothing else
+/// from one, and opening a `Runtime` creates the state directory -- which a
+/// preview, whose whole promise is that it changes nothing, must not do.
+pub fn preview(input: ScanPreviewInput, now_rfc3339: &str) -> ToolResult<ScanPreviewOutput> {
     let manifest = load_manifest(&input.manifest_path)?;
     let scope_id = manifest.id();
     let request = input
@@ -34,7 +37,7 @@ pub fn preview(input: ScanPreviewInput, runtime: &Runtime) -> ToolResult<ScanPre
         .map_err(|e| ToolFailure::new(e.code, e.detail))?;
     let packets_per_second = request.budgets.maximum_packets_per_second;
 
-    match AuthorizedScan::authorize(manifest, request, &runtime.now())? {
+    match AuthorizedScan::authorize(manifest, request, now_rfc3339)? {
         Authorization::Approved(scan) => Ok(ScanPreviewOutput {
             policy_decision: PolicyDecisionTag::Approved,
             plan_hash: Some(scan.plan().hash()),
@@ -86,7 +89,11 @@ pub enum StartAdmission {
     Authorized(Box<AuthorizedScan>),
 }
 
-pub fn admit(input: &ScanStartInput, runtime: &Runtime) -> ToolResult<StartAdmission> {
+/// Decide whether a manifest authorizes this request. Opens nothing and
+/// creates nothing -- it takes the time rather than a [`Runtime`] so that a
+/// caller can refuse a scan before the state directory exists, which is what
+/// makes "a denied scan leaves no trace" true rather than tidy.
+pub fn admit(input: &ScanStartInput, now_rfc3339: &str) -> ToolResult<StartAdmission> {
     let manifest = load_manifest(&input.manifest_path)?;
     let request = input
         .request
@@ -94,7 +101,7 @@ pub fn admit(input: &ScanStartInput, runtime: &Runtime) -> ToolResult<StartAdmis
         .into_request(manifest.id(), manifest.ceiling())
         .map_err(|e| ToolFailure::new(e.code, e.detail))?;
 
-    match AuthorizedScan::authorize(manifest, request, &runtime.now())? {
+    match AuthorizedScan::authorize(manifest, request, now_rfc3339)? {
         Authorization::Approved(scan) => Ok(StartAdmission::Authorized(scan)),
         Authorization::Denied { denial, .. } => {
             Ok(StartAdmission::Denied(Box::new(ScanStartOutput {
@@ -108,12 +115,40 @@ pub fn admit(input: &ScanStartInput, runtime: &Runtime) -> ToolResult<StartAdmis
     }
 }
 
-/// Admit the scan into the store and begin it.
+/// Work an admission left for the caller to run.
 ///
-/// Called only after the approval gate has been satisfied, and only with an
-/// [`AuthorizedScan`], so neither check can be skipped by reaching this
-/// function directly.
-pub fn begin(authorized: AuthorizedScan, runtime: &Runtime) -> ToolResult<ScanStartOutput> {
+/// Present exactly when this call created the scan. A reused key produces
+/// `None`, which is the whole of the idempotency guarantee: the second caller
+/// gets the first scan's handle and starts nothing.
+pub struct Work {
+    pub scan_id: ScanId,
+    /// The plan index to start from. Zero for a start; the stored cursor for
+    /// a resume.
+    pub from_index: u64,
+    pub ledger: BudgetLedger,
+}
+
+/// What admitting a scan into the store produced.
+pub struct Admission {
+    /// The document both surfaces publish for this outcome.
+    pub output: ScanStartOutput,
+    pub work: Option<Work>,
+}
+
+/// Admit the scan into the store, and say what work that left.
+///
+/// Split out of [`begin`] because the two interfaces run the work
+/// differently and must not answer differently: the tool surface detaches a
+/// scheduler and returns, and the command surface runs to completion in the
+/// caller's own process (AC-5.12). Everything up to that point -- the
+/// idempotency decision, the status write, the stale-marker clear, and the
+/// document that reports all three -- is one implementation, so the two
+/// surfaces cannot drift on it.
+///
+/// Called only with an [`AuthorizedScan`], so the manifest check cannot be
+/// skipped by reaching this function directly; the approval gate is applied
+/// by `scan.start`'s caller, between authorization and here.
+pub fn admit_into_store(authorized: &AuthorizedScan, runtime: &Runtime) -> ToolResult<Admission> {
     let request_json = serde_json::to_string(authorized.request())
         .map_err(|e| ToolFailure::new("request_unserializable", e))?;
 
@@ -149,19 +184,42 @@ pub fn begin(authorized: AuthorizedScan, runtime: &Runtime) -> ToolResult<ScanSt
         status,
     };
 
-    if fresh {
+    let work = fresh.then(|| {
+        // Before any work begins, so a marker written for an earlier run of
+        // this scan cannot cancel this one on the watcher's first look.
         bathy_engine::cancel::clear(&runtime.state_dir, scan_id);
-        let ledger = BudgetLedger::new(authorized.request().budgets);
-        spawn_scan(runtime, authorized, scan_id, 0, ledger)?;
-    }
+        Work {
+            scan_id,
+            from_index: 0,
+            ledger: BudgetLedger::new(authorized.request().budgets),
+        }
+    });
 
-    Ok(ScanStartOutput {
-        policy_decision: PolicyDecisionTag::Approved,
-        handle: Some(handle),
-        reason_code: None,
-        detail: None,
-        reused: !fresh,
+    Ok(Admission {
+        output: ScanStartOutput {
+            policy_decision: PolicyDecisionTag::Approved,
+            handle: Some(handle),
+            reason_code: None,
+            detail: None,
+            reused: !fresh,
+        },
+        work,
     })
+}
+
+/// Admit the scan into the store and begin it, detached.
+pub fn begin(authorized: AuthorizedScan, runtime: &Runtime) -> ToolResult<ScanStartOutput> {
+    let admission = admit_into_store(&authorized, runtime)?;
+    if let Some(work) = admission.work {
+        spawn_scan(
+            runtime,
+            authorized,
+            work.scan_id,
+            work.from_index,
+            work.ledger,
+        )?;
+    }
+    Ok(admission.output)
 }
 
 // ---------------------------------------------------------------------------
@@ -179,6 +237,7 @@ pub fn status(input: ScanStatusInput, runtime: &Runtime) -> ToolResult<ScanStatu
     Ok(ScanStatusOutput {
         scan_id: record.scan_id,
         status: record.status,
+        estimated_targets: record.estimated_targets,
         units_completed,
         units_total: record.estimated_probes,
         packets_spent: record.packets_spent,
@@ -268,7 +327,21 @@ pub fn cancel(input: ScanCancelInput, runtime: &Runtime) -> ToolResult<ScanCance
 // scan.resume
 // ---------------------------------------------------------------------------
 
-pub fn resume(input: ScanResumeInput, runtime: &Runtime) -> ToolResult<ScanResumeOutput> {
+/// What preparing a resume produced: the document, and the work it left.
+pub struct Resumption {
+    pub output: ScanResumeOutput,
+    /// `None` when the scan had no unfinished units, which is the "already
+    /// complete" answer both surfaces return.
+    pub work: Option<(Box<AuthorizedScan>, Work)>,
+}
+
+/// Re-authorize a stopped scan and work out where it restarts.
+///
+/// Split from [`resume`] for the reason [`admit_into_store`] is split from
+/// [`begin`]: the re-authorization, the plan check, the cursor, the
+/// stale-marker clear and the document are one implementation, and only the
+/// running of the work differs between the two surfaces.
+pub fn prepare_resume(input: &ScanResumeInput, runtime: &Runtime) -> ToolResult<Resumption> {
     let manifest = load_manifest(&input.manifest_path)?;
     let record = record_for(&runtime.store, input.scan_id)?;
     let request: ScanRequest = serde_json::from_str(&record.request_json)
@@ -302,33 +375,64 @@ pub fn resume(input: ScanResumeInput, runtime: &Runtime) -> ToolResult<ScanResum
         .next_pending_unit(input.scan_id, total)
         .map_err(store_error)?
     else {
-        return Ok(ScanResumeOutput {
-            scan_id: input.scan_id,
-            status: record.status,
-            resumed_from_unit: total,
-            units_total: total,
-            resumed: false,
+        return Ok(Resumption {
+            output: ScanResumeOutput {
+                scan_id: input.scan_id,
+                status: record.status,
+                resumed_from_unit: total,
+                units_total: total,
+                resumed: false,
+            },
+            work: None,
         });
     };
 
+    // Before any work begins; see `admit_into_store`.
     bathy_engine::cancel::clear(&runtime.state_dir, input.scan_id);
     runtime
         .store
         .set_status(input.scan_id, TaskStatus::Running)
         .map_err(store_error)?;
 
+    // Seeded from the prior run's counters rather than reset: a resumed scan
+    // that got a fresh, unspent budget could exceed the ceiling an operator
+    // wrote down by cancelling and resuming.
     let ledger = BudgetLedger::resumed(
         authorized.request().budgets,
         record.packets_spent,
         record.elapsed_seconds,
     );
-    spawn_scan(runtime, *authorized, input.scan_id, from_index, ledger)?;
 
-    Ok(ScanResumeOutput {
-        scan_id: input.scan_id,
-        status: TaskStatus::Running,
-        resumed_from_unit: from_index,
-        units_total: total,
-        resumed: true,
+    Ok(Resumption {
+        output: ScanResumeOutput {
+            scan_id: input.scan_id,
+            status: TaskStatus::Running,
+            resumed_from_unit: from_index,
+            units_total: total,
+            resumed: true,
+        },
+        work: Some((
+            authorized,
+            Work {
+                scan_id: input.scan_id,
+                from_index,
+                ledger,
+            },
+        )),
     })
+}
+
+/// Re-authorize a stopped scan and continue it, detached.
+pub fn resume(input: ScanResumeInput, runtime: &Runtime) -> ToolResult<ScanResumeOutput> {
+    let resumption = prepare_resume(&input, runtime)?;
+    if let Some((authorized, work)) = resumption.work {
+        spawn_scan(
+            runtime,
+            *authorized,
+            work.scan_id,
+            work.from_index,
+            work.ledger,
+        )?;
+    }
+    Ok(resumption.output)
 }
