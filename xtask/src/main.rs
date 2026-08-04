@@ -288,6 +288,121 @@ fn find_pinned_dependency_prose_drift(root: &Path) -> Vec<String> {
     drift
 }
 
+// ---------------------------------------------------------------------------
+// The one deferred architecture move, registered mechanically (AC-5.39).
+// ---------------------------------------------------------------------------
+
+/// What the tree says about the ops layer and about feature-gating.
+///
+/// Plain data, like [`PackageInfo`], so [`find_deferred_move_violations`] can
+/// be handed synthetic facts. The rule is the part worth testing; the scrape
+/// is the part that has to read files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpsLayer {
+    /// `bathy` reaches into `bathy_mcp::{engine,tools}`, and those modules
+    /// are still in `bathy-mcp`. That is the arrangement the deferral is
+    /// about: a layer named for one of its two consumers.
+    shared_from_bathy_mcp: bool,
+    /// Every site that makes `serve mcp` -- or the dependency it fronts --
+    /// conditional on a cargo feature. Each is a human-readable location.
+    feature_gates: Vec<String>,
+}
+
+/// The condition the M5 exit review wrote down, as a check.
+///
+/// The overview records that `bathy_mcp::{engine,tools}` now serves both the
+/// command line and the MCP server, that the honest home for it is a crate
+/// below both, and that the move is deferred for v0.1 **with one trigger**:
+/// *if `serve mcp` is ever feature-gated, the ops layer must move rather than
+/// be duplicated back into `bathy`* -- because feature-gating it where it
+/// stands takes `scan status`, `result query` and `explain` out with it.
+///
+/// That trigger was prose, and this milestone built `ABSENCE_CLAIMS` on the
+/// finding that prose does not enforce itself: the README asserted three
+/// times that the MCP server did not exist yet, in the commit range that
+/// shipped it, and every check passed. A deferral nobody can be reminded of
+/// is a deferral that becomes permanent by default.
+///
+/// Two directions, and the second is why this is not just an `assert!`:
+///
+/// 1. The layer is still shared **and** something feature-gates it: the move
+///    is now due, and the message says what it is.
+/// 2. The layer is no longer shared: either the move happened or the sharing
+///    ended, and this registration is now checking nothing. A check that has
+///    quietly stopped applying is worse than no check, because it reads as
+///    coverage. It reports itself, naming what to delete.
+fn find_deferred_move_violations(ops: &OpsLayer) -> Vec<String> {
+    if !ops.shared_from_bathy_mcp {
+        return vec![
+            "`bathy` no longer reaches into `bathy_mcp::{engine,tools}`, or those \
+             modules have left `bathy-mcp`. The deferred move this check registers \
+             has either happened or become moot, so the check now guards nothing: \
+             delete `find_deferred_move_violations` and the deferral paragraph in \
+             docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md, and drop \
+             AC-5.39 with them"
+                .to_string(),
+        ];
+    }
+    ops.feature_gates
+        .iter()
+        .map(|site| {
+            format!(
+                "{site} makes `serve mcp` (or the crate it fronts) conditional on a \
+                 cargo feature, while the ops layer both surfaces use still lives in \
+                 `bathy-mcp`. That is the written trigger for the deferred move: the \
+                 ops layer (`bathy-mcp`'s `engine.rs` and `tools/`) must move to a \
+                 crate below both surfaces first, because gating it where it stands \
+                 takes `scan status`, `result query` and `explain` out with it. See \
+                 the deferral in docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md \
+                 and AC-5.39"
+            )
+        })
+        .collect()
+}
+
+/// Read [`OpsLayer`] out of the tree.
+fn scrape_ops_layer(root: &Path) -> OpsLayer {
+    let read = |relative: &str| std::fs::read_to_string(root.join(relative)).unwrap_or_default();
+
+    let mut uses_ops_layer = false;
+    let mut sources = Vec::new();
+    collect_files(root, &root.join("crates/bathy/src"), &mut sources);
+    for relative in &sources {
+        let text = read(relative);
+        if text.contains("bathy_mcp::tools") || text.contains("bathy_mcp::engine") {
+            uses_ops_layer = true;
+        }
+    }
+    let ops_layer_lives_in_bathy_mcp = root.join("crates/bathy-mcp/src/engine.rs").exists()
+        && root.join("crates/bathy-mcp/src/tools/mod.rs").exists();
+
+    let manifest = read("crates/bathy/Cargo.toml");
+    let mut feature_gates = Vec::new();
+    if manifest.contains("[features]") {
+        feature_gates.push("crates/bathy/Cargo.toml declares [features]".to_string());
+    }
+    for line in manifest.lines() {
+        if line.contains("bathy-mcp") && line.contains("optional") {
+            feature_gates
+                .push("crates/bathy/Cargo.toml makes bathy-mcp an optional dependency".to_string());
+        }
+    }
+    // `bathy` has no cargo features at all today, so any `cfg(feature = ...)`
+    // in its sources is new. Narrower rules -- looking only at `serve.rs`, or
+    // only for a feature named `mcp` -- would miss the gate being spelled
+    // some other way, and this one has no false positives to spend.
+    for relative in &sources {
+        if read(relative).contains("cfg(feature") {
+            feature_gates.push(format!("{relative} is compiled behind a cargo feature"));
+        }
+    }
+
+    OpsLayer {
+        shared_from_bathy_mcp: uses_ops_layer && ops_layer_lives_in_bathy_mcp,
+        feature_gates,
+    }
+}
+
 /// Report every difference between a pinned crate's real direct dependencies
 /// and its pinned set, in both directions -- an addition is a purity claim
 /// that quietly stopped being true, and a removal is documentation naming a
@@ -410,6 +525,9 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
     let mut violations = find_violations(&packages);
     violations.extend(find_pinned_dependency_drift(&packages));
     violations.extend(find_pinned_dependency_prose_drift(Path::new(".")));
+    violations.extend(find_deferred_move_violations(&scrape_ops_layer(Path::new(
+        ".",
+    ))));
 
     if violations.is_empty() {
         let sites: usize = PINNED_DEPENDENCIES
@@ -418,7 +536,7 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
             .sum();
         println!(
             "check-deps: ok ({} crates ranked, {} pinned dependency set(s), {sites} prose \
-             site(s) discovered and checked against them)",
+             site(s) discovered and checked against them, 1 deferred move registered)",
             count_ranked(&packages),
             PINNED_DEPENDENCIES.len(),
         );
@@ -1131,6 +1249,98 @@ mod tests {
         // satisfy a shorter prefix of it.
         assert!(!names_dependency("bathy-types-extra", "bathy-types"));
         assert!(names_dependency("`bathy-types`,", "bathy-types"));
+    }
+
+    // -----------------------------------------------------------------
+    // The deferred ops-layer move (AC-5.39).
+    // -----------------------------------------------------------------
+
+    fn ops(shared: bool, gates: &[&str]) -> OpsLayer {
+        OpsLayer {
+            shared_from_bathy_mcp: shared,
+            feature_gates: gates.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn feature_gating_serve_mcp_while_the_ops_layer_is_still_shared_is_refused() {
+        let found = find_deferred_move_violations(&ops(true, &["crates/bathy/Cargo.toml"]));
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("must move to a crate below both surfaces"));
+    }
+
+    #[test]
+    fn a_shared_ops_layer_that_nothing_gates_is_the_arrangement_v0_1_ships() {
+        assert!(find_deferred_move_violations(&ops(true, &[])).is_empty());
+    }
+
+    #[test]
+    fn the_registration_reports_itself_once_it_has_stopped_applying() {
+        // The vacuity direction. If `bathy` stops reaching into
+        // `bathy_mcp::{engine,tools}` -- because the move happened, or
+        // because the sharing ended some other way -- this check guards
+        // nothing, and a check that reads as coverage while guarding nothing
+        // is the failure mode the whole file is written against.
+        let found = find_deferred_move_violations(&ops(false, &[]));
+        assert_eq!(found.len(), 1);
+        assert!(found[0].contains("guards nothing"), "{}", found[0]);
+    }
+
+    #[test]
+    fn the_scrape_sees_the_sharing_this_repository_actually_has_and_no_gate() {
+        // Without this, every rule test above could be exercising a fact the
+        // scraper never produces: the premise of the whole registration is
+        // that `bathy` really does call into `bathy_mcp::tools` today.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let scraped = scrape_ops_layer(&root);
+        assert!(
+            scraped.shared_from_bathy_mcp,
+            "the ops layer is not shared any more; see \
+             `the_registration_reports_itself_once_it_has_stopped_applying`"
+        );
+        assert!(scraped.feature_gates.is_empty(), "{scraped:?}");
+    }
+
+    #[test]
+    fn the_scrape_finds_a_gate_however_it_is_spelled() {
+        for (relative, text) in [
+            (
+                "crates/bathy/Cargo.toml",
+                "[features]\nmcp = [\"dep:bathy-mcp\"]\n",
+            ),
+            (
+                "crates/bathy/Cargo.toml",
+                "[dependencies]\nbathy-mcp = { path = \"../bathy-mcp\", optional = true }\n",
+            ),
+            (
+                "crates/bathy/src/commands/serve.rs",
+                "#[cfg(feature = \"mcp\")]\nfn serve() {}\n",
+            ),
+        ] {
+            let root = scratch_dir("deferred-move");
+            // The arrangement the deferral is about, so the gate is the only
+            // thing that varies between these three cases.
+            write(&root, "crates/bathy-mcp/src/engine.rs", "// ops layer");
+            write(&root, "crates/bathy-mcp/src/tools/mod.rs", "// ops layer");
+            write(
+                &root,
+                "crates/bathy/src/commands/scope.rs",
+                "bathy_mcp::tools::scope::validate",
+            );
+            write(&root, relative, text);
+
+            let scraped = scrape_ops_layer(&root);
+            assert!(scraped.shared_from_bathy_mcp, "{relative}: {scraped:?}");
+            assert!(
+                !scraped.feature_gates.is_empty(),
+                "{relative} spells a feature gate that the scrape does not see: {text}"
+            );
+            assert_eq!(
+                find_deferred_move_violations(&scraped).len(),
+                scraped.feature_gates.len()
+            );
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     #[test]
