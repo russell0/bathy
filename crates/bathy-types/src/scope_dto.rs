@@ -5,19 +5,30 @@ use crate::ids::ScopeId;
 use crate::nonempty::NonEmpty;
 use crate::request::Budgets;
 
-/// Wire/schema mirror of `bathy_scope::manifest::ScopeManifest`'s on-disk
-/// JSON form.
+/// The on-disk JSON form of a scope manifest: the document that decides which
+/// addresses a scan is authorized to touch.
 ///
-/// Lives here, not in `bathy-scope`, purely so `bathy_types::schema::all()`
-/// can publish `scope-manifest.json` without `bathy-types` -- a
-/// zero-internal-dependency, pure contract crate -- taking on `ipnet`'s
-/// CIDR-parsing behavior as a dependency. Accordingly, `allowed_cidrs` and
-/// `denied_cidrs` are plain strings here, not `ipnet::IpNet`: this type
-/// describes the wire *shape*, it does not validate that each string is a
-/// syntactically valid CIDR (that validation, and the reserved-range and
-/// deny-beats-allow policy `ScopeManifestDto` deliberately says nothing
-/// about, live in `bathy_scope::manifest::ScopeManifest::load`, which is the
-/// only code path that may ever decide whether a packet is authorized).
+/// This describes the wire *shape* only. `allowed_cidrs` and `denied_cidrs`
+/// are plain strings, and a document that validates against this schema may
+/// still be refused when it is loaded -- a string that is not a syntactically
+/// valid CIDR, a range that is reserved, and an expiry already past are all
+/// decided there, not here. Deny always beats allow, regardless of
+/// specificity.
+// The rest of the rationale is deliberately in `//` comments, not `///` ones:
+// schemars copies doc comments on a wire type into `schemas/*.json` as
+// `description`, and that file is the contract agents read. Where this type
+// lives in the workspace, and why, is a maintainer's concern, not a caller's.
+// `xtask check-schemas` fails on a leak (see `xtask/src/prose.rs`).
+//
+// It lives in `bathy-types` rather than in `bathy-scope` so that
+// `scope-manifest.json` can be published without this crate -- which has no
+// internal dependencies and is pure contract -- taking on `ipnet`'s
+// CIDR-parsing behavior. That is also why the CIDR fields are `String` and
+// not `ipnet::IpNet`. The validation this type does not do, and the
+// reserved-range and deny-beats-allow policy it says nothing about, live in
+// `bathy_scope::manifest::ScopeManifest::load`, which is the only code path
+// that may ever decide whether a packet is authorized.
+//
 // Deliberately a `//` comment, not a `///` one: schemars copies doc
 // comments on a wire type into `schemas/*.json` as `description`, and
 // that file is the contract agents read. How the Rust type enforces
@@ -32,10 +43,11 @@ use crate::request::Budgets;
 // one allowed CIDR" rule independently via its own explicit empty check,
 // since `ScopeManifest::load` does not deserialize through this DTO at
 // all -- keep both in sync by hand if the rule ever changes.
-/// This type is a schema/documentation artifact, not part of any runtime
-/// authorization path. `bathy_scope::manifest::ScopeManifest` is the sole
-/// authority on what a manifest means; this mirror must be kept in sync
-/// with it by hand.
+//
+// Also `//`, for the same reason: this type is a schema/documentation
+// artifact and is on no runtime authorization path.
+// `bathy_scope::manifest::ScopeManifest` is the sole authority on what a
+// manifest means; this mirror must be kept in sync with it by hand.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ScopeManifestDto {
@@ -50,16 +62,18 @@ pub struct ScopeManifestDto {
     // only and adds no new runtime parsing.
     #[schemars(extend("format" = "date-time"))]
     pub not_after: String,
-    /// CIDR strings, e.g. `"10.30.0.0/24"`. Parsed and validated by
-    /// `bathy-scope` at load time, not by this type.
+    /// CIDR strings, e.g. `"10.30.0.0/24"`. Parsed and validated when the
+    /// manifest is loaded, not by this schema.
     pub allowed_cidrs: NonEmpty<String>,
     /// CIDR strings. Deny always beats allow, regardless of specificity.
     #[serde(default)]
     pub denied_cidrs: Vec<String>,
     pub budget_ceiling: Budgets,
     /// Reserved for v0.2 detached-signature verification; accepted on the
-    /// wire but NOT cryptographically verified by this version. See
-    /// `bathy_scope::manifest::ScopeManifest::signature_verified`.
+    /// wire but NOT cryptographically verified by this version.
+    // The runtime side of that promise is
+    // `bathy_scope::manifest::ScopeManifest::signature_verified`, which is a
+    // maintainer's reference and not a caller's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
 }

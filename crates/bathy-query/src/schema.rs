@@ -118,58 +118,12 @@ mod tests {
         }
     }
 
-    #[test]
-    fn no_published_description_carries_maintainer_prose() {
-        // A published `description` is contract text an agent reads. Rust doc
-        // comments become exactly that, so the moment M5 Task 2 made these
-        // types serializable, every `///` on them turned into a promise --
-        // including the ones that cite source files, test names, plan
-        // criteria and superseded revisions.
-        //
-        // This is the M5 Task 1 `$defs` sweep's rule (`///` for prose an
-        // agent needs, `//` for prose a maintainer needs), enforced by a test
-        // rather than by a reviewer with a regex, because the same leak
-        // recurred here the first time these types were serialized. Scoped to
-        // this crate's own descriptions is not possible -- a leak anywhere in
-        // a document we publish is ours -- so it runs over everything the two
-        // schemas contain, `bathy-types`' shared `$defs` included.
-        const MARKERS: &[&str] = &[
-            ".rs", "crate::", "AC-", "Task ", "schemars", "serde", "#[", "impl ", "()", "_v1",
-        ];
-
-        fn walk(node: &Value, path: &str, found: &mut Vec<String>) {
-            match node {
-                Value::Object(map) => {
-                    if let Some(Value::String(description)) = map.get("description") {
-                        for marker in MARKERS {
-                            if description.contains(marker) {
-                                found.push(format!("{path}: contains {marker:?}: {description}"));
-                            }
-                        }
-                    }
-                    for (key, value) in map {
-                        walk(value, &format!("{path}/{key}"), found);
-                    }
-                }
-                Value::Array(items) => {
-                    for (index, value) in items.iter().enumerate() {
-                        walk(value, &format!("{path}/{index}"), found);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut found = Vec::new();
-        for (name, schema) in all() {
-            walk(&schema, name, &mut found);
-        }
-        assert!(
-            found.is_empty(),
-            "maintainer prose reached the published contract:\n{}",
-            found.join("\n")
-        );
-    }
+    // The "no maintainer prose in a published `description`" check used to
+    // live here, as `no_published_description_carries_maintainer_prose`, and
+    // walked this crate's two schemas only -- two of the six documents in
+    // `schemas/`, one of which (`scope-manifest.json`) was leaking at the
+    // time. It now lives in `xtask/src/prose.rs` and runs over every file in
+    // `schemas/` as part of `check-schemas`. One mechanism, six documents.
 
     #[test]
     fn the_fold_schema_documents_the_duplicate_sequence_ordering() {

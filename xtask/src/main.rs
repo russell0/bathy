@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod prose;
 mod readme;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -175,15 +176,34 @@ fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
-    let drift = diff_or_write(&schemas, Path::new("schemas"), write)?;
-    if drift.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    let dir = Path::new("schemas");
+    let drift = diff_or_write(&schemas, dir, write)?;
+
+    // Over every file in the directory, in both modes: a published
+    // `description` is contract text an agent reads, and `emit-schemas` must
+    // not be able to launder a leaked doc comment into the tree either. See
+    // `prose`'s module documentation for why this is not a unit test in the
+    // crate that generates the document.
+    let leaks = prose::check_dir(dir)?;
+
+    let mut problems = Vec::new();
+    if !drift.is_empty() {
+        problems.push(format!(
             "schema drift in: {}. Run `cargo run -p xtask -- emit-schemas` and commit.",
             drift.join(", ")
-        )
-        .into())
+        ));
+    }
+    if !leaks.is_empty() {
+        problems.push(format!(
+            "maintainer prose reached a published contract -- make the doc comment a `//` \
+             comment, or rewrite it as contract text:\n{}",
+            leaks.join("\n")
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("\n").into())
     }
 }
 
