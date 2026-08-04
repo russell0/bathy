@@ -7,14 +7,43 @@ use crate::confidence::Confidence;
 use crate::ids::{Digest, ScanId};
 use crate::nonempty::NonEmpty;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// `Ord` is derived, and it is load-bearing rather than incidental:
+// `bathy-query`'s `ScanFold` keys a `BTreeMap` on `(IpAddr, Endpoint)`
+// specifically so that iteration order over a scan's results is total and
+// stable, which is what makes a fold byte-reproducible and a diff of two
+// folds free of phantom reorderings. A `BTreeMap` cannot be keyed on a type
+// with no `Ord`, so without this derive the whole query layer would have to
+// fall back to a `HashMap` and give up determinism. The derived order is
+// declaration order (`Tcp` before `Udp`); it is a stable sort key, not a
+// statement that TCP ranks above UDP in any domain sense. Pinned by
+// `transport_orders_by_declaration_order` below so a reordering of these
+// variants -- which would silently permute every consumer's output -- fails
+// a test rather than passing review.
+//
+// Deliberately a `//` comment, not a `///` doc comment: schemars copies doc
+// comments on a wire type into that type's published JSON Schema as
+// `description`, and `schemas/*.json` is the contract agents read. Internal
+// rationale about why a Rust trait is derived does not belong in it -- see
+// the drift `xtask check-schemas` reported when this text was first written
+// as a doc comment. Doc comments here are for prose an agent needs (e.g.
+// `PortState`'s, below); `//` is for prose a maintainer needs.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "lowercase")]
 pub enum Transport {
     Tcp,
     Udp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+// See `Transport` above for why `Ord` is derived here, and for why this is a
+// `//` comment rather than a `///` one. Field order matters to the derived
+// `Ord`: `transport` first, then `port`, so endpoints group by transport and
+// then ascend by port -- the order an operator reading a port list expects.
+// Pinned by `endpoints_order_by_transport_then_port`.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(deny_unknown_fields)]
 pub struct Endpoint {
     pub transport: Transport,
@@ -879,5 +908,37 @@ mod tests {
             Some("string"),
             "schema was {value:#}"
         );
+    }
+
+    // --- The derived total order on `Transport`/`Endpoint`. Derived for
+    // `bathy-query`'s `BTreeMap<(IpAddr, Endpoint), _>` key; see those types'
+    // own doc comments. The two tests below exist because a derived `Ord` is
+    // silently defined by *source order* -- swapping two enum variants or two
+    // struct fields is a one-line diff that reviews as cosmetic and permutes
+    // every downstream consumer's output. ---
+
+    #[test]
+    fn transport_orders_by_declaration_order() {
+        assert!(Transport::Tcp < Transport::Udp);
+    }
+
+    #[test]
+    fn endpoints_order_by_transport_then_port() {
+        let tcp = |port| Endpoint {
+            transport: Transport::Tcp,
+            port,
+        };
+        let udp = |port| Endpoint {
+            transport: Transport::Udp,
+            port,
+        };
+        // Transport dominates: every TCP endpoint sorts before every UDP one,
+        // even one with a far lower port.
+        assert!(tcp(65535) < udp(1));
+        // Within one transport, ports ascend numerically.
+        assert!(tcp(80) < tcp(443));
+        let mut sorted = vec![udp(53), tcp(443), tcp(80), udp(5353)];
+        sorted.sort();
+        assert_eq!(sorted, vec![tcp(80), tcp(443), udp(53), udp(5353)]);
     }
 }
