@@ -323,6 +323,14 @@ Two things the encoding must decide explicitly, both inherited from Task 1:
 
   1. **`serve mcp` is Task 4's, not Task 3's.** It cannot be implemented before `bathy-mcp` exists, and a subcommand that parses and then reports "not implemented" is a stub of exactly the kind this crate spent a milestone deliberately not shipping (see the `[[bin]]` note in its own `Cargo.toml`). Task 4 adds it, in the commit that adds the server it fronts.
   2. **`--scope` takes a PATH, not `PATH|ID`.** v0.1 has no manifest registry for an id to be resolved against — `ScopeManifest::load` reads a document and nothing indexes documents by `ScopeId`. Accepting an id-shaped string would open it as a filename and fail with a confusing I/O error. This becomes `PATH|ID` when a registry exists, not before.
+
+     **Propagated to Task 4 and Task 5 in the Task 3 fix round**, which the original edit failed to do. Task 4's contract table said `scope.validate` takes `{ scope_id | manifest_json, … }` and Task 5's Step-1 literal passed `scope_id`, and **neither shape is expressible through the CLI** — so the architectural premise Task 4's thin-adapter design rests on ("anything the MCP server can do, the CLI can do") was not satisfiable for that tool as the two documents stood. The rulings, now written into Task 4's contract table:
+
+     - **A scope is named by a path, in both surfaces.** `scope.validate` takes `{ manifest_path, targets[] }`; `scan.preview`/`scan.start` take `{ manifest_path, request: ScanRequest }`. The server loads the document exactly as `--scope <PATH>` does and fills `ScanRequest::authorization_scope_id` from the manifest it loaded, refusing rather than reconciling if the caller supplied a different one. `ScanRequest` itself is unchanged: `authorization_scope_id` is the *identity* of the manifest that authorized the scan — it is hashed into the plan and recorded on every event — and was never a lookup key.
+     - **`manifest_json` is rejected, not deferred.** It is not a missing feature waiting on a registry. The manifest is the authorization document, and an inline one lets the caller *author its own authorization* — an agent could mint a manifest allowing whatever it wanted to scan and pass it in the same call. Deny-by-default means the allow set arrives out of band, from an operator, as a file the agent did not write. A tool that accepts an inline manifest is a scope bypass with a JSON field for a door, and is the same class of defect as M3's unconsulted emission path. Making the CLI accept one too would propagate the hole rather than close it.
+     - **A manifest registry is not v0.1.** No milestone owns one, and none should: it is a naming and lifecycle system for authorization documents (who may register one, how they expire, how a stale id is refused), which is a design problem in its own right and not a convenience wrapper over `load`. When it lands — post-v0.1, unscheduled — `manifest_path` gains a `scope_id` sibling in the CLI and the MCP surface **in the same commit**, because a resolution rule that exists in one surface and not the other is exactly the divergence this note was written to fix.
+
+     Pinned by **AC-5.38**, so this stays a property of the shipped tool surface rather than a paragraph in a plan.
   3. **A usage error must not exit 2.** `clap`'s own `Error::exit` uses status 2, which this plan assigns to *policy denial* — so a typo would be indistinguishable from an authorization refusal to the agent this exit-code table exists for. The CLI therefore parses with `try_parse` and maps usage errors to 1 (operational), and `--help`/`--version` to 0. Any future argument parser has to make the same choice; it is a property of the exit-code table, not of `clap`.
   4. **`scan start` prints the handle and then keeps running.** AC-5.12 says it "returns a `TaskHandle` immediately and does not block until completion". A CLI process has nowhere to leave a running scan — there is no daemon in v0.1 — so "immediately" is discharged as: the handle is written and flushed to stdout before the scheduler is constructed, and the scan then continues in the same process until it finishes. `scan status`, `scan events --follow` and `scan cancel` all work against it from other processes meanwhile. The alternative reading (print a handle, exit, leave the scan unstarted) would make `scan start` not scan.
 
@@ -586,17 +594,19 @@ Tool contracts:
 
 | Tool | Input | Output |
 |---|---|---|
-| `scope.validate` | `{ scope_id \| manifest_json, targets[] }` | `{ decision, reason_code?, detail?, in_scope_count, out_of_scope[] }` |
-| `scan.preview` | `ScanRequest` | `{ plan_hash, estimated_targets, estimated_probes, policy_decision, reason_code?, estimated_runtime_seconds }` |
-| `scan.start` | `ScanRequest` | `TaskHandle` (in `structuredContent`) · or `{ policy_decision: "denied", reason_code, detail }` · or an MRTR `InputRequiredResult` (`resultType: "input_required"`) carrying an embedded `elicitation/create` plus an authenticated `requestState` |
+| `scope.validate` | `{ manifest_path, targets[] }` | `{ decision, reason_code?, detail?, in_scope_count, out_of_scope[] }` |
+| `scan.preview` | `{ manifest_path, request: ScanRequest }` | `{ plan_hash, estimated_targets, estimated_probes, policy_decision, reason_code?, estimated_runtime_seconds }` |
+| `scan.start` | `{ manifest_path, request: ScanRequest }` | `TaskHandle` (in `structuredContent`) · or `{ policy_decision: "denied", reason_code, detail }` · or an MRTR `InputRequiredResult` (`resultType: "input_required"`) carrying an embedded `elicitation/create` plus an authenticated `requestState` |
 | `scan.status` | `{ scan_id }` | `{ status, units_completed, units_total, packets_spent, last_sequence, plan_hash }` |
 | `scan.events` | `{ scan_id, after_sequence, limit }` | `{ events[], next_cursor, has_more }` |
 | `scan.cancel` | `{ scan_id }` | `{ status, units_completed, resumable: bool }` |
-| `scan.resume` | `{ scan_id }` | `{ status, resumed_from_unit }` |
+| `scan.resume` | `{ manifest_path, scan_id }` | `{ status, resumed_from_unit }` |
 | `result.query` | `{ scan_id, filter: { state?, service?, min_confidence?, port_range? } }` | `{ endpoints[], total }` |
 | `result.diff` | `{ before_scan_id, after_scan_id, include_confidence_only: bool }` | `ScanDiff` |
 | `evidence.get` | `{ digest, max_bytes? }` | `{ bytes (base64), length, truncated }` |
 | `fingerprint.explain` | `{ rule_id }` | `{ rule_id, service, specificity, rationale, source }` |
+
+**`manifest_path`, in all four tools that name a scope, is the same input `--scope <PATH>` takes** — corrected in the Task 3 fix round, where the table still read `scope_id | manifest_json` and `scan.resume` named no scope at all despite `bathy scan resume` requiring one. The reasoning is under Task 3's plan edit #2: there is no registry for an id to resolve against, an inline manifest would let the caller author its own authorization, and a tool the CLI cannot express breaks the premise that makes this server a thin adapter. `ScanRequest::authorization_scope_id` is filled by the server from the manifest it loaded — it is the manifest's identity, not a lookup key — and a caller that supplies a conflicting one is refused rather than reconciled. Pinned by AC-5.38.
 
 `result.diff` returns `ScanDiff`, and its `outputSchema` **must be `schemas/scan-diff.json` itself** — the committed, drift-checked document M5 Task 2 published — not a shape re-derived in this crate. Two spellings of one contract is the specific failure the encoding was designed a task early to avoid, and a tool schema that drifts from the committed one is that failure with a version-skew delay on it. Its tool `description` must also name the budget case from AC-5.37 explicitly: an agent choosing between "nothing changed" and "we could not tell" needs to know that a rate-limit change alone produces the second.
 
@@ -636,6 +646,7 @@ git commit -m "feat(mcp): eleven typed tools with task handles and human approva
   2. `result.diff`'s tool description says the same thing in the words an agent reads before calling it, asserted against the advertised tool rather than against a doc comment. **Task 4 owns this.**
 
   The durable fix, and the reason this is a criterion rather than a note: `bathy-plan` already canonicalizes `expanded_targets`/`resolved_ports` inside the hashed document, so emitting a separate **coverage digest** alongside `plan_hash` on `scan.started` would let the diff compare what was *looked at* rather than which plan was *authorized*, and `CoverageDiffers` would stop firing on a budget tweak entirely. That is additive — a new field on one event and one more folded value — and is the v0.2 remedy unless Task 4 finds it cheap enough to do here. It is written as a criterion rather than as prose in a report for the same reason AC-5.33 exists: a requirement that lives only in a report gets re-derived under time pressure, and this one was found by a reviewer, not by a test.
+- **AC-5.38** **Every tool that names a scope names it the way the CLI does, and no tool accepts an inline manifest.** Asserted over the published input schemas: every scope-taking tool (`scope.validate`, `scan.preview`, `scan.start`, `scan.resume`) has a `manifest_path` property, and **no** tool's input schema anywhere contains a property named `manifest_json`, `manifest`, `scope_manifest`, `scope_id` or `allowed_cidrs`. This is AC-5.14's shape — a test over every published schema, asserting an absence — and it exists for the same reason: the premise that the MCP server can do nothing the CLI cannot is what makes this surface auditable from a shell, and it is a premise that decays silently. The `manifest_json` half is an authorization boundary, not a convenience: a caller that can pass a manifest can authorize itself, which is why the absence is asserted rather than the presence of a validation step. Added in the Task 3 fix round; see Task 3's plan edit #2 for the full ruling.
 - **AC-5.32** The shipped server speaks stdio. Nothing in the crate implements the deprecated HTTP+SSE transport, depends on `Mcp-Session-Id`, or assumes SSE resumability.
 
 **Open decision for the implementer to make and justify:** whether to *also* advertise `io.modelcontextprotocol/tasks` alongside the bespoke `scan.status`/`scan.cancel` tools, so an agent host that understands only the standard Tasks extension still gets task semantics. The spec sanctions either. Recommendation: defer to M7 and record the deferral — eleven tools is a published contract and the extension is additive — but say whether shipping without it materially narrows who can drive bathy.
@@ -661,7 +672,10 @@ async fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
     let s = lab_server().await;
     let mut calls = 0;
 
-    let validated = s.call("scope.validate", json!({"scope_id": LAB_SCOPE, "targets": ["10.30.0.0/29"]})).await.unwrap();
+    // `manifest_path`, not `scope_id`: there is no registry to resolve an id
+    // against, and `--scope <PATH>` is what the CLI takes. See Task 3's plan
+    // edit #2 and AC-5.38. `lab_request()` carries the same path.
+    let validated = s.call("scope.validate", json!({"manifest_path": LAB_SCOPE_PATH, "targets": ["10.30.0.0/29"]})).await.unwrap();
     calls += 1;
     assert_eq!(validated["decision"], "approved");
 
@@ -736,7 +750,7 @@ git commit -m "test(mcp): the ten-call authorized inventory workflow, as an exec
 ## Milestone Exit Criteria
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` and `check-schemas` clean.
-- [ ] AC-5.1 through AC-5.37 each demonstrated by a named passing test.
+- [ ] AC-5.1 through AC-5.38 each demonstrated by a named passing test.
 - [ ] `bathy serve mcp` connects to a real MCP client and lists eleven tools.
 - [ ] `docs/protocol-notes.md` exists and names the verified spec revision.
 - [ ] **This milestone ships the agent-facing product.** Tag `v0.1.0-beta.1`.
