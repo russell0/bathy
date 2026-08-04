@@ -4,6 +4,7 @@ mod gates;
 mod phrases;
 mod prose;
 mod readme;
+mod visibility;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -60,6 +61,14 @@ const SUBCOMMANDS: &[&str] = &[
     // and `test --workspace` do not reach it. This is the command that does.
     "check-fuzz-crate",
     "check-ci",
+    // The two commands that answer questions the working tree cannot. Neither
+    // is a `ci.yml` step: `check-ci-status` asks GitHub what CI said (asking
+    // that from inside CI is circular), and `linux-gate` runs CI's own `test`
+    // job in a container (running that on the runner would be CI in CI). They
+    // are listed here because `check-ci` validates `ci.yml` against this list
+    // and because `usage:` should name every command that exists.
+    "check-ci-status",
+    "linux-gate",
     "publish-check",
     "emit-schemas",
     "gen-ports",
@@ -98,6 +107,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             gates::run_fuzz(seconds, flag_value(&args, "--target"))
         }
         Some("check-ci") => gates::check_ci(SUBCOMMANDS),
+        Some("check-ci-status") => visibility::check_ci_status(),
+        Some("linux-gate") => visibility::linux_gate(),
         Some("publish-check") => gates::publish_check(),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
         None => Err(format!("usage: xtask <{}>", SUBCOMMANDS.join("|")).into()),

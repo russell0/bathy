@@ -90,6 +90,27 @@ record passed the whole suite; and two RFC quotations turned out to be
 fabricated — plausible sentences, in quotation marks, asserting something
 stronger than the document said. Each of those now has a test that dies.
 
+### Running the gates, including the ones that are not local
+
+Every gate above is `cargo run -p xtask -- check-<something>` over the working
+tree. Two things that are not in the working tree need their own commands, and
+both exist because CI's `test` job was red on 17 consecutive pushes over five
+days while every local command was green:
+
+- `cargo run -p xtask -- check-ci-status` asks GitHub what CI actually
+  concluded, **for the commit you are on**. It fails on a red run, and equally
+  on a green run for an older commit — the branch this was written on had
+  thirteen unpushed commits, so a green badge would have described code nobody
+  was working on.
+- `cargo run -p xtask -- linux-gate` runs `ci.yml`'s own `test` job steps —
+  read out of `ci.yml`, not restated — inside a Linux container over this
+  working tree, as your own uid rather than as root. Linux is this project's
+  primary target and macOS is best-effort, but development happens on macOS,
+  and the two failures that went unnoticed were invisible there: one assertion
+  was `#[cfg(target_os = "linux")]` and so never compiled locally, and two test
+  fixtures depended on the kernel handing out ephemeral ports in ascending
+  order, which macOS does and Linux does not.
+
 ## Authorized use
 
 bathy is built for scanning networks you are authorized to scan. Every scan requires
