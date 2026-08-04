@@ -675,7 +675,7 @@ git commit -m "feat(interpret): pure rule engine with confidence ladder and cite
 - **AC-4.10** `interpret` is pure: `bathy-interpret`'s dependency tree contains no async runtime, no filesystem access, and no clock. Asserted in CI.
 - **AC-4.11** Confidence comes from a single declared ladder; product+version outranks product-only outranks protocol-only. No magic numbers in match arms.
 - **AC-4.12** Every `Interpretation` carries a `rule_id`, a `matched_span` indexing real bytes of the response, and a rationale. `explain(rule_id)` returns documentation for every rule that can fire. **Assert the cited slice CONTENT for every rule, not just one** — a span-shifting mutation in any rule that lacks a content assertion survives silently, and a property test that only checks `end <= len` cannot catch an off-by-one that still lands in bounds.
-- **AC-4.20** Any property test over arbitrary bytes must be INSTRUMENTED to prove it reaches the code it claims to cover. A naive `any::<u8>()` strategy measured 6 non-empty results in 4096 cases and zero spans past offset 6 — it never reached the offset arithmetic in a single real rule and could not fail. Report the non-empty and deep-span counts.
+- **AC-4.25** Any property test over arbitrary bytes must be INSTRUMENTED to prove it reaches the code it claims to cover. A naive `any::<u8>()` strategy measured 6 non-empty results in 4096 cases and zero spans past offset 6 — it never reached the offset arithmetic in a single real rule and could not fail. Report the non-empty and deep-span counts.
 - **AC-4.13** Unrecognized input yields an empty vector. Interpretation never guesses a service.
 - **AC-4.14** `interpret` returns byte-identical results for identical input, and its output ordering is total and stable.
 - **AC-4.15** `interpret` does not panic on any input: empty, all-zero, all-`0xff`, and non-UTF-8 bytes at multiple lengths. Reinforced by a fuzz target in M7.
@@ -853,12 +853,38 @@ git commit -m "feat(engine): service identification with evidence stored before 
 - **AC-4.23** `evidence_level: none` stores no blobs and consequently emits no `service.observed` — a direct consequence of `NonEmpty<Digest>`, not a special case.
 - **AC-4.24** Probe packets are charged to the same `BudgetLedger` as connect probes; a budget of 3 permits at most 3 total emissions.
 
+**Added after Task 5's review — every one of these was a real defect, found by
+execution, in code that had already passed its task review:**
+
+- **AC-4.26** Probe reconnects are **paced by the rate limiter**, not merely charged to the ledger. Charging without `limiter.acquire` made `maximum_packets_per_second` — an *authorization* term that `bathy_scope::policy` refuses requests for exceeding — unenforced on the probe path. Measured before the fix: 2 packets at 1 pps completed in 24 ms. The acquire must additionally sit inside a `select!` against the cancellation token, or a cancelled scan blocks waiting for a token it will never use.
+- **AC-4.27** Cancellation stops **new probe traffic**, not just new units. `record` runs from an unconditional drain loop, so a `detect_service` with no cancellation token opened a second connection and wrote 135 real bytes after cancel. The converse is equally a bug: the already-paid-for connect probe must still be drained (M3 invariant 2). Both halves need pinning in one test.
+- **AC-4.28** Stored evidence bytes are asserted to be **exactly the bytes that justified the finding**, the `evidence_level` caps are asserted at their exact values (8 KiB / 64 KiB), and `intensity` is asserted to bound the number of probe candidates attempted. Before these, replacing the evidence with `b"not the response"`, setting both caps to `1`, and hardcoding `intensity = 9` each survived the entire 91-test suite.
+
+**Tracked follow-up (M5) — cancelled identification is lost permanently and invisibly.**
+Ruled IMPORTANT by the Task 5 re-review, reproduced against
+`resuming_a_cancelled_scan_identifies_the_untouched_endpoint_without_re_probing`.
+A unit whose connect probe completes but whose `detect_service` is cut off by
+cancellation is recorded in `completed_units` — which keys off connect
+completion alone — so invariant 3 ("resumption never re-probes") skips it on
+every future resume. The operator paid for that packet, resumes specifically to
+finish the work, and silently never gets the identification. `RunSummary` has no
+per-unit field and `EventBody` has no variant distinguishing "identification ran
+and found nothing" from "identification never ran", so a `port.state = Open`
+with no following `service.observed` is byte-for-byte identical in both cases —
+undetectable by any consumer, human or automated. Not CRITICAL: no unauthorized
+traffic, no safety violation. But cancel-then-resume is a first-class, tested
+operation here, not an edge case, and the result is a permanent false negative
+indistinguishable from a true one. **Fix in M5 by recording per-unit
+identification status separately from connect completion**, so resumption can
+re-drive identification without re-probing reachability. Not closable as an
+inline test comment.
+
 ---
 
 ## Milestone Exit Criteria
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` clean.
-- [ ] AC-4.1 through AC-4.24 each demonstrated by a named passing test.
+- [ ] AC-4.1 through AC-4.28 each demonstrated by a named passing test.
 - [ ] `cargo tree -p bathy-interpret` shows no async runtime and no I/O crates.
 - [ ] The replay corpus passes with the network genuinely denied, proving interpretation needs no network. On Linux: `unshare -rn cargo test -p bathy-interpret`. **On macOS use `sandbox-exec`**, which works and needs no SIP changes, no sudo, and no `dtruss`:
 
