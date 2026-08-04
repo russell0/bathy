@@ -118,6 +118,20 @@ mod tests {
             "Change",
             "Undetermined",
         ];
+        // The `hits > 0` sweep at the bottom is built *from* `OURS`, so it is
+        // vacuous in exactly the way `OURS` is: an empty list gives an empty
+        // `seen` and the guard iterates zero times too. A guard derived from
+        // the thing it guards is not a guard. This crate publishes two
+        // documents and the six types below are their whole membership; the
+        // number is stated here so shortening the list fails rather than
+        // narrowing the check.
+        assert_eq!(
+            OURS.len(),
+            6,
+            "this crate publishes six types of its own; a shorter list silently \
+             stops checking the ones that were removed from it, and the `hits > 0` \
+             sweep below cannot see that because it is derived from this list"
+        );
         let mut seen: BTreeMap<&str, usize> = OURS.iter().map(|n| (*n, 0)).collect();
 
         for (file, schema) in all() {

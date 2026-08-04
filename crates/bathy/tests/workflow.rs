@@ -682,6 +682,19 @@ fn the_inventory_workflow_parses_no_prose_and_builds_no_command_line() {
         ("[\"content\"]", "reading the text mirror"),    // [forbidden-token]
         ("server.call(", "the harness reads the mirror there"), // [forbidden-token]
     ];
+    // `checked` is incremented inside the loop over `FORBIDDEN`, so
+    // `checked == FORBIDDEN.len()` is `0 == 0` on an empty list -- the guard
+    // is derived from the thing it guards and cannot see it disappear. The
+    // M5 close-out review found this shape in `bathy-types`; it is here too,
+    // one layer more expensive, because AC-5.25 is closed by this test alone.
+    // Seven tokens, four families (XML, prose splitting, command lines, the
+    // text mirror); the literal is what makes deleting one fail.
+    assert_eq!(
+        FORBIDDEN.len(),
+        7,
+        "the forbidden-token list was shortened; the `checked` count below is \
+         computed from it and will still agree with itself"
+    );
     let source = include_str!("workflow.rs");
     let mut checked = 0usize;
     for (token, why) in FORBIDDEN {

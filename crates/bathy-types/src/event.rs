@@ -805,6 +805,20 @@ mod tests {
 
     #[test]
     fn an_added_field_is_optional_in_every_direction() {
+        // The register is the mechanism `docs/event-log-compatibility.md` §3
+        // names as enforcement, and a loop over an empty register enforces
+        // nothing while still reporting `ok`. The M5 close-out review emptied
+        // it and this test passed. `xtask/src/phrases.rs` already gets this
+        // right twice -- `the_repository_itself_passes_every_rule` asserts
+        // `scanned > 0` first, and `every_rule_without_exception_honours_the_sentinel`
+        // asserts `offending.len() == RULES.len()` -- and this file did not.
+        assert!(
+            !FIELDS_ADDED_AFTER_THE_LOG_EXISTED.is_empty(),
+            "the register is empty, so the loop below checks nothing and this test \
+             passes without exercising a single field. `rule_id` (bd386e9) is the \
+             one entry there has ever been; if it was removed, the compatibility \
+             policy lost its enforcement rather than its subject matter."
+        );
         for (event_type, spelling) in FIELDS_ADDED_AFTER_THE_LOG_EXISTED {
             assert_eq!(
                 *event_type, "service.observed",

@@ -1245,6 +1245,25 @@ identification, structured event output.
     #[test]
     fn an_empty_readme_fails_every_claim_rather_than_passing() {
         let found = violations("", &truth());
+        // Both sides of the comparison below are computed from
+        // `number_claims`, so an emptied registry gives `0 >= 0` and this
+        // test goes on passing over a checker that checks nothing. The M5
+        // close-out review found the same shape in `bathy-types`; here the
+        // consequence is that `check-readme` -- the mechanism that replaced
+        // three milestones of human attention -- could be silently disarmed
+        // and still print `ok`. The floor is stated as a literal for that
+        // reason. It is a floor, not a pin: adding a claim is the point of
+        // the registry and must not fail here.
+        let patterns: usize = number_claims(&truth())
+            .iter()
+            .map(|c| c.patterns.len())
+            .sum();
+        assert!(
+            patterns >= 16,
+            "the numeric-claim registry is down to {patterns} patterns; the \
+             comparison below is derived from it on both sides and cannot see \
+             that, and `check-readme` would still report ok"
+        );
         assert!(
             found.len()
                 >= number_claims(&truth())

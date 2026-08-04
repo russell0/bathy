@@ -72,6 +72,45 @@ mod tests {
         ("redis.rs", include_str!("redis.rs")),
     ];
 
+    /// The register the two clean-room checks below iterate over must name
+    /// **every** probe module, or those checks are a promise about whichever
+    /// files somebody remembered.
+    ///
+    /// Not a hand-written count: the truth is the `pub mod` list at the top of
+    /// this very file, read back through `include_str!`, so adding a probe
+    /// without adding it here fails rather than quietly narrowing the scan.
+    /// The M5 close-out review found this shape elsewhere in the tree
+    /// (`FIELDS_ADDED_AFTER_THE_LOG_EXISTED`, emptied, and its test still
+    /// passed); this file had the same hole with more riding on it -- an empty
+    /// or short `PROBE_FILES` turns the structural half of the clean-room
+    /// promise into a loop that runs zero times and reports `ok`.
+    #[test]
+    fn the_register_names_every_probe_module_or_the_two_checks_below_are_partial() {
+        let declared: Vec<String> = include_str!("mod.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub mod "))
+            .filter_map(|rest| rest.strip_suffix(';'))
+            .map(|name| format!("{name}.rs"))
+            .collect();
+        assert!(
+            !declared.is_empty(),
+            "no `pub mod` line was found in this file, so the comparison below is \
+             vacuous in the other direction"
+        );
+        let mut registered: Vec<String> = PROBE_FILES
+            .iter()
+            .map(|(name, _)| (*name).to_owned())
+            .collect();
+        let mut declared_sorted = declared.clone();
+        registered.sort();
+        declared_sorted.sort();
+        assert_eq!(
+            registered, declared_sorted,
+            "PROBE_FILES and this module's `pub mod` declarations disagree; a probe \
+             missing from the register is a probe neither clean-room check reads"
+        );
+    }
+
     #[test]
     fn every_probe_file_documents_a_source() {
         for (name, text) in PROBE_FILES {

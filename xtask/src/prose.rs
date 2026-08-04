@@ -457,6 +457,19 @@ mod tests {
 
     #[test]
     fn contract_text_that_brushes_a_marker_is_still_not_flagged() {
+        // The entire false-positive half of this check is this list. An empty
+        // one leaves the widening unopposed while still reporting `ok`, which
+        // is the same shape the M5 close-out review found in
+        // `FIELDS_ADDED_AFTER_THE_LOG_EXISTED`. The floor is the number of
+        // marker *families* the list exists to defend against, so deleting
+        // cases until only the easy ones remain fails here.
+        assert!(
+            LEGITIMATE.len() >= 5,
+            "only {} legitimate-text cases remain; this list is the only thing \
+             holding the marker lists back from flagging contract prose, and a \
+             short one lets a widening land unopposed",
+            LEGITIMATE.len()
+        );
         for (label, text) in LEGITIMATE {
             let hits = markers_in(text);
             assert!(
@@ -586,6 +599,34 @@ mod tests {
         // still pass, so the disclosure cannot quietly become wrong in
         // either direction: widening the markers until one of these is
         // caught fails here and forces the list to be edited.
+        //
+        // The name of this test claims it *is* the list, and the prose block
+        // claims it "cannot drift away from the code" -- neither was true of
+        // an empty or shortened `HOLES`, over which the loop below runs zero
+        // times and reports success. So the count is pinned to the `- Hn.`
+        // bullets in this file's own disclosure, read back through
+        // `include_str!`: closing a hole means deleting both, and forgetting
+        // either fails here.
+        let disclosed = include_str!("prose.rs")
+            .lines()
+            .filter(|line| {
+                let line = line.trim_start_matches('/').trim();
+                line.starts_with("- H") && line[3..].starts_with(|c: char| c.is_ascii_digit())
+            })
+            .count();
+        assert!(
+            disclosed > 0,
+            "the WHAT STILL GETS THROUGH disclosure lists no holes; either the check \
+             became complete (it did not) or the bullets moved and this comparison \
+             is now vacuous in both directions"
+        );
+        assert_eq!(
+            HOLES.len(),
+            disclosed,
+            "`HOLES` has {} entries and the disclosure below lists {disclosed}; the \
+             two are one statement written twice and they have drifted",
+            HOLES.len()
+        );
         for (label, text) in HOLES {
             assert!(
                 markers_in(text).is_empty(),
