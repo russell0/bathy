@@ -18,6 +18,24 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      # AC-7.15's four criterion benchmarks, executed rather than merely
+      # compiled. `cargo test --workspace` above does NOT reach them: Cargo's
+      # default target selection for `test` is lib, bins, tests and examples,
+      # and benches are not in it. `cargo clippy --all-targets` above does
+      # compile them, so a benchmark that stops building is already caught --
+      # but a benchmark that builds and then panics at run time (the
+      # `interpret` one reads `testdata/captures/` from disk, so a moved
+      # corpus is exactly that) would not be, and a benchmark nobody can run
+      # is a benchmark nobody runs.
+      #
+      # `--benches` with `harness = false` runs each criterion target in its
+      # own `--test` mode: every benchmark executed once, no timing collected,
+      # about a second. It is deliberately not a performance gate -- a
+      # wall-clock threshold on a shared runner is a flaky test, and a flaky
+      # test is one people learn to ignore. `check-bench` asserts this step
+      # exists, because the claim "CI runs them" is exactly the kind of claim
+      # this project has watched go quietly false.
+      - run: cargo test --workspace --benches
       - run: cargo run -p xtask -- check-deps
       - run: cargo run -p xtask -- check-schemas
       # `README.md` was factually wrong at three consecutive milestone
@@ -99,6 +117,25 @@ jobs:
       # have run them, and `lab/run.sh test` is what runs them with
       # `BATHY_LAB_REQUIRED` set so an absent lab fails instead of skipping.
       - run: cargo run -p xtask -- check-lab
+      # AC-7.11 to AC-7.15, the half that reads text.
+      #
+      # The comparison itself (`bench/compare.sh`) does NOT run here and is
+      # not meant to: it needs the lab up -- about 2.8 GiB of pinned images --
+      # and a wall-clock measurement taken on a shared, oversubscribed runner
+      # is not a measurement. What runs here is the gate on the *published*
+      # numbers: `check-bench` re-renders `docs/benchmarks.md`'s generated
+      # block from the committed `bench/results.json` and fails on drift, and
+      # separately fails if a scanner loses its row, if a command line is not
+      # published verbatim, if a run carries a timing without a score, if a
+      # category where bathy loses is dropped from the document, if the
+      # scheduler's connect-timeout default has moved since the run was taken
+      # (which makes every timing in it stale), or if one of AC-7.15's four
+      # criterion benchmarks disappears or loses `harness = false`.
+      #
+      # A benchmark document is worse than a README for rot, because its
+      # numbers cannot be checked by reading the code. This is the same
+      # arrangement `emit-schemas`/`check-schemas` uses, for the same reason.
+      - run: cargo run -p xtask -- check-bench
       # AC-7.7 to AC-7.10, the half that reads text: a fuzz target exists for
       # every function that consumes untrusted bytes, each has committed seed
       # inputs, the `interpret` target still carries its `matched_span`

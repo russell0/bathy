@@ -1,0 +1,300 @@
+{
+  "environment": {
+    "observed_at": "2026-08-04T21:34:46Z",
+    "host": "Linux aarch64",
+    "executed_in": "a rust:1-bookworm container attached to bathy-lab_labnet (this host cannot route to it)",
+    "privileged": true,
+    "repetitions": 5
+  },
+  "parameters": {
+    "targets": [
+      "10.30.0.10",
+      "10.30.0.11",
+      "10.30.0.12",
+      "10.30.0.13",
+      "10.30.0.14",
+      "10.30.0.15",
+      "10.30.0.16",
+      "10.30.0.17",
+      "10.30.0.18",
+      "10.30.0.200",
+      "10.30.0.201"
+    ],
+    "ports": [
+      22,
+      25,
+      53,
+      80,
+      443,
+      587,
+      853,
+      2222,
+      3306,
+      5432,
+      6379,
+      8080,
+      33060
+    ],
+    "timeout_ms": 2000,
+    "timeout_source": "`SchedulerConfig::default`'s `connect_timeout` in `crates/bathy-engine/src/scheduler.rs`, read rather than restated; bathy does not expose it as a flag, so every other tool is given the same ceiling",
+    "rate_ceiling": 100000,
+    "rate_source": "`budget_ceiling.maximum_packets_per_second` in `lab/scope.json` — the ceiling the lab's own manifest authorizes, given to every tool that has a rate knob"
+  },
+  "scanners": [
+    {
+      "name": "bathy",
+      "version": "bathy 0.1.0-alpha.1",
+      "path": "/w/target/bench/release/bathy",
+      "remedy": "cargo build --release -p bathy (bench/compare.sh does this for you)"
+    },
+    {
+      "name": "nmap",
+      "version": "Nmap version 7.93 ( https://nmap.org )",
+      "path": "/usr/bin/nmap",
+      "remedy": "apt-get install nmap, or BENCH_APT_PACKAGES=\"nmap\" bench/compare.sh"
+    },
+    {
+      "name": "masscan",
+      "version": null,
+      "path": null,
+      "remedy": "BENCH_APT_PACKAGES=\"nmap masscan\" bench/compare.sh (Debian packages it; nothing here installs it for you)"
+    },
+    {
+      "name": "rustscan",
+      "version": null,
+      "path": null,
+      "remedy": "no Debian package exists; put a Linux rustscan binary in bench/tools/, which bench/compare.sh prepends to PATH"
+    }
+  ],
+  "runs": [
+    {
+      "variant": "bathy-ports-only",
+      "scanner": "bathy",
+      "operation": "TCP connect scan, service detection off (--no-service-detection)",
+      "needs_raw_sockets": false,
+      "identifies_services": false,
+      "command_lines": [
+        "bathy --json --state-dir /tmp/bathy-bench-404 scan start --scope lab/scope.json --idempotency-key bench --targets 10.30.0.10,10.30.0.11,10.30.0.12,10.30.0.13,10.30.0.14,10.30.0.15,10.30.0.16,10.30.0.17,10.30.0.18,10.30.0.200,10.30.0.201 --ports 22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 --max-packets-per-second 100000 --no-service-detection",
+        "bathy --json --state-dir /tmp/bathy-bench-404 result query --scan $SCAN_ID"
+      ],
+      "milliseconds": [
+        2063,
+        2054,
+        2069,
+        2072,
+        2047
+      ],
+      "accuracy": {
+        "expected_open": 12,
+        "found_open": 12,
+        "false_negatives": [],
+        "false_positives": [],
+        "products_expected": 6,
+        "products_named": 0,
+        "products_named_at": [],
+        "products_missed": [
+          "10.30.0.10:80 (lab: nginx, reported: nothing)",
+          "10.30.0.11:2222 (lab: OpenSSH, reported: nothing)",
+          "10.30.0.13:3306 (lab: MySQL, reported: nothing)",
+          "10.30.0.15:25 (lab: Postfix, reported: nothing)",
+          "10.30.0.15:587 (lab: Postfix, reported: nothing)",
+          "10.30.0.17:443 (lab: nginx, reported: nothing)"
+        ],
+        "versions_expected": 4,
+        "versions_named": 0
+      },
+      "absent_reason": null,
+      "privilege_note": null,
+      "tcp_active_opens": 143
+    },
+    {
+      "variant": "bathy-connect",
+      "scanner": "bathy",
+      "operation": "TCP connect scan with service detection (bathy's default)",
+      "needs_raw_sockets": false,
+      "identifies_services": true,
+      "command_lines": [
+        "bathy --json --state-dir /tmp/bathy-bench-404 scan start --scope lab/scope.json --idempotency-key bench --targets 10.30.0.10,10.30.0.11,10.30.0.12,10.30.0.13,10.30.0.14,10.30.0.15,10.30.0.16,10.30.0.17,10.30.0.18,10.30.0.200,10.30.0.201 --ports 22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 --max-packets-per-second 100000",
+        "bathy --json --state-dir /tmp/bathy-bench-404 result query --scan $SCAN_ID"
+      ],
+      "milliseconds": [
+        26978,
+        26300,
+        26265,
+        26285,
+        26269
+      ],
+      "accuracy": {
+        "expected_open": 12,
+        "found_open": 12,
+        "false_negatives": [],
+        "false_positives": [],
+        "products_expected": 6,
+        "products_named": 5,
+        "products_named_at": [
+          "10.30.0.10:80",
+          "10.30.0.11:2222",
+          "10.30.0.13:3306",
+          "10.30.0.15:25",
+          "10.30.0.15:587"
+        ],
+        "products_missed": [
+          "10.30.0.17:443 (lab: nginx, reported: nothing)"
+        ],
+        "versions_expected": 4,
+        "versions_named": 3
+      },
+      "absent_reason": null,
+      "privilege_note": null,
+      "tcp_active_opens": 159
+    },
+    {
+      "variant": "nmap-connect",
+      "scanner": "nmap",
+      "operation": "TCP connect scan (-sT), no version detection",
+      "needs_raw_sockets": false,
+      "identifies_services": false,
+      "command_lines": [
+        "nmap -n -Pn -sT -p 22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 --max-rtt-timeout 2000ms --max-rate 100000 -oX - 10.30.0.10 10.30.0.11 10.30.0.12 10.30.0.13 10.30.0.14 10.30.0.15 10.30.0.16 10.30.0.17 10.30.0.18 10.30.0.200 10.30.0.201"
+      ],
+      "milliseconds": [
+        1475,
+        1466,
+        1485,
+        1475,
+        1484
+      ],
+      "accuracy": {
+        "expected_open": 12,
+        "found_open": 12,
+        "false_negatives": [],
+        "false_positives": [],
+        "products_expected": 6,
+        "products_named": 0,
+        "products_named_at": [],
+        "products_missed": [
+          "10.30.0.10:80 (lab: nginx, reported: nothing)",
+          "10.30.0.11:2222 (lab: OpenSSH, reported: nothing)",
+          "10.30.0.13:3306 (lab: MySQL, reported: nothing)",
+          "10.30.0.15:25 (lab: Postfix, reported: nothing)",
+          "10.30.0.15:587 (lab: Postfix, reported: nothing)",
+          "10.30.0.17:443 (lab: nginx, reported: nothing)"
+        ],
+        "versions_expected": 4,
+        "versions_named": 0
+      },
+      "absent_reason": null,
+      "privilege_note": null,
+      "tcp_active_opens": 170
+    },
+    {
+      "variant": "nmap-syn",
+      "scanner": "nmap",
+      "operation": "SYN scan (-sS) — Nmap's own default when privileged",
+      "needs_raw_sockets": true,
+      "identifies_services": false,
+      "command_lines": [
+        "nmap -n -Pn -sS -p 22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 --max-rtt-timeout 2000ms --max-rate 100000 -oX - 10.30.0.10 10.30.0.11 10.30.0.12 10.30.0.13 10.30.0.14 10.30.0.15 10.30.0.16 10.30.0.17 10.30.0.18 10.30.0.200 10.30.0.201"
+      ],
+      "milliseconds": [
+        1375,
+        1388,
+        1359,
+        1367,
+        1390
+      ],
+      "accuracy": {
+        "expected_open": 12,
+        "found_open": 12,
+        "false_negatives": [],
+        "false_positives": [],
+        "products_expected": 6,
+        "products_named": 0,
+        "products_named_at": [],
+        "products_missed": [
+          "10.30.0.10:80 (lab: nginx, reported: nothing)",
+          "10.30.0.11:2222 (lab: OpenSSH, reported: nothing)",
+          "10.30.0.13:3306 (lab: MySQL, reported: nothing)",
+          "10.30.0.15:25 (lab: Postfix, reported: nothing)",
+          "10.30.0.15:587 (lab: Postfix, reported: nothing)",
+          "10.30.0.17:443 (lab: nginx, reported: nothing)"
+        ],
+        "versions_expected": 4,
+        "versions_named": 0
+      },
+      "absent_reason": null,
+      "privilege_note": "this operation needs raw sockets and had them (running as uid 0 with CAP_NET_RAW). bathy's own scan is an unprivileged connect scan, so this row is a different operation, not a faster version of the same one.",
+      "tcp_active_opens": 0
+    },
+    {
+      "variant": "nmap-version",
+      "scanner": "nmap",
+      "operation": "TCP connect scan with version detection (-sT -sV)",
+      "needs_raw_sockets": false,
+      "identifies_services": true,
+      "command_lines": [
+        "nmap -n -Pn -sT -sV -p 22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 --max-rtt-timeout 2000ms --max-rate 100000 -oX - 10.30.0.10 10.30.0.11 10.30.0.12 10.30.0.13 10.30.0.14 10.30.0.15 10.30.0.16 10.30.0.17 10.30.0.18 10.30.0.200 10.30.0.201"
+      ],
+      "milliseconds": [
+        17819,
+        17785,
+        139145,
+        139137,
+        17754
+      ],
+      "accuracy": {
+        "expected_open": 12,
+        "found_open": 12,
+        "false_negatives": [],
+        "false_positives": [],
+        "products_expected": 6,
+        "products_named": 5,
+        "products_named_at": [
+          "10.30.0.10:80",
+          "10.30.0.11:2222",
+          "10.30.0.15:25",
+          "10.30.0.15:587",
+          "10.30.0.17:443"
+        ],
+        "products_missed": [
+          "10.30.0.13:3306 (lab: MySQL, reported: nothing)"
+        ],
+        "versions_expected": 4,
+        "versions_named": 3
+      },
+      "absent_reason": null,
+      "privilege_note": null,
+      "tcp_active_opens": 294
+    },
+    {
+      "variant": "masscan-syn",
+      "scanner": "masscan",
+      "operation": "SYN scan; masscan has no connect mode and no version detection",
+      "needs_raw_sockets": true,
+      "identifies_services": false,
+      "command_lines": [
+        "masscan -p22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 --rate 100000 --wait 2 -oL - 10.30.0.10 10.30.0.11 10.30.0.12 10.30.0.13 10.30.0.14 10.30.0.15 10.30.0.16 10.30.0.17 10.30.0.18 10.30.0.200 10.30.0.201"
+      ],
+      "milliseconds": null,
+      "accuracy": null,
+      "absent_reason": "`masscan` is not installed on this machine, so this row is empty rather than absent from the table",
+      "privilege_note": "this operation needs raw sockets and had them (running as uid 0 with CAP_NET_RAW). bathy's own scan is an unprivileged connect scan, so this row is a different operation, not a faster version of the same one.",
+      "tcp_active_opens": null
+    },
+    {
+      "variant": "rustscan-connect",
+      "scanner": "rustscan",
+      "operation": "TCP connect scan, no version detection of its own",
+      "needs_raw_sockets": false,
+      "identifies_services": false,
+      "command_lines": [
+        "rustscan --greppable --no-config -a 10.30.0.10,10.30.0.11,10.30.0.12,10.30.0.13,10.30.0.14,10.30.0.15,10.30.0.16,10.30.0.17,10.30.0.18,10.30.0.200,10.30.0.201 -p 22,25,53,80,443,587,853,2222,3306,5432,6379,8080,33060 -t 2000"
+      ],
+      "milliseconds": null,
+      "accuracy": null,
+      "absent_reason": "`rustscan` is not installed on this machine, so this row is empty rather than absent from the table",
+      "privilege_note": null,
+      "tcp_active_opens": null
+    }
+  ]
+}
