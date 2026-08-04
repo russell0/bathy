@@ -23,7 +23,7 @@ mod state;
 
 use clap::Parser;
 
-use cli::{Cli, Command, EvidenceCommand, ResultCommand, ScanCommand, ScopeCommand};
+use cli::{Cli, Command, EvidenceCommand, ResultCommand, ScanCommand, ScopeCommand, ServeCommand};
 use emit::Emitter;
 use exit::{CliError, ExitCode};
 
@@ -217,9 +217,12 @@ fn rendered(e: &clap::Error) -> String {
 fn dispatch(cli: &Cli, emitter: &Emitter) -> Result<ExitCode, CliError> {
     let state_dir = state::resolve_state_dir(cli.state_dir.clone())?;
     match &cli.command {
-        Command::Scope(ScopeCommand::Validate(args)) => {
-            commands::scope::validate(&args.scope, state::clock().as_ref(), emitter)
-        }
+        Command::Scope(ScopeCommand::Validate(args)) => commands::scope::validate(
+            &args.scope,
+            &args.targets,
+            state::clock().as_ref(),
+            emitter,
+        ),
         Command::Scan(ScanCommand::Preview(args)) => {
             commands::scan::preview(args, state::clock().as_ref(), emitter)
         }
@@ -249,6 +252,9 @@ fn dispatch(cli: &Cli, emitter: &Emitter) -> Result<ExitCode, CliError> {
         }
         Command::Explain(args) => {
             commands::explain::run(args.rule_id.as_deref(), args.list, emitter)
+        }
+        Command::Serve(ServeCommand::Mcp(args)) => {
+            commands::serve::mcp(args, &state_dir, emitter)
         }
     }
 }

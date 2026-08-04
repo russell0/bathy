@@ -43,6 +43,12 @@ bathy-interpret = { path = "../bathy-interpret" }
 bathy-probe = { path = "../bathy-probe" }
 bathy-engine = { path = "../bathy-engine" }
 bathy-query = { path = "../bathy-query" }
+# `bathy serve mcp` fronts this crate, and `scope validate` renders the same
+# typed answer the `scope.validate` tool returns rather than a second one.
+# The plan's Task 3 edit #1 assigned the subcommand to Task 4, "in the commit
+# that adds the server it fronts"; `xtask`'s layer table already ranks
+# `bathy-mcp` below `bathy` for exactly this edge.
+bathy-mcp = { path = "../bathy-mcp" }
 # `derive` for the command tree. `wrap_help` deliberately NOT enabled: it
 # reflows help text to the terminal it is rendered in, and `--help` is where
 # this CLI's exit-code table lives (AC-5.11) -- a documented contract a test

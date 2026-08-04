@@ -75,6 +75,32 @@ pub enum Command {
     Evidence(EvidenceCommand),
     /// Explain an interpretation rule: what it looks for and where it comes from.
     Explain(ExplainArgs),
+    /// Expose the same engine to an agent over a machine protocol.
+    #[command(subcommand)]
+    Serve(ServeCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServeCommand {
+    /// Serve eleven typed tools over the Model Context Protocol, on stdio.
+    ///
+    /// Stdout is the transport, so this command writes nothing else to it;
+    /// diagnostics go to stderr. It runs until the client disconnects.
+    Mcp(ServeMcpArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ServeMcpArgs {
+    /// A scan wider than this many addresses asks a human before it starts.
+    ///
+    /// Server-side configuration on purpose: a threshold a caller could set
+    /// is not a threshold. There is no tool argument for it.
+    #[arg(long, value_name = "TARGETS", default_value_t = bathy_mcp::config::DEFAULT_APPROVAL_THRESHOLD_TARGETS)]
+    pub approval_threshold_targets: u64,
+
+    /// How many seconds an approval stays redeemable.
+    #[arg(long, value_name = "SECONDS", default_value_t = 600)]
+    pub approval_ttl_seconds: u64,
 }
 
 #[derive(Debug, Subcommand)]
@@ -88,6 +114,15 @@ pub struct ScopeValidateArgs {
     /// Path to the scope manifest JSON document.
     #[arg(long, value_name = "PATH")]
     pub scope: PathBuf,
+
+    /// Addresses, CIDRs or inclusive ranges to check against the manifest.
+    ///
+    /// Present so this command can answer the same question the
+    /// `scope.validate` tool answers. Without it the tool surface could do
+    /// something the command surface could not, and the premise that makes
+    /// the tool surface auditable from a shell would not hold.
+    #[arg(long, value_name = "TARGET", value_delimiter = ',')]
+    pub targets: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]

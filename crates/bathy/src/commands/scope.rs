@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use bathy_scope::ScopeManifest;
 use bathy_types::clock::Clock;
+use bathy_types::task::PolicyDecisionTag;
+use bathy_types::tools::ScopeValidateInput;
 
 use crate::emit::Emitter;
 use crate::exit::{CliError, ExitCode};
@@ -25,48 +27,77 @@ pub fn load_manifest(path: &Path) -> Result<Arc<ScopeManifest>, CliError> {
     Ok(Arc::new(manifest))
 }
 
-pub fn validate(path: &Path, clock: &dyn Clock, emitter: &Emitter) -> Result<ExitCode, CliError> {
-    let manifest = load_manifest(path)?;
+/// `bathy scope validate --scope PATH [--targets ...]`.
+///
+/// The answer is computed by the same function the `scope.validate` tool
+/// calls, and rendered from the same type. Two implementations of one
+/// question is how two surfaces come to disagree about authorization, and
+/// this is the question where disagreeing matters most.
+pub fn validate(
+    path: &Path,
+    targets: &[String],
+    clock: &dyn Clock,
+    emitter: &Emitter,
+) -> Result<ExitCode, CliError> {
     let now = clock.now_rfc3339();
-    let expired = manifest.is_expired(&now);
-    let ceiling = manifest.ceiling();
+    let out = bathy_mcp::tools::scope::validate(
+        ScopeValidateInput {
+            manifest_path: path.display().to_string(),
+            targets: targets.to_vec(),
+        },
+        &now,
+    )
+    .map_err(|f| CliError::operational(f.error, f.detail))?;
 
-    // An expired manifest authorizes nothing, so reporting it as a
-    // successful validation would be the wrong answer, not merely an
-    // incomplete one. It is a policy refusal (exit 2) with the same
-    // `scope_expired` code `bathy_scope::evaluate` would produce.
-    if expired {
+    // A manifest that authorizes nothing -- expired, or asked about a target
+    // it does not cover -- is a policy refusal (exit 2) carrying the same
+    // reason code the engine's own evaluation would produce, not a successful
+    // validation with a discouraging field in it.
+    if out.decision == PolicyDecisionTag::Denied {
         return Err(CliError::Denied {
-            reason_code: bathy_types::DenyReason::ScopeExpired.code(),
-            detail: format!("manifest {} expired before {now}", manifest.id()),
+            reason_code: reason_code_of(&out),
+            detail: out.detail.unwrap_or_default(),
         });
     }
 
-    let value = serde_json::json!({
-        "scope_id": manifest.id().to_string(),
-        "description": manifest.description(),
-        "expired": expired,
-        "signature_present": manifest.had_signature(),
-        "signature_verified": manifest.signature_verified(),
-        "budget_ceiling": {
-            "maximum_packets": ceiling.maximum_packets,
-            "maximum_runtime_seconds": ceiling.maximum_runtime_seconds,
-            "maximum_packets_per_second": ceiling.maximum_packets_per_second,
-        },
-    });
+    let ceiling = &out.budget_ceiling;
     let human = format!(
-        "{} \"{}\"\n  valid at {now}\n  ceiling {}pkt / {}s / {}pps\n  signature: {}",
-        manifest.id(),
-        manifest.description(),
+        "{} \"{}\"\n  valid at {now}\n  ceiling {}pkt / {}s / {}pps\n  \
+         {} target(s) in scope\n  signature: {}",
+        out.scope_id,
+        out.description,
         ceiling.maximum_packets,
         ceiling.maximum_runtime_seconds,
         ceiling.maximum_packets_per_second,
-        if manifest.had_signature() {
+        out.in_scope_count,
+        if out.signature_present {
             "present but NOT verified in this version"
         } else {
             "none"
         }
     );
+    let value =
+        serde_json::to_value(&out).map_err(|e| CliError::operational("encode_failed", e))?;
     emitter.result(value, human);
     Ok(ExitCode::Success)
+}
+
+/// Map the reported reason back onto one of the engine's stable codes.
+///
+/// `CliError::Denied` holds a `&'static str` because these four codes are a
+/// closed set the whole program shares; anything outside it would be a code
+/// this surface invented, so it is refused rather than passed through.
+fn reason_code_of(out: &bathy_types::tools::ScopeValidateOutput) -> &'static str {
+    let reported = out.reason_code.as_deref().unwrap_or_default();
+    for reason in [
+        bathy_types::DenyReason::ScopeMismatch,
+        bathy_types::DenyReason::ScopeExpired,
+        bathy_types::DenyReason::TargetOutOfScope,
+        bathy_types::DenyReason::BudgetExceedsCeiling,
+    ] {
+        if reason.code() == reported {
+            return reason.code();
+        }
+    }
+    bathy_types::DenyReason::TargetOutOfScope.code()
 }
