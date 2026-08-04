@@ -71,7 +71,19 @@ use bathy_interpret::{Interpretation, interpret, known_probe_ids};
 use bathy_types::{ProbeCapture, Transport};
 use serde::{Deserialize, Serialize};
 
-const CORPUS_DIR: &str = "../../testdata/captures";
+/// Resolved against this crate's own manifest directory, not the process's
+/// current working directory (M4 whole-branch review, MINOR-2). The plan's
+/// own AC-4.17 exit criterion runs this test binary *directly* --
+/// `sandbox-exec -f deny-network.sb <path-to-compiled-replay-test-binary>`
+/// -- rather than through `cargo test`, and `cargo test` is the only thing
+/// that sets the cwd to the package root. Run as documented from the
+/// workspace root, the previous cwd-relative `../../testdata/captures`
+/// resolved to a path outside the repository and every one of these six
+/// tests failed on a missing corpus directory. `CARGO_MANIFEST_DIR` is set
+/// at compile time by Cargo for both invocations, so the binary carries its
+/// own absolute corpus path and the documented command is correct as
+/// written, from anywhere.
+const CORPUS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../testdata/captures");
 
 // --- Fixture deserialization (dev-only shape; see this file's module doc
 // comment for why `ProbeCapture` itself cannot be deserialized directly). ---
@@ -285,6 +297,128 @@ fn every_fixture_decodes_and_names_a_probe_id_the_registry_knows() {
         checked += 1;
     }
     assert!(checked >= 16);
+}
+
+// --- AC-4.18: fixture provenance, made structural (M4 whole-branch
+// review, IMPORTANT-2).
+//
+// `captured_from` is a required `String`, so a *missing* field already
+// fails deserialization. An EMPTY one did not: blanking a real capture's
+// entire provenance record -- image, digest, capture method, all of it --
+// passed the whole suite. That is the evidentiary basis of this project's
+// clean-room claim (see `README.md`'s "Clean room" section), which is a
+// legal position, not a style preference, and it rested entirely on
+// authorship discipline with no structural guard at all.
+//
+// The corpus content itself was already exemplary and needed no change:
+// eight real captures each naming a full image and digest, nine clearly
+// labelled `SYNTHETIC (not a container capture)` with stated reasoning, and
+// not one fixture pretending to be something it is not. What follows makes
+// that discipline enforced rather than merely observed.
+//
+// Deliberately a CLOSED vocabulary of exactly two prefixes rather than a
+// "non-empty" check. Non-empty alone would accept `"x"`, or a plausible
+// paragraph of prose that names no image at all -- and the failure mode
+// being guarded against is not a blank field, it is a field that reads
+// convincingly while sourcing nothing. Requiring every fixture to declare
+// which of the two kinds it is forces the question to be answered.
+//
+// The nine synthetic fixtures are legitimate and must keep passing. Their
+// existence is why AC-4.18's own plan text ("**Each** fixture records the
+// lab image and digest it was captured from") is unsatisfiable as written
+// -- a negative or no-match case has no container to have come from, and
+// labelling it honestly is strictly better than manufacturing a digest for
+// it. That is a plan defect, recorded as MINOR-4 for the controller; the
+// implementation's call was the right one and is what is asserted here.
+
+const REAL_PREFIX: &str = "REAL CAPTURE:";
+const SYNTHETIC_PREFIX: &str = "SYNTHETIC";
+
+/// Whether `s` contains a syntactically complete OCI content digest: the
+/// literal `sha256:` followed by exactly 64 lowercase hex characters.
+///
+/// Written out by hand rather than with a regex on purpose -- `regex` is
+/// this crate's one non-`bathy-types` *normal* dependency and the subject
+/// of AC-4.10's purity claim; a dev-only need is not a reason to reach for
+/// it here. The length check is what makes this more than a substring
+/// search: `"sha256:"` alone, or a truncated digest, does not identify an
+/// image and must not pass for provenance.
+fn names_a_sha256_digest(s: &str) -> bool {
+    s.match_indices("sha256:").any(|(i, _)| {
+        let rest = &s[i + "sha256:".len()..];
+        rest.len() >= 64
+            && rest[..64]
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    })
+}
+
+/// AC-4.18. Every fixture declares which kind it is, and a fixture claiming
+/// to be a real container capture names the digest that claim rests on.
+#[test]
+fn every_fixture_states_its_provenance_and_every_real_capture_names_an_image_digest() {
+    let (mut real, mut synthetic) = (0usize, 0usize);
+    for (name, fixture) in load_corpus() {
+        let from = fixture.captured_from.trim();
+        assert!(
+            !from.is_empty(),
+            "{name}: captured_from is empty. Every fixture must record where its bytes \
+             came from -- either {REAL_PREFIX:?} with the lab image and its digest, or \
+             {SYNTHETIC_PREFIX:?} with the reason the bytes were hand-built. This is \
+             the evidentiary basis of the clean-room claim in README.md."
+        );
+        if let Some(detail) = from.strip_prefix(REAL_PREFIX) {
+            real += 1;
+            assert!(
+                names_a_sha256_digest(from),
+                "{name}: captured_from claims {REAL_PREFIX:?} but names no complete \
+                 image digest (`sha256:` followed by 64 hex characters). A real capture \
+                 must be reproducible from the exact image it came from, not merely \
+                 asserted to exist. Got: {from:?}"
+            );
+            assert!(
+                detail
+                    .trim_start()
+                    .split_whitespace()
+                    .next()
+                    .is_some_and(|w| { !w.starts_with("sha256:") && !w.starts_with("digest") }),
+                "{name}: captured_from names a digest but no image reference before it. \
+                 Record both, e.g. `REAL CAPTURE: docker.io/library/nginx:1.27-alpine, \
+                 digest sha256:...`. Got: {from:?}"
+            );
+        } else if from.starts_with(SYNTHETIC_PREFIX) {
+            synthetic += 1;
+            assert!(
+                from.len() > SYNTHETIC_PREFIX.len() + 20,
+                "{name}: captured_from is labelled {SYNTHETIC_PREFIX:?} but states no \
+                 reason. A hand-built fixture must say what it is built to exercise and \
+                 why no container produced it. Got: {from:?}"
+            );
+            assert!(
+                !names_a_sha256_digest(from),
+                "{name}: captured_from is labelled {SYNTHETIC_PREFIX:?} yet names an \
+                 image digest. Synthetic bytes did not come from that image; either \
+                 the label is wrong or the digest is fabricated provenance. Got: {from:?}"
+            );
+        } else {
+            panic!(
+                "{name}: captured_from starts with neither {REAL_PREFIX:?} nor \
+                 {SYNTHETIC_PREFIX:?}, so nothing here can tell whether these bytes came \
+                 off a real wire or were written by hand -- which is the one thing this \
+                 field exists to say. Got: {from:?}"
+            );
+        }
+    }
+    // Both arms must actually have been taken, or the assertions above are
+    // checking a category the corpus no longer contains.
+    assert!(
+        real >= 8,
+        "expected at least the eight real container captures M4 Task 2 recorded, found {real}"
+    );
+    assert!(
+        synthetic >= 1,
+        "expected at least one clearly-labelled synthetic fixture, found {synthetic}"
+    );
 }
 
 /// AC-4.18's "at least two per probe" made a real assertion, not just an
