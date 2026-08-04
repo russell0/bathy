@@ -58,6 +58,69 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct PackageInfo {
     name: String,
     dependencies: Vec<String>,
+    /// The subset of `dependencies` that a downstream consumer of this
+    /// package actually builds -- `[dependencies]`, not `[dev-dependencies]`
+    /// or `[build-dependencies]`. [`find_pinned_dependency_drift`] needs the
+    /// distinction; the layer and forbidden-substring rules deliberately do
+    /// not, because a dev-dependency on a higher layer is still a cycle and a
+    /// dev-dependency on an inference client still puts one in the repo.
+    normal_dependencies: Vec<String>,
+}
+
+/// Crates whose documented central claim *is* their direct dependency set,
+/// pinned to the set the documentation states.
+///
+/// `bathy-query`'s purity claim -- "no crate in this layer touches the store,
+/// the network, the clock or the filesystem", and it stays true because the
+/// graph makes it impossible rather than because anyone remembers -- is a
+/// claim about exactly this list. It was stated in four places in prose, and
+/// when M5 Task 2 added a fourth dependency all four went on saying three.
+/// Prose that counts is prose that rots; this is the source of truth the
+/// prose now names instead of counting.
+const PINNED_DEPENDENCIES: &[(&str, &[&str])] = &[(
+    "bathy-query",
+    &[
+        "bathy-types",
+        "schemars",
+        "serde",
+        "serde_json",
+        "thiserror",
+    ],
+)];
+
+/// Report every difference between a pinned crate's real direct dependencies
+/// and its pinned set, in both directions -- an addition is a purity claim
+/// that quietly stopped being true, and a removal is documentation naming a
+/// crate that is no longer there. A pinned crate that is not in the workspace
+/// at all is reported too: a renamed package must not silently disable its
+/// own check.
+fn find_pinned_dependency_drift(packages: &[PackageInfo]) -> Vec<String> {
+    let mut drift = Vec::new();
+    for (name, pinned) in PINNED_DEPENDENCIES {
+        let Some(pkg) = packages.iter().find(|p| p.name == *name) else {
+            drift.push(format!(
+                "{name} has a pinned dependency set but is not in the workspace -- renamed, \
+                 or removed without its pin"
+            ));
+            continue;
+        };
+        let actual: BTreeSet<&str> = pkg.normal_dependencies.iter().map(String::as_str).collect();
+        let expected: BTreeSet<&str> = pinned.iter().copied().collect();
+        for added in actual.difference(&expected) {
+            drift.push(format!(
+                "{name} directly depends on {added}, which is not in its pinned set; \
+                 this crate's documented claim is its dependency list, so update both \
+                 or drop the dependency"
+            ));
+        }
+        for removed in expected.difference(&actual) {
+            drift.push(format!(
+                "{name}'s pinned set names {removed}, which it no longer depends on; \
+                 the documentation that names it is now wrong"
+            ));
+        }
+    }
+    drift
 }
 
 /// Pure rule check: given a workspace's packages, return every
@@ -119,11 +182,21 @@ fn parse_packages(
     for pkg in meta["packages"].as_array().ok_or("no packages")? {
         let name = pkg["name"].as_str().ok_or("unnamed package")?.to_string();
         let mut dependencies = Vec::new();
+        let mut normal_dependencies = Vec::new();
         for dep in pkg["dependencies"].as_array().ok_or("no dependencies")? {
             let dep_name = dep["name"].as_str().ok_or("unnamed dep")?.to_string();
+            // `cargo metadata` spells a normal dependency's `kind` as `null`;
+            // `"dev"` and `"build"` are the other two.
+            if dep["kind"].is_null() {
+                normal_dependencies.push(dep_name.clone());
+            }
             dependencies.push(dep_name);
         }
-        packages.push(PackageInfo { name, dependencies });
+        packages.push(PackageInfo {
+            name,
+            dependencies,
+            normal_dependencies,
+        });
     }
     Ok(packages)
 }
@@ -134,10 +207,15 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
         .output()?;
     let meta: serde_json::Value = serde_json::from_slice(&meta.stdout)?;
     let packages = parse_packages(&meta)?;
-    let violations = find_violations(&packages);
+    let mut violations = find_violations(&packages);
+    violations.extend(find_pinned_dependency_drift(&packages));
 
     if violations.is_empty() {
-        println!("check-deps: ok ({} crates ranked)", count_ranked(&packages));
+        println!(
+            "check-deps: ok ({} crates ranked, {} pinned dependency set(s))",
+            count_ranked(&packages),
+            PINNED_DEPENDENCIES.len()
+        );
         Ok(())
     } else {
         for v in &violations {
@@ -438,7 +516,111 @@ mod tests {
         PackageInfo {
             name: name.to_string(),
             dependencies: deps.iter().map(|d| d.to_string()).collect(),
+            normal_dependencies: deps.iter().map(|d| d.to_string()).collect(),
         }
+    }
+
+    /// A package whose `[dev-dependencies]` differ from its `[dependencies]`.
+    fn pkg_with_dev(name: &str, normal: &[&str], dev: &[&str]) -> PackageInfo {
+        PackageInfo {
+            name: name.to_string(),
+            dependencies: normal.iter().chain(dev).map(|d| d.to_string()).collect(),
+            normal_dependencies: normal.iter().map(|d| d.to_string()).collect(),
+        }
+    }
+
+    /// The real pinned set for `bathy-query`, as a fixture.
+    fn pinned_query_deps() -> Vec<&'static str> {
+        PINNED_DEPENDENCIES
+            .iter()
+            .find(|(n, _)| *n == "bathy-query")
+            .expect("bathy-query is pinned")
+            .1
+            .to_vec()
+    }
+
+    #[test]
+    fn a_crate_matching_its_pinned_dependency_set_is_clean() {
+        let packages = vec![pkg("bathy-query", &pinned_query_deps())];
+        let drift = find_pinned_dependency_drift(&packages);
+        assert!(drift.is_empty(), "unexpected drift: {drift:?}");
+    }
+
+    #[test]
+    fn a_new_direct_dependency_on_a_pinned_crate_is_reported() {
+        // The claim `bathy-query`'s documentation makes is that nothing in
+        // its graph can reach a socket, a clock or the filesystem. `tokio`
+        // arriving is that claim ceasing to be true.
+        let mut deps = pinned_query_deps();
+        deps.push("tokio");
+        let drift = find_pinned_dependency_drift(&[pkg("bathy-query", &deps)]);
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert!(drift[0].contains("tokio"), "{drift:?}");
+        assert!(drift[0].contains("pinned set"), "{drift:?}");
+    }
+
+    #[test]
+    fn a_dependency_that_disappears_from_a_pinned_crate_is_reported_too() {
+        // The other direction: documentation naming a crate that is no
+        // longer there is wrong in the same way, and only a two-sided check
+        // catches it.
+        let deps: Vec<&str> = pinned_query_deps()
+            .into_iter()
+            .filter(|d| *d != "thiserror")
+            .collect();
+        let drift = find_pinned_dependency_drift(&[pkg("bathy-query", &deps)]);
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert!(drift[0].contains("thiserror"), "{drift:?}");
+    }
+
+    #[test]
+    fn a_dev_dependency_does_not_count_against_a_pinned_set() {
+        // `bathy-query` really does dev-depend on `bathy-engine` and friends
+        // to fold the log of a real scan. The pin is about what a *consumer*
+        // builds, which is `[dependencies]` only -- a pin that counted dev
+        // dependencies would have to be updated by every new test fixture and
+        // would be turned off within a milestone.
+        let packages = vec![pkg_with_dev(
+            "bathy-query",
+            &pinned_query_deps(),
+            &["bathy-engine", "tempfile", "tokio", "proptest"],
+        )];
+        let drift = find_pinned_dependency_drift(&packages);
+        assert!(drift.is_empty(), "unexpected drift: {drift:?}");
+    }
+
+    #[test]
+    fn a_pinned_crate_missing_from_the_workspace_is_reported_not_skipped() {
+        // A renamed package must not silently disable its own check.
+        let drift = find_pinned_dependency_drift(&[pkg("bathy-types", &[])]);
+        assert_eq!(drift.len(), 1, "{drift:?}");
+        assert!(drift[0].contains("bathy-query"), "{drift:?}");
+        assert!(drift[0].contains("not in the workspace"), "{drift:?}");
+    }
+
+    #[test]
+    fn parse_packages_separates_dev_dependencies_from_normal_ones() {
+        // The `kind` field is the whole basis of the distinction above, so
+        // the parse of it is asserted directly rather than assumed.
+        let meta = serde_json::json!({"packages": [{
+            "name": "bathy-query",
+            "dependencies": [
+                {"name": "bathy-types", "kind": null},
+                {"name": "serde", "kind": null},
+                {"name": "bathy-engine", "kind": "dev"},
+                {"name": "cc", "kind": "build"},
+            ],
+        }]});
+        let packages = parse_packages(&meta).unwrap();
+        assert_eq!(
+            packages[0].normal_dependencies,
+            vec!["bathy-types", "serde"]
+        );
+        assert_eq!(
+            packages[0].dependencies,
+            vec!["bathy-types", "serde", "bathy-engine", "cc"],
+            "the layer and forbidden-substring rules still see every kind"
+        );
     }
 
     #[test]

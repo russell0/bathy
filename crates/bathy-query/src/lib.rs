@@ -8,13 +8,17 @@
 //!
 //! Everything here is a pure function of its arguments. No crate in this
 //! layer touches the store, the network, the clock or the filesystem, and
-//! `[dependencies]` is `bathy-types` plus the three data crates
-//! `bathy-types` itself already pulls in -- `serde`, `serde_json` and
-//! `schemars` -- so staying pure remains a property of the dependency graph
-//! rather than of anybody's discipline. M5 Task 2 added those three to
-//! publish `ScanFold` and `ScanDiff` as committed JSON Schemas (AC-5.35);
-//! `cargo tree -p bathy-query` is unchanged by the addition, because every
-//! one of them was already there transitively.
+//! `[dependencies]` is `bathy-types` plus the pure data crates `bathy-types`
+//! itself already pulls in -- `serde`, `serde_json`, `schemars`, `thiserror`
+//! -- so staying pure remains a property of the dependency graph rather than
+//! of anybody's discipline. M5 Task 2 added those four to publish `ScanFold`
+//! and `ScanDiff` as committed JSON Schemas (AC-5.35) and to give `WireError`
+//! a `Display`; `cargo tree -p bathy-query` is unchanged by the addition,
+//! because every one of them was already there transitively.
+//!
+//! That list is the claim, so it is pinned rather than described: `xtask`'s
+//! `PINNED_DEPENDENCIES` holds it and `check-deps` fails on a direct
+//! dependency this module does not name, in either direction.
 //!
 //! Purity is not a stylistic preference here. M5 Task 2's diff is a function
 //! of two folds, so any nondeterminism in a fold shows up downstream as a

@@ -27,8 +27,9 @@
 //!
 //! Everything below `bathy-query` in the layer order is a `[dev-dependencies]`
 //! edge only (see this crate's `Cargo.toml`); the library itself depends on
-//! `bathy-types` and three pure data crates (`serde`, `serde_json`,
-//! `schemars`) that `bathy-types` already pulls in.
+//! `bathy-types` and the pure data crates `bathy-types` already pulls in
+//! (`serde`, `serde_json`, `schemars`, `thiserror`). That set is pinned in
+//! `xtask`'s `PINNED_DEPENDENCIES` and `check-deps` fails if it moves.
 
 use std::sync::Arc;
 
