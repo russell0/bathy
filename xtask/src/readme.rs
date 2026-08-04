@@ -121,6 +121,53 @@ pub struct Truth {
     /// `EvidenceLevel::Headers` / `Full` caps, in KiB.
     pub evidence_cap_headers_kib: usize,
     pub evidence_cap_full_kib: usize,
+    /// The subset of [`ABSENCE_CLAIMS`] whose falsifying path exists.
+    pub falsified_absences: BTreeSet<String>,
+}
+
+/// Claims that something does **not** exist, each registered with the path
+/// whose presence makes the claim false.
+///
+/// M5's review found `README.md` saying three times, in the commit range that
+/// shipped it, that the MCP server did not exist yet -- three lines from a
+/// table row describing the shipped server in detail. `check-readme` passed,
+/// because it checks numbers and table membership and this is prose.
+///
+/// A claim of absence is the one kind of prose claim that *is* mechanically
+/// checkable, because something in the tree falsifies it. So the rule is:
+/// **writing one means registering the path that would make it false.** That
+/// is the same discipline the `[phrase-rule]` marker uses -- the checker
+/// cannot find a claim nobody registered, which is why the limitation is
+/// written into the `NOT MECHANICALLY CHECKED` list at the bottom of this
+/// file rather than left implied.
+const ABSENCE_CLAIMS: &[AbsenceClaim] = &[
+    AbsenceClaim {
+        phrase: "an MCP server (the rest of Milestone 5)",
+        falsified_by: "crates/bathy-mcp/src/server.rs",
+    },
+    AbsenceClaim {
+        phrase: "The MCP server is the rest of Milestone 5.",
+        falsified_by: "crates/bathy-mcp/src/server.rs",
+    },
+    AbsenceClaim {
+        phrase: "the MCP tool names arrive with the server",
+        falsified_by: "crates/bathy-mcp/src/descriptors.rs",
+    },
+    AbsenceClaim {
+        phrase: "a packet daemon (Milestone 6)",
+        falsified_by: "crates/bathy-packetd/Cargo.toml",
+    },
+    AbsenceClaim {
+        phrase: "the verification suite (Milestone 7)",
+        falsified_by: "lab/Cargo.toml",
+    },
+];
+
+pub struct AbsenceClaim {
+    /// Exactly as `README.md` writes it, matched against the flattened prose.
+    phrase: &'static str,
+    /// Relative to the repository root. If this exists, the phrase is a lie.
+    falsified_by: &'static str,
 }
 
 /// A claim stated as a number.
@@ -280,6 +327,18 @@ pub fn violations(readme: &str, truth: &Truth) -> Vec<String> {
             if !matched {
                 out.push(unmatched(claim.claim, pattern));
             }
+        }
+    }
+
+    // A claim of absence whose falsifier is in the tree. See `ABSENCE_CLAIMS`.
+    for claim in ABSENCE_CLAIMS {
+        if truth.falsified_absences.contains(claim.phrase) && prose.contains(claim.phrase) {
+            out.push(format!(
+                "{README}: the claim \"{}\" is false.\n  \
+                 {} exists, which is what that sentence says does not.\n  \
+                 source of truth: the tree",
+                claim.phrase, claim.falsified_by,
+            ));
         }
     }
 
@@ -454,6 +513,11 @@ pub fn gather_truth(root: &Path) -> Fallible<Truth> {
         committed_schemas: count_files(&root.join("schemas"))?,
         evidence_cap_headers_kib: evidence_cap(root, "Headers")?,
         evidence_cap_full_kib: evidence_cap(root, "Full")?,
+        falsified_absences: ABSENCE_CLAIMS
+            .iter()
+            .filter(|c| root.join(c.falsified_by).exists())
+            .map(|c| c.phrase.to_string())
+            .collect(),
     })
 }
 
@@ -639,7 +703,18 @@ pub fn check_readme() -> Fallible<()> {
 // README is correct", only as "these numbers agree with the tree".
 //
 //   - "Milestones 1-4 of 7 landed". Which milestones are *done* is a
-//     judgement about acceptance, not a fact in the tree. The 7 is checked.
+//     judgement about acceptance, not a fact in the tree -- a milestone whose
+//     crates all exist may still be open on a criterion, and one that is
+//     closed leaves nothing behind that says so. The 7 is checked. What *can*
+//     be checked is the other half of the same sentence, and now is: a claim
+//     that something does not exist yet, registered in `ABSENCE_CLAIMS` with
+//     the path that falsifies it. M5's review found three such claims about
+//     the MCP server standing in the commit range that shipped it.
+//   - **A claim of absence nobody registered.** `ABSENCE_CLAIMS` is a
+//     register, not a scan: it catches a claim that has gone stale, never a
+//     new claim written without an entry. Writing "X does not exist yet" and
+//     not registering it is exactly as invisible to this checker as the three
+//     MCP sentences were before the register existed.
 //   - Every guarantee sentence in the status note and "Authorized use":
 //     what the scheduler checks and when, that a scan is refused in full and
 //     never silently trimmed, that a mid-scan expiry does not halt a run in
@@ -747,7 +822,37 @@ identification, structured event output.
             committed_schemas: 6,
             evidence_cap_headers_kib: 8,
             evidence_cap_full_kib: 64,
+            falsified_absences: names(&["an MCP server (the rest of Milestone 5)"]),
         }
+    }
+
+    /// The defect this rule exists for: `README.md` said three times, in the
+    /// commit range that shipped it, that the MCP server did not exist yet.
+    #[test]
+    fn a_claim_of_absence_whose_falsifier_is_in_the_tree_fails_and_names_both() {
+        let readme = "What does not exist yet: an MCP server (the rest of Milestone 5), \
+                      privileged SYN/ICMP scanning.";
+        let found = violations(readme, &truth());
+        let named = found
+            .iter()
+            .find(|v| v.contains("an MCP server (the rest of Milestone 5)"))
+            .unwrap_or_else(|| panic!("no violation named the false claim: {found:#?}"));
+        assert!(
+            named.contains("crates/bathy-mcp/src/server.rs"),
+            "the failure must name what falsifies the claim: {named}"
+        );
+    }
+
+    /// And it is the *tree* that decides, not the phrase: the same sentence
+    /// about a crate that really is absent is not a violation.
+    #[test]
+    fn a_claim_of_absence_whose_falsifier_is_absent_is_not_a_violation() {
+        let readme = "What does not exist yet: a packet daemon (Milestone 6).";
+        let found = violations(readme, &truth());
+        assert!(
+            !found.iter().any(|v| v.contains("a packet daemon")),
+            "{found:#?}"
+        );
     }
 
     /// Assert that mutating the README produces a failure that names the

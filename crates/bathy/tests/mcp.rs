@@ -1001,6 +1001,123 @@ fn server_discover_advertises_the_implemented_version_its_capabilities_and_its_i
 }
 
 #[test]
+fn discovery_is_cacheable_on_terms_this_server_chose_rather_than_inherited() {
+    // `DiscoverResult::from_server_info` hard-codes `ttlMs: 0` and
+    // `cacheScope: private`. Spec-legal, and a value nobody decided -- the
+    // same class as the two Legacy defaults this server already overrides,
+    // one method over. A discovery answer here is one protocol version, one
+    // capability and eleven compiled-in tools.
+    let mut server = Server::start(64);
+    let result = server.request(
+        "server/discover",
+        json!({ "_meta": Server::meta("harness") }),
+    )["result"]
+        .clone();
+    assert_eq!(
+        result["cacheScope"],
+        json!("public"),
+        "an answer that is the same for every caller is not private: {result:#}"
+    );
+    assert!(
+        result["ttlMs"].as_u64().is_some_and(|t| t > 0),
+        "`ttlMs: 0` means immediately stale, for a document that cannot change \
+         while the process runs: {result:#}"
+    );
+    // The same terms as `tools/list`, from the same constant: two answers
+    // about one compiled-in tool set must not expire at different times.
+    let tools = server.list_tools();
+    assert_eq!(result["ttlMs"], tools["ttlMs"], "{result:#}\n{tools:#}");
+    assert_eq!(result["cacheScope"], tools["cacheScope"]);
+}
+
+#[test]
+fn every_result_carries_the_server_identity_the_specification_asks_for() {
+    // "Servers SHOULD include `io.modelcontextprotocol/serverInfo` in every
+    // result's `_meta`". `server/discover` did, because the SDK put it there;
+    // `tools/list` and `tools/call` returned `_meta: null`. That is the SDK's
+    // behaviour rather than a choice made here -- and it becomes a choice
+    // once it has been read.
+    const KEY: &str = "io.modelcontextprotocol/serverInfo";
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let mut server = Server::start(64);
+
+    for (what, result) in [
+        (
+            "server/discover",
+            server.request(
+                "server/discover",
+                json!({ "_meta": Server::meta("harness") }),
+            )["result"]
+                .clone(),
+        ),
+        ("tools/list", server.list_tools()),
+        (
+            "tools/call",
+            server.call_raw(
+                "scope.validate",
+                json!({ "manifest_path": scope.path(), "targets": [ip.to_string()] }),
+            ),
+        ),
+    ] {
+        assert_eq!(
+            result["_meta"][KEY]["name"],
+            json!("bathy"),
+            "{what} carries no server identity: {result:#}"
+        );
+    }
+
+    // And on a refusal too, which is the result a client is most likely to be
+    // holding when it wants to know whose server said no.
+    let refused = server.call_raw("scan.status", json!({ "scan_id": "not-an-identifier" }));
+    assert_eq!(refused["isError"], json!(true));
+    assert_eq!(refused["_meta"][KEY]["name"], json!("bathy"), "{refused:#}");
+}
+
+#[test]
+fn a_capability_this_server_does_not_declare_is_answered_as_absent_not_as_empty() {
+    // The SDK answers four of these with a *successful empty result*: a
+    // server that declares only `tools` would answer `prompts/list` with
+    // `{"prompts": []}`, which says "I have prompts and there are none" where
+    // the truth is "I do not implement prompts". The SDK is already
+    // inconsistent -- `prompts/get` and `resources/read` default to `-32601`
+    // -- so five of the nine undeclared methods told the truth and four did
+    // not. Found by sweeping every `ServerHandler` default rather than by
+    // fixing the one that was reported.
+    let mut server = Server::start(64);
+    let capabilities = server.request("server/discover", json!({ "_meta": Server::meta("h") }))
+        ["result"]["capabilities"]
+        .clone();
+    assert!(
+        capabilities["prompts"].is_null()
+            && capabilities["resources"].is_null()
+            && capabilities["completions"].is_null()
+            && capabilities["logging"].is_null(),
+        "this test is about methods whose capability is NOT declared: {capabilities:#}"
+    );
+
+    for method in [
+        "completion/complete",
+        "prompts/list",
+        "prompts/get",
+        "resources/list",
+        "resources/templates/list",
+        "resources/read",
+        "logging/setLevel",
+    ] {
+        let reply = server.request(method, json!({ "_meta": Server::meta("harness") }));
+        assert_eq!(
+            reply["error"]["code"],
+            json!(-32601),
+            "{method} answered as though this server implemented it: {reply}"
+        );
+    }
+
+    // And the server is still answering the capability it does declare.
+    assert_eq!(server.tools().len(), 11);
+}
+
+#[test]
 fn a_version_this_server_does_not_implement_is_answered_with_32022_and_the_list_it_does() {
     let mut server = Server::start(64);
     let reply = server.request(
@@ -1266,18 +1383,62 @@ fn the_three_tools_that_change_something_are_not_advertised_as_reads() {
 
 #[test]
 fn the_diff_tool_tells_an_agent_a_budget_change_alone_makes_it_say_it_cannot_tell() {
+    // AC-5.37's disclosure half. This used to assert four keywords, and the
+    // keywords survived rewriting the sentence they were meant to guard:
+    // "is enough on its own" could become "may matter" and the conclusion
+    // could be reversed, and `coverage_differs` still appeared elsewhere in
+    // the paragraph. So the assertion is the *claim* -- the three clauses an
+    // agent choosing between "nothing changed" and "we could not tell"
+    // actually needs -- each as a contiguous run of words.
     let mut server = Server::start(64);
     let tools = server.tools();
     let description = tool_named(&tools, "result.diff")["description"]
         .as_str()
         .expect("result.diff carries a description")
         .to_string();
-    for phrase in ["budget", "rate limit", "coverage_differs", "same endpoints"] {
+    // Rendered without the line breaks and emphasis the description carries,
+    // so the claim is matched as a sentence rather than as a layout.
+    let prose = description.replace(['\n', '*'], " ");
+    let flattened: String = {
+        let mut out = String::new();
+        let mut spaced = false;
+        for c in prose.chars() {
+            if c.is_whitespace() {
+                if !spaced {
+                    out.push(' ');
+                }
+                spaced = true;
+            } else {
+                out.push(c);
+                spaced = false;
+            }
+        }
+        out
+    };
+
+    for clause in [
+        // 1. A budget change *alone* is sufficient. This is the claim; the
+        //    word doing the work is "enough on its own".
+        "lowering a rate limit, raising a packet ceiling or extending a runtime cap \
+         between the two runs is enough on its own",
+        // 2. What that produces.
+        "to make every one-sided endpoint undetermined and set the whole comparison to \
+         `coverage_differs`",
+        // 3. That it happens even when nothing about the endpoints changed --
+        //    which is the part an agent would otherwise misread as a finding.
+        "even though the two scans looked at exactly the same endpoints",
+        // 4. And how to read the answer, stated as the two readings and which
+        //    one is wrong.
+        "read `coverage_differs` as \"the two runs were not the same authorization\", \
+         never as \"the two runs did not cover the same ports\"",
+    ] {
         assert!(
-            description.contains(phrase),
-            "the advertised description does not name `{phrase}`. An agent choosing \
-             between \"nothing changed\" and \"we could not tell\" has to know that a \
-             budget change alone produces the second: {description}"
+            flattened.contains(clause),
+            "the advertised description no longer makes this claim:\n  {clause}\n\n\
+             An agent choosing between \"nothing changed\" and \"we could not tell\" has \
+             to be told that a budget change alone produces the second. Keyword presence \
+             does not guard that -- this assertion exists because rewriting the sentence \
+             and reversing its conclusion left the keywords intact.\n\n{flattened}"
         );
     }
 }
@@ -2571,6 +2732,71 @@ fn every_refusal_an_agent_can_provoke_is_a_typed_error_it_can_act_on() {
 
     // The server is still answering after all of that.
     assert_eq!(server.tools().len(), 11);
+}
+
+#[test]
+fn a_resume_is_re_authorized_and_says_which_manifest_rule_refused_it() {
+    // The security-relevant half of `scan.resume`: a resume is new network
+    // activity, so the manifest is evaluated again rather than trusted from
+    // when the scan was admitted. `every_refusal_an_agent_can_provoke...`
+    // covered this tool only for `no_such_scan`, and a mutation that replaced
+    // the propagated reason code and detail with literals survived -- the
+    // typed answer on the re-authorization path was unasserted, while the
+    // equivalent `scan.start` path was covered.
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let mut server = Server::start(64);
+
+    let started = server.call(
+        "scan.start",
+        json!({
+            "manifest_path": scope.path(),
+            "request": scan_request(&ip.to_string(), "1-4", "resume-denials"),
+        }),
+    );
+    let scan_id = started["handle"]["task_id"].as_str().unwrap().to_string();
+    // Finished first, so the positive control at the end is not racing the
+    // running scan's own writer for the event log.
+    wait_for_terminal(&mut server, &scan_id);
+
+    // A manifest that has lapsed since the scan was admitted.
+    let expired = server.call_expecting_failure(
+        "scan.resume",
+        json!({ "manifest_path": scope.expired(), "scan_id": scan_id }),
+    );
+    assert_eq!(expired["error"], json!("scope_expired"), "{expired}");
+    assert!(
+        expired["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains(SCOPE_ID)),
+        "the refusal must name the manifest that refused: {expired}"
+    );
+
+    // A manifest that has been narrowed to somewhere else entirely.
+    let elsewhere = Scope::new(&["10.30.0.0/24"]);
+    let narrowed = server.call_expecting_failure(
+        "scan.resume",
+        json!({ "manifest_path": elsewhere.path(), "scan_id": scan_id }),
+    );
+    assert_eq!(
+        narrowed["error"],
+        json!("target_out_of_scope"),
+        "{narrowed}"
+    );
+    assert!(
+        narrowed["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains(&ip.to_string())),
+        "the refusal must name the address that is no longer authorized: {narrowed}"
+    );
+
+    // And the manifest that still authorizes it does not refuse, so the two
+    // refusals above are about the manifest and not about the scan.
+    let allowed = server.call(
+        "scan.resume",
+        json!({ "manifest_path": scope.path(), "scan_id": scan_id }),
+    );
+    assert_eq!(allowed["scan_id"], json!(scan_id), "{allowed:#}");
 }
 
 // ---------------------------------------------------------------------------

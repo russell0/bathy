@@ -40,8 +40,8 @@ use std::sync::Arc;
 use bathy_types::ids::Digest;
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, CallToolResult, ClientCapabilities,
-    Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion, ServerCapabilities,
-    ServerInfo,
+    DiscoverResult, Implementation, ListToolsResult, PaginatedRequestParams, ProtocolVersion,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -159,6 +159,26 @@ impl ServerHandler for BathyMcpServer {
         Cow::Borrowed(&[PROTOCOL_VERSION])
     }
 
+    /// Discovery, with the two cache hints chosen rather than inherited.
+    ///
+    /// `DiscoverResult::from_server_info` hard-codes `ttlMs: 0` and
+    /// `cacheScope: private` -- spec-legal, and a value nobody decided.
+    /// A discovery answer here is one protocol version, one capability and
+    /// eleven compiled-in tools; it cannot change while the process runs and
+    /// it is the same for every caller, which is the identical reasoning
+    /// `tools/list` is already published under. The same number and the same
+    /// scope, from the same constants, so the two answers cannot drift.
+    async fn discover(
+        &self,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<DiscoverResult, McpError> {
+        Ok(
+            DiscoverResult::from_server_info(vec![PROTOCOL_VERSION], self.get_info())
+                .with_ttl_ms(descriptors::TOOLS_TTL_MS)
+                .with_cache_scope(CacheScope::Public),
+        )
+    }
+
     async fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
@@ -167,9 +187,11 @@ impl ServerHandler for BathyMcpServer {
         // The set is compiled in and cannot change while this process runs,
         // so it is cacheable and shareable. The order is sorted by name,
         // asserted rather than assumed.
-        Ok(ListToolsResult::with_all_items(descriptors::all())
+        let mut result = ListToolsResult::with_all_items(descriptors::all())
             .with_ttl_ms(descriptors::TOOLS_TTL_MS)
-            .with_cache_scope(CacheScope::Public))
+            .with_cache_scope(CacheScope::Public);
+        stamp_identity(&mut result.meta);
+        Ok(result)
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -189,14 +211,95 @@ impl ServerHandler for BathyMcpServer {
                 Some(serde_json::json!({ "tools": descriptors::TOOL_NAMES })),
             ));
         }
-        match self.dispatch(request, &context).await {
-            Ok(response) => Ok(response),
-            Err(Refusal::Tool(failure)) => Ok(CallToolResponse::Complete(failure.into_result())),
+        let mut response = match self.dispatch(request, &context).await {
+            Ok(response) => response,
+            Err(Refusal::Tool(failure)) => CallToolResponse::Complete(failure.into_result()),
             // The one condition the specification names a protocol error for.
-            Err(Refusal::Protocol(error)) => Err(*error),
+            Err(Refusal::Protocol(error)) => return Err(*error),
+        };
+        if let CallToolResponse::Complete(result) = &mut response {
+            stamp_identity(&mut result.meta);
         }
+        Ok(response)
+    }
+
+    // -----------------------------------------------------------------------
+    // Capabilities this server does not have, answered as not having them.
+    //
+    // The SDK's defaults for these four are a *successful empty result*: a
+    // server that declares only `tools` answers `prompts/list` with
+    // `{"prompts": []}`, which says "I have prompts and there are none" where
+    // the truth is "I do not implement prompts". The SDK is already
+    // inconsistent about it -- `prompts/get` and `resources/read` default to
+    // `-32601` -- so five of the nine undeclared methods told the truth and
+    // four did not.
+    //
+    // Found by sweeping every `ServerHandler` default rather than by fixing
+    // the one that was reported, which is what the Global Constraint asks
+    // for: a defect found in one file is a defect class until proven
+    // otherwise. The reported instance was `server/discover`'s cache hints,
+    // above; these four are the rest of the class.
+    // -----------------------------------------------------------------------
+
+    async fn complete(
+        &self,
+        _request: rmcp::model::CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::CompleteResult, McpError> {
+        Err(McpError::method_not_found::<
+            rmcp::model::CompleteRequestMethod,
+        >())
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, McpError> {
+        Err(McpError::method_not_found::<
+            rmcp::model::ListPromptsRequestMethod,
+        >())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        Err(McpError::method_not_found::<
+            rmcp::model::ListResourcesRequestMethod,
+        >())
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
+        Err(McpError::method_not_found::<
+            rmcp::model::ListResourceTemplatesRequestMethod,
+        >())
     }
 }
+
+/// `_meta["io.modelcontextprotocol/serverInfo"]`, which the specification
+/// says servers **SHOULD** include in every result.
+///
+/// `server/discover` gets it from the SDK; `tools/list` and `tools/call` did
+/// not, and "the SDK does not" is a description rather than a decision once
+/// it has been read. A client that caches a tool list for an hour benefits
+/// most from knowing whose list it is.
+fn stamp_identity(meta: &mut Option<rmcp::model::MetaObject>) {
+    let identity = serde_json::to_value(Implementation::new("bathy", env!("CARGO_PKG_VERSION")))
+        .expect("an Implementation always serializes");
+    meta.get_or_insert_default()
+        .insert(SERVER_INFO_META_KEY.to_string(), identity);
+}
+
+/// The reserved `_meta` key. Spelled out because the SDK's own constant is
+/// private, and asserted against the SDK's reader in the tests below so a
+/// typo cannot pass for an identity nobody can find.
+const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
 
 /// Whether the caller declared that it can answer an `elicitation/create`.
 ///
