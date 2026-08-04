@@ -88,6 +88,72 @@ const PINNED_DEPENDENCIES: &[(&str, &[&str])] = &[(
     ],
 )];
 
+/// Every file whose prose states a pinned crate's dependency set in words.
+///
+/// [`PINNED_DEPENDENCIES`] pins the set; this pins the *prose about* the set,
+/// which is a different thing and is what actually rotted. MINOR-1 was "a
+/// count that is wrong in N places". The sweep that fixed it found six places
+/// and missed a seventh: `.github/workflows/ci.yml` still said
+/// `bathy-query`'s `[dependencies]` is "`bathy-types` and nothing else" --
+/// and that sentence is not an incidental mention, it is the *premise* of the
+/// argument that splits `bathy-query` across the two MSRV jobs. The
+/// conclusion survived (every added crate was already in `bathy-types`'
+/// 1.88-clean graph, and both jobs pass), but nothing in the tree could have
+/// told anyone the premise had stopped being true.
+///
+/// The check is one-directional on purpose: every crate in the pinned set
+/// must be *named* in each file. A crate the set no longer contains is not
+/// reported, because a file may legitimately name `serde` for a reason that
+/// has nothing to do with this claim, and a check with false positives gets
+/// deleted. Addition is the direction that rots -- it is the direction that
+/// rotted here.
+const PINNED_DEPENDENCY_PROSE: &[(&str, &[&str])] = &[(
+    "bathy-query",
+    &[
+        "crates/bathy-query/Cargo.toml",
+        "crates/bathy-query/src/lib.rs",
+        "crates/bathy-query/tests/real_log_fold.rs",
+        ".github/workflows/ci.yml",
+    ],
+)];
+
+/// Report every file in [`PINNED_DEPENDENCY_PROSE`] that describes a pinned
+/// crate's dependency set without naming one of the crates in it.
+///
+/// A file that cannot be read is reported, not skipped: a path that has been
+/// renamed away must fail loudly rather than quietly stop being checked.
+fn find_pinned_dependency_prose_drift(root: &Path) -> Vec<String> {
+    let mut drift = Vec::new();
+    for (crate_name, files) in PINNED_DEPENDENCY_PROSE {
+        let Some((_, pinned)) = PINNED_DEPENDENCIES.iter().find(|(n, _)| n == crate_name) else {
+            drift.push(format!(
+                "{crate_name} has prose sites listed but no pinned dependency set"
+            ));
+            continue;
+        };
+        for file in *files {
+            let path = root.join(file);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                drift.push(format!(
+                    "{file} states {crate_name}'s dependency set but could not be read \
+                     -- renamed, or removed without its entry here"
+                ));
+                continue;
+            };
+            for dependency in *pinned {
+                if !text.contains(dependency) {
+                    drift.push(format!(
+                        "{file} describes {crate_name}'s dependencies but never names \
+                         `{dependency}`, which is in its pinned set; the description is \
+                         out of date"
+                    ));
+                }
+            }
+        }
+    }
+    drift
+}
+
 /// Report every difference between a pinned crate's real direct dependencies
 /// and its pinned set, in both directions -- an addition is a purity claim
 /// that quietly stopped being true, and a removal is documentation naming a
@@ -209,12 +275,18 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
     let packages = parse_packages(&meta)?;
     let mut violations = find_violations(&packages);
     violations.extend(find_pinned_dependency_drift(&packages));
+    violations.extend(find_pinned_dependency_prose_drift(Path::new(".")));
 
     if violations.is_empty() {
         println!(
-            "check-deps: ok ({} crates ranked, {} pinned dependency set(s))",
+            "check-deps: ok ({} crates ranked, {} pinned dependency set(s), {} prose \
+             site(s) checked against them)",
             count_ranked(&packages),
-            PINNED_DEPENDENCIES.len()
+            PINNED_DEPENDENCIES.len(),
+            PINNED_DEPENDENCY_PROSE
+                .iter()
+                .map(|(_, files)| files.len())
+                .sum::<usize>()
         );
         Ok(())
     } else {
@@ -889,6 +961,88 @@ mod tests {
             "a type gaining a field without regeneration must be reported as drift: {drift:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- PINNED_DEPENDENCY_PROSE: the prose about the pinned set. ---
+
+    /// Writes a scratch tree containing every path in
+    /// [`PINNED_DEPENDENCY_PROSE`], each holding `text`.
+    fn prose_tree(label: &str, text: &str) -> std::path::PathBuf {
+        let root = scratch_dir(label);
+        for (_, files) in PINNED_DEPENDENCY_PROSE {
+            for file in *files {
+                let path = root.join(file);
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(&path, text).unwrap();
+            }
+        }
+        root
+    }
+
+    #[test]
+    fn every_real_prose_site_names_every_crate_in_the_pinned_set() {
+        // The check over this repository, which is what the seventh site --
+        // `.github/workflows/ci.yml`, the premise of the MSRV job split --
+        // was missing.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let drift = find_pinned_dependency_prose_drift(&root);
+        assert!(drift.is_empty(), "{}", drift.join("\n"));
+    }
+
+    #[test]
+    fn a_prose_site_is_reported_only_when_it_omits_a_pinned_crate() {
+        // Both directions against the same fixture builder, because the
+        // clean half is what proves the reported half fails for the stated
+        // reason rather than because `prose_tree` wrote the wrong paths.
+        let complete = prose_tree(
+            "prose-complete",
+            "bathy-types, schemars, serde, serde_json and thiserror.",
+        );
+        assert!(
+            find_pinned_dependency_prose_drift(&complete).is_empty(),
+            "a site naming the whole set is clean"
+        );
+        let _ = std::fs::remove_dir_all(&complete);
+
+        // The shape of the seventh site: names the crate and one dependency,
+        // and stops.
+        let partial = prose_tree(
+            "prose-missing",
+            "bathy-query's `[dependencies]` is `bathy-types` and nothing else.",
+        );
+        let drift = find_pinned_dependency_prose_drift(&partial);
+        assert!(
+            drift
+                .iter()
+                .any(|d| d.contains("ci.yml") && d.contains("thiserror")),
+            "the seventh site and the crate it omits must both be named: {drift:?}"
+        );
+        // Four unnamed crates in each of the four listed files.
+        assert_eq!(drift.len(), 16, "{drift:?}");
+        let _ = std::fs::remove_dir_all(&partial);
+    }
+
+    #[test]
+    fn a_prose_site_that_has_been_renamed_away_is_reported_not_skipped() {
+        // A path that no longer exists must fail, not quietly stop being
+        // checked -- the same rule `find_pinned_dependency_drift` applies to
+        // a renamed package.
+        let root = scratch_dir("prose-missing-file");
+        std::fs::create_dir_all(&root).unwrap();
+        let drift = find_pinned_dependency_prose_drift(&root);
+        assert!(
+            drift.iter().any(|d| d.contains("could not be read")),
+            "{drift:?}"
+        );
+        assert_eq!(
+            drift.len(),
+            PINNED_DEPENDENCY_PROSE
+                .iter()
+                .map(|(_, f)| f.len())
+                .sum::<usize>(),
+            "every unreadable site must be reported once, not collapsed: {drift:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // --- emit_schemas_into: the prose check runs before the write. ---

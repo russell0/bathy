@@ -144,9 +144,21 @@ jobs:
       - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p bathy -p xtask --all-targets
       # `bathy-query` joined this job in M5 Task 1 -- and it is the first
       # crate whose floor these two jobs, as previously written, could not
-      # express. Its `[dependencies]` is `bathy-types` and nothing else, so
-      # `1.88` is the floor a *consumer* of the library gets and is what its
-      # `rust-version` declares. Its `[dev-dependencies]` are another matter:
+      # express. Its `[dependencies]` are `bathy-types`, `schemars`, `serde`,
+      # `serde_json` and `thiserror`, every one of them already in
+      # `bathy-types`' own 1.88-clean graph, so `1.88` is the floor a
+      # *consumer* of the library gets and is what its `rust-version`
+      # declares. That set is not a comment anyone has to remember: it is
+      # pinned in `xtask`'s `PINNED_DEPENDENCIES` and `check-deps` fails on a
+      # direct dependency added or removed without the pin moving with it.
+      # Said "`bathy-types` and nothing else" until the M5 Task 2 residual
+      # round -- true when written in M5 Task 1, false from M5 Task 2, and
+      # not an incidental mention: it is the premise of this whole split.
+      # `PINNED_DEPENDENCIES` is what stops the premise rotting again; it
+      # cannot check this sentence, so the sentence points at it instead of
+      # restating it.
+      #
+      # Its `[dev-dependencies]` are another matter:
       # `tests/real_log_fold.rs` folds a log produced by a REAL scan, which
       # needs `bathy-engine` -> `bathy-store` -> `libsqlite3-sys`, whose
       # build script needs `1.95`.
