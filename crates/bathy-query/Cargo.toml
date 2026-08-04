@@ -31,6 +31,21 @@ repository.workspace = true
 # network, the clock or the filesystem, and the shortest way to keep that
 # true is to depend on nothing that could.
 bathy-types = { path = "../bathy-types" }
+# Added in M5 Task 2 for AC-5.35: `ScanFold` and `ScanDiff` are published
+# contracts with committed, drift-checked JSON Schemas, which needs derives
+# (`serde`, `schemars`) and a `Value` to hand `xtask` (`serde_json`).
+#
+# The purity argument above is unaffected, and that is checkable rather than
+# asserted: all three were already in this crate's transitive graph via
+# `bathy-types`, which depends on every one of them, so `cargo tree -p
+# bathy-query` gains no node. None of them can reach a socket, a clock, a
+# database or the filesystem. The MSRV claim was re-verified by execution
+# against a real 1.88 toolchain after the change, not assumed -- see this
+# task's report.
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 # Determinism and order-independence (AC-5.1) are universally quantified
@@ -59,6 +74,10 @@ bathy-probe = { path = "../bathy-probe" }
 bathy-scope = { path = "../bathy-scope", features = ["test-util"] }
 bathy-store = { path = "../bathy-store" }
 tempfile = { workspace = true }
+# `real_log_fold.rs` puts a real fold through its published wire encoding
+# (AC-5.35). `serde_json` is a normal dependency of this crate too; naming it
+# here as well is what lets the integration test use it.
+serde_json = { workspace = true }
 # `io-util` on top of the workspace feature set: the nginx fixture below
 # reads the probe's request and writes the captured response by hand, which
 # needs `AsyncReadExt`/`AsyncWriteExt` -- the same reason `bathy-engine`

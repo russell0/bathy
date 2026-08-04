@@ -127,7 +127,11 @@ dependencies = [
  "bathy-store",
  "bathy-types",
  "proptest",
+ "schemars",
+ "serde",
+ "serde_json",
  "tempfile",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]
@@ -1216,6 +1220,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "bathy-probe",
+ "bathy-query",
  "bathy-types",
  "csv",
  "regex",

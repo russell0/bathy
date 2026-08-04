@@ -8,8 +8,13 @@
 //!
 //! Everything here is a pure function of its arguments. No crate in this
 //! layer touches the store, the network, the clock or the filesystem, and
-//! `[dependencies]` is `bathy-types` alone so that staying pure is a
-//! property of the dependency graph rather than of anybody's discipline.
+//! `[dependencies]` is `bathy-types` plus the three data crates
+//! `bathy-types` itself already pulls in -- `serde`, `serde_json` and
+//! `schemars` -- so staying pure remains a property of the dependency graph
+//! rather than of anybody's discipline. M5 Task 2 added those three to
+//! publish `ScanFold` and `ScanDiff` as committed JSON Schemas (AC-5.35);
+//! `cargo tree -p bathy-query` is unchanged by the addition, because every
+//! one of them was already there transitively.
 //!
 //! Purity is not a stylistic preference here. M5 Task 2's diff is a function
 //! of two folds, so any nondeterminism in a fold shows up downstream as a
@@ -19,6 +24,11 @@
 //! iteration order) and why the fold sorts by `sequence` before folding
 //! rather than trusting the order a caller happened to hand it.
 
+pub mod diff;
 pub mod fold;
+pub mod schema;
+pub mod wire;
 
+pub use diff::{Change, ChangeKind, ScanDiff, Undecidable, Undetermined, diff};
 pub use fold::{EndpointKey, EndpointState, ScanFold, Terminal, fold_events};
+pub use wire::{FoldEntry, ScanFoldWire, WireError};

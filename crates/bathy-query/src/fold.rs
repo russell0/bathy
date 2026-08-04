@@ -3,6 +3,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use bathy_types::event::{DenyReason, Endpoint, Event, EventBody, Observation, PortState};
 use bathy_types::ids::Digest;
 
@@ -43,74 +46,120 @@ pub struct ScanFold {
     /// -- a scan denied by policy is terminal and folds to
     /// [`Terminal::Denied`].
     pub terminal: Option<Terminal>,
+    /// The `plan_hash` the scan announced in `scan.started`, if it announced
+    /// one.
+    ///
+    /// Recorded because **the fold's endpoint set is only as wide as the plan
+    /// that produced it**, and a consumer that forgets this manufactures the
+    /// phantom change this crate exists to avoid: diffing Monday's scan of
+    /// ports 1-1000 against Tuesday's scan of ports 22 and 80 finds 998
+    /// endpoints missing from Tuesday, none of which went anywhere. Nobody
+    /// looked. `plan_hash` names *the work*, not the attempt
+    /// (`bathy-plan`'s `ScanPlan::build` excludes `idempotency_key` from it
+    /// and canonicalizes target/port order), so two runs of the same request
+    /// against the same manifest carry the same hash and are genuinely
+    /// comparable, and two runs of different requests are not.
+    /// [`crate::diff::diff`] is the consumer, and it refuses to read absence
+    /// as evidence unless these agree.
+    ///
+    /// `None` means the log contained no `scan.started` at all -- a refused
+    /// scan (whose entire log is one `policy.denied`), an empty log, or a
+    /// truncated one. Absence of a hash is never treated as agreement.
+    pub plan_hash: Option<Digest>,
 }
 
 /// What the log knows about one endpoint.
-#[derive(Clone, Debug, Default, PartialEq)]
+//
+// Serialized as-is, and the same four field names appear inside
+// `crate::wire::FoldEntry` -- one spelling of an endpoint record, whether it
+// is published as part of a fold or as the `before`/`after` of a
+// `crate::diff::Change`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+// See `crate::wire`'s note on `required`: this crate's encoder never omits a
+// field, so the schema says so rather than inheriting `schemars`' default
+// treatment of `Option` as optional.
+#[schemars(extend("required" = ["state", "observation", "evidence_refs", "probe_id"]))]
 pub struct EndpointState {
-    /// The last observed reachability of this endpoint, or `None` if the log
+    /// The last observed reachability of this endpoint, or `null` if the log
     /// contains no `port.state` event for it.
     ///
-    /// `Option` rather than a bare `PortState`, and this is a deliberate
-    /// departure from the M5 plan's sketched interface. A `service.observed`
-    /// event carries no port state of its own, so a log containing one with
-    /// no preceding `port.state` for the same endpoint leaves this field
-    /// with nothing to hold. The alternatives were all worse: defaulting to
-    /// `Open` invents an observation the log never recorded (and M5 Task 2
-    /// would then report a state change between a real `None` and an
-    /// invented `Open`), and defaulting to `Indeterminate` overloads a
-    /// variant whose documented meaning is "probed, but the response was
-    /// contradictory across retries" -- a *finding*, not an absence.
-    ///
-    /// This is the same distinction `open_endpoints` exists to preserve, one
-    /// level down: "we probed it and it was shut" and "we never probed it"
-    /// are different answers and neither may impersonate the other.
-    ///
-    /// A gap-free log from `bathy-engine` never produces `None` here --
-    /// `Scheduler::detect_service` only runs on an endpoint already found
-    /// `Open`, so `port.state` always precedes `service.observed`. It is
-    /// reachable only from a truncated or hand-edited log, which is exactly
-    /// the input a pure function that will one day be handed a file from
-    /// disk has to have a defined answer for.
+    /// `null` is not `closed` and not `filtered`: "we probed it and it was
+    /// shut" and "we never observed its reachability" are different answers,
+    /// and neither may impersonate the other. A scan that identified a
+    /// service without ever recording a port state leaves this `null`.
+    //
+    // `Option` rather than a bare `PortState`, and this is a deliberate
+    // departure from the M5 plan's sketched interface. A `service.observed`
+    // event carries no port state of its own, so a log containing one with no
+    // preceding `port.state` for the same endpoint leaves this field with
+    // nothing to hold. The alternatives were all worse: defaulting to `Open`
+    // invents an observation the log never recorded (and the diff would then
+    // report a state change between a real `None` and an invented `Open`),
+    // and defaulting to `Indeterminate` overloads a variant whose documented
+    // meaning is "probed, but the response was contradictory across retries"
+    // -- a *finding*, not an absence.
+    //
+    // A gap-free log from `bathy-engine` never produces `None` here --
+    // `Scheduler::detect_service` only runs on an endpoint already found
+    // `Open`, so `port.state` always precedes `service.observed`. It is
+    // reachable only from a truncated or hand-edited log, which is exactly
+    // the input a pure function that will one day be handed a file from disk
+    // has to have a defined answer for.
     pub state: Option<PortState>,
-    /// The last service observation for this endpoint, by sequence.
+    /// The last service identification for this endpoint, or `null` if
+    /// nothing identified it.
     pub observation: Option<Observation>,
     /// Every distinct evidence digest any event cited for this endpoint, in
-    /// first-cited order.
-    ///
-    /// Accumulated across events rather than replaced by the latest one: a
-    /// digest is a pointer into the content-addressed evidence store, and
-    /// dropping one destroys the ability to answer "what did we actually see
-    /// on this port" for anything but the final observation. Deduplicated
-    /// because the same bytes cited twice are one piece of evidence, and
-    /// order is first-citation order, which is total because the events were
-    /// put in a total order before folding.
+    /// first-cited order, deduplicated. Superseded observations' evidence
+    /// stays reachable: the digests accumulate rather than being replaced by
+    /// the latest event's.
+    //
+    // A digest is a pointer into the content-addressed evidence store, and
+    // dropping one destroys the ability to answer "what did we actually see
+    // on this port" for anything but the final observation. Order is
+    // first-citation order, which is total because the events were put in a
+    // total order before folding.
     pub evidence_refs: Vec<Digest>,
-    /// The probe behind [`EndpointState::observation`], if there is one.
+    /// The probe that produced `observation`, or `null` if nothing
+    /// identified this endpoint.
     pub probe_id: Option<String>,
 }
 
-/// The three ways a scan's log can end.
+/// The three ways a scan's log can end: it completed, it failed, or it was
+/// refused by policy.
 ///
-/// One variant per terminal `EventBody`, and "terminal" is `bathy-engine`'s
-/// own definition, not this crate's: `durable_log.rs`'s `is_terminal` and
-/// `scheduler.rs`'s `already_terminated()` both match exactly
-/// `ScanCompleted | ScanFailed | PolicyDenied`, and a denial is the *only*
-/// event a refused scan's log contains (`scheduler.rs`'s
-/// `a_scope_validity_denial_emits_no_scan_started`). This enum must mirror
-/// that set: an earlier revision omitted [`Terminal::Denied`], and a refused
-/// scan then folded byte-identically to a scan that had never run -- so a
-/// diff against it reported every endpoint on the host as having disappeared
-/// when no packet had been sent. See
-/// `a_policy_denied_scan_is_terminal_and_is_not_a_scan_that_never_ran`.
-///
-/// "Still running" and "cancelled mid-flight" are the cases represented by
-/// `ScanFold::terminal` being `None` rather than by a value here. Adding a
-/// terminal `EventBody` to `bathy-types` without adding it here is the defect
-/// this doc comment exists to prevent; `fold_events`'s `match` is exhaustive
-/// over `EventBody`, so a new variant there will not compile until it is
-/// decided here.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// On the wire this is an internally tagged object -- `{"outcome":
+/// "completed" | "failed" | "denied", ...}` -- and `null` in place of the
+/// whole object means the scan is still running or was cancelled mid-flight.
+/// `null` never means "refused": a refused scan is `denied`, and the
+/// difference decides whether an endpoint missing from the scan is a service
+/// that went away or a packet that was never sent.
+//
+// One variant per terminal `EventBody`, and "terminal" is `bathy-engine`'s
+// own definition, not this crate's: `durable_log.rs`'s `is_terminal` and
+// `scheduler.rs`'s `already_terminated()` both match exactly
+// `ScanCompleted | ScanFailed | PolicyDenied`, and a denial is the *only*
+// event a refused scan's log contains (`scheduler.rs`'s
+// `a_scope_validity_denial_emits_no_scan_started`). This enum must mirror
+// that set: an earlier revision omitted `Terminal::Denied`, and a refused
+// scan then folded byte-identically to a scan that had never run -- so a
+// diff against it reported every endpoint on the host as having disappeared
+// when no packet had been sent. See
+// `a_policy_denied_scan_is_terminal_and_is_not_a_scan_that_never_ran`.
+//
+// Adding a terminal `EventBody` to `bathy-types` without adding it here is
+// the defect these comments exist to prevent; `fold_events`'s `match` is
+// exhaustive over `EventBody`, so a new variant there will not compile until
+// it is decided here.
+//
+// Every `///` line above is published in `schemas/scan-fold.json` and
+// `schemas/scan-diff.json` as this type's `description`, which is why the
+// rationale is in `//` comments -- the M5 Task 1 `$defs` sweep's rule, now
+// load-bearing for this crate too because M5 Task 2 made these types
+// serializable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Terminal {
     Completed {
         probes_sent: u64,
@@ -122,15 +171,17 @@ pub enum Terminal {
         detail: String,
     },
     /// The scan was refused by policy and no packet was emitted under it.
-    ///
-    /// `reason_code` is the typed [`DenyReason`], not a `String`, because
-    /// that is what `EventBody::PolicyDenied` carries and an agent branches
-    /// on `DenyReason::code`'s stable wire strings. Distinct from
-    /// [`Terminal::Failed`], whose `reason_code` is an untyped engine/IO
-    /// string: "we were not allowed to look" and "we tried and it broke" are
-    /// different answers to "what happened to this scan", and M5 Task 2's
-    /// diff must be able to tell them apart before it classifies an empty
-    /// result.
+    /// `reason_code` is one of the four stable deny codes; it is not an
+    /// engine error, and retrying it without changing the authorization will
+    /// be refused again.
+    //
+    // The typed `DenyReason`, not a `String`, because that is what
+    // `EventBody::PolicyDenied` carries and an agent branches on
+    // `DenyReason::code`'s stable wire strings. Distinct from
+    // `Terminal::Failed`, whose `reason_code` is an untyped engine/IO string:
+    // "we were not allowed to look" and "we tried and it broke" are different
+    // answers to "what happened to this scan", and the diff must be able to
+    // tell them apart before it classifies an empty result.
     Denied {
         reason_code: DenyReason,
         detail: String,
@@ -176,11 +227,12 @@ impl ScanFold {
 /// Pure: same events in, byte-identical `ScanFold` out, for any permutation
 /// of the input. Nothing here reads a clock, a socket, a database or a file.
 ///
-/// One caveat, attached where it belongs rather than to the claim as a whole:
-/// on a **malformed** log -- one with two events sharing a `sequence`, which
-/// `bathy-evidence` cannot produce -- the tiebreak is keyed on `Debug`
-/// rendering, which is stable within a build but carries no cross-release
-/// guarantee from Rust. See the "Ordering" section.
+/// The claim is unconditional as of M5 Task 2. It used to carry a caveat for
+/// the malformed case -- two events sharing a `sequence`, which
+/// `bathy-evidence` cannot produce -- because the tiebreak was keyed on
+/// `Debug` rendering, which Rust does not promise across releases. It is now
+/// keyed on [`tie_key`], a typed projection of the fields this fold reads.
+/// See the "Ordering" section.
 ///
 /// # Ordering
 ///
@@ -195,32 +247,22 @@ impl ScanFold {
 /// one: two events sharing a sequence number would be left in whatever
 /// relative order the caller supplied, and the fold's determinism guarantee
 /// would quietly become a guarantee about the caller. Ties are therefore
-/// broken by the events' own `Debug` rendering, which is a pure function of
-/// their contents -- so two events that tie on both are indistinguishable to
-/// the fold and applying either first gives the same result. Rendering is
-/// computed only inside a run of equal sequence numbers, so a well-formed log
-/// never pays for it.
+/// broken by [`tie_key`], a pure function of the event fields this fold reads
+/// -- so two events that tie on both are indistinguishable to the fold and
+/// applying either first gives the same result. The key is computed only
+/// inside a run of equal sequence numbers, so a well-formed log never pays
+/// for it.
 ///
-/// **The scope of that tiebreak's guarantee, stated exactly.** `Debug` is
-/// total, pure and deterministic *within a build*, which is the whole of what
-/// the fold's callers can observe: two folds compared in one process agree
-/// unconditionally. Rust promises nothing about `Debug` output across
-/// releases, so on the tie path -- and only there -- "byte-identical" is
-/// build-relative. Three things bound this. It is unreachable from a real
-/// log: `bathy-evidence`'s log is append-only, gap-free and monotonic in
-/// `sequence` by construction, so no two events can collide. Nothing today
-/// compares a `ScanFold` across builds, because `ScanFold` is not
-/// serializable (deliberately -- see the crate docs). And the alternative
-/// keys were each worse: a canonical-JSON (RFC 8785) rendering *is* stable
-/// across releases and is this project's hashing input, but reaching it means
-/// adding `serde_json` to a crate whose single-dependency graph is what
-/// makes its purity checkable rather than merely asserted; a derived `Ord` on
-/// `Event` is impossible (`Confidence` wraps an `f64`) and would in any case
-/// be silently defined by source order, the exact drift `bathy-types`'
-/// `transport_orders_by_declaration_order` exists to catch. The moment
-/// `ScanFold` gains a wire encoding (M5 Task 2), the tie path becomes
-/// cross-release visible and this trade must be re-decided -- which is why
-/// it is a named obligation on Task 2 in the M5 plan and not a note here.
+/// **The scope of that tiebreak's guarantee, stated exactly.** It is total,
+/// pure, deterministic, and depends on no rendering this project does not
+/// own -- so it holds across builds and across toolchain releases, and the
+/// published `scan-fold` schema says so. This replaced a `Debug`-keyed
+/// tiebreak whose guarantee was build-relative (M5 Task 1, MINOR-1;
+/// re-decided under AC-5.36 when `ScanFold` gained a wire encoding, because a
+/// serialized fold is exactly the artefact two different builds can compare).
+/// The tie path remains unreachable from a real log: `bathy-evidence`'s log
+/// is append-only, gap-free and monotonic in `sequence` by construction, so
+/// no two events can collide.
 ///
 /// # Malformed and contradictory logs
 ///
@@ -253,7 +295,14 @@ pub fn fold_events(events: &[Event]) -> ScanFold {
 
     for event in total_order(events) {
         match &event.body {
-            EventBody::ScanStarted { .. } | EventBody::Progress { .. } => {}
+            EventBody::Progress { .. } => {}
+
+            EventBody::ScanStarted { plan_hash, .. } => {
+                // Last one by sequence wins, exactly like `terminal`: a
+                // spliced or resumed log can carry more than one
+                // `scan.started`, and the current belief is the latest.
+                fold.plan_hash = Some(*plan_hash);
+            }
 
             EventBody::PolicyDenied {
                 reason_code,
@@ -326,7 +375,8 @@ pub fn fold_events(events: &[Event]) -> ScanFold {
 
 /// Put `events` into the total order the fold applies them in: by `sequence`,
 /// then -- only where sequence numbers collide, which a well-formed log never
-/// does -- by the events' own `Debug` rendering.
+/// does -- by [`tie_key`], a typed projection of exactly the fields the fold
+/// reads.
 ///
 /// See [`fold_events`]'s "Ordering" section for why the tiebreak exists at
 /// all. Borrowing rather than cloning: the fold reads each event once and
@@ -345,7 +395,12 @@ fn total_order(events: &[Event]) -> Vec<&Event> {
             end += 1;
         }
         if end - start > 1 {
-            ordered[start..end].sort_by_cached_key(|event| format!("{event:?}"));
+            // `sort_by`, not `sort_by_cached_key`: the key borrows from the
+            // event it describes, which a cached key (whose type may not
+            // depend on the element's lifetime) cannot do. The cost is
+            // recomputing keys per comparison inside a tie run, which a
+            // well-formed log never has and a malformed one has two of.
+            ordered[start..end].sort_by(|a, b| tie_key(a).cmp(&tie_key(b)));
         }
         start = end;
     }
@@ -353,8 +408,162 @@ fn total_order(events: &[Event]) -> Vec<&Event> {
     ordered
 }
 
+/// The ordering key for two events that share a `sequence`.
+///
+/// Every field of every `EventBody` variant that [`fold_events`] *reads*,
+/// projected into one comparable value -- and nothing else. Two events with
+/// equal keys are therefore indistinguishable to the fold, so applying either
+/// first gives the same `ScanFold`, which is the whole property the tiebreak
+/// has to deliver. Fields the fold ignores (`timestamp`, `engine_version`,
+/// `scan_id`, `estimated_targets`, `estimated_probes`) are deliberately
+/// absent: including them would order events the fold cannot tell apart, at
+/// the cost of a wider surface to keep correct.
+///
+/// # Why a typed key rather than `Debug` (AC-5.36)
+///
+/// M5 Task 1 keyed this on `format!("{event:?}")` and scoped the fold's
+/// determinism claim to a single build, because `Debug` output carries no
+/// cross-release stability guarantee from Rust and the alternatives then
+/// available were worse. That trade was ruled correct *while `ScanFold` was
+/// unserializable and no caller could observe the tie path's outcome across
+/// builds*. M5 Task 2 ends that condition: `ScanFold` now has a committed
+/// wire encoding and a `Deserialize` impl, so an agent can store Monday's
+/// fold as JSON, upgrade the binary, and diff it against Tuesday's -- and a
+/// tiebreak that moved between those two builds would surface as a change
+/// that did not happen.
+///
+/// So the key is now built from the events' own typed fields. It depends on
+/// this crate's source and nothing else: no `Debug` formatter, no float
+/// formatting, no serializer, no dependency's rendering. `PortState` is
+/// ranked by an explicit `match` rather than by declaration order, so
+/// reordering that enum cannot silently permute the tiebreak. `Confidence` is
+/// compared by `f64::to_bits`, which is total and exact over the finite
+/// non-`NaN` values `Confidence::new` admits -- and deliberately *finer* than
+/// `PartialEq` (it separates `0.0` from `-0.0`), because a key that is too
+/// fine can only order events the fold could not tell apart, while a key that
+/// is too coarse would hand the decision back to the caller's argument order.
+///
+/// The canonical-JSON alternative (RFC 8785, this project's hashing input) is
+/// **not available here and that is a fact about the profile, not a
+/// preference**: `bathy_types::canonical::canonical_json` rejects
+/// non-integer numbers, and every `service.observed` carries a `Confidence`
+/// that is one. It would fail on the commonest event in any real log.
+fn tie_key(event: &Event) -> TieKey<'_> {
+    // One explicit discriminant per variant, written out rather than derived,
+    // for the same reason `PortState` is ranked by hand below.
+    const STARTED: u8 = 0;
+    const HOST: u8 = 1;
+    const PORT: u8 = 2;
+    const SERVICE: u8 = 3;
+    const PROGRESS: u8 = 4;
+    const DENIED: u8 = 5;
+    const COMPLETED: u8 = 6;
+    const FAILED: u8 = 7;
+
+    let mut key = TieKey {
+        kind: PROGRESS,
+        ..TieKey::default()
+    };
+    match &event.body {
+        EventBody::Progress { .. } => {}
+        EventBody::ScanStarted { plan_hash, .. } => {
+            key.kind = STARTED;
+            key.digests = std::slice::from_ref(plan_hash);
+        }
+        EventBody::HostDiscovered { target, .. } => {
+            key.kind = HOST;
+            key.target = Some(target.ip);
+        }
+        EventBody::PortStateObserved {
+            target,
+            endpoint,
+            state,
+            evidence_refs,
+        } => {
+            key.kind = PORT;
+            key.target = Some(target.ip);
+            key.endpoint = Some(*endpoint);
+            key.state = Some(port_state_rank(*state));
+            key.digests = evidence_refs.as_ref().map_or(&[], |refs| refs.as_slice());
+        }
+        EventBody::ServiceObserved {
+            target,
+            endpoint,
+            observation,
+            evidence_refs,
+            probe_id,
+        } => {
+            key.kind = SERVICE;
+            key.target = Some(target.ip);
+            key.endpoint = Some(*endpoint);
+            key.service = Some(observation.service.as_str());
+            key.product = observation.product.as_deref();
+            key.version = observation.version.as_deref();
+            key.confidence = Some(observation.confidence.get().to_bits());
+            key.probe_id = Some(probe_id.as_str());
+            key.digests = evidence_refs.as_slice();
+        }
+        EventBody::PolicyDenied {
+            reason_code,
+            detail,
+        } => {
+            key.kind = DENIED;
+            key.text = (reason_code.code(), detail.as_str());
+        }
+        EventBody::ScanCompleted {
+            probes_sent,
+            packets_spent,
+            findings,
+        } => {
+            key.kind = COMPLETED;
+            key.counters = [*probes_sent, *packets_spent, *findings];
+        }
+        EventBody::ScanFailed {
+            reason_code,
+            detail,
+        } => {
+            key.kind = FAILED;
+            key.text = (reason_code.as_str(), detail.as_str());
+        }
+    }
+    key
+}
+
+/// See [`tie_key`]. Field order here is the comparison order, and only
+/// `kind` is load-bearing: within one `kind` the remaining fields are
+/// disjointly populated, so no two variants are ever compared on the same
+/// field.
+#[derive(Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct TieKey<'a> {
+    kind: u8,
+    target: Option<IpAddr>,
+    endpoint: Option<Endpoint>,
+    state: Option<u8>,
+    service: Option<&'a str>,
+    product: Option<&'a str>,
+    version: Option<&'a str>,
+    confidence: Option<u64>,
+    probe_id: Option<&'a str>,
+    text: (&'a str, &'a str),
+    digests: &'a [Digest],
+    counters: [u64; 3],
+}
+
+/// An explicit rank for [`PortState`], so that reordering the enum's variants
+/// in `bathy-types` cannot silently permute this crate's tiebreak -- the
+/// drift `bathy-types`' own `transport_orders_by_declaration_order` exists to
+/// catch, avoided here by not depending on declaration order at all.
+fn port_state_rank(state: PortState) -> u8 {
+    match state {
+        PortState::Open => 0,
+        PortState::Closed => 1,
+        PortState::Filtered => 2,
+        PortState::Indeterminate => 3,
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use bathy_types::confidence::Confidence;
@@ -366,18 +575,18 @@ mod tests {
         "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap()
     }
 
-    fn ip(s: &str) -> IpAddr {
+    pub(crate) fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
 
-    pub(super) fn tcp(port: u16) -> Endpoint {
+    pub(crate) fn tcp(port: u16) -> Endpoint {
         Endpoint {
             transport: Transport::Tcp,
             port,
         }
     }
 
-    pub(super) fn ev(sequence: u64, body: EventBody) -> Event {
+    pub(crate) fn ev(sequence: u64, body: EventBody) -> Event {
         Event {
             scan_id: scan_id(),
             sequence,
@@ -387,11 +596,11 @@ mod tests {
         }
     }
 
-    pub(super) fn digest(tag: &str) -> Digest {
+    pub(crate) fn digest(tag: &str) -> Digest {
         Digest::of_bytes(tag.as_bytes())
     }
 
-    fn started(sequence: u64) -> Event {
+    pub(crate) fn started(sequence: u64) -> Event {
         ev(
             sequence,
             EventBody::ScanStarted {
@@ -402,7 +611,7 @@ mod tests {
         )
     }
 
-    fn completed(sequence: u64) -> Event {
+    pub(crate) fn completed(sequence: u64) -> Event {
         ev(
             sequence,
             EventBody::ScanCompleted {
@@ -413,7 +622,7 @@ mod tests {
         )
     }
 
-    fn failed(sequence: u64) -> Event {
+    pub(crate) fn failed(sequence: u64) -> Event {
         ev(
             sequence,
             EventBody::ScanFailed {
@@ -423,7 +632,7 @@ mod tests {
         )
     }
 
-    pub(super) fn denied(sequence: u64) -> Event {
+    pub(crate) fn denied(sequence: u64) -> Event {
         ev(
             sequence,
             EventBody::PolicyDenied {
@@ -444,7 +653,7 @@ mod tests {
         )
     }
 
-    fn port_state(sequence: u64, addr: &str, port: u16, state: PortState) -> Event {
+    pub(crate) fn port_state(sequence: u64, addr: &str, port: u16, state: PortState) -> Event {
         ev(
             sequence,
             EventBody::PortStateObserved {
@@ -457,7 +666,7 @@ mod tests {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn service(
+    pub(crate) fn service(
         sequence: u64,
         addr: &str,
         port: u16,
@@ -840,6 +1049,96 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_hash_is_recorded_so_a_diff_can_ask_whether_two_scans_covered_the_same_work() {
+        // The fold's endpoint set is only as wide as the plan that produced
+        // it, so absence of an endpoint means "nobody looked" unless the two
+        // plans agree. `crate::diff` cannot ask that question if the fold
+        // throws the answer away, which is what it did until M5 Task 2.
+        let f = fold_events(&[started(1), port_state(2, "10.0.0.1", 80, PortState::Open)]);
+        assert_eq!(f.plan_hash, Some(digest("plan")));
+
+        assert_eq!(
+            fold_events(&[]).plan_hash,
+            None,
+            "a log with no scan.started announces no plan"
+        );
+        assert_eq!(
+            fold_events(&[denied(1)]).plan_hash,
+            None,
+            "a refused scan never started, so it has no plan hash to compare"
+        );
+    }
+
+    #[test]
+    fn the_last_scan_started_by_sequence_supplies_the_plan_hash() {
+        // A resumed or spliced log carries more than one `scan.started`, and
+        // the current belief is the latest -- the same rule `terminal`
+        // follows, and the reason both are folded rather than only the first
+        // one seen.
+        let restarted = ev(
+            2,
+            EventBody::ScanStarted {
+                plan_hash: digest("second-plan"),
+                estimated_targets: 1,
+                estimated_probes: 2,
+            },
+        );
+        let f = fold_events(&[restarted, started(1)]);
+        assert_eq!(f.plan_hash, Some(digest("second-plan")));
+    }
+
+    #[test]
+    fn a_duplicate_sequence_tie_is_ordered_by_the_events_own_fields_not_their_debug_rendering() {
+        // AC-5.36's decision, made observable. Two contradictory `port.state`
+        // events share sequence 1, so `tie_key` decides which is applied
+        // last and therefore wins.
+        //
+        // This is a *witness* for which key is in use, not merely a
+        // determinism check (`duplicate_sequence_numbers_fold_independently_
+        // of_caller_order` above already covers determinism, and passes under
+        // either key). `tie_key` ranks `Open` before `Closed`, so `Closed` is
+        // applied last and wins. The superseded `Debug` key sorted the
+        // rendered strings, where "...state: Closed..." precedes
+        // "...state: Open...", so `Open` won. Restoring the `Debug` key --
+        // or reversing the `PortState` ranks -- flips this assertion.
+        let open = port_state(1, "10.0.0.1", 80, PortState::Open);
+        let closed = port_state(1, "10.0.0.1", 80, PortState::Closed);
+        for input in [
+            vec![open.clone(), closed.clone()],
+            vec![closed.clone(), open.clone()],
+        ] {
+            assert_eq!(
+                fold_events(&input).endpoints[&(ip("10.0.0.1"), tcp(80))].state,
+                Some(PortState::Closed),
+                "the tie is broken by PortState's explicit rank, not by Debug output"
+            );
+        }
+    }
+
+    #[test]
+    fn events_a_tie_cannot_distinguish_fold_the_same_either_way() {
+        // The property `tie_key` actually owes the fold: two events sharing a
+        // sequence and differing only in fields the fold never reads
+        // (`timestamp`, `engine_version`) tie -- and tying is harmless
+        // precisely because folding either first gives the same answer.
+        let mut early = port_state(1, "10.0.0.1", 80, PortState::Open);
+        early.timestamp = "2026-08-01T00:00:00.000Z".into();
+        let mut late = port_state(1, "10.0.0.1", 80, PortState::Open);
+        late.timestamp = "2026-08-02T00:00:00.000Z".into();
+        late.engine_version = "0.2.0".into();
+
+        assert_eq!(
+            tie_key(&early),
+            tie_key(&late),
+            "the fold reads neither field"
+        );
+        assert_eq!(
+            fold_events(&[early.clone(), late.clone()]),
+            fold_events(&[late, early])
+        );
+    }
+
+    #[test]
     fn an_empty_log_folds_to_an_empty_result() {
         let f = fold_events(&[]);
         assert!(f.endpoints.is_empty());
@@ -1174,6 +1473,7 @@ mod proptests {
                 matches!(fold.terminal, Some(Terminal::Denied { .. })),
             );
             bump("fold recorded a host as up", !fold.hosts_up.is_empty());
+            bump("fold recorded a plan hash", fold.plan_hash.is_some());
             bump(
                 "log has a duplicated sequence number (tiebreak path)",
                 duplicate_sequence,
@@ -1254,6 +1554,11 @@ mod proptests {
             CASES * 5 / 100,
         );
         floor("fold recorded a host as up", CASES * 20 / 100);
+        // Same generator weight as `ScanStarted` (1 of 18). Without this
+        // bucket, `crate::diff`'s comparability rule -- which reads
+        // `plan_hash` before it will call anything a disappearance -- would
+        // rest on a field the generated logs might never populate.
+        floor("fold recorded a plan hash", CASES * 10 / 100);
         floor(
             "log has a duplicated sequence number (tiebreak path)",
             CASES * 30 / 100,

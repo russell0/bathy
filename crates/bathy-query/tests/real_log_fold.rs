@@ -19,9 +19,16 @@
 //! scan's log observes each endpoint once and so cannot exercise
 //! supersession or order-dependence at all.
 //!
+//! M5 Task 2 extends the same technique to the diff: the last three tests
+//! diff two real scans of the same two ports either side of a listener
+//! shutdown, diff a real completed scan against a real refused one, and put a
+//! real fold through its published wire encoding and diff it on the other
+//! side.
+//!
 //! Everything below `bathy-query` in the layer order is a `[dev-dependencies]`
-//! edge only (see this crate's `Cargo.toml`); the library itself still depends
-//! on `bathy-types` and nothing else.
+//! edge only (see this crate's `Cargo.toml`); the library itself depends on
+//! `bathy-types` and three pure data crates (`serde`, `serde_json`,
+//! `schemars`) that `bathy-types` already pulls in.
 
 use std::sync::Arc;
 
@@ -32,7 +39,7 @@ use bathy_engine::{GroupCommitConfig, GroupCommitLog, Scheduler, SchedulerConfig
 use bathy_evidence::EvidenceStore;
 use bathy_plan::ScanPlan;
 use bathy_probe::ProbeRegistry;
-use bathy_query::{Terminal, fold_events};
+use bathy_query::{ChangeKind, ScanFold, Terminal, Undecidable, diff, fold_events};
 use bathy_scope::{BudgetLedger, ScopeManifest};
 use bathy_store::{StartRequest, TaskStore};
 use bathy_types::clock::{Clock, FixedClock};
@@ -512,5 +519,158 @@ async fn a_real_log_of_a_policy_denied_scan_folds_to_a_denied_terminal() {
         format!("{today:?}"),
         format!("{never_ran:?}"),
         "a refused scan must not be byte-identical to a scan that never ran"
+    );
+}
+
+// --- M5 Task 2: diffing two REAL scans, not two hand-built folds. ---
+
+#[tokio::test]
+async fn diffing_two_real_scans_across_a_listener_shutdown_reports_the_state_change() {
+    // The product's headline question -- "what changed since Monday" --
+    // answered from two real logs of two real scans of the same two ports,
+    // with one service shut down in between.
+    //
+    // Everything a hand-built fold could get wrong is live here: that two
+    // independent runs of the same request really do announce the same
+    // `plan_hash` (the diff refuses to call anything a disappearance
+    // otherwise), that a real completed scan really does fold to
+    // `Terminal::Completed`, and that a port whose listener is gone is
+    // observed `Closed` rather than vanishing from the log.
+    let (closing_port, shutdown) = closeable_port_serving_nginx().await;
+    let steady_port = silent_open_port().await;
+    let ports = [closing_port, steady_port];
+
+    let monday = fold_events(&scan_real_ports(&ports, "m5-task-2-diff-monday").await);
+    shutdown.cancel();
+    // Let the accept loop observe the cancellation and drop the listener, so
+    // the second scan meets a genuinely unbound port.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let tuesday = fold_events(&scan_real_ports(&ports, "m5-task-2-diff-tuesday").await);
+
+    // Fixture sanity, asserted rather than assumed: two runs of the same
+    // request are comparable because `plan_hash` names the work and not the
+    // attempt. If this ever stopped holding, every real diff would silently
+    // become undecidable, and the tests below would still pass.
+    assert_eq!(
+        monday.plan_hash, tuesday.plan_hash,
+        "two runs of the same request must announce the same plan"
+    );
+    assert!(monday.plan_hash.is_some());
+
+    let d = diff(&monday, &tuesday);
+
+    assert_eq!(
+        d.undecidable, None,
+        "two completed scans of one plan are comparable: {d:#?}"
+    );
+    assert!(d.undetermined.is_empty(), "{d:#?}");
+    assert_eq!(d.changes.len(), 1, "exactly one endpoint changed: {d:#?}");
+
+    let change = &d.changes[0];
+    assert_eq!(change.target, loopback());
+    assert_eq!(change.endpoint, tcp(closing_port));
+    assert_eq!(
+        change.kind,
+        ChangeKind::StateChanged,
+        "a port whose listener went away was observed Closed; it did not disappear"
+    );
+    assert_eq!(change.before.as_ref().unwrap().state, Some(PortState::Open));
+    assert_eq!(
+        change.after.as_ref().unwrap().state,
+        Some(PortState::Closed)
+    );
+    // What was learned on Monday is still attached to the change, which is
+    // what makes it actionable: "nginx 1.26.0 was here and the port is shut".
+    assert_eq!(
+        change
+            .before
+            .as_ref()
+            .unwrap()
+            .observation
+            .as_ref()
+            .unwrap()
+            .product
+            .as_deref(),
+        Some("nginx")
+    );
+    assert_eq!(
+        d.unchanged, 1,
+        "the port nobody touched is unchanged, not a change: {d:#?}"
+    );
+}
+
+#[tokio::test]
+async fn diffing_a_real_completed_scan_against_a_real_refused_one_reports_no_disappearance() {
+    // AC-5.34 against the engine rather than against hand-built events: an
+    // operator's scope manifest expires, the scheduler refuses before
+    // dispatching anything, and the log it leaves behind is one event. The
+    // diff of yesterday's good scan against it must not report the services
+    // as gone -- no packet was sent.
+    let listener_port = open_port_serving_nginx().await;
+    let good = scan_real_ports(&[listener_port], "m5-task-2-diff-denied-baseline").await;
+    let refused = scan_real_ports_under(
+        &[listener_port],
+        "m5-task-2-diff-denied-expired",
+        expired_manifest(),
+    )
+    .await;
+    assert_eq!(
+        refused.len(),
+        1,
+        "fixture sanity: a refused scan's log is one event, got {refused:#?}"
+    );
+
+    let d = diff(&fold_events(&good), &fold_events(&refused));
+
+    assert!(
+        !d.changes
+            .iter()
+            .any(|c| c.kind == ChangeKind::EndpointDisappeared),
+        "a refused scan must not be diffed as a disappearance: {d:#?}"
+    );
+    assert!(d.changes.is_empty(), "{d:#?}");
+    assert_eq!(
+        d.undetermined.len(),
+        1,
+        "the endpoint is unanswered: {d:#?}"
+    );
+    assert_eq!(d.undecidable, Some(Undecidable::ScanIncomplete));
+    match &d.after_terminal {
+        Some(Terminal::Denied { reason_code, .. }) => assert_eq!(
+            reason_code.code(),
+            "scope_expired",
+            "and the diff carries why, or an agent cannot act on it"
+        ),
+        other => panic!("expected a denied terminal on the later side, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_real_fold_survives_the_wire_and_diffs_identically_on_the_other_side() {
+    // AC-5.35 against a real log. The wire encoding exists so an agent can
+    // keep Monday's fold and diff it against Tuesday's later -- possibly from
+    // a different process. If the round trip lost anything the classifier
+    // reads, the diff of the decoded folds would differ from the diff of the
+    // originals, and every one of the unit tests above would still pass.
+    let (events, nginx_port, _) = scan_two_real_ports().await;
+    let monday = fold_events(&events);
+
+    let json = serde_json::to_string(&monday).expect("a real fold serializes");
+    let decoded: ScanFold = serde_json::from_str(&json).expect("and deserializes");
+    assert_eq!(decoded, monday);
+
+    // The identification really did survive, named rather than implied.
+    let nginx = &decoded.endpoints[&(loopback(), tcp(nginx_port))];
+    assert_eq!(
+        nginx.observation.as_ref().unwrap().version.as_deref(),
+        Some("1.26.0")
+    );
+    assert_eq!(nginx.evidence_refs.len(), 1);
+
+    let tuesday = fold_events(&scan_real_ports(&[nginx_port], "m5-task-2-wire-tuesday").await);
+    assert_eq!(
+        diff(&decoded, &tuesday),
+        diff(&monday, &tuesday),
+        "a fold that has been through the wire must diff exactly like the original"
     );
 }
