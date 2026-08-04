@@ -221,11 +221,19 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_connection_reports_closed() {
-        // Bind then drop, so the port is almost certainly unbound and refusing.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let out = probe_connect("127.0.0.1".parse().unwrap(), port, Duration::from_secs(2)).await;
+        // Was: bind, read the port, `drop(listener)` -- "so the port is
+        // almost certainly unbound and refusing". "Almost certainly" was
+        // load-bearing and false: a sibling test in this same binary can be
+        // handed the port back the instant it is released. Measured at
+        // 1-in-30 with the ephemeral range narrowed, and it made bystanders
+        // red too. `closed_port` keeps the port instead of vacating it.
+        let refusing = crate::test_support::closed_port();
+        let out = probe_connect(
+            "127.0.0.1".parse().unwrap(),
+            refusing.port(),
+            Duration::from_secs(2),
+        )
+        .await;
         assert_eq!(out, ConnectOutcome::Closed);
     }
 
@@ -419,12 +427,12 @@ mod tests {
 
     #[tokio::test]
     async fn local_signal_is_false_for_a_refused_connection() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
+        // A port this test owns and refuses on, rather than one it vacated
+        // and hopes is still free -- see `test_support`'s module doc.
+        let refusing = crate::test_support::closed_port();
         let (out, local) = probe_connect_with_local_signal(
             "127.0.0.1".parse().unwrap(),
-            port,
+            refusing.port(),
             Duration::from_secs(2),
         )
         .await;

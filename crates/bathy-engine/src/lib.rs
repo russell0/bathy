@@ -48,6 +48,13 @@ pub mod discovery;
 pub mod durable_log;
 pub mod rate;
 pub mod scheduler;
+// Fixtures shared by the modules above's own `#[cfg(test)] mod tests`, and
+// compiled only for them. It exists because "a port with nothing listening"
+// is a claim about the whole machine that four tests here used to make by
+// binding a port and dropping it -- see the module doc for the measured
+// failure rates that produced, in those tests AND in bystanders.
+#[cfg(test)]
+mod test_support;
 
 pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
 pub use discovery::{DiscoveryConfig, DiscoveryConfigError, DiscoveryResult, discover_host};

@@ -242,10 +242,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_refusing_port_still_proves_the_host_is_up() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let cfg = DiscoveryConfig::new(vec![port], Duration::from_secs(2)).unwrap();
+        // A port this test owns and refuses on. Vacating one (bind, read
+        // the port, drop) put the answer in the hands of whichever sibling
+        // test grabbed it next: a re-bind flips `method` to
+        // `tcp-connect-open` and this test reports a defect that is not
+        // there. See `test_support`'s module doc.
+        let refusing = crate::test_support::closed_port();
+        let cfg = DiscoveryConfig::new(vec![refusing.port()], Duration::from_secs(2)).unwrap();
         let r = discover_host("127.0.0.1".parse().unwrap(), &cfg, &limiter()).await;
         assert!(r.up, "a refusal is positive evidence of a live host");
         assert_eq!(r.method, "tcp-connect-refused");

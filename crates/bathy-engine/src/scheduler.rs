@@ -2608,18 +2608,22 @@ mod tests {
         let open1 = open_port().await;
         let open2 = open_port().await;
 
-        let closed1 = {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
-        let closed2 = {
-            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let p = l.local_addr().unwrap().port();
-            drop(l);
-            p
-        };
+        // Two ports this test OWNS and refuses on, held for its whole
+        // duration -- not two it bound, released, and assumed stayed free.
+        // The released version asserted something no process can guarantee,
+        // and it was the single flakiest test in this crate: 16 failures in
+        // 30 runs with the ephemeral range narrowed enough to make the
+        // collision rate observable. It failed two different ways. A
+        // sibling test winning `closed1` made this count three `Open`
+        // states instead of two; `filtered_listener` (bound AFTER these two
+        // were released) winning one of them collapsed the plan to four
+        // units and tripped `plan.len() == 5` below. And it made
+        // `packet_ceiling_is_enforced_across_a_cancel_resume_loop_via_a_fresh_scheduler`
+        // red as a bystander, by scanning a port that test was using as
+        // ground truth. See `test_support`'s module doc for the full
+        // measurement.
+        let closed1 = crate::test_support::closed_port();
+        let closed2 = crate::test_support::closed_port();
 
         // A single filtered port: fill its accept queue (same technique as
         // elsewhere in this module) so the probe against it silently times
@@ -2644,7 +2648,13 @@ mod tests {
         }
         assert!(filled, "setup: expected the accept queue to fill");
 
-        let ports = [open1, open2, closed1, closed2, filtered_addr.port()];
+        let ports = [
+            open1,
+            open2,
+            closed1.port(),
+            closed2.port(),
+            filtered_addr.port(),
+        ];
         let specs: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
         let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
         let h = make_harness(
@@ -2674,7 +2684,7 @@ mod tests {
         assert_eq!(
             count_state(PortState::Closed),
             2,
-            "2 refused (unbound) ports"
+            "2 ports this test reserved and refuses on"
         );
         assert_eq!(count_state(PortState::Filtered), 1, "1 full-backlog port");
 
@@ -2688,6 +2698,11 @@ mod tests {
         );
         drop(held);
         drop(filtered_listener);
+        // Explicit, and after every assertion: these two are what make the
+        // two `Closed` outcomes above true, so releasing them early would
+        // put this test straight back where it started.
+        drop(closed1);
+        drop(closed2);
     }
 
     #[tokio::test]
