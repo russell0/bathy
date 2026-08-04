@@ -46,12 +46,13 @@ pub fn diff_scans(input: ResultDiffInput, runtime: &Runtime) -> ToolResult<ScanD
     let after = fold_of(runtime, input.after_scan_id)?;
     let mut d = diff(&before, &after);
     if !input.include_confidence_only {
-        // Dropped from the list, and deliberately *not* moved into
-        // `unchanged`: a confidence wobble is a difference the scan really
-        // saw, and counting it as no difference would be a second claim
-        // rather than a narrower view of the same one.
-        d.changes
-            .retain(|c| c.kind != bathy_query::ChangeKind::ConfidenceOnly);
+        // `bathy-query`'s own definition of "substantive", called rather than
+        // re-derived here. This surface and the command line both reach this
+        // function, so an inline predicate would be a second spelling of a
+        // contract that has one -- which is what `ScanDiff::retain_substantive`
+        // documents at length, because the comment claiming that discipline
+        // was written before anything enforced it.
+        d.retain_substantive();
     }
     Ok(d)
 }

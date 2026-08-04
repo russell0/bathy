@@ -1,6 +1,18 @@
 # An authorized inventory in ten typed calls
 
-The claim is ten or fewer; this run took nine. It is a **verbatim capture** of one run of
+The claim is ten or fewer; this run took nine. **The ten is not
+unconditional, and here is what it depends on:** six of the nine are typed
+calls that do not depend on anything -- two `scope.validate`s, `scan.preview`,
+`scan.start`, `result.query`, `evidence.get` -- and the other three are
+`scan.events` polls. There is no protocol-level way to be *told* a scan has
+finished (a held response stream is what clients and intermediaries time out;
+see `docs/protocol-notes.md`), so an agent asks, and asking costs a call. How
+many times it has to ask is a function of how long the scan takes against a
+fixed backoff, which is a property of the machine: re-paced six times slower,
+this workflow takes eleven calls. The unconditional half of the claim is the
+six. The test asserts the two halves separately and says which one gave way.
+
+Otherwise it is a **verbatim capture** of one run of
 `an_agent_completes_an_authorized_inventory_in_ten_typed_calls`
 (`crates/bathy/tests/workflow.rs`), taken over a real stdio transport against
 the shipped binary. Nothing here is hand-written: the test serializes its own
@@ -25,7 +37,10 @@ answered a real HTTP request, and the evidence bytes below are the ones it
 sent. The address (`192.168.1.64`), the ephemeral port numbers, the manifest's
 temporary path, the scan id and the timestamps are this run's. Re-running the
 test produces a different scan id and different ports; everything else is the
-same shape.
+same shape. One substitution is made and it is the only one: the platform's
+temporary directory is written `$TMPDIR/`, because on macOS the real prefix
+carries a token that is stable per user per machine. The RFC 1918 address and
+the two-second ephemeral ports identify nothing and are left as they were.
 
 The lab has three endpoints on purpose, because a filter with nothing to
 exclude tests nothing:
@@ -48,7 +63,7 @@ The brief names two hosts. The manifest authorizes one.
 {
   "name": "scope.validate",
   "arguments": {
-    "manifest_path": "/var/folders/c9/ysrs81h56ts_vzx52jrlh8nc0000gn/T/.tmpj58wJl/scope.json",
+    "manifest_path": "$TMPDIR/.tmpj58wJl/scope.json",
     "targets": [
       "192.168.1.64",
       "10.30.0.1"
@@ -92,7 +107,7 @@ The narrowed brief, confirmed rather than assumed.
 {
   "name": "scope.validate",
   "arguments": {
-    "manifest_path": "/var/folders/c9/ysrs81h56ts_vzx52jrlh8nc0000gn/T/.tmpj58wJl/scope.json",
+    "manifest_path": "$TMPDIR/.tmpj58wJl/scope.json",
     "targets": [
       "192.168.1.64"
     ]
@@ -130,7 +145,7 @@ What the scan would do, before it does it.
 {
   "name": "scan.preview",
   "arguments": {
-    "manifest_path": "/var/folders/c9/ysrs81h56ts_vzx52jrlh8nc0000gn/T/.tmpj58wJl/scope.json",
+    "manifest_path": "$TMPDIR/.tmpj58wJl/scope.json",
     "request": {
       "idempotency_key": "inventory-workflow",
       "max_packets_per_second": 6,
@@ -177,7 +192,7 @@ Start it.
 {
   "name": "scan.start",
   "arguments": {
-    "manifest_path": "/var/folders/c9/ysrs81h56ts_vzx52jrlh8nc0000gn/T/.tmpj58wJl/scope.json",
+    "manifest_path": "$TMPDIR/.tmpj58wJl/scope.json",
     "request": {
       "idempotency_key": "inventory-workflow",
       "max_packets_per_second": 6,

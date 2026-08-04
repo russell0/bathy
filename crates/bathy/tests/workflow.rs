@@ -32,8 +32,51 @@ mod harness;
 use harness::*;
 
 /// AC-5.24: "a complete authorized inventory ... completes in ten or fewer
-/// typed tool calls". The README makes the same claim in words.
+/// typed tool calls".
+///
+/// # The condition, which used to be stated nowhere
+///
+/// This budget is **not** unconditional, and the M5 whole-branch review was
+/// right to refuse to let that stand. The inventory is
+/// [`TYPED_CALLS_BESIDES_POLLING`] calls plus however many `scan.events`
+/// polls the scan's duration requires against a fixed backoff schedule --
+/// and a scan's duration is a property of the machine. Re-paced to one packet
+/// per second (the same shape as a machine six times slower) the workflow
+/// takes eleven calls and fails here, on the budget rather than on the
+/// deadline. So the honest form of the claim is:
+///
+/// > A complete authorized inventory takes six typed calls plus one poll per
+/// > round trip until the scan is done. Against the shipped lab that is nine.
+///
+/// The six are asserted exactly, because that half **is** machine-independent
+/// and it is the half the criterion is actually about: whether an agent
+/// holding only these eleven tools can finish the job without constructing a
+/// command line. The poll count is bounded rather than fixed, and the failure
+/// message below says which of the two gave way, so a slow CI runner is
+/// reported as a claim needing its condition restated rather than as a
+/// surface that stopped working.
+///
+/// Making the poll count machine-independent is not available at this
+/// surface, and that is a decision recorded elsewhere rather than an
+/// oversight: `notifications/progress` would hold a response stream open for
+/// the length of a scan, which clients and intermediaries time out
+/// (`docs/protocol-notes.md`, "Progress notifications"). Polling a durable
+/// cursor is the mechanism, and polling costs a call.
 const CALL_BUDGET: usize = 10;
+
+/// The part of the claim that does not depend on how fast this machine is:
+/// `scope.validate` (denied), `scope.validate` (narrowed), `scan.preview`,
+/// `scan.start`, `result.query`, `evidence.get`.
+///
+/// Asserted exactly rather than as a bound. A workflow that needed a seventh
+/// typed call would mean the tool surface is not sufficient, which is a
+/// different and much more serious thing than a slow scan needing an extra
+/// poll -- and folding both into one `<= 10` made them indistinguishable.
+const TYPED_CALLS_BESIDES_POLLING: usize = 6;
+
+/// What the platform's temporary directory is written as in the rendered
+/// transcript. See the substitution at the end of the workflow.
+const TEMP_DIR_PLACEHOLDER: &str = "$TMPDIR/";
 
 /// A target the lab manifest does not authorize. Naming it costs nothing --
 /// `scope.validate` emits no packet -- and it is what makes the refusal in
@@ -330,6 +373,7 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
     let mut seen: BTreeSet<u64> = BTreeSet::new();
     let mut outcome: Option<String> = None;
     let mut pages = 0usize;
+    let typed_calls_before_polling = agent.calls();
     let deadline = Instant::now() + Duration::from_secs(60);
     while outcome.is_none() {
         assert!(
@@ -441,9 +485,33 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
     );
 
     let inventory_calls = agent.calls();
+    // The two halves of the claim, asserted separately because they fail for
+    // different reasons and mean different things. See `CALL_BUDGET`.
+    let typed_calls = inventory_calls - pages;
+    assert_eq!(
+        typed_calls, TYPED_CALLS_BESIDES_POLLING,
+        "the inventory needed {typed_calls} typed calls besides polling, not \
+         {TYPED_CALLS_BESIDES_POLLING}. This is the machine-independent half of \
+         the claim: it changed because the tool surface changed, not because \
+         this machine is slow."
+    );
     assert!(
         inventory_calls <= CALL_BUDGET,
-        "the inventory took {inventory_calls} calls; the claim is {CALL_BUDGET}"
+        "the inventory took {inventory_calls} calls: {typed_calls} typed and \
+         {pages} polls. The typed half is unchanged, so the surface is fine and \
+         the budget is what gave way -- this scan took longer than the backoff \
+         schedule's window, which is a property of this machine. Restate the \
+         condition on AC-5.24 and `docs/examples/agent-inventory-workflow.md`, \
+         or slow the backoff; do not raise {CALL_BUDGET} silently."
+    );
+    // Belt and braces on the arithmetic above: `typed_calls` is a
+    // subtraction, and a subtraction that quietly went wrong would make the
+    // first assertion pass for the wrong reason.
+    assert_eq!(
+        typed_calls_before_polling + pages + 2,
+        inventory_calls,
+        "the call accounting does not add up: {typed_calls_before_polling} before \
+         polling, {pages} polls, then result.query and evidence.get"
     );
 
     // -----------------------------------------------------------------
@@ -511,7 +579,19 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
                 })
             })
             .collect();
-        std::fs::write(path, serde_json::to_vec_pretty(&steps).unwrap()).expect("transcript");
+        // One substitution, and it is the only edit made to a verbatim
+        // capture. The manifest paths in these arguments are real, and on
+        // macOS they carry `DARWIN_USER_TEMP_DIR` -- a token that is stable
+        // per user per machine and is therefore a linkable identifier, unlike
+        // the RFC 1918 address and the two-second ephemeral ports the
+        // document already discloses as local. It costs nothing: the path is
+        // meaningless to a reader either way. Done here rather than in the
+        // rendered document so a re-render cannot reintroduce it.
+        let rendered = serde_json::to_string_pretty(&steps).unwrap().replace(
+            std::env::temp_dir().to_str().expect("a printable temp dir"),
+            TEMP_DIR_PLACEHOLDER,
+        );
+        std::fs::write(path, rendered).expect("transcript");
     }
 }
 

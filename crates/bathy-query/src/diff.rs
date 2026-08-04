@@ -222,17 +222,42 @@ pub enum Undecidable {
 }
 
 impl ScanDiff {
-    /// The changes an operator asked about: everything except
-    /// [`ChangeKind::ConfidenceOnly`].
+    /// Whether a change is one an operator asked about, as opposed to
+    /// confidence noise.
     ///
-    /// This is the `include_confidence_only: false` half of the M5 plan's
-    /// `result.diff` tool contract, implemented once here rather than once
-    /// per adapter -- the CLI and the MCP server must not each re-derive what
-    /// "substantive" means and drift.
+    /// The single definition of "substantive". It is `fn` rather than inline
+    /// in both readers below because there being *one* of it is the whole
+    /// point: the `include_confidence_only: false` half of `result.diff`'s
+    /// contract is answered on two surfaces, and two spellings is how they
+    /// come to disagree.
+    pub fn is_substantive(change: &Change) -> bool {
+        change.kind != ChangeKind::ConfidenceOnly
+    }
+
+    /// The changes an operator asked about.
     pub fn substantive_changes(&self) -> impl Iterator<Item = &Change> {
-        self.changes
-            .iter()
-            .filter(|c| c.kind != ChangeKind::ConfidenceOnly)
+        self.changes.iter().filter(|c| Self::is_substantive(c))
+    }
+
+    /// Drop everything [`ScanDiff::substantive_changes`] would not yield.
+    ///
+    /// This exists because the doc comment above used to claim a discipline
+    /// that was not in force: it said "implemented once here rather than once
+    /// per adapter", while `substantive_changes` had **zero** production
+    /// callers and `bathy_mcp::tools::result::diff_scans` -- the one function
+    /// both surfaces route through -- re-derived the predicate inline with
+    /// `retain`. Nothing had diverged yet; the comment was simply describing
+    /// a rule nothing enforced. An owned diff needs to filter in place and a
+    /// borrowed one needs an iterator, which is why there are two readers, and
+    /// they now share [`ScanDiff::is_substantive`] so there is still one
+    /// definition.
+    ///
+    /// Deliberately *not* moving the dropped changes into `unchanged`: a
+    /// confidence wobble is a difference the scan really saw, and counting it
+    /// as no difference would be a second claim rather than a narrower view
+    /// of the same one.
+    pub fn retain_substantive(&mut self) {
+        self.changes.retain(Self::is_substantive);
     }
 
     /// Whether absence of an endpoint from one side counted as evidence.
