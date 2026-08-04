@@ -4,12 +4,24 @@
 //! source: PostgreSQL's own Frontend/Backend Protocol documentation,
 //! "Message Formats" §`SSLRequest`
 //! (<https://www.postgresql.org/docs/current/protocol-message-formats.html>):
-//! an 8-byte message -- a `u32` length of `8`, followed by the fixed
-//! request code `80877103` (`0x04D2162F`, chosen by the protocol's
-//! designers, per §"Initiating the Protocol", to be unlikely to collide
-//! with a client's intended protocol-version startup packet) -- to which
-//! the server replies with exactly one byte: `S` if it will proceed with
-//! SSL, `N` if not. Corroborated against a real server:
+//! an 8-byte message -- `Int32(8)` ("Length of message contents in bytes,
+//! including self") followed by `Int32(80877103)`, the fixed SSL request
+//! code, documented on that same page under `SSLRequest` itself: "The
+//! value is chosen to contain 1234 in the most significant 16 bits, and
+//! 5679 in the least significant 16 bits. (To avoid confusion, this code
+//! must not be the same as any protocol version number.)" The server's
+//! reply is documented separately, in "Message Flow" §54.2.10 ("SSL
+//! Session Encryption",
+//! <https://www.postgresql.org/docs/current/protocol-flow.html>): "The
+//! server then responds with a single byte containing S or N, indicating
+//! that it is willing or unwilling to perform SSL, respectively."
+//!
+//! (An earlier version of this comment attributed the request code's
+//! rationale to a section named "Initiating the Protocol". No such section
+//! exists in PostgreSQL's Frontend/Backend Protocol chapter -- the word
+//! "Initiating" appears nowhere in it. The rationale is on the Message
+//! Formats page under `SSLRequest`, as quoted above. M4 whole-branch fix
+//! wave citation sweep.) Corroborated against a real server:
 //! `docker.io/library/postgres:16-alpine`
 //! (digest `sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777`,
 //! run without SSL configured), which replied `N` to exactly the 8 bytes
@@ -18,9 +30,23 @@
 //! Real PostgreSQL keeps the connection open after this single byte
 //! (waiting for either a TLS handshake or a plaintext startup packet next)
 //! rather than closing it, so the reply's completeness can't be learned
-//! from an EOF -- but the protocol itself guarantees the reply is exactly
-//! one byte, which is framing knowledge, not interpretation of what the
-//! byte *means* (`S` vs `N`). [`ProbeIo::read_at_most`] exists precisely
+//! from an EOF -- but the protocol documents the reply as a single byte
+//! ("The server then responds with a single byte containing S or N"),
+//! which is framing knowledge, not interpretation of what the byte *means*
+//! (`S` vs `N`). §54.2.10 also directs frontends to read exactly that one
+//! byte and treat anything queued behind it as suspect, which is why
+//! `truncated` is reported honestly below rather than being drained:
+//! "If additional bytes are available to read at this point, it likely
+//! means that a man-in-the-middle is attempting to perform a
+//! buffer-stuffing attack (CVE-2021-23222)."
+//!
+//! Not an unconditional guarantee, and this comment previously overstated
+//! it as one (M4 whole-branch fix wave citation sweep): the same section
+//! records that "the frontend should also be prepared to handle an
+//! ErrorMessage response to SSLRequest from the server", which is longer
+//! than one byte. This probe captures whatever arrived and leaves that
+//! distinction entirely to `bathy-interpret`, which is the correct split
+//! either way. [`ProbeIo::read_at_most`] exists precisely
 //! for this: it returns as soon as that one byte has arrived instead of
 //! waiting out the whole deadline the way a generic `read_bounded` call
 //! would, while still reporting `truncated` honestly (see that method's

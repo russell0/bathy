@@ -1,12 +1,32 @@
 //! `mysql-greeting-v1`: reads the server's initial handshake packet
 //! without sending anything first.
 //!
-//! source: MySQL's own "Connection Phase" / "Protocol::HandshakeV10"
-//! documentation
-//! (<https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html>):
-//! "the server sends a handshake packet as soon as the connection is
-//! established", before the client sends anything. That server-speaks-
-//! first shape is exactly what this probe relies on (AC-4.6). Corroborated
+//! source: MySQL's own "Connection Phase" documentation
+//! (<https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase.html>),
+//! under "Initial Handshake": "The initial handshake starts with the
+//! server sending the Protocol::Handshake packet." That server-speaks-
+//! first shape is exactly what this probe relies on (AC-4.6) -- though the
+//! same page states it is the ordinary case rather than a guarantee: a
+//! server "may send a ERR packet and finish the handshake" instead, which
+//! is one of the shapes this probe must capture without interpreting. The
+//! packet's own field layout (`int<1> protocol version`, "Always 10",
+//! immediately followed by `string<NUL> server version`) is on the
+//! separate "Protocol::HandshakeV10" page
+//! (<https://dev.mysql.com/doc/dev/mysql-server/latest/page_protocol_connection_phase_packets_protocol_handshake_v10.html>),
+//! which is what `bathy_interpret::rules`'s `mysql.handshake.v10` reads.
+//!
+//! (An earlier version of this comment quoted the Connection Phase page as
+//! saying "the server sends a handshake packet as soon as the connection
+//! is established". That sentence does not appear on the page in any form
+//! -- the string "as soon as" does not occur on it at all -- and its
+//! absolutism concealed the ERR-packet alternative the page does document.
+//! It also cited the overview page for the field layout the overview page
+//! does not contain, which is the same defect `rules.rs` already records
+//! as fixed on its own side and which was never swept across the branch.
+//! Found by the M4 whole-branch fix wave's citation sweep, not by the
+//! review; it is the second fabricated quotation of the same species as
+//! the SMTP one in IMPORTANT-3. The probe's wire behaviour -- it writes
+//! nothing at all -- was and is correct.) Corroborated
 //! against a real server: `docker.io/library/mysql:8.4`
 //! (digest `sha256:b3b90af2a6552ae30c266fdb7d5dd55f3afb72404bb78d37fe8a23eb857fd3fb`),
 //! which sent (hex) `4a0000000a382e342e3131...` -- a `HandshakeV10` packet

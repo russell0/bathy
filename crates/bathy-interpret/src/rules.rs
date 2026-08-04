@@ -343,8 +343,10 @@ fn ssh_bare_protocol(bytes: &[u8]) -> Option<Hit> {
 //   (<https://www.postgresql.org/docs/current/protocol-message-formats.html>).
 //   That page defines what the client sends; it does not document the
 //   server's reply at all.
-// - The *reply*'s meaning is documented separately, in "Protocol Flow"
-//   §54.2.10 ("SSL Session Encryption",
+// - The *reply*'s meaning is documented separately, in "Message Flow"
+//   §54.2.10 ("SSL Session Encryption" -- "Message Flow" is the page's own
+//   title; `protocol-flow` is only its URL slug, corrected in the M4
+//   whole-branch fix wave's citation sweep,
 //   <https://www.postgresql.org/docs/current/protocol-flow.html>): "The
 //   server then responds with a single byte containing S or N, indicating
 //   that it is willing or unwilling to perform SSL, respectively." (Root-
@@ -604,10 +606,18 @@ static SMTP_POSTFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^220[ -].*\bPostfix\b").expect("static regex compiles"));
 
 /// Scans every line, not just the first: RFC 5321 §4.2's own ABNF for the
-/// `Greeting` allows a *multiline* 220 reply (`"220-" Domain [SP text] CRLF
-/// *("220-" [text] CRLF) "220" SP [text] CRLF`), so the text naming a
-/// product may legitimately be on a continuation line rather than the very
-/// first one. (Root-cause fix, M4 Task 3 review round 1: an earlier
+/// `Greeting` allows a *multiline* 220 reply -- verbatim: `( "220-"
+/// (Domain / address-literal) [ SP textstring ] CRLF *( "220-" [
+/// textstring ] CRLF ) "220" [ SP textstring ] CRLF )` -- so the text
+/// naming a product may legitimately be on a continuation line rather than
+/// the very first one. (An earlier version of this comment transcribed the
+/// final line as `"220" SP [text] CRLF`, moving the `SP` outside the
+/// optional group and so making it mandatory. It is not: a conformant
+/// final line may be a bare `220\r\n`, which `SMTP_GREETING_RE` -- `^220[
+/// -]` -- does not match. That is a real, if narrow, false negative, left
+/// as-is here deliberately: widening the regex is a behaviour change to a
+/// matcher, which belongs in a rule change with its own corpus fixture,
+/// not in a citation correction. M4 whole-branch fix wave citation sweep.) (Root-cause fix, M4 Task 3 review round 1: an earlier
 /// version only checked `utf8_lines(bytes).first()`, which is always
 /// offset 0 -- making `Hit::span`'s offset term dead code for every
 /// realistic single-line-greeting test, the same issue fixed in
@@ -639,8 +649,14 @@ fn smtp_bare_protocol(bytes: &[u8]) -> Option<Hit> {
 }
 
 // =====================================================================
-// TLS -- source: RFC 8446 §5.1 (record layer: content type `0x16` =
-// handshake) and §4 (`HandshakeType::server_hello` = `0x02`). Corroborated
+// TLS -- source: RFC 8446 §5.1 ("Record Layer": `ContentType ...
+// handshake(22)`, i.e. content type `0x16`) and §4 ("Handshake Protocol",
+// which defines `enum { ... server_hello(2), ... } HandshakeType`, i.e.
+// `0x02`). §4 is NOT the handshake type registry -- that is §11, as §4's
+// own text says: "New handshake message types are assigned by IANA as
+// described in Section 11." An earlier version of this comment and of the
+// rule's own `source` string below called §4 the registry (M4 whole-branch
+// review, MINOR-3). Corroborated
 // against `docker.io/library/nginx:1.27-alpine` (same digest as the HTTP
 // rule above) terminating TLS 1.3 with a locally generated self-signed
 // certificate (M4 Task 2 report): sending `tls-v1`'s `ClientHello` elicited
@@ -734,7 +750,7 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProtocolOnly,
             rationale: "The server replied with the single byte `S`, PostgreSQL's documented \
                         SSLRequest reply meaning it will negotiate SSL.",
-            source: "PostgreSQL \"Protocol Flow\" §54.2.10 (\"SSL Session Encryption\": \"The \
+            source: "PostgreSQL \"Message Flow\" §54.2.10 (\"SSL Session Encryption\": \"The \
                       server then responds with a single byte containing S or N, indicating \
                       that it is willing or unwilling to perform SSL, respectively.\" -- \
                       postgresql.org/docs/current/protocol-flow.html); capture from \
@@ -751,7 +767,7 @@ static ALL_RULES: &[Rule] = &[
             specificity: Specificity::ProtocolOnly,
             rationale: "The server replied with the single byte `N`, PostgreSQL's documented \
                         SSLRequest reply meaning it will not negotiate SSL.",
-            source: "PostgreSQL \"Protocol Flow\" §54.2.10 (\"SSL Session Encryption\": \"The \
+            source: "PostgreSQL \"Message Flow\" §54.2.10 (\"SSL Session Encryption\": \"The \
                       server then responds with a single byte containing S or N, indicating \
                       that it is willing or unwilling to perform SSL, respectively.\" -- \
                       postgresql.org/docs/current/protocol-flow.html); capture from \
@@ -767,7 +783,9 @@ static ALL_RULES: &[Rule] = &[
             service: "redis",
             specificity: Specificity::ProtocolOnly,
             rationale: "The server replied `+PONG`, RESP's documented reply to the `PING` command.",
-            source: "Redis RESP protocol specification \
+            source: "Redis RESP protocol specification, \"Simple strings\" (a `+`-prefixed \
+                      reply \"terminated by CRLF\") plus its \"Inline commands\" example, which \
+                      shows `C: PING` answered by `S: +PONG` \
                       (redis.io/docs/latest/develop/reference/protocol-spec/); capture from \
                       redis:7-alpine (digest sha256:e7723ff73d963f5cc6d9c4643ea3d989527a402a319239054e9472a7fb9219a2), \
                       M4 Task 2 report",
@@ -866,7 +884,12 @@ static ALL_RULES: &[Rule] = &[
                         inner handshake type of 0x02 (ServerHello) -- confirms a TLS server \
                         answered, but (for TLS 1.3) the certificate is encrypted, so no product \
                         or version can be read from these bytes.",
-            source: "RFC 8446 §5.1 (record layer), §4 (handshake type registry); capture from \
+            source: "RFC 8446 §5.1 (\"Record Layer\": `ContentType ... handshake(22)`, i.e. \
+                      0x16), §4 (\"Handshake Protocol\", which defines `enum { ... \
+                      server_hello(2), ... } HandshakeType`, i.e. 0x02) -- the IANA \"TLS \
+                      HandshakeType\" registry itself is §11, not §4, as §4's own text says \
+                      (\"New handshake message types are assigned by IANA as described in \
+                      Section 11\"); capture from \
                       nginx:1.27-alpine (same digest as http.server.nginx.v1) terminating TLS \
                       1.3 with a locally generated self-signed certificate, M4 Task 2 report",
         },

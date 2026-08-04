@@ -1,12 +1,38 @@
 //! `smtp-banner-v1`: reads the greeting, then sends a fixed `EHLO` and
 //! captures whatever follows.
 //!
-//! source: RFC 5321 §3.1 ("Session Initiation"): "the SMTP server MUST
-//! send a 220 'Service ready' reply... after which the client sends its
-//! own greeting"; RFC 5321 §4.1.1.1 for the `EHLO <domain>` command shape.
-//! `bathy.invalid` is used as the client domain per RFC 6761 §6.4 (`.invalid`
-//! is reserved for use in obviously invalid contexts, exactly this one --
-//! a probe that never intends to actually receive mail at this name).
+//! source: RFC 5321 §3.1 ("Session Initiation"): "An SMTP session is
+//! initiated when a client opens a connection to a server and the server
+//! responds with an opening message." The 220 is descriptive, not
+//! mandated: the sentence naming it is in §4.3.1 ("Sequencing Overview") --
+//! "Normally, a receiver will send a 220 'Service ready' reply when the
+//! connection is completed. The sender SHOULD wait for this greeting
+//! message before sending any commands." -- and §3.1 explicitly permits
+//! the opposite, "a 554 response MAY be given in the initial connection
+//! opening message instead of the 220". The client's turn is §3.2 ("Client
+//! Initiation"): "the client normally sends the EHLO command to the
+//! server, indicating the client's identity". RFC 5321 §4.1.1.1 gives the
+//! command shape: `ehlo = "EHLO" SP ( Domain / address-literal ) CRLF`.
+//!
+//! (An earlier version of this comment attributed to §3.1 the sentence
+//! "the SMTP server MUST send a 220 'Service ready' reply... after which
+//! the client sends its own greeting". No such sentence exists anywhere in
+//! RFC 5321, and no MUST-level requirement to send a 220 exists in it at
+//! all -- the RFC's own modality is "Normally ... will send" plus a SHOULD
+//! on the client. The same fabricated quotation was found and corrected in
+//! `bathy_interpret::rules` during M4 Task 3 but was never swept for
+//! across the branch, so the two crates directly contradicted each other
+//! on what §3.1 says until the M4 whole-branch review, IMPORTANT-3. The
+//! probe's `EHLO bathy.invalid` bytes were, and remain, correct.)
+//!
+//! `bathy.invalid` is used as the client domain per RFC 2606 §2, which
+//! reserves `.invalid` "for use in online construction of domain names
+//! that are sure to be invalid and which it is obvious at a glance are
+//! invalid" -- exactly this case, a probe that never intends to receive
+//! mail at this name. RFC 6761 §6.4 ("Domain Name Reservation
+//! Considerations for 'invalid.'") records its special-use status. (The
+//! "obvious at a glance" phrasing is RFC 2606's; an earlier version of
+//! this comment attributed it to RFC 6761, which does not contain it.)
 //! Corroborated against a real server: `docker.io/boky/postfix:latest`
 //! (digest `sha256:aafc772384232497bed875e1eb66b4d3e54ba1ebc86e2e185a6dc1dbc48182ef`),
 //! which replied `220 <host> ESMTP Postfix (Debian)\r\n` and then, to

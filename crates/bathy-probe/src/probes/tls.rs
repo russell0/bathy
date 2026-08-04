@@ -56,9 +56,16 @@
 //! The M4 Task 2 brief's wire-behavior table describes this probe as
 //! capturing "the raw ServerHello and certificate bytes". For a
 //! **TLS 1.3** `ClientHello` specifically, that is not achievable: RFC
-//! 8446 §4.4 moves `Certificate` (along with `EncryptedExtensions` and
-//! `CertificateVerify`) into the encrypted handshake flight, derived from
-//! key material this probe deliberately never computes. Only
+//! 8446 §4.4 puts `Certificate` and `CertificateVerify` in the encrypted
+//! handshake flight ("These messages are encrypted under keys derived from
+//! the [sender]_handshake_traffic_secret"), and §4.3.1 does the same for
+//! `EncryptedExtensions` ("the first message that is encrypted under keys
+//! derived from the server_handshake_traffic_secret") -- key material this
+//! probe deliberately never computes. (§4.4 is "Authentication Messages"
+//! and covers Certificate, CertificateVerify and Finished;
+//! `EncryptedExtensions` is §4.3.1. An earlier version of this comment
+//! filed all three under §4.4. M4 whole-branch fix wave citation sweep.)
+//! Only
 //! `ClientHello` and `ServerHello` (and a possible `HelloRetryRequest`)
 //! are ever sent in the clear under TLS 1.3 -- the certificate is
 //! ciphertext to any observer that has not derived the handshake traffic
