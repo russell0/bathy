@@ -680,10 +680,20 @@ git commit -m "feat(mcp): eleven typed tools with task handles and human approva
 ### Task 5: The ten-call workflow demonstration
 
 **Files:**
-- Create: `crates/bathy-mcp/tests/workflow.rs`
+- Create: `crates/bathy/tests/workflow.rs` (the plan said `crates/bathy-mcp/tests/workflow.rs`; corrected during Task 5 — see plan edit #1 below)
+- Create: `crates/bathy/tests/harness/mod.rs` (the stdio client, moved out of `crates/bathy/tests/mcp.rs` so both test binaries drive one)
 - Create: `docs/examples/agent-inventory-workflow.md`
 
 This is the project's headline claim made executable: an agent completes an authorized inventory with a handful of typed calls and zero string construction.
+
+  **Six corrections to this task, made during Task 5 and flagged as plan edits. The first two are defects that made the task as written unbuildable and untestable respectively.**
+
+  1. **The test cannot live in `crates/bathy-mcp/tests/`.** `bathy-mcp` declares no `[[bin]]`, so `CARGO_BIN_EXE_bathy` does not exist for its test targets and nothing there can spawn `bathy serve mcp`. A test in that crate could only call handler functions in-process — which is precisely what the claim is not about: "an agent with only this surface can finish the job" is a statement about the wire, and a workflow driven through library calls proves the library, not the surface. It goes in `crates/bathy/tests/workflow.rs`, beside the protocol suite that already drives the shipped binary. Task 4's own tests moved for the same reason and this line was not updated with them.
+  2. **Step 1's second test cannot pass as written, on any tree.** `for forbidden in ["from_str::<Xml", "quick_xml", "split_whitespace", "Command::new"] { assert!(!src.contains(forbidden)) }` searches its own source for strings that its own list contains, so it fails on the array literal that defines it. This is the identical shape as the overview's `[phrase-rule]` sentinel — a rule whose statement trips its own check — and it takes the identical fix: the check is per line, and a line that must name a forbidden token in order to forbid it carries `[forbidden-token]`. The shipped test also asserts the sentinel is still present, because a guard whose exceptions have all been deleted is a guard over nothing.
+  3. **`evidence.get` returns `bytes_hex`.** Step 1 reads `evidence["bytes"]`, which is the encoding Task 4's contract table already corrected (deviation #2 in `docs/protocol-notes.md`); the sketch was not updated with it.
+  4. **`scan.start` returns a `ScanStartOutput`, not a bare `TaskHandle`.** `serde_json::from_value::<TaskHandle>(s.call("scan.start", …))` does not deserialize: the document is `{ policy_decision, handle, reused }`, and the handle is a field of it. That shape is what carries a denial, which is the reason it exists.
+  5. **There is no M7 lab to run against, and Step 2 said to use one.** M7 builds it; this milestone ships before M7 by the overview's own recommended order. The test binds its own lab — a listener that answers `GET` with an nginx banner, a listener that accepts and says nothing, and a port it vacates — on this machine's own routable address, under a manifest it writes into a temporary directory. That is also what makes the lab satisfy the next correction, which a Docker fixture chosen for realism might not.
+  6. **A `result.query` filter needs a fixture that excludes something.** Step 1 filters on `{"state": "open"}` and asserts only that the result is non-empty, which passes just as happily against a server that ignores the filter entirely — the Global Constraint *a fixture that satisfies every branch tests none of them*, which this milestone added after finding exactly this in the parity suite. The shipped workflow filters on `state` **and** `service`, the lab excludes something in each dimension, and a control query with no filter names both excluded endpoints and proves they were in the fold all along.
 
 - [ ] **Step 1: Write the test**
 
@@ -753,28 +763,30 @@ async fn the_workflow_involves_no_string_parsing_anywhere() {
 }
 ```
 
-- [ ] **Step 2: Run against the M7 lab** — expected 2 passed.
+- [ ] **Step 2: Run against the lab the test binds itself** (plan edit #5: M7's Docker lab does not exist yet and this milestone ships before it) — expected 2 passed. Mutation-verify one mutation per stage, since a workflow test that passes with a stage's effect removed is a demonstration rather than a test.
 
-- [ ] **Step 3: Write `docs/examples/agent-inventory-workflow.md`** transcribing the exact calls and responses from a real run.
+- [ ] **Step 3: Write `docs/examples/agent-inventory-workflow.md`** by rendering it from the transcript the test itself emits (AC-5.26), never by transcribing calls into a document by hand.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add crates/bathy-mcp/tests docs/examples
+git add crates/bathy/tests docs/examples
 git commit -m "test(mcp): the ten-call authorized inventory workflow, as an executable claim"
 ```
 
 **Acceptance criteria:**
-- **AC-5.24** A complete authorized inventory — validate, preview, start, poll to terminal, query, fetch evidence — completes in ten or fewer typed tool calls against the lab.
-- **AC-5.25** The workflow performs no XML parsing, no command-string construction, and no whitespace splitting, enforced by a source-level assertion.
-- **AC-5.26** `docs/examples/agent-inventory-workflow.md` transcribes a real run, not an invented one.
+- **AC-5.24** A complete authorized inventory — validate, preview, start, poll to terminal, query, fetch evidence — completes in ten or fewer typed tool calls against the lab. Closed by `an_agent_completes_an_authorized_inventory_in_ten_typed_calls`, which takes nine and fails rather than exceeding ten. **Every call is made over the stdio transport and every decision is taken on a typed field of `structuredContent`**: the text mirror is discarded by the client before the workflow can see it, so the surface is proved *sufficient* rather than merely present. The workflow contains a refusal — an unauthorized target, denied with a stable `reason_code` and a typed `out_of_scope` the agent narrows its own request with — because an inventory that only ever succeeds demonstrates none of the safety properties.
+- **AC-5.25** The workflow performs no XML parsing, no command-string construction, no whitespace splitting, and no reading of the JSON text mirror, enforced by a source-level assertion over the test's own source with a `[forbidden-token]` sentinel for the lines that name a token in order to forbid it. Closed by `the_inventory_workflow_parses_no_prose_and_builds_no_command_line`.
+- **AC-5.26** `docs/examples/agent-inventory-workflow.md` transcribes a real run, not an invented one — and *mechanically*: the test serializes its own transcript when `BATHY_WORKFLOW_TRANSCRIPT` names a file, and the document is rendered from that file. A transcript typed out by hand is the thing this criterion exists to prevent, and "I ran it and copied it" is manual verification, which does not close a criterion here.
+- **AC-5.39** **The deferred move of the ops layer out of `bathy-mcp` is registered mechanically, not in prose.** The overview records that `bathy_mcp::{engine,tools}` now serves both surfaces and that the honest home is a crate below both, deferred for v0.1 with one written trigger: *if `serve mcp` is ever feature-gated, the ops layer must move rather than be duplicated back into `bathy`*. A trigger condition that lives only in a paragraph is exactly what `ABSENCE_CLAIMS` was built because prose cannot enforce. `cargo run -p xtask -- check-deps` fails if the ops layer is still shared and the dependency or the subcommand becomes feature-gated, **and** reports the registration as stale if the sharing ends — a check that has quietly stopped applying is worse than none.
+- **AC-5.40** **The release-before-publish ordering in `bathy-engine` is closed by a test that fails when the two statements are swapped**, not merely when the release is deleted. Per the Global Constraint added this milestone, that is the actual bug shape and it is M3's durability inversion again. Closed by `the_log_is_released_before_the_terminal_status_is_written_not_merely_alongside_it`, which makes the store write fail and asserts the log is free anyway: reordering makes the failing write return before the release and the log stays locked.
 
 ---
 
 ## Milestone Exit Criteria
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` and `check-schemas` clean.
-- [ ] AC-5.1 through AC-5.38 each demonstrated by a named passing test.
+- [ ] AC-5.1 through AC-5.40 each demonstrated by a named passing test.
 - [ ] `bathy serve mcp` connects to a real MCP client and lists eleven tools.
 - [ ] `docs/protocol-notes.md` exists and names the verified spec revision.
 - [ ] **This milestone ships the agent-facing product.** Tag `v0.1.0-beta.1`.
