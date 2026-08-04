@@ -2118,6 +2118,24 @@ fn parity_cases(name: &str, f: &Fixture) -> Vec<Case> {
                     envelope: &["has_more", "next_cursor"],
                 },
             },
+            // `--after 2`, not `--after 0`. The two cases above pass the
+            // cursor's own default, so a surface that dropped `--after` on
+            // the floor answered identically and survived the whole
+            // workspace -- the same non-binding shape the `result.query`
+            // filter controls below are about, and found by the same sweep.
+            // Two events are skipped here, and the control below proves the
+            // fixture's log is long enough for that to remove something.
+            Case {
+                what: "a scan's event log read from a cursor that is not the default",
+                arguments: json!({ "scan_id": f.scan_id, "after_sequence": 2, "limit": 1000 }),
+                argv: f.cli(&[
+                    "scan", "events", "--scan", &f.scan_id, "--after", "2", "--limit", "1000",
+                ]),
+                parity: Parity::LineStream {
+                    array: "events",
+                    envelope: &["has_more", "next_cursor"],
+                },
+            },
         ],
         "scan.cancel" => vec![Case {
             what: "stopping a scan, and whether there is anything left to resume",
@@ -2126,10 +2144,15 @@ fn parity_cases(name: &str, f: &Fixture) -> Vec<Case> {
             parity: Parity::Identical,
         }],
         // The fixture scan has run its plan out, so both surfaces take the
-        // "nothing left to resume" branch and neither starts work. The branch
-        // that *does* start work is the one the command runs to completion,
-        // and it prints this document first -- see `Parity::FirstLine`, which
-        // the round-trip test above exercises.
+        // "nothing left to resume" branch and neither starts work -- one line
+        // each, the same document, which is why `Identical` is the right
+        // relation here. The branch that *does* start work is the one the
+        // command runs to completion, and it prints this document first
+        // followed by a run summary; that two-line shape is asserted
+        // separately, at the end of this test, not by a `Parity` variant.
+        // (An earlier draft of this comment named a `Parity::FirstLine`
+        // variant. There is no such variant -- the enum has exactly
+        // `Identical` and `LineStream` -- and there never was.)
         "scan.resume" => vec![Case {
             what: "resuming a scan with no unfinished units",
             arguments: json!({ "manifest_path": f.scope, "scan_id": f.scan_id }),
@@ -2457,43 +2480,107 @@ fn every_advertised_tool_and_its_subcommand_answer_the_same_question_the_same_wa
          the two comparisons above prove nothing about the command that passes it"
     );
 
-    // A control for the filtered `result.query` case above. If neither
-    // surface filtered anything, the two would agree for the wrong reason --
-    // which is exactly how a field-by-field comparison over the fields that
-    // happen to agree passes. So: a filter the tool's own answer visibly
-    // narrows, asked of both.
+    // A control for the `--after 2` case above, the same shape as the filter
+    // controls below: the cursor has to remove something from the tool's own
+    // answer, or a command that ignored it would agree for want of data.
+    let whole_log = server.call(
+        "scan.events",
+        json!({ "scan_id": fixture.scan_id, "after_sequence": 0, "limit": 1000 }),
+    );
+    let from_cursor = server.call(
+        "scan.events",
+        json!({ "scan_id": fixture.scan_id, "after_sequence": 2, "limit": 1000 }),
+    );
+    assert!(
+        from_cursor["events"].as_array().unwrap().len()
+            < whole_log["events"].as_array().unwrap().len(),
+        "`after_sequence: 2` skipped nothing, so the comparison above proves nothing \
+         about whether the command passes `--after`: {} vs {}",
+        from_cursor["events"].as_array().unwrap().len(),
+        whole_log["events"].as_array().unwrap().len()
+    );
+
+    // Controls for the filtered `result.query` case above -- **one per field
+    // of the filter**, and this is the whole point of them.
+    //
+    // The combined case above passes `--state open --service http
+    // --min-confidence 0.8 --port-range 1-65535` together and looks
+    // exhaustive. It is not: the fixture's single endpoint satisfies all four
+    // at once, so three of the four remove nothing, and a command surface
+    // that dropped `--state`, `--service` or `--min-confidence` on the floor
+    // produced a byte-identical document and survived the whole workspace.
+    // That is the same defect the parity comparison itself was written to
+    // fix -- a guard that covers the instances already known -- one level
+    // down inside the fix. A fixture that satisfies every branch tests none
+    // of them.
+    //
+    // So each field gets a value the fixture **excludes**, with `total == 0`
+    // asserted against a non-zero unfiltered total first: proof the tool's
+    // own answer narrowed, before the command is asked to reproduce it.
     let all = server.call("result.query", json!({ "scan_id": fixture.scan_id }));
     assert!(
         all["total"].as_u64().unwrap() > 0,
         "the fixture scan folded to no endpoints, so nothing below can be narrowed: {all:#}"
     );
-    let narrowed = server.call(
-        "result.query",
-        json!({
-            "scan_id": fixture.scan_id,
-            "filter": { "port_range": { "low": 1, "high": 1 } },
-        }),
-    );
-    assert_eq!(
-        narrowed["total"],
-        json!(0),
-        "the filter narrowed nothing, so the comparison below proves nothing: {narrowed:#}"
-    );
-    let argv = fixture.cli(&[
-        "result",
-        "query",
-        "--scan",
-        &fixture.scan_id,
-        "--port-range",
-        "1-1",
-    ]);
-    let (code, stdout) = bathy(&argv.iter().map(String::as_str).collect::<Vec<_>>());
-    assert_eq!(code, 0, "{stdout}");
-    assert_eq!(
-        json_lines(&stdout)[0],
-        narrowed,
-        "the command could not express the filter that narrowed the tool's answer"
-    );
+    // `min_confidence` is asked of `diff_after` rather than the fixture scan:
+    // that log is this test's own construction and every `service.observed`
+    // in it carries confidence exactly 0.5 (see `confidence_variant`), so
+    // 0.75 excludes it *by construction* rather than by whatever confidence
+    // the interpreter happens to assign an nginx banner today.
+    let narrowing: [(&str, &str, Value, Vec<&str>); 4] = [
+        (
+            "state",
+            &fixture.scan_id,
+            json!({ "state": "closed" }),
+            vec!["--state", "closed"],
+        ),
+        (
+            "service",
+            &fixture.scan_id,
+            json!({ "service": "ssh" }),
+            vec!["--service", "ssh"],
+        ),
+        (
+            "min_confidence",
+            &fixture.diff_after,
+            json!({ "min_confidence": 0.75 }),
+            vec!["--min-confidence", "0.75"],
+        ),
+        (
+            "port_range",
+            &fixture.scan_id,
+            json!({ "port_range": { "low": 1, "high": 1 } }),
+            vec!["--port-range", "1-1"],
+        ),
+    ];
+    for (field, scan_id, filter, flags) in narrowing {
+        let narrowed = server.call(
+            "result.query",
+            json!({ "scan_id": scan_id, "filter": filter }),
+        );
+        assert!(
+            narrowed["total_before_filter"].as_u64().unwrap() > 0,
+            "`{field}`: the scan being filtered folded to nothing, so a `total` of 0 \
+             below would prove nothing: {narrowed:#}"
+        );
+        assert_eq!(
+            narrowed["total"],
+            json!(0),
+            "`{field}` narrowed nothing, so the comparison below proves nothing about \
+             whether the command passes it: {narrowed:#}"
+        );
+        let mut tail = vec!["result", "query", "--scan", scan_id];
+        tail.extend_from_slice(&flags);
+        let argv = fixture.cli(&tail);
+        let (code, stdout) = bathy(&argv.iter().map(String::as_str).collect::<Vec<_>>());
+        assert_eq!(code, 0, "`{field}`: {stdout}");
+        assert_eq!(
+            json_lines(&stdout)[0],
+            narrowed,
+            "`{field}`: the command could not express the filter that narrowed the \
+             tool's answer -- {argv:?}"
+        );
+    }
 
     // The one intended difference in *shape*, asserted rather than skipped.
     //
