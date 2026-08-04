@@ -1,0 +1,37 @@
+{
+  "$defs": {
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Read a page of a scan's event log.",
+  "properties": {
+    "after_sequence": {
+      "default": 0,
+      "description": "Return only events with a sequence number strictly greater than this.\nStart at 0; then pass the previous page's `next_cursor`.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "limit": {
+      "default": 200,
+      "description": "How many events to return at most. 1 to 1000.",
+      "format": "uint32",
+      "maximum": 1000,
+      "minimum": 1,
+      "type": "integer"
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    }
+  },
+  "required": [
+    "scan_id"
+  ],
+  "title": "ScanEventsInput",
+  "type": "object"
+}

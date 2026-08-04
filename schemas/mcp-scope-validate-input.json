@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Load a scope manifest and report what it authorizes.",
+  "properties": {
+    "manifest_path": {
+      "description": "Filesystem path to the scope manifest document.",
+      "type": "string"
+    },
+    "targets": {
+      "default": [],
+      "description": "Addresses, CIDRs or inclusive ranges to check against the manifest.\nAn empty list checks the manifest alone.",
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "manifest_path"
+  ],
+  "title": "ScopeValidateInput",
+  "type": "object"
+}

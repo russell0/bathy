@@ -1,0 +1,400 @@
+{
+  "$defs": {
+    "Confidence": {
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched an interpretation rule.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "DenyReason": {
+      "description": "Stable, machine-readable reasons a scan request can be denied by policy.\nThe four wire strings below are the whole set -- agents branch on them, so\nthey are part of the public contract and must not be reworded without a\nversion bump.",
+      "enum": [
+        "scope_mismatch",
+        "scope_expired",
+        "target_out_of_scope",
+        "budget_exceeds_ceiling"
+      ],
+      "type": "string"
+    },
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "Endpoint": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "required": [
+        "transport",
+        "port"
+      ],
+      "type": "object"
+    },
+    "Event": {
+      "description": "One immutable entry in a scan's append-only log.\n\n`sequence` is gap-free and monotonic per scan; resumption replays from the\nlast persisted sequence, so a gap means data loss and is a hard error.",
+      "oneOf": [
+        {
+          "properties": {
+            "estimated_probes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "estimated_targets": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "event_type": {
+              "const": "scan.started",
+              "type": "string"
+            },
+            "plan_hash": {
+              "$ref": "#/$defs/Digest"
+            }
+          },
+          "required": [
+            "event_type",
+            "plan_hash",
+            "estimated_targets",
+            "estimated_probes"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "event_type": {
+              "const": "host.discovered",
+              "type": "string"
+            },
+            "evidence_refs": {
+              "$ref": "#/$defs/NonEmpty_of_Digest"
+            },
+            "method": {
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            }
+          },
+          "required": [
+            "event_type",
+            "target",
+            "method",
+            "evidence_refs"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "endpoint": {
+              "$ref": "#/$defs/Endpoint"
+            },
+            "event_type": {
+              "const": "port.state",
+              "type": "string"
+            },
+            "evidence_refs": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NonEmpty_of_Digest"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state": {
+              "$ref": "#/$defs/PortState"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            }
+          },
+          "required": [
+            "event_type",
+            "target",
+            "endpoint",
+            "state"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "endpoint": {
+              "$ref": "#/$defs/Endpoint"
+            },
+            "event_type": {
+              "const": "service.observed",
+              "type": "string"
+            },
+            "evidence_refs": {
+              "$ref": "#/$defs/NonEmpty_of_Digest"
+            },
+            "observation": {
+              "$ref": "#/$defs/Observation"
+            },
+            "probe_id": {
+              "type": "string"
+            },
+            "target": {
+              "$ref": "#/$defs/Target"
+            }
+          },
+          "required": [
+            "event_type",
+            "target",
+            "endpoint",
+            "observation",
+            "evidence_refs",
+            "probe_id"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "event_type": {
+              "const": "scan.progress",
+              "type": "string"
+            },
+            "packets_spent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "probes_sent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "probes_total": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event_type",
+            "probes_sent",
+            "probes_total",
+            "packets_spent"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "event_type": {
+              "const": "policy.denied",
+              "type": "string"
+            },
+            "reason_code": {
+              "$ref": "#/$defs/DenyReason"
+            }
+          },
+          "required": [
+            "event_type",
+            "reason_code",
+            "detail"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "event_type": {
+              "const": "scan.completed",
+              "type": "string"
+            },
+            "findings": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "packets_spent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "probes_sent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "event_type",
+            "probes_sent",
+            "packets_spent",
+            "findings"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "event_type": {
+              "const": "scan.failed",
+              "type": "string"
+            },
+            "reason_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "event_type",
+            "reason_code",
+            "detail"
+          ],
+          "type": "object"
+        }
+      ],
+      "properties": {
+        "engine_version": {
+          "type": "string"
+        },
+        "scan_id": {
+          "$ref": "#/$defs/ScanId"
+        },
+        "sequence": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "timestamp": {
+          "description": "RFC 3339 UTC with milliseconds. Supplied by an injected `Clock`.",
+          "format": "date-time",
+          "type": "string"
+        }
+      },
+      "required": [
+        "scan_id",
+        "sequence",
+        "timestamp",
+        "engine_version"
+      ],
+      "type": "object"
+    },
+    "NonEmpty_of_Digest": {
+      "description": "A vector guaranteed to hold at least one element.\n\nUsed so that a `Finding` cannot be constructed without evidence. The\nguarantee lives in the type system rather than in a validation pass,\nbecause a validation pass can be forgotten.",
+      "items": {
+        "$ref": "#/$defs/Digest"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "description": "What a probe concluded about one endpoint. Every field beyond `service` is\noptional because partial identification is normal and honest.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "product": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "service",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "PortState": {
+      "description": "The observed reachability of one endpoint.\n\n`Filtered` and `Closed` are distinct on purpose: a closed port is positive\nevidence that a host is up, a filtered port is evidence of a middlebox.",
+      "oneOf": [
+        {
+          "enum": [
+            "open",
+            "closed",
+            "filtered"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "Probed, but the response was contradictory across retries.",
+          "type": "string"
+        }
+      ]
+    },
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "Target": {
+      "additionalProperties": false,
+      "properties": {
+        "ip": {
+          "format": "ip",
+          "type": "string"
+        }
+      },
+      "required": [
+        "ip"
+      ],
+      "type": "object"
+    },
+    "Transport": {
+      "enum": [
+        "tcp",
+        "udp"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "events": {
+      "items": {
+        "$ref": "#/$defs/Event"
+      },
+      "type": "array"
+    },
+    "has_more": {
+      "description": "True when the log already holds events beyond this page. False does\nnot mean the scan is over -- a running scan appends more.",
+      "type": "boolean"
+    },
+    "next_cursor": {
+      "description": "The sequence number to pass as the next call's `after_sequence`.\nUnchanged from the request when the page is empty.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "events",
+    "next_cursor",
+    "has_more"
+  ],
+  "title": "ScanEventsOutput",
+  "type": "object"
+}

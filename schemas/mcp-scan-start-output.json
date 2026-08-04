@@ -1,0 +1,113 @@
+{
+  "$defs": {
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "PolicyDecisionTag": {
+      "enum": [
+        "approved",
+        "denied"
+      ],
+      "type": "string"
+    },
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "TaskHandle": {
+      "additionalProperties": false,
+      "description": "Returned immediately by `scan.start`. Never blocks on scan completion.",
+      "properties": {
+        "estimated_targets": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "plan_hash": {
+          "$ref": "#/$defs/Digest"
+        },
+        "policy_decision": {
+          "$ref": "#/$defs/PolicyDecisionTag"
+        },
+        "status": {
+          "$ref": "#/$defs/TaskStatus"
+        },
+        "task_id": {
+          "$ref": "#/$defs/ScanId"
+        }
+      },
+      "required": [
+        "task_id",
+        "plan_hash",
+        "policy_decision",
+        "estimated_targets",
+        "status"
+      ],
+      "type": "object"
+    },
+    "TaskStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "denied",
+          "description": "Refused by policy. Terminal, and carries a `policy.denied` event.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "detail": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "handle": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/TaskHandle"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Present exactly when `policy_decision` is `approved`."
+    },
+    "policy_decision": {
+      "$ref": "#/$defs/PolicyDecisionTag"
+    },
+    "reason_code": {
+      "description": "A stable code, present exactly when `policy_decision` is `denied`.\nNo packet was emitted and no scan record was created.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "reused": {
+      "description": "True when this key already named a scan and that scan was returned\ninstead of a second one being started.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "policy_decision",
+    "reused"
+  ],
+  "title": "ScanStartOutput",
+  "type": "object"
+}

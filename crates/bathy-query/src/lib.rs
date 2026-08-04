@@ -31,8 +31,10 @@
 pub mod diff;
 pub mod fold;
 pub mod schema;
+pub mod tools;
 pub mod wire;
 
 pub use diff::{Change, ChangeKind, ScanDiff, Undecidable, Undetermined, diff};
 pub use fold::{EndpointKey, EndpointState, ScanFold, Terminal, fold_events};
+pub use tools::{EndpointFilter, PortRange, ResultQueryInput, ResultQueryOutput};
 pub use wire::{FoldEntry, ScanFoldWire, WireError};

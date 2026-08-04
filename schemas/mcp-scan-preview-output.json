@@ -1,0 +1,91 @@
+{
+  "$defs": {
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "PolicyDecisionTag": {
+      "enum": [
+        "approved",
+        "denied"
+      ],
+      "type": "string"
+    },
+    "ScopeId": {
+      "description": "Identifies an authorization scope manifest.",
+      "pattern": "^scope_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "detail": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "estimated_probes": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "estimated_runtime_seconds": {
+      "description": "A lower bound: the probe count divided by the packets-per-second\nceiling, rounded up. Probe latency and connection limits can only\nmake a real run slower than this.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "estimated_targets": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "plan_hash": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Digest"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The hash of the plan this request expands to. Present only when the\nscan was approved, so it matches what the command-line surface\nreports for the same request."
+    },
+    "policy_decision": {
+      "$ref": "#/$defs/PolicyDecisionTag"
+    },
+    "reason_code": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope_id": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ScopeId"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "required": [
+    "policy_decision"
+  ],
+  "title": "ScanPreviewOutput",
+  "type": "object"
+}

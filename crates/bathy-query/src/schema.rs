@@ -26,6 +26,18 @@ pub fn all() -> BTreeMap<&'static str, Value> {
         "scan-diff",
         to_value(schemars::schema_for!(crate::diff::ScanDiff)),
     );
+    // The endpoint query tool's pair. It lives here rather than beside the
+    // other tool shapes because its output is stated in terms of a fold
+    // entry, which is defined here -- the same reason the fold and the diff
+    // are published here at all.
+    m.insert(
+        "mcp-result-query-input",
+        to_value(schemars::schema_for!(crate::tools::ResultQueryInput)),
+    );
+    m.insert(
+        "mcp-result-query-output",
+        to_value(schemars::schema_for!(crate::tools::ResultQueryOutput)),
+    );
     m
 }
 
@@ -38,10 +50,37 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_returns_exactly_the_two_schemas_this_crate_publishes() {
+    fn all_returns_exactly_the_four_schemas_this_crate_publishes() {
         let mut names: Vec<&str> = all().keys().copied().collect();
         names.sort_unstable();
-        assert_eq!(names, vec!["scan-diff", "scan-fold"]);
+        assert_eq!(
+            names,
+            vec![
+                "mcp-result-query-input",
+                "mcp-result-query-output",
+                "scan-diff",
+                "scan-fold"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_query_input_names_no_scope_and_no_command() {
+        let rendered = serde_json::to_string(&all()["mcp-result-query-input"]).unwrap();
+        for forbidden in [
+            "\"manifest_json\"",
+            "\"manifest\"",
+            "\"scope_manifest\"",
+            "\"scope_id\"",
+            "\"allowed_cidrs\"",
+            "\"command\"",
+            "\"args\"",
+            "\"flags\"",
+            "\"argv\"",
+            "\"raw\"",
+        ] {
+            assert!(!rendered.contains(forbidden), "exposes {forbidden}");
+        }
     }
 
     #[test]

@@ -1,0 +1,121 @@
+{
+  "$defs": {
+    "Confidence": {
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched an interpretation rule.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "EndpointFilter": {
+      "additionalProperties": false,
+      "description": "Narrow a folded scan to the endpoints worth looking at.\n\nEvery field is optional, and an endpoint is kept only if it satisfies all\nthe fields that were supplied.",
+      "properties": {
+        "min_confidence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Confidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Keep only endpoints identified with at least this confidence. An\nendpoint carrying no identification at all is dropped by this field."
+        },
+        "port_range": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortRange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Keep only endpoints whose port falls inside this inclusive range."
+        },
+        "service": {
+          "description": "Keep only endpoints whose identified service matches this exactly.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Keep only endpoints in this reachability state. An endpoint whose\nstate was never observed is dropped by this field."
+        }
+      },
+      "type": "object"
+    },
+    "PortRange": {
+      "additionalProperties": false,
+      "description": "An inclusive port range.",
+      "properties": {
+        "high": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "low": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "low",
+        "high"
+      ],
+      "type": "object"
+    },
+    "PortState": {
+      "description": "The observed reachability of one endpoint.\n\n`Filtered` and `Closed` are distinct on purpose: a closed port is positive\nevidence that a host is up, a filtered port is evidence of a middlebox.",
+      "oneOf": [
+        {
+          "enum": [
+            "open",
+            "closed",
+            "filtered"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "Probed, but the response was contradictory across retries.",
+          "type": "string"
+        }
+      ]
+    },
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Fold a scan's event log into per-endpoint state and return the endpoints\nthat match a filter.",
+  "properties": {
+    "filter": {
+      "$ref": "#/$defs/EndpointFilter",
+      "default": {}
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    }
+  },
+  "required": [
+    "scan_id"
+  ],
+  "title": "ResultQueryInput",
+  "type": "object"
+}

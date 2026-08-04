@@ -1,0 +1,108 @@
+{
+  "$defs": {
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "ScopeId": {
+      "description": "Identifies an authorization scope manifest.",
+      "pattern": "^scope_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    },
+    "TaskStatus": {
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "running",
+            "paused",
+            "completed",
+            "cancelled",
+            "failed"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "denied",
+          "description": "Refused by policy. Terminal, and carries a `policy.denied` event.",
+          "type": "string"
+        }
+      ]
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "created_at": {
+      "type": "string"
+    },
+    "elapsed_seconds": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "last_sequence": {
+      "description": "The highest sequence number written to this scan's event log.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "packets_spent": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "plan_hash": {
+      "$ref": "#/$defs/Digest"
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    },
+    "scope_id": {
+      "$ref": "#/$defs/ScopeId"
+    },
+    "status": {
+      "$ref": "#/$defs/TaskStatus"
+    },
+    "units_completed": {
+      "description": "Probe units whose result has been durably written.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "units_total": {
+      "description": "Probe units the plan contains.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "updated_at": {
+      "type": "string"
+    }
+  },
+  "required": [
+    "scan_id",
+    "status",
+    "units_completed",
+    "units_total",
+    "packets_spent",
+    "elapsed_seconds",
+    "last_sequence",
+    "plan_hash",
+    "scope_id",
+    "idempotency_key",
+    "created_at",
+    "updated_at"
+  ],
+  "title": "ScanStatusOutput",
+  "type": "object"
+}

@@ -1,0 +1,22 @@
+{
+  "$defs": {
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Report a scan's stored lifecycle record.",
+  "properties": {
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    }
+  },
+  "required": [
+    "scan_id"
+  ],
+  "title": "ScanStatusInput",
+  "type": "object"
+}

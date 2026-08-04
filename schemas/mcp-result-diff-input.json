@@ -1,0 +1,31 @@
+{
+  "$defs": {
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Compare two finished scans.",
+  "properties": {
+    "after_scan_id": {
+      "$ref": "#/$defs/ScanId"
+    },
+    "before_scan_id": {
+      "$ref": "#/$defs/ScanId"
+    },
+    "include_confidence_only": {
+      "default": false,
+      "description": "Keep changes where only the confidence moved. Confidence wobbles\nbetween runs, so these are separated from substantive change and\ndropped by default.",
+      "type": "boolean"
+    }
+  },
+  "required": [
+    "before_scan_id",
+    "after_scan_id"
+  ],
+  "title": "ResultDiffInput",
+  "type": "object"
+}

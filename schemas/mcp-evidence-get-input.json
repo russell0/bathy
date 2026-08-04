@@ -1,0 +1,32 @@
+{
+  "$defs": {
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Fetch the exact bytes a finding cited.",
+  "properties": {
+    "digest": {
+      "$ref": "#/$defs/Digest",
+      "description": "A `blake3:<64 hex>` digest, as cited by an event's `evidence_refs`."
+    },
+    "max_bytes": {
+      "description": "Return at most this many bytes. Absent returns all of them.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": [
+        "integer",
+        "null"
+      ]
+    }
+  },
+  "required": [
+    "digest"
+  ],
+  "title": "EvidenceGetInput",
+  "type": "object"
+}

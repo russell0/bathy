@@ -11,6 +11,7 @@ pub mod request;
 pub mod schema;
 pub mod scope_dto;
 pub mod task;
+pub mod tools;
 
 pub use canonical::{CanonicalError, canonical_json, plan_digest};
 pub use capture::ProbeCapture;
@@ -26,3 +27,10 @@ pub use request::{
 };
 pub use scope_dto::ScopeManifestDto;
 pub use task::{PolicyDecisionTag, TaskHandle, TaskStatus};
+pub use tools::{
+    BudgetCeiling, EvidenceGetInput, EvidenceGetOutput, FingerprintExplainInput,
+    FingerprintExplainOutput, ResultDiffInput, ScanCancelInput, ScanCancelOutput, ScanEventsInput,
+    ScanEventsOutput, ScanPreviewInput, ScanPreviewOutput, ScanRequestSpec, ScanResumeInput,
+    ScanResumeOutput, ScanStartInput, ScanStartOutput, ScanStatusInput, ScanStatusOutput,
+    ScopeValidateInput, ScopeValidateOutput, SpecError,
+};

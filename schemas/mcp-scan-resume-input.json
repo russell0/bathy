@@ -1,0 +1,27 @@
+{
+  "$defs": {
+    "ScanId": {
+      "description": "Identifies one scan task.",
+      "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "Continue a scan that stopped before its plan was exhausted.",
+  "properties": {
+    "manifest_path": {
+      "description": "Filesystem path to the scope manifest authorizing this scan. It is\nevaluated again: a manifest that has expired or narrowed since the\nscan started refuses the resume.",
+      "type": "string"
+    },
+    "scan_id": {
+      "$ref": "#/$defs/ScanId"
+    }
+  },
+  "required": [
+    "manifest_path",
+    "scan_id"
+  ],
+  "title": "ScanResumeInput",
+  "type": "object"
+}
