@@ -245,14 +245,25 @@ pub struct EventsArgs {
     /// Return only events after this sequence number.
     #[arg(long, value_name = "SEQUENCE", default_value_t = 0)]
     pub after: u64,
-    /// How many events to read at most, 1-1000.
+    /// How many events to read at most, 1-1000. Unset reads the whole log.
     ///
     /// The same bound the `scan.events` tool takes, and here for the same
     /// reason `--targets` is on `scope validate`: a question the tool
     /// surface can ask and this one cannot is a question an operator cannot
     /// reproduce from a shell. Under `--follow` it bounds each poll.
-    #[arg(long, value_name = "N", default_value_t = 200)]
-    pub limit: u32,
+    ///
+    /// **There is no default bound**, and that is deliberate. It used to
+    /// default to 200: a 402-event log then produced 200 lines on stdout,
+    /// exit 0, and the "there is more" notice on stderr alone -- so
+    /// `bathy --json scan events --scan X > events.jsonl`, which discards
+    /// stderr as scripts do, silently became a prefix of the answer with a
+    /// success code, and nothing on stdout said so. An agent reading that
+    /// file has no way to tell a complete log from a truncated one. A read
+    /// that is not following now returns the whole log unless a caller
+    /// writes down a bound, so truncation only ever happens because someone
+    /// asked for it.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<u32>,
     /// Keep reading as the scan writes, until it reaches a terminal event.
     #[arg(long)]
     pub follow: bool,

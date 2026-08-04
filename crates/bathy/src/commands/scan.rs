@@ -422,6 +422,11 @@ pub fn events(
     let scan_id = state::parse_scan_id(&args.scan)?;
     let runtime = runtime(state_dir)?;
     let mut cursor = args.after;
+    // The tool's own ceiling on one page. Used as the page size when the
+    // caller named no bound: an unbounded read is still paged, it just does
+    // not stop after the first page.
+    const MAX_PAGE: u32 = 1_000;
+    let page_size = args.limit.unwrap_or(MAX_PAGE);
     // A follower's only stopping condition used to be a terminal event, and
     // a scan whose process was killed never writes one -- so `--follow`
     // polled forever against a log nothing would ever append to. An agent
@@ -435,7 +440,7 @@ pub fn events(
             ScanEventsInput {
                 scan_id,
                 after_sequence: cursor,
-                limit: args.limit,
+                limit: page_size,
             },
             &runtime,
         )
@@ -461,15 +466,29 @@ pub fn events(
         // page: one read, one page, the same events. A caller that wants the
         // rest asks for it, and is told on stderr that there is a rest --
         // stdout stays line-delimited JSON and nothing else (AC-5.10).
+        //
+        // With no `--limit`, a non-following read keeps going until the log
+        // is exhausted. That is the whole of the fix for the truncation the
+        // M5 Task 4 fix review found: stdout was silently a *prefix* of the
+        // answer, with exit 0 and the only warning on a stream scripts
+        // discard, and a consumer had no in-band way to tell. The bound is
+        // still here and still the same bound the tool takes; it is now
+        // something a caller asks for rather than something they get.
         if !args.follow {
-            if page.has_more {
+            if !page.has_more {
+                return Ok(ExitCode::Success);
+            }
+            if args.limit.is_some() {
                 emitter.note(format!(
                     "more events remain; re-run with --after {cursor}, or raise \
-                     --limit (currently {})",
-                    args.limit
+                     --limit (currently {page_size})"
                 ));
+                return Ok(ExitCode::Success);
             }
-            return Ok(ExitCode::Success);
+            // Unbounded, and there is more log: read the next page. `cursor`
+            // strictly advances whenever `has_more` is set (a page that had
+            // more to give was not empty), so this terminates.
+            continue;
         }
         if saw_terminal {
             return Ok(ExitCode::Success);

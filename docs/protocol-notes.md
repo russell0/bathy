@@ -301,6 +301,33 @@ What holds now is stronger than the sentence was:
   fails rather than passes. `scan start` and `scan resume` print the tool's
   document and then a run summary, because this surface runs to completion the
   work the tool detaches.
+- **A `scan events` read that is not following is unbounded, and `--limit` has
+  no default.** This is the one behaviour the M5 Task 4 fix review sent back.
+  `--limit` briefly defaulted to 200, which made a 402-event log answer with
+  200 lines on stdout, exit 0, and the notice that there was more on stderr
+  alone — so `bathy --json scan events --scan X > events.jsonl` silently became
+  a *prefix* of the answer, and a consumer reading that file had no in-band way
+  to tell. Silent truncation with a success code is the same defect shape as a
+  usage error that exits 0 with an empty stdout, which this project has already
+  fixed once.
+
+  Of the three remedies on the table — leave a non-following read unbounded,
+  signal truncation in band, or exit non-zero on truncation — the first is the
+  one taken. A continuation record on stdout would put a non-event into a
+  stream whose entire contract is one event per line, so every consumer would
+  have to learn a second record shape to stay correct; and a non-zero exit
+  would report a *success* (the caller got exactly the bound it asked for) as a
+  failure, and would need a code the exit table does not have. Leaving the read
+  unbounded costs nothing, because the bound stays fully expressible: `--limit`
+  is still the same bound the `scan.events` tool takes, the parity comparison
+  still passes it explicitly and still binds, and a truncation now only ever
+  happens because a caller wrote one down — in which case the notice on stderr
+  still says what is left and how to ask for it.
+
+  Guarded by `a_read_that_is_not_following_returns_the_whole_log_rather_than_a_silent_prefix`,
+  over a 1,402-event log: more than one page of the tool's own 1,000-event
+  ceiling, so it proves the command pages to the end rather than that one large
+  page happened to be enough.
 
 Refusals differ in *envelope* on purpose and not in *code*: the tool marks a
 policy denial `isError` with a structured result, the command exits 2 with a

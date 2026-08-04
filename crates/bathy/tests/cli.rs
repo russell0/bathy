@@ -1553,3 +1553,99 @@ fn the_binary_reports_its_own_version() {
     out.success();
     assert!(out.stdout.starts_with("bathy "), "{}", out.stdout);
 }
+
+/// Writes a synthetic, well-formed event log of `n` records straight into a
+/// state directory and returns the scan identifier naming it.
+///
+/// `scan events` reads the log through `EventLogReader` and consults no
+/// stored record, so a log is all this needs -- which is what makes a
+/// thousand-event fixture cheap enough to assert on. The records are
+/// gap-free from sequence 1, because `EventLog`'s own reader treats any
+/// deviation as corruption.
+fn synthetic_log(dir: &str, n: u64) -> String {
+    let scan_id = "scan_01ARZ3NDEKTSV4RRFFQ69G5FAX";
+    let mut text = String::new();
+    for sequence in 1..=n {
+        text.push_str(&format!(
+            "{{\"scan_id\":\"{scan_id}\",\"sequence\":{sequence},\
+             \"timestamp\":\"2026-08-04T00:00:00.000Z\",\"engine_version\":\"0.1.0\",\
+             \"event_type\":\"port.state\",\"target\":{{\"ip\":\"192.0.2.1\"}},\
+             \"endpoint\":{{\"port\":{},\"transport\":\"tcp\"}},\"state\":\"closed\"}}\n",
+            1024 + sequence
+        ));
+    }
+    std::fs::create_dir_all(dir).expect("state directory");
+    std::fs::write(PathBuf::from(dir).join(format!("{scan_id}.jsonl")), text)
+        .expect("write the synthetic log");
+    scan_id.to_string()
+}
+
+/// A read that is not following returns the **whole** log.
+///
+/// M5 Task 4's fix review found the opposite: `--limit` defaulted to 200, so
+/// a 402-event log produced 200 lines on stdout with exit 0 and the only
+/// warning on stderr. `bathy --json scan events --scan X > events.jsonl`
+/// discards stderr, as scripts do, so the file silently became a prefix of
+/// the answer and nothing in it said so -- the same shape as the usage error
+/// that exited 0 with an empty stdout, which this project already fixed once.
+///
+/// 1,402 events, deliberately more than one page of the tool's own 1,000-event
+/// ceiling: this has to prove the command *pages* to the end of the log, not
+/// merely that some larger single page happens to cover the fixture.
+#[test]
+fn a_read_that_is_not_following_returns_the_whole_log_rather_than_a_silent_prefix() {
+    let state = state_dir();
+    let state = state.path().to_str().unwrap().to_string();
+    let scan_id = synthetic_log(&state, 1_402);
+
+    let out = bathy(&[
+        "--json",
+        "--state-dir",
+        &state,
+        "scan",
+        "events",
+        "--scan",
+        &scan_id,
+    ]);
+    out.success();
+    let lines = out.json_lines();
+    assert_eq!(
+        lines.len(),
+        1_402,
+        "stdout was a prefix of the answer, not the answer. stderr:\n{}",
+        out.stderr
+    );
+    assert_eq!(lines[0]["sequence"], 1);
+    assert_eq!(lines[1_401]["sequence"], 1_402);
+    assert!(
+        !out.stderr.contains("more events remain"),
+        "nothing was withheld, so nothing should say otherwise: {}",
+        out.stderr
+    );
+
+    // The bound is still expressible, and still bounds -- it is now something
+    // a caller asks for rather than something they get. A truncation the
+    // caller wrote down is still announced.
+    let bounded = bathy(&[
+        "--json",
+        "--state-dir",
+        &state,
+        "scan",
+        "events",
+        "--scan",
+        &scan_id,
+        "--limit",
+        "200",
+    ]);
+    bounded.success();
+    assert_eq!(
+        bounded.json_lines().len(),
+        200,
+        "--limit stopped bounding the read"
+    );
+    assert!(
+        bounded.stderr.contains("more events remain"),
+        "a bounded read that withheld events must say so: {}",
+        bounded.stderr
+    );
+}
