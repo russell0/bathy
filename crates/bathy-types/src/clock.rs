@@ -6,8 +6,10 @@
 //! trait is what makes an event log byte-comparable between a recorded run
 //! and a replayed one -- the foundation of this project's
 //! reproducible-interpretation claim. CI enforces the "nowhere else" half of
-//! that with a grep over `crates/` and `xtask/` excluding this file (see
-//! `.github/workflows/ci.yml`, "no direct time/id generation outside Clock").
+//! that with a scan over `crates/` and `xtask/` excluding this file --
+//! `cargo run -p xtask -- check-phrases`, rule `clock-only-time-and-ids`
+//! (AC-2.1), which `.github/workflows/ci.yml` invokes rather than
+//! reimplementing.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +25,26 @@ pub trait Clock: Send + Sync {
     fn now_rfc3339(&self) -> String;
     fn new_scan_id(&self) -> ScanId;
     fn new_event_id(&self) -> EventId;
+
+    /// The same instant as [`Clock::now_rfc3339`], as milliseconds since the
+    /// Unix epoch.
+    ///
+    /// Exists because not every consumer of "now" is writing a timestamp into
+    /// an event. `bathy-mcp`'s approval gate needs a *duration* comparison --
+    /// has this token's time-to-live elapsed -- and arithmetic on a formatted
+    /// RFC 3339 string is not that. Before this method existed it called
+    /// `SystemTime::now()` directly, which is the one thing this trait exists
+    /// to prevent: the AC-2.1 check was red from `89142bf` to the M5 blocker
+    /// wave because a wall-clock need had no injected answer. Adding the
+    /// method is the fix; exempting the call site would have been the
+    /// band-aid, because an un-injected clock is un-injected whether it lands
+    /// in a log record or in an expiry decision.
+    ///
+    /// Pre-epoch instants saturate to `0`. [`FixedClock`] accepts any
+    /// shape-valid RFC 3339 timestamp, including `1969-…`, and this is a
+    /// count of milliseconds *since* the epoch; a test clock set before it has
+    /// no meaningful positive value and none is invented.
+    fn now_unix_millis(&self) -> u64;
 }
 
 /// C2: the whole-branch review found no `Clock for Arc<T>` (or `Box<T>`,
@@ -54,6 +76,9 @@ impl<T: Clock + ?Sized> Clock for std::sync::Arc<T> {
     }
     fn new_event_id(&self) -> EventId {
         (**self).new_event_id()
+    }
+    fn now_unix_millis(&self) -> u64 {
+        (**self).now_unix_millis()
     }
 }
 
@@ -114,6 +139,11 @@ impl Clock for SystemClock {
     }
     fn new_event_id(&self) -> EventId {
         EventId::from_ulid(self.next_ulid())
+    }
+    fn now_unix_millis(&self) -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis().min(u128::from(u64::MAX)) as u64)
     }
 }
 
@@ -176,6 +206,12 @@ fn format_rfc3339_millis(epoch_secs: i64, millis: u32) -> String {
 /// seed, however large, can ever produce a non-canonical id.
 pub struct FixedClock {
     now: String,
+    /// `now`, as milliseconds since the Unix epoch. Computed once in
+    /// [`FixedClock::new`], after `now` has been validated, so
+    /// [`Clock::now_unix_millis`] cannot disagree with
+    /// [`Clock::now_rfc3339`]: both are derived from the same validated
+    /// string rather than from two independent readings.
+    now_millis: u64,
     counter: AtomicU64,
     seed: u64,
 }
@@ -250,11 +286,51 @@ fn validate_rfc3339_millis(s: &str) -> Result<(), ClockError> {
     Ok(())
 }
 
+/// The inverse of [`format_rfc3339_millis`], for a string that has already
+/// passed [`validate_rfc3339_millis`].
+///
+/// Uses Howard Hinnant's `days_from_civil` -- the decode direction of the
+/// `civil_from_days` algorithm `format_rfc3339_millis` runs in the encode
+/// direction -- so the two are the same calendar, not two calendars that
+/// happen to agree on the dates anyone tested. The tests below check absolute
+/// values obtained independently (Python's `datetime`), not only that the pair
+/// round-trips against itself, because a matched pair of inverse errors
+/// round-trips perfectly.
+///
+/// Saturates to `0` before the epoch: the result is a count of milliseconds
+/// *since* 1970, and `FixedClock` will accept `1969-12-31T23:59:59.999Z`.
+fn epoch_millis_from_rfc3339(s: &str) -> u64 {
+    let n = |i: usize, len: usize| -> i64 {
+        s[i..i + len]
+            .parse()
+            .expect("validated as ascii digits before this is called")
+    };
+    let (year, month, day) = (n(0, 4), n(5, 2), n(8, 2));
+    let (hour, minute, second, millis) = (n(11, 2), n(14, 2), n(17, 2), n(20, 3));
+
+    // `days_from_civil`: March-based year, so a leap day is the last day of
+    // the internal year and needs no special case anywhere.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let total = secs
+        .checked_mul(1_000)
+        .and_then(|ms| ms.checked_add(millis));
+    u64::try_from(total.unwrap_or(0)).unwrap_or(0)
+}
+
 impl FixedClock {
     pub fn new(now: &str, seed: u64) -> Result<Self, ClockError> {
         validate_rfc3339_millis(now)?;
         Ok(Self {
             now: now.to_owned(),
+            now_millis: epoch_millis_from_rfc3339(now),
             counter: AtomicU64::new(0),
             seed,
         })
@@ -274,6 +350,9 @@ impl Clock for FixedClock {
     }
     fn new_event_id(&self) -> EventId {
         EventId::from_ulid(self.next_ulid())
+    }
+    fn now_unix_millis(&self) -> u64 {
+        self.now_millis
     }
 }
 
@@ -640,5 +719,69 @@ mod tests {
                 "format_rfc3339_millis produced {s:?}, which the validator rejected"
             );
         }
+    }
+
+    /// Absolute values, obtained from Python's `datetime` rather than from
+    /// this file's own encoder. A decoder tested only against its own inverse
+    /// passes with both halves wrong in the same direction.
+    #[test]
+    fn fixed_clock_unix_millis_match_values_computed_outside_this_file() {
+        for (stamp, expected) in [
+            ("1970-01-01T00:00:00.000Z", 0_u64),
+            ("2026-08-01T15:04:31.182Z", 1_785_596_671_182),
+            ("2000-02-29T12:00:00.500Z", 951_825_600_500),
+            ("2026-08-04T00:00:00.001Z", 1_785_801_600_001),
+            ("9999-12-31T23:59:59.999Z", 253_402_300_799_999),
+        ] {
+            assert_eq!(
+                FixedClock::new(stamp, 7).unwrap().now_unix_millis(),
+                expected,
+                "{stamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fixed_clock_reports_one_instant_two_ways_not_two_instants() {
+        for stamp in [
+            "1970-01-01T00:00:00.000Z",
+            "2026-08-01T15:04:31.182Z",
+            "2000-02-29T12:00:00.500Z",
+            "2038-01-19T03:14:07.999Z",
+        ] {
+            let c = FixedClock::new(stamp, 7).unwrap();
+            let ms = c.now_unix_millis();
+            assert_eq!(
+                format_rfc3339_millis((ms / 1_000) as i64, (ms % 1_000) as u32),
+                c.now_rfc3339(),
+                "the two accessors must name the same instant"
+            );
+        }
+    }
+
+    #[test]
+    fn a_pre_epoch_fixed_clock_saturates_at_zero_rather_than_wrapping() {
+        // `u64` cannot hold a negative count of milliseconds since 1970, and
+        // wrapping would put a test clock set to 1969 roughly 584 million
+        // years in the future -- which would make every time-to-live in the
+        // workspace look unexpired forever.
+        for stamp in ["1969-12-31T23:59:59.999Z", "1900-01-01T00:00:00.000Z"] {
+            assert_eq!(FixedClock::new(stamp, 7).unwrap().now_unix_millis(), 0);
+        }
+    }
+
+    #[test]
+    fn a_system_clock_reports_one_instant_two_ways_not_two_instants() {
+        let c = SystemClock::default();
+        let ms = c.now_unix_millis();
+        let from_string = epoch_millis_from_rfc3339(&c.now_rfc3339());
+        // Two separate readings of a running clock, so not equality -- but a
+        // `now_unix_millis` returning seconds, microseconds, or a value from
+        // a different epoch is off by orders of magnitude, not by a second.
+        assert!(
+            from_string.abs_diff(ms) < 5_000,
+            "now_unix_millis()={ms} and now_rfc3339()={} disagree by more than five seconds",
+            c.now_rfc3339()
+        );
     }
 }

@@ -64,13 +64,20 @@ pub struct BathyMcpServer {
 impl BathyMcpServer {
     pub fn new(config: ServerConfig) -> Result<Self, String> {
         let runtime = Runtime::open(&config.state_dir)?;
+        // One clock for the whole server: the same `Arc<dyn Clock>` the task
+        // store and every scheduler hold. Two clocks would be two answers to
+        // "what time is it" inside one process, which is the shape of defect
+        // `Clock for Arc<T>` was added to make impossible (see C2 in
+        // `bathy_types::clock`).
+        let approval = ApprovalGate::new(
+            config.approval_signing_key,
+            config.approval_threshold_targets,
+            config.approval_ttl,
+            Arc::clone(&runtime.clock),
+        );
         Ok(Self {
             runtime: Arc::new(runtime),
-            approval: Arc::new(ApprovalGate::new(
-                config.approval_signing_key,
-                config.approval_threshold_targets,
-                config.approval_ttl,
-            )),
+            approval: Arc::new(approval),
         })
     }
 

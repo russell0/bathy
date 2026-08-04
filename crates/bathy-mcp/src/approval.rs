@@ -35,10 +35,12 @@
 //! scheduler is constructed, so no rejected path emits a packet.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use bathy_types::clock::Clock;
 use bathy_types::ids::Digest;
 use rmcp::model::{
     ElicitRequest, ElicitRequestParams, ElicitationSchema, InputRequest, InputRequests,
@@ -142,16 +144,42 @@ pub struct ApprovalGate {
     /// carrying it could still open.
     redeemed: Mutex<HashMap<u64, u64>>,
     counter: AtomicU64,
+    /// Wall-clock time, injected like every other time reading in this
+    /// workspace.
+    ///
+    /// This field is the fix for AC-2.1's check being red from `89142bf`
+    /// through the whole back half of M5: `consume` below read the clock with
+    /// a bare `std::time::SystemTime` reading, which the Global Constraint
+    /// forbids everywhere but `bathy_types::clock`. The tempting reading of that
+    /// constraint is that it governs *event* timestamps and a token
+    /// time-to-live is exempt. It is not the reading the constraint states,
+    /// and it is not the right one: an expiry horizon that no test can move
+    /// is an expiry horizon no test can check, which is exactly why the only
+    /// coverage this had was a `sleep(20ms)` against real time. Injected, the
+    /// horizon is a value a test sets --
+    /// `the_nonce_set_forgets_an_entry_only_once_the_clock_passes_the_ttl`
+    /// below moves it and asserts on both sides.
+    ///
+    /// `BathyMcpServer::new` hands this the *same* `Arc<dyn Clock>` the
+    /// runtime gives the task store and every scheduler, so the server has
+    /// one clock, not two.
+    clock: Arc<dyn Clock>,
 }
 
 impl ApprovalGate {
-    pub fn new(signing_key: Vec<u8>, threshold_targets: u64, ttl: Duration) -> Self {
+    pub fn new(
+        signing_key: Vec<u8>,
+        threshold_targets: u64,
+        ttl: Duration,
+        clock: Arc<dyn Clock>,
+    ) -> Self {
         Self {
             codec: RequestStateCodec::new(signing_key),
             ttl,
             threshold_targets,
             redeemed: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
+            clock,
         }
     }
 
@@ -256,7 +284,7 @@ impl ApprovalGate {
     /// Record a nonce, refusing one already present. Also drops entries no
     /// live token could still carry, so the set cannot grow without bound.
     fn consume(&self, nonce: u64) -> Result<(), ApprovalError> {
-        let now = now_ms();
+        let now = self.clock.now_unix_millis();
         let forget_at = now.saturating_add(self.ttl.as_millis().min(u128::from(u64::MAX)) as u64);
         let mut redeemed = self.redeemed.lock().expect("approval nonce set");
         redeemed.retain(|_, expiry| *expiry > now);
@@ -282,22 +310,64 @@ fn granted(responses: Option<&InputResponses>) -> bool {
     answer["action"] == "accept" && answer["content"]["approved"] == serde_json::Value::Bool(true)
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
+    use bathy_types::clock::SystemClock;
+    use bathy_types::ids::{EventId, ScanId};
+
     use super::*;
 
     const KEY: &[u8] = b"a-test-signing-key-of-decent-len";
     const PLAN: &str = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
 
+    /// A clock a test can move. `FixedClock` cannot be advanced -- that is the
+    /// point of it -- and the nonce set's forgetting horizon is a property
+    /// *about* the passage of time, so asserting it needs a clock that passes.
+    ///
+    /// Ids are delegated to a real `SystemClock` because nothing in this
+    /// module reads them; only `now_unix_millis` is under test here.
+    struct ManualClock {
+        millis: AtomicU64,
+        ids: SystemClock,
+    }
+
+    impl ManualClock {
+        fn at(millis: u64) -> Arc<Self> {
+            Arc::new(Self {
+                millis: AtomicU64::new(millis),
+                ids: SystemClock::default(),
+            })
+        }
+        fn advance(&self, by: Duration) {
+            self.millis
+                .fetch_add(by.as_millis() as u64, Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for ManualClock {
+        fn now_rfc3339(&self) -> String {
+            self.ids.now_rfc3339()
+        }
+        fn new_scan_id(&self) -> ScanId {
+            self.ids.new_scan_id()
+        }
+        fn new_event_id(&self) -> EventId {
+            self.ids.new_event_id()
+        }
+        fn now_unix_millis(&self) -> u64 {
+            self.millis.load(Ordering::SeqCst)
+        }
+    }
+
     fn gate() -> ApprovalGate {
-        ApprovalGate::new(KEY.to_vec(), 64, Duration::from_secs(600))
+        ApprovalGate::new(
+            KEY.to_vec(),
+            64,
+            Duration::from_secs(600),
+            Arc::new(SystemClock::default()),
+        )
     }
 
     fn digest(s: &str) -> Digest {
@@ -369,6 +439,7 @@ mod tests {
             b"a-completely-different-key-here!!".to_vec(),
             64,
             Duration::from_secs(600),
+            Arc::new(SystemClock::default()),
         );
         let args = digest("args");
         let state = issue(&issuer, "alice", &args);
@@ -424,13 +495,90 @@ mod tests {
 
     #[test]
     fn an_expired_token_is_refused_and_says_so() {
-        let g = ApprovalGate::new(KEY.to_vec(), 64, Duration::from_millis(1));
+        // The seal's own time-to-live is checked inside `RequestStateCodec`
+        // against rmcp's clock, not this crate's, so this one property still
+        // has to be measured against real elapsed time. The horizon this
+        // module owns -- the nonce set's -- is the injected one, and the test
+        // below moves it instead of sleeping.
+        let g = ApprovalGate::new(
+            KEY.to_vec(),
+            64,
+            Duration::from_millis(1),
+            Arc::new(SystemClock::default()),
+        );
         let args = digest("args");
         let state = issue(&g, "alice", &args);
         std::thread::sleep(Duration::from_millis(20));
         assert_eq!(
             g.redeem(Some(&state), Some(&accepted()), "alice", &args, PLAN),
             Err(ApprovalError::Expired)
+        );
+    }
+
+    #[test]
+    fn the_nonce_set_forgets_an_entry_only_once_the_clock_passes_the_ttl() {
+        let ttl = Duration::from_secs(600);
+        let clock = ManualClock::at(1_785_596_671_182);
+        let g = ApprovalGate::new(KEY.to_vec(), 64, ttl, Arc::clone(&clock) as Arc<dyn Clock>);
+
+        // Two nonces redeemed at the same instant. Seven is probed as time
+        // passes; eight is left alone, because probing an entry is itself a
+        // `consume` and re-inserts it -- see the last assertion.
+        assert_eq!(g.consume(7), Ok(()));
+        assert_eq!(g.consume(8), Ok(()));
+        assert_eq!(
+            g.consume(7),
+            Err(ApprovalError::AlreadyUsed),
+            "a redeemed nonce is refused while a token carrying it could still open"
+        );
+
+        // One millisecond short of the horizon: still remembered. Without
+        // this half, a `retain` that dropped everything unconditionally would
+        // pass the half below.
+        clock.advance(ttl - Duration::from_millis(1));
+        assert_eq!(
+            g.consume(7),
+            Err(ApprovalError::AlreadyUsed),
+            "the entry must survive right up to the time-to-live"
+        );
+
+        // Past it: no live token can still carry that nonce, so the entry is
+        // dropped rather than growing the set forever.
+        clock.advance(Duration::from_millis(2));
+        assert_eq!(
+            g.consume(8),
+            Ok(()),
+            "past the time-to-live an untouched entry is forgotten -- the seal, not \
+             this set, is what refuses the stale token"
+        );
+        assert_eq!(
+            g.consume(7),
+            Err(ApprovalError::AlreadyUsed),
+            "a refused replay renews the horizon, which errs towards remembering \
+             for longer; forgetting early is the direction that would matter"
+        );
+    }
+
+    #[test]
+    fn the_forgetting_horizon_is_the_injected_clock_and_not_the_system_one() {
+        // A clock pinned decades in the past. If `consume` read the system
+        // clock directly -- what it did until the M5 blocker wave, and what
+        // made the AC-2.1 check red -- `forget_at` would be
+        // computed from a real reading and the entry would still be live, so
+        // this would report `AlreadyUsed`.
+        let clock = ManualClock::at(0);
+        let g = ApprovalGate::new(
+            KEY.to_vec(),
+            64,
+            Duration::from_secs(600),
+            Arc::clone(&clock) as Arc<dyn Clock>,
+        );
+        assert_eq!(g.consume(1), Ok(()));
+        clock.advance(Duration::from_secs(601));
+        assert_eq!(
+            g.consume(1),
+            Ok(()),
+            "the gate must age its nonce set by the clock it was given"
         );
     }
 
