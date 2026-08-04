@@ -245,35 +245,83 @@ fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     // named from `bathy-types` without moving the fold below the layer that
     // owns it.
     let schemas = union_schemas(vec![bathy_types::schema::all(), bathy_query::schema::all()])?;
-    let dir = Path::new("schemas");
-    let drift = diff_or_write(&schemas, dir, write)?;
+    emit_schemas_into(&schemas, Path::new("schemas"), write)
+}
 
-    // Over every file in the directory, in both modes: a published
-    // `description` is contract text an agent reads, and `emit-schemas` must
-    // not be able to launder a leaked doc comment into the tree either. See
-    // `prose`'s module documentation for why this is not a unit test in the
-    // crate that generates the document.
+/// The body of [`emit_schemas`], against a given schema set and directory so
+/// the ordering below is testable without writing to this repository's own
+/// `schemas/`.
+///
+/// **The prose check runs over the in-memory set first, and nothing is
+/// written if it fires.** The first version ran `diff_or_write` and only then
+/// `prose::check_dir`, which had two consequences the M5 Task 2 fix re-review
+/// found. `emit-schemas` exited non-zero *and* left the leak on disk, so the
+/// stated property ("regenerating cannot launder a leaked doc comment into
+/// the tree") was not what the code delivered. Worse, `check-schemas` against
+/// a leak that lived in a `///` rather than in the committed file saw only
+/// drift -- the prose check read the still-clean committed document and found
+/// nothing -- and told the maintainer to run `emit-schemas` and commit, which
+/// is precisely the action that publishes the leak. Checking the source of
+/// the write before the write closes both: a leak in a doc comment is now
+/// reported as a leak in every mode, and drift can no longer be reported on
+/// its own while one exists.
+fn emit_schemas_into(
+    schemas: &BTreeMap<&'static str, serde_json::Value>,
+    dir: &Path,
+    write: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut source_leaks = Vec::new();
+    for (name, schema) in schemas {
+        source_leaks.extend(prose::find_maintainer_prose(
+            &format!("{name}.json"),
+            schema,
+        ));
+    }
+    if !source_leaks.is_empty() {
+        return Err(format!(
+            "{}\nNothing was written: the doc comments these came from are the fix, \
+             and regenerating would only copy them into the committed contract.",
+            leak_report(&source_leaks)
+        )
+        .into());
+    }
+
+    let drift = diff_or_write(schemas, dir, write)?;
+
+    // Over every file in the directory as well, in both modes: `check_dir`
+    // reads `dir` rather than the set above, so a committed document no crate
+    // generates any more -- which regeneration never touches and the source
+    // check above never sees -- is still checked. See `prose`'s module
+    // documentation for why this is not a unit test in the crate that
+    // generates the document.
     let leaks = prose::check_dir(dir)?;
 
     let mut problems = Vec::new();
     if !drift.is_empty() {
         problems.push(format!(
-            "schema drift in: {}. Run `cargo run -p xtask -- emit-schemas` and commit.",
+            "schema drift in: {}. The published types no longer match the committed \
+             documents; run `cargo run -p xtask -- emit-schemas` and commit. (The \
+             regenerated text has already been checked for maintainer prose above, so \
+             following this instruction cannot publish a leaked doc comment.)",
             drift.join(", ")
         ));
     }
     if !leaks.is_empty() {
-        problems.push(format!(
-            "maintainer prose reached a published contract -- make the doc comment a `//` \
-             comment, or rewrite it as contract text:\n{}",
-            leaks.join("\n")
-        ));
+        problems.push(leak_report(&leaks));
     }
     if problems.is_empty() {
         Ok(())
     } else {
         Err(problems.join("\n").into())
     }
+}
+
+fn leak_report(leaks: &[String]) -> String {
+    format!(
+        "maintainer prose reached a published contract -- make the doc comment a `//` \
+         comment, or rewrite it as contract text:\n{}",
+        leaks.join("\n")
+    )
 }
 
 /// Merge every publishing crate's `schema::all()` into one filename-keyed
@@ -840,6 +888,107 @@ mod tests {
             1,
             "a type gaining a field without regeneration must be reported as drift: {drift:?}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- emit_schemas_into: the prose check runs before the write. ---
+
+    fn leaky_schema() -> BTreeMap<&'static str, serde_json::Value> {
+        BTreeMap::from([(
+            "thing",
+            serde_json::json!({
+                "title": "Thing",
+                "description": "Kept in sync with the loader in manifest.rs by hand.",
+                "type": "object",
+            }),
+        )])
+    }
+
+    #[test]
+    fn a_leak_in_a_doc_comment_is_refused_before_anything_is_written() {
+        // The write-before-check ordering the fix re-review found: the
+        // command exited non-zero and the leak was on disk anyway.
+        let dir = scratch_dir("emit-leak-write");
+        let err = emit_schemas_into(&leaky_schema(), &dir, true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("maintainer prose"), "{err}");
+        assert!(err.contains("thing.json"), "{err}");
+        assert!(err.contains("Nothing was written"), "{err}");
+        assert!(
+            !dir.exists(),
+            "emit-schemas must not create the directory, let alone the file, \
+             when the schema it would write carries maintainer prose"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_leak_in_a_doc_comment_is_never_reported_as_mere_drift() {
+        // The trap: with a clean file committed and a leak added to the
+        // `///` it came from, `check-schemas` used to report only drift and
+        // tell the maintainer to run `emit-schemas` and commit -- which is
+        // exactly the action that publishes the leak. The prose check reads
+        // the committed file, which is still clean, so it said nothing.
+        let dir = scratch_dir("emit-leak-drift");
+        emit_schemas_into(&one_schema(), &dir, true).expect("a clean schema writes");
+        let clean = std::fs::read_to_string(dir.join("thing.json")).unwrap();
+
+        let err = emit_schemas_into(&leaky_schema(), &dir, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("maintainer prose"),
+            "the leak must be named, not hidden behind a drift report: {err}"
+        );
+        assert!(
+            !err.contains("schema drift"),
+            "a source leak must not be reported as drift with an `emit-schemas` \
+             instruction attached: {err}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("thing.json")).unwrap(),
+            clean,
+            "check mode must leave the committed document alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ordinary_drift_still_names_the_files_and_the_remedy() {
+        // The other side of the previous test: with no leak anywhere, drift
+        // must still be reported and must still point at `emit-schemas`.
+        let dir = scratch_dir("emit-plain-drift");
+        emit_schemas_into(&one_schema(), &dir, true).unwrap();
+        let changed = BTreeMap::from([(
+            "thing",
+            serde_json::json!({"type": "object", "properties": {"new_field": {"type": "string"}}}),
+        )]);
+        let err = emit_schemas_into(&changed, &dir, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("schema drift"), "{err}");
+        assert!(err.contains("thing.json"), "{err}");
+        assert!(err.contains("emit-schemas"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_leak_in_a_committed_document_no_crate_generates_is_still_caught() {
+        // `find_maintainer_prose` over the in-memory set cannot see this
+        // one; only the directory read can. Both must run.
+        let dir = scratch_dir("emit-orphan");
+        emit_schemas_into(&one_schema(), &dir, true).unwrap();
+        std::fs::write(
+            dir.join("orphan-legacy.json"),
+            r#"{"title":"OrphanLegacy","description":"Superseded by revision one; see fold.rs."}"#,
+        )
+        .unwrap();
+        let err = emit_schemas_into(&one_schema(), &dir, false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("orphan-legacy.json"), "{err}");
+        assert!(err.contains("maintainer prose"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
