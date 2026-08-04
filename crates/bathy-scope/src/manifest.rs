@@ -474,11 +474,11 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
 /// |---|---|---|
 /// | `::/96` | IPv4-compatible (deprecated) | 4291 §2.5.5.1 |
 /// | `::ffff:0:0/96` | IPv4-mapped | 4291 §2.5.5.2 |
-/// | `::ffff:0:0:0/96` | IPv4-translated (SIIT) | 2765 §3.5, retained by 6145 |
+/// | `::ffff:0:0:0/96` | IPv4-translated (SIIT) | 2765 §2.1 (historic; see below) |
 /// | `64:ff9b::/96` | NAT64 well-known prefix | 6052 |
 /// | `64:ff9b:1::/48` | NAT64 local-use prefix | 8215 |
 /// | `2002::/16` | 6to4 | 3056 |
-/// | `2001::/32` | Teredo (embeds an *obfuscated* IPv4 address/port) | 4380, updated by 8190 |
+/// | `2001::/32` | Teredo (embeds an *obfuscated* IPv4 address/port) | 4380 (registry entry corrected by 8190) |
 /// | interface ID `0000:5EFE:*` or `0200:5EFE:*`, any prefix | ISATAP | 5214 §6.1 |
 ///
 /// This count (eight) is still **a floor, not a proof of completeness** --
@@ -514,8 +514,11 @@ fn is_ordinary_unicast(ip: IpAddr) -> bool {
 ///
 /// # Known, structural limitations (not fixable by adding more guards here)
 ///
-/// - **NAT64/SIIT "Network-Specific Prefix"** (RFC 6052 §3.1, and the
-///   corresponding option in RFC 6145): an operator may choose *any* of
+/// - **NAT64/SIIT "Network-Specific Prefix"** (RFC 6052 §1.3 defines the
+///   term; §3.3 and §3.4 are where it is chosen, for stateless and stateful
+///   translation respectively -- not §3.1, which is *Restrictions on the Use
+///   of the Well-Known Prefix*. Corresponding option in RFC 6145): an
+///   operator may choose *any* of
 ///   their own globally-routed prefixes as a translation prefix instead of
 ///   the fixed Well-Known Prefix or the fixed IPv4-translated format. Such
 ///   an address is bit-for-bit indistinguishable from ordinary global
@@ -543,8 +546,14 @@ fn ipv6_is_ordinary_by_prefix_rules(v6: std::net::Ipv6Addr) -> bool {
         || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0 && s[5] == 0)
         // ::ffff:0:0/96 -- IPv4-mapped (RFC 4291 §2.5.5.2).
         || v6.to_ipv4_mapped().is_some()
-        // ::ffff:0:0:0/96 -- IPv4-translated (SIIT, RFC 2765 §3.5, retained
-        // by RFC 6145). One segment offset from the mapped form above:
+        // ::ffff:0:0:0/96 -- IPv4-translated (SIIT, RFC 2765 §2.1
+        // "Addresses"; §3.5 is *Knowing when to Translate*). RFC 6145
+        // OBSOLETED 2765 and did NOT retain this form -- its §2 item 2 says
+        // it moved "the address format to the address format document
+        // [RFC6052]", and RFC 6052 defines no such prefix. Refused anyway:
+        // the form is historic, not unreachable, and an address a stack will
+        // still parse is an address a scope check has to have an answer for.
+        // One segment offset from the mapped form above:
         // 0xffff lives in segment 4, not segment 5.
         || (s[0] == 0 && s[1] == 0 && s[2] == 0 && s[3] == 0 && s[4] == 0xffff && s[5] == 0)
         // 64:ff9b::/96 -- NAT64 well-known prefix (RFC 6052).
@@ -553,8 +562,10 @@ fn ipv6_is_ordinary_by_prefix_rules(v6: std::net::Ipv6Addr) -> bool {
         || (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001)
         // 2002::/16 -- 6to4 (RFC 3056).
         || s[0] == 0x2002
-        // 2001::/32 -- Teredo (RFC 4380, updated by RFC 8190). Refuses the
-        // whole prefix without attempting to decode the obfuscated payload.
+        // 2001::/32 -- Teredo (RFC 4380; RFC 8190 updates RFC 6890, not
+        // 4380 -- it corrects this prefix's special-purpose registry entry).
+        // Refuses the whole prefix without attempting to decode the
+        // obfuscated payload.
         || (s[0] == 0x2001 && s[1] == 0)
         // ISATAP (RFC 5214 §6.1): fixed marker at segments 4-5, independent
         // of segments 0-3. See this function's doc comment above.
@@ -995,7 +1006,8 @@ mod tests {
 
     // --- Fix round 2 (CRITICAL): the sixth IPv4-in-IPv6 embedding scheme,
     // found by a re-review after round 1 shipped -- IPv4-translated
-    // addresses, ::ffff:0:0:0/96 (RFC 2765 SIIT, retained by RFC 6145).
+    // addresses, ::ffff:0:0:0/96 (RFC 2765 §2.1 SIIT; obsoleted by RFC 6145,
+    // which moved address formats to RFC 6052 rather than retaining this one).
     // Genuinely distinct from IPv4-mapped by a one-segment offset: 0xffff
     // sits in segment 4 here, not segment 5, so `to_ipv4_mapped()` legitimately
     // returns `None` for these addresses and none of the round-1 guards

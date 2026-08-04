@@ -118,6 +118,14 @@ pub struct Truth {
     pub silent_protocols: BTreeSet<String>,
     /// Files under `schemas/`.
     pub committed_schemas: usize,
+    /// Files under `schemas/` whose name begins `mcp-`: the tool surface.
+    pub mcp_schemas: usize,
+    /// The subset of [`Truth::mcp_schemas`] that are tool *input* schemas.
+    pub mcp_input_schemas: usize,
+    /// The subset of [`Truth::mcp_schemas`] that are tool *output* schemas.
+    /// Not equal to [`Truth::mcp_input_schemas`], and that is the point:
+    /// `result.diff`'s output schema is `schemas/scan-diff.json` itself.
+    pub mcp_output_schemas: usize,
     /// `EvidenceLevel::Headers` / `Full` caps, in KiB.
     pub evidence_cap_headers_kib: usize,
     pub evidence_cap_full_kib: usize,
@@ -245,6 +253,32 @@ fn number_claims(truth: &Truth) -> Vec<NumberClaim> {
             source: "schemas/*.json",
             expected: truth.committed_schemas,
             patterns: &[r"(\w+) schemas are committed under"],
+        },
+        // The three below are one sentence that the total above did not
+        // cover, and the M5 whole-branch review found it wrong: "twenty-one
+        // of them are the MCP tool surface: every tool's input and its
+        // output" implies 11 x 2 = 22, and there are 21, because
+        // `result.diff` advertises `schemas/scan-diff.json` itself rather
+        // than a copy. The total was pinned; the *breakdown* of the same
+        // directory was a second claim nothing read. It is three numbers
+        // with a source of truth in the tree, so it is three claims here.
+        NumberClaim {
+            claim: "number of committed schemas that are the MCP tool surface",
+            source: "schemas/mcp-*.json",
+            expected: truth.mcp_schemas,
+            patterns: &[r"(\w+) of them are the MCP tool surface"],
+        },
+        NumberClaim {
+            claim: "number of committed MCP tool input schemas",
+            source: "schemas/mcp-*input*.json",
+            expected: truth.mcp_input_schemas,
+            patterns: &[r"(\w+) tool input schemas"],
+        },
+        NumberClaim {
+            claim: "number of committed MCP tool output schemas",
+            source: "schemas/mcp-*output*.json",
+            expected: truth.mcp_output_schemas,
+            patterns: &[r"(\w+) tool output schemas"],
         },
         NumberClaim {
             claim: "evidence cap at EvidenceLevel::Headers, in KiB",
@@ -511,6 +545,13 @@ pub fn gather_truth(root: &Path) -> Fallible<Truth> {
         protocols,
         silent_protocols,
         committed_schemas: count_files(&root.join("schemas"))?,
+        mcp_schemas: count_matching(&root.join("schemas"), |n| n.starts_with("mcp-"))?,
+        mcp_input_schemas: count_matching(&root.join("schemas"), |n| {
+            n.starts_with("mcp-") && n.contains("input")
+        })?,
+        mcp_output_schemas: count_matching(&root.join("schemas"), |n| {
+            n.starts_with("mcp-") && n.contains("output")
+        })?,
         evidence_cap_headers_kib: evidence_cap(root, "Headers")?,
         evidence_cap_full_kib: evidence_cap(root, "Full")?,
         falsified_absences: ABSENCE_CLAIMS
@@ -636,9 +677,20 @@ fn workspace_members(root: &Path) -> Fallible<BTreeSet<String>> {
 }
 
 fn count_files(dir: &Path) -> Fallible<usize> {
+    count_matching(dir, |_| true)
+}
+
+/// Files in `dir` whose file name satisfies `keep`.
+///
+/// The README's schema sentence makes three claims about one directory -- a
+/// total and two subtotals -- and only the total had a counter. A subtotal is
+/// as checkable as a total; the reason it went unchecked was that nobody
+/// wrote the predicate down.
+fn count_matching(dir: &Path, keep: impl Fn(&str) -> bool) -> Fallible<usize> {
     let mut n = 0;
     for entry in std::fs::read_dir(dir).map_err(|e| format!("reading {}: {e}", dir.display()))? {
-        if entry?.path().is_file() {
+        let entry = entry?;
+        if entry.path().is_file() && entry.file_name().to_str().is_some_and(&keep) {
             n += 1;
         }
     }
@@ -718,9 +770,22 @@ pub fn check_readme() -> Fallible<()> {
 //   - Every guarantee sentence in the status note and "Authorized use":
 //     what the scheduler checks and when, that a scan is refused in full and
 //     never silently trimmed, that a mid-scan expiry does not halt a run in
-//     progress, that `bathy_scope::evaluate` has no caller. Each is a
-//     statement about control flow. These are the claims M3's review found
-//     wrong, and they are the ones a checker helps with least.
+//     progress, *which* of the three packet-emitting subcommands refuse
+//     before the state directory is opened (`preview` and `start` do;
+//     `resume` opens it first, because the plan it re-authorizes is the one
+//     already in the store). Each is a statement about control flow. These
+//     are the claims M3's review found wrong, and they are the ones a
+//     checker helps with least. This entry used to name "that
+//     `bathy_scope::evaluate` has no caller" as a human-verified README
+//     claim; that sentence left the README two milestones ago and `evaluate`
+//     has had three production callers since M5, so the entry was describing
+//     neither the file nor the tree.
+//   - **The floor under `--intensity`.** The *default* (4) is pinned in
+//     three phrasings. That `--intensity 0` still sends one probe rather
+//     than none -- `select_probes` sets `budget = 1` -- is a second claim
+//     about the same knob and is a branch, not a number, so it is not
+//     pinned. It is in the README because understating what goes on someone
+//     else's wire is a defect in its own right.
 //   - "Most carry a real request" and the named example bytes (`GET /`, a TLS
 //     `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind` query, a
 //     PostgreSQL `SSLRequest`). The *count* of payload-free probes and *which*
@@ -776,7 +841,8 @@ mod tests {
 | `xtask` | Checks. |
 
 Six schemas are committed under [`schemas/`](schemas/) and CI fails if a type
-changes without regenerating them.
+changes without regenerating them. 5 of them are the MCP tool surface: 3 tool
+input schemas and 2 tool output schemas.
 
 **What a scanned third party sees on their wire.** A port that answers then
 receives **up to `intensity` further connections — four by default** — each a
@@ -820,10 +886,47 @@ identification, structured event output.
             ]),
             silent_protocols: names(&["SSH", "MySQL"]),
             committed_schemas: 6,
+            mcp_schemas: 5,
+            mcp_input_schemas: 3,
+            mcp_output_schemas: 2,
             evidence_cap_headers_kib: 8,
             evidence_cap_full_kib: 64,
             falsified_absences: names(&["an MCP server (the rest of Milestone 5)"]),
         }
+    }
+
+    /// The defect this rule exists for. The README asserted "twenty-one of
+    /// them are the MCP tool surface: every tool's input and its output",
+    /// which is 11 x 2 and is not 21 -- and `check-readme` was green, because
+    /// it pinned the directory's *total* and nothing read the breakdown of
+    /// the same directory. Written as a symmetric claim, which is exactly the
+    /// wrong shape it had.
+    #[test]
+    fn a_tool_surface_breakdown_that_assumes_one_output_per_input_fails() {
+        let readme = readme().replace("2 tool output schemas", "3 tool output schemas");
+        let joined = violations(&readme, &truth()).join("\n");
+        assert!(
+            joined.contains("number of committed MCP tool output schemas"),
+            "got:\n{joined}"
+        );
+        assert!(
+            joined.contains("schemas/mcp-*output*.json"),
+            "got:\n{joined}"
+        );
+    }
+
+    #[test]
+    fn the_tool_surface_subtotal_is_pinned_independently_of_the_directory_total() {
+        let readme = readme().replace("5 of them are the MCP", "6 of them are the MCP");
+        let joined = violations(&readme, &truth()).join("\n");
+        assert!(
+            joined.contains("number of committed schemas that are the MCP tool surface"),
+            "got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("number of committed schemas\n"),
+            "the directory total is a different claim and must not also fail: {joined}"
+        );
     }
 
     /// The defect this rule exists for: `README.md` said three times, in the
