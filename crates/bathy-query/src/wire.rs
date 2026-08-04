@@ -35,6 +35,12 @@
 //! entry; the benefit is that an agent can read every field without asking
 //! whether its absence meant anything.
 //!
+//! Both halves of that are enforced. The schema says every property is
+//! required (`every_property_of_every_type_this_crate_publishes_is_required`),
+//! and the encoder is checked against those published `required` lists over a
+//! fold and a diff with every nullable field at its null
+//! (`every_required_property_is_physically_present_in_a_maximally_null_document`).
+//!
 //! # Ordering of duplicate-`sequence` events (AC-5.36)
 //!
 //! A serialized fold is exactly the artefact two different builds can
@@ -62,8 +68,8 @@ use crate::fold::{EndpointState, ScanFold, Terminal};
 // field optional, while this crate's encoder never omits a field (see the
 // module docs: `null` is how an unknown value is spelled, not absence). The
 // derived list would therefore promise less than the encoder delivers.
-// `every_property_of_every_published_type_is_required` fails if a field is
-// added and left out of this list.
+// `every_property_of_every_type_this_crate_publishes_is_required` fails if a
+// field is added and left out of this list.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("required" = [
@@ -366,6 +372,158 @@ mod tests {
         );
         assert!(json["terminal"].is_null());
         assert!(json["plan_hash"].is_null());
+    }
+
+    #[test]
+    fn every_required_property_is_physically_present_in_a_maximally_null_document() {
+        // The schema side of "nothing is omitted" is guarded type-wide by
+        // `every_property_of_every_type_this_crate_publishes_is_required`.
+        // This is the encoder side, and it was one field wide: an
+        // `an_unknown_port_state_encodes_as_null` test pins `FoldEntry::state`
+        // and nothing pinned the other eight nullable fields, so
+        // `skip_serializing_if` on `FoldEntry::probe_id` or on
+        // `EndpointState::state` produced a document violating the committed
+        // `required` list with every test green.
+        //
+        // The `required` lists are read back out of the published schemas
+        // rather than restated here, so the encoder is checked against the
+        // one source of truth a consumer actually validates against.
+        fn required(node: &serde_json::Value, what: &str) -> Vec<String> {
+            node["required"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{what} publishes no `required` list: {node:#}"))
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .expect("required entries are strings")
+                        .to_string()
+                })
+                .collect()
+        }
+        fn assert_present(value: &serde_json::Value, fields: &[String], what: &str) {
+            let object = value
+                .as_object()
+                .unwrap_or_else(|| panic!("{what} is not an object: {value:#}"));
+            assert!(!fields.is_empty(), "{what} has an empty `required` list");
+            for field in fields {
+                assert!(
+                    object.contains_key(field),
+                    "{what}: `{field}` is required by the published schema but absent from \
+                     the encoded document -- `null` is how this crate spells absence, and a \
+                     missing key is not `null`: {value:#}"
+                );
+            }
+        }
+
+        let fold_schema = &crate::schema::all()["scan-fold"];
+        let diff_schema = &crate::schema::all()["scan-diff"];
+
+        // Every nullable field at its null: no port state, no observation, no
+        // probe, no evidence, no terminal, no plan hash.
+        let blank = EndpointState {
+            state: None,
+            observation: None,
+            evidence_refs: Vec::new(),
+            probe_id: None,
+        };
+        let before = ScanFold {
+            endpoints: BTreeMap::from([((ip("10.0.0.1"), tcp(1)), blank.clone())]),
+            hosts_up: BTreeSet::new(),
+            terminal: None,
+            plan_hash: None,
+        };
+        let after = ScanFold {
+            endpoints: BTreeMap::from([
+                (
+                    (ip("10.0.0.1"), tcp(1)),
+                    EndpointState {
+                        state: Some(PortState::Open),
+                        ..blank.clone()
+                    },
+                ),
+                // One-sided, so it lands in `undetermined` with a null
+                // `before` and an all-null `after`.
+                ((ip("10.0.0.2"), tcp(2)), blank.clone()),
+            ]),
+            hosts_up: BTreeSet::new(),
+            terminal: None,
+            plan_hash: None,
+        };
+
+        for (label, fold) in [("before", &before), ("after", &after)] {
+            let json = serde_json::to_value(fold).unwrap();
+            assert_present(&json, &required(fold_schema, "ScanFold"), label);
+            let entry_required = required(&fold_schema["$defs"]["FoldEntry"], "FoldEntry");
+            for (index, entry) in json["endpoints"].as_array().unwrap().iter().enumerate() {
+                assert_present(
+                    entry,
+                    &entry_required,
+                    &format!("{label}.endpoints[{index}]"),
+                );
+            }
+        }
+
+        // Two diffs, because no single one can put every nullable field at
+        // its null: `undecidable` is null only when both scans completed the
+        // same plan, and both terminals are null only when neither did.
+        //
+        // `incomparable` covers `undecidable: non-null`, both terminals null,
+        // and a populated `undetermined` whose entries each have one null
+        // side. `comparable` covers `undecidable: null` and a `Change` with a
+        // null `before` -- an appearance, which only a comparable pair can
+        // produce.
+        let completed = Terminal::Completed {
+            probes_sent: 0,
+            packets_spent: 0,
+            findings: 0,
+        };
+        let comparable_before = ScanFold {
+            terminal: Some(completed.clone()),
+            plan_hash: Some(digest("plan")),
+            ..before.clone()
+        };
+        let comparable_after = ScanFold {
+            terminal: Some(completed),
+            plan_hash: Some(digest("plan")),
+            ..after.clone()
+        };
+        let incomparable = diff(&before, &after);
+        let comparable = diff(&comparable_before, &comparable_after);
+        assert!(
+            incomparable.undecidable.is_some() && !incomparable.undetermined.is_empty(),
+            "the incomparable fixture must reach `undetermined`: {incomparable:?}"
+        );
+        assert!(
+            comparable.undecidable.is_none()
+                && comparable
+                    .changes
+                    .iter()
+                    .any(|c| c.kind == ChangeKind::EndpointAppeared),
+            "the comparable fixture must reach an appearance: {comparable:?}"
+        );
+
+        let state_required = required(&diff_schema["$defs"]["EndpointState"], "EndpointState");
+        let diff_required = required(diff_schema, "ScanDiff");
+        for (label, d) in [("incomparable", &incomparable), ("comparable", &comparable)] {
+            let json = serde_json::to_value(d).unwrap();
+            assert_present(&json, &diff_required, &format!("{label} ScanDiff"));
+            for (list, name) in [("changes", "Change"), ("undetermined", "Undetermined")] {
+                let entry_required = required(&diff_schema["$defs"][name], name);
+                for (index, entry) in json[list].as_array().unwrap().iter().enumerate() {
+                    let what = format!("{label}.{list}[{index}]");
+                    assert_present(entry, &entry_required, &what);
+                    for side in ["before", "after"] {
+                        if entry[side].is_object() {
+                            assert_present(
+                                &entry[side],
+                                &state_required,
+                                &format!("{what}.{side}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

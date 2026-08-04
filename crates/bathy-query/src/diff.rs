@@ -23,8 +23,9 @@ use crate::fold::{EndpointKey, EndpointState, ScanFold, Terminal};
 // because `schemars` marks every `Option` field optional, while this crate's
 // encoder never omits a field (see `crate::wire`'s module docs: `null` is how
 // an unknown value is spelled, not absence). The derived list would promise
-// less than the encoder delivers. `every_property_of_every_published_type_is_
-// required` fails if a field is added and left out of one of these lists.
+// less than the encoder delivers.
+// `every_property_of_every_type_this_crate_publishes_is_required` fails if a
+// field is added and left out of one of these lists.
 // A `//` comment, not a `///` one: this is maintainer rationale and must not
 // reach the published schema's `description` (M5 Task 1, the `$defs` sweep).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
