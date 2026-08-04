@@ -118,8 +118,15 @@ pub enum ChangeKind {
     /// reachability". The endpoint is present in both scans either way, so
     /// this is never an appearance or a disappearance.
     StateChanged,
-    /// The identified service differs -- `ssh` answering where `http` used
-    /// to, or an endpoint identified for the first time.
+    /// The identified service differs. Three shapes reach this kind, and the
+    /// third is the commonest: `ssh` answering where `http` used to; an
+    /// endpoint identified for the first time; and an endpoint that was
+    /// identified before and **could not be identified this time**, which
+    /// leaves `after.observation` null on a port that may well be still open
+    /// and still running the same service. A slow banner or a truncated
+    /// response is enough to produce it. It is reported because it is a real
+    /// difference in what the scan learned, not because the service is known
+    /// to have gone -- read `before` and `after` before acting on it.
     //
     // Not in the M5 plan's original six kinds; added here and reported as a
     // plan defect, because without it a service replaced by a different
@@ -184,14 +191,29 @@ pub enum Undecidable {
     ScanIncomplete,
     /// Both scans completed, but they did not run the same plan, so an
     /// endpoint one of them never mentions may simply never have been in its
-    /// plan. A re-run of the same request against the same scope produces the
-    /// same `plan_hash` and is comparable; a scan of a different port range
-    /// is not.
+    /// plan.
+    ///
+    /// **A budget change alone is enough.** A plan covers its budgets as well
+    /// as its targets and ports, so lowering a rate limit, raising a packet
+    /// ceiling or extending a runtime cap between two runs makes them
+    /// incomparable here even when both looked at exactly the same endpoints.
+    /// Only a re-run of the same request, against the same scope, with the
+    /// same budgets, is comparable.
+    ///
+    /// This is deliberately coarse in the safe direction: nothing is hidden,
+    /// because every endpoint it suppresses is listed in `undetermined` with
+    /// both of its records. But "cannot say" here does not mean the two scans
+    /// covered different ports, and it should not be rendered to an operator
+    /// as though it did.
     //
     // `bathy-plan` excludes the idempotency key from `plan_hash` and
     // canonicalizes target and port order, so "the same work" really is the
     // same hash. Without this rule, diffing a 1000-port scan against a
-    // 2-port one reports 998 disappearances.
+    // 2-port one reports 998 disappearances. It deliberately *includes*
+    // budgets (`plan_hash_changes_when_budgets_change`; "reusing a key with a
+    // larger budget must be a conflict"), which is right for its own purpose
+    // and is what makes this reason fire on a budget tweak. The fix is a
+    // separate coverage digest on `scan.started` -- AC-5.37, owned by Task 4.
     CoverageDiffers,
 }
 
@@ -236,6 +258,10 @@ impl ScanDiff {
 ///   (AC-5.34).
 /// - **Two completed scans of different plans are not comparable either.**
 ///   The narrower scan's silence is about its plan, not about the network.
+///   "Different plans" is decided by `plan_hash`, which covers budgets as
+///   well as coverage, so this also fires on two runs that looked at exactly
+///   the same endpoints under a different rate limit. See
+///   [`Undecidable::CoverageDiffers`].
 /// - **Evidence digests and `probe_id` are not compared.** The same
 ///   conclusion reached from different bytes (an HTTP `Date` header moves
 ///   every second) or by a different probe is the same conclusion. Comparing

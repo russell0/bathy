@@ -68,7 +68,7 @@
         },
         {
           "const": "service_changed",
-          "description": "The identified service differs -- `ssh` answering where `http` used\nto, or an endpoint identified for the first time.",
+          "description": "The identified service differs. Three shapes reach this kind, and the\nthird is the commonest: `ssh` answering where `http` used to; an\nendpoint identified for the first time; and an endpoint that was\nidentified before and **could not be identified this time**, which\nleaves `after.observation` null on a port that may well be still open\nand still running the same service. A slow banner or a truncated\nresponse is enough to produce it. It is reported because it is a real\ndifference in what the scan learned, not because the service is known\nto have gone -- read `before` and `after` before acting on it.",
           "type": "string"
         },
         {
@@ -321,7 +321,7 @@
         },
         {
           "const": "coverage_differs",
-          "description": "Both scans completed, but they did not run the same plan, so an\nendpoint one of them never mentions may simply never have been in its\nplan. A re-run of the same request against the same scope produces the\nsame `plan_hash` and is comparable; a scan of a different port range\nis not.",
+          "description": "Both scans completed, but they did not run the same plan, so an\nendpoint one of them never mentions may simply never have been in its\nplan.\n\n**A budget change alone is enough.** A plan covers its budgets as well\nas its targets and ports, so lowering a rate limit, raising a packet\nceiling or extending a runtime cap between two runs makes them\nincomparable here even when both looked at exactly the same endpoints.\nOnly a re-run of the same request, against the same scope, with the\nsame budgets, is comparable.\n\nThis is deliberately coarse in the safe direction: nothing is hidden,\nbecause every endpoint it suppresses is listed in `undetermined` with\nboth of its records. But \"cannot say\" here does not mean the two scans\ncovered different ports, and it should not be rendered to an operator\nas though it did.",
           "type": "string"
         }
       ]

@@ -142,4 +142,60 @@ mod tests {
             "and its guarantee stated: {description}"
         );
     }
+
+    /// The published `description` of one variant of a `oneOf`-encoded enum,
+    /// found by its wire string rather than by position -- a positional index
+    /// would silently start asserting about a different variant the moment
+    /// one is inserted above it.
+    fn variant_description(schema: &Value, def: &str, wire_name: &str) -> String {
+        schema["$defs"][def]["oneOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{def} is not a oneOf: {schema:#}"))
+            .iter()
+            .find(|v| v["const"] == wire_name)
+            .unwrap_or_else(|| panic!("{def} has no `{wire_name}` variant: {schema:#}"))["description"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{def}::{wire_name} carries no description: {schema:#}"))
+            .to_string()
+    }
+
+    #[test]
+    fn the_service_changed_kind_documents_identification_loss_not_only_gain() {
+        // `classify` compares `after`'s service against `before`'s, so an
+        // endpoint that is still open and still running the same service but
+        // failed to be identified on the second run -- a slow banner, a
+        // truncated response -- is a `service_changed` with a null
+        // `after.observation`. The classification is right; it is a real
+        // difference in what the scan learned. But the losing direction is
+        // the noisier of the two in practice and the published text covered
+        // only the gaining one, so an agent reading the contract would take a
+        // lost identification for a replaced service.
+        let description = variant_description(&all()["scan-diff"], "ChangeKind", "service_changed");
+        assert!(
+            description.contains("could not be identified") && description.contains("still open"),
+            "the losing direction must be described: {description}"
+        );
+    }
+
+    #[test]
+    fn the_coverage_differs_reason_says_a_budget_change_alone_triggers_it() {
+        // The plan a scan announces covers its budgets as well as its targets
+        // and ports, so two runs over identical endpoints are incomparable
+        // here if a rate limit moved between them. Tuning a budget is a
+        // routine operational act; changing a port range is not. Framing this
+        // as "did not run the same plan" leaves a reader to assume it means
+        // "did not cover the same ports", which is the commoner and wrong
+        // reading. See AC-5.37 for the carry-forward that fixes the cause.
+        let description =
+            variant_description(&all()["scan-diff"], "Undecidable", "coverage_differs");
+        assert!(
+            description.contains("budget"),
+            "the budget case must be named: {description}"
+        );
+        assert!(
+            description.contains("same endpoints"),
+            "and it must say the two scans may have looked at the same \
+             endpoints anyway: {description}"
+        );
+    }
 }
