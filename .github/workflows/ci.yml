@@ -113,6 +113,26 @@ jobs:
       # it succeeds while reaching nothing, which is the failure mode this
       # milestone already measured once in a property-test strategy.
       - run: cargo run -p xtask -- check-fuzz
+      # `fuzz/` is its own workspace on purpose (three reasons, in
+      # `fuzz/Cargo.toml`), and the cost is that `cargo fmt --all`, `cargo
+      # clippy --workspace` and `cargo test --workspace` above never reach
+      # ~900 lines of Rust. Until this step existed the compensating control
+      # was a sentence in `fuzz/README.md` asking a human to remember to `cd
+      # fuzz` -- the same shape as the MSRV membership rule that had no
+      # executable form and three recorded recurrences, and strictly weaker
+      # than the five inline gates M5 closed.
+      #
+      # It is an xtask subcommand rather than three steps carrying
+      # `working-directory: fuzz` because `check-ci` refuses those, and
+      # refuses them for this reason: from the repository root `cargo fmt
+      # --all -- --check` means the root workspace, and a step that quietly
+      # means a different one is a gate nobody can reproduce by typing what
+      # the workflow says.
+      #
+      # It runs HERE, on stable: only *building* the fuzz targets needs
+      # nightly. The `deny` job covers `fuzz/`'s dependency graph separately,
+      # since that needs the cargo-deny action.
+      - run: cargo run -p xtask -- check-fuzz-crate
       # The gate on the gates: every `run:` step in this file must be either a
       # `cargo run -p xtask -- <subcommand>` that exists or one of a small
       # named set of cargo built-ins. Closing five inline gates is not closing
@@ -339,8 +359,23 @@ jobs:
       # free to change under a floating `@v2`, and impossible to reproduce
       # locally because nobody could say what it was. The four checks are now
       # named, `xtask check-deny` runs exactly these four, and
-      # `this_repositorys_deny_job_declares_the_set_this_command_runs`
-      # (xtask/src/gates.rs) fails if the two lists ever differ.
+      # `gates::deny_job_violations` fails if the two ever differ.
+      #
+      # WHICH INPUT THE CHECK NAMES GO IN. `command-arguments:`, not
+      # `arguments:`. The action splices its inputs as
+      #
+      #   cargo-deny --log-level L --manifest-path M <arguments> <command> \
+      #              <command-arguments>
+      #
+      # so the four check names sat BEFORE the subcommand for a milestone,
+      # producing `cargo-deny ... advisories bans licenses sources check` --
+      # which exits 2 with `unrecognized subcommand 'advisories'`. Measured
+      # against `cargo-deny 0.20.2` rather than reasoned about. The previous
+      # checker compared that list to its own and found it equal: it checked
+      # the spelling of a set and never the position it was spelled in.
+      # `arguments:` is the global-flag slot and carries `--all-features`,
+      # which decides which crates are in the graph at all -- so the local
+      # command passes it too.
       #
       # Still open, deliberately: `@v2` floats. Pinning it to a commit SHA is
       # the correct fix and is not made here because the SHA has to be
@@ -348,5 +383,22 @@ jobs:
       # substantive half -- what actually runs -- no longer floats.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
+          manifest-path: ./Cargo.toml
+          arguments: --all-features --config deny.toml
           command: check
-          arguments: advisories bans licenses sources
+          command-arguments: advisories bans licenses sources
+      # The second graph. `fuzz/` is its own workspace, so `cargo metadata` at
+      # the root lists twelve packages and none of them is `bathy-fuzz`: this
+      # job never saw `libfuzzer-sys`, `arbitrary` or `ipnet`, and no advisory
+      # or licence check ever ran over them. The first run that did point here
+      # found `libfuzzer-sys` is `(MIT OR Apache-2.0) AND NCSA` -- a licence
+      # in nobody's allow list. `deny.toml` now carries a scoped exception
+      # with the ruling. `--config deny.toml` because cargo-deny defaults its
+      # config to `<cwd>/deny.toml`, and one policy for both graphs is the
+      # point.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: fuzz/Cargo.toml
+          arguments: --all-features --config deny.toml
+          command: check
+          command-arguments: advisories bans licenses sources

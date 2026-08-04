@@ -705,81 +705,194 @@ pub fn check_msrv(run: bool) -> Fallible<()> {
 /// the two agree, is what makes the local run the same run.
 pub const DENY_CHECKS: &[&str] = &["advisories", "bans", "licenses", "sources"];
 
-/// The check set `ci.yml`'s deny job declares, if it declares one.
-pub fn deny_checks_in_ci(ci: &str) -> Option<Vec<String>> {
-    let mut in_deny = false;
-    for line in ci.lines() {
+/// The manifests `cargo deny` is pointed at, root-relative.
+///
+/// `fuzz/Cargo.toml` is the second one because `fuzz/` is its own workspace:
+/// `cargo metadata` at the root lists twelve packages and none of them is
+/// `bathy-fuzz`, so root `cargo deny` never saw `libfuzzer-sys`, `arbitrary`
+/// or `ipnet`. It found something the first time it was pointed there —
+/// `libfuzzer-sys` is `(MIT OR Apache-2.0) AND NCSA`, and NCSA was in
+/// nobody's allow list. See `deny.toml`'s exception for the ruling.
+pub const DENY_MANIFESTS: &[&str] = &["./Cargo.toml", "fuzz/Cargo.toml"];
+
+/// The cargo-deny global flags, which must be identical locally and in CI:
+/// they decide which crates are in the graph at all, so a run without them
+/// checks a different set of crates and reports the same "ok".
+///
+/// `--config deny.toml` is here rather than left to default because
+/// cargo-deny resolves its config against the *current directory*, not
+/// against `--manifest-path`: `fuzz/` has no `deny.toml`, and one policy
+/// file for both graphs is the point.
+pub const DENY_GLOBAL_ARGS: &[&str] = &["--all-features", "--config", "deny.toml"];
+
+/// One `cargo-deny-action` step's declared inputs, as `ci.yml` spells them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DenyStep {
+    pub manifest_path: Option<String>,
+    pub arguments: Option<Vec<String>>,
+    pub command: Option<String>,
+    pub command_arguments: Option<Vec<String>>,
+}
+
+/// Every `cargo-deny-action` step in the `deny` job, with its inputs.
+///
+/// Reads STEPS rather than lines. The input names matter and are easy to
+/// confuse — this is how the check set came to be declared in `arguments:`,
+/// which the action splices in *before* the subcommand, producing
+/// `cargo-deny … advisories bans licenses sources check` and the exit-2
+/// `unrecognized subcommand 'advisories'`. The old checker compared that
+/// list to `DENY_CHECKS`, found it equal, and reported ok: it checked the
+/// spelling of a set and never the position it was spelled in.
+pub fn deny_steps_in_ci(ci: &str) -> Vec<DenyStep> {
+    let Some(block) = job_block(ci, "deny") else {
+        return Vec::new();
+    };
+    let mut steps = Vec::new();
+    for lines in steps_of(block) {
         // A comment discussing `arguments:` is not a declaration of one. This
         // file's deny job carries a paragraph about the input having been
         // absent, and reading that paragraph as the check set produced a
         // failure message quoting its own prose.
-        if line.trim_start().starts_with('#') {
+        let uncommented = || {
+            lines
+                .iter()
+                .map(|line| line.trim_start())
+                .filter(|line| !line.starts_with('#'))
+        };
+        if !uncommented().any(|line| line.contains("cargo-deny-action@")) {
             continue;
         }
-        if let Some(rest) = line.strip_prefix("  ")
-            && !rest.starts_with(' ')
-            && let Some(name) = rest.strip_suffix(':')
-        {
-            in_deny = name == "deny";
+        let input = |name: &str| {
+            uncommented().find_map(|line| {
+                let rest = line
+                    .strip_prefix("- ")
+                    .unwrap_or(line)
+                    .strip_prefix(name)?
+                    .strip_prefix(':')?;
+                Some(rest.trim().to_string())
+            })
+        };
+        let words = |name: &str| {
+            input(name).map(|v| v.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+        };
+        steps.push(DenyStep {
+            manifest_path: input("manifest-path"),
+            arguments: words("arguments"),
+            command: input("command"),
+            command_arguments: words("command-arguments"),
+        });
+    }
+    steps
+}
+
+/// What the local command runs for one manifest, derived rather than
+/// remembered — and the same argv the action produces from the inputs above.
+pub fn deny_command(manifest: &str) -> Vec<String> {
+    let mut argv = vec!["--manifest-path".to_string(), manifest.to_string()];
+    argv.extend(DENY_GLOBAL_ARGS.iter().map(|a| (*a).to_string()));
+    argv.push("check".to_string());
+    argv.extend(DENY_CHECKS.iter().map(|c| (*c).to_string()));
+    argv
+}
+
+/// What is wrong with the `deny` job, as text a person can act on.
+pub fn deny_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
+    let steps = deny_steps_in_ci(ci);
+    let mut found = Vec::new();
+    for manifest in DENY_MANIFESTS {
+        let Some(step) = steps
+            .iter()
+            .find(|s| s.manifest_path.as_deref() == Some(*manifest))
+        else {
+            found.push(format!(
+                "{ci_path}: the `deny` job has no `cargo-deny-action` step with \
+                 `manifest-path: {manifest}`, so that crate graph is audited by nobody. \
+                 `fuzz/` is its own workspace: root `cargo deny` does not reach it, and \
+                 the first run that did found an unallowed licence."
+            ));
+            continue;
+        };
+        if step.command.as_deref() != Some("check") {
+            found.push(format!(
+                "{ci_path}: the `cargo-deny-action` step for {manifest} declares \
+                 `command: {}` rather than `check`.",
+                step.command.as_deref().unwrap_or("<absent>")
+            ));
         }
-        if in_deny && let Some(at) = line.find("arguments:") {
-            return Some(
-                line[at + "arguments:".len()..]
-                    .split_whitespace()
-                    .map(str::to_owned)
-                    .collect(),
-            );
+        match step.command_arguments.as_deref() {
+            None => found.push(format!(
+                "{ci_path}: the `cargo-deny-action` step for {manifest} declares no \
+                 `command-arguments:`, so which checks run is the action's default — \
+                 written down nowhere here and free to change under a floating `@v2`. \
+                 Note the input name: `arguments:` is spliced in BEFORE the subcommand \
+                 (`cargo-deny … advisories … check`) and exits 2 with `unrecognized \
+                 subcommand`, which is how this job spent a milestone unable to run."
+            )),
+            Some(declared) if declared != DENY_CHECKS => found.push(format!(
+                "{ci_path}: the step for {manifest} runs `{}` and this command runs \
+                 `{}`. A local gate that checks a different set from CI is worse than \
+                 none.",
+                declared.join(" "),
+                DENY_CHECKS.join(" "),
+            )),
+            Some(_) => {}
+        }
+        match step.arguments.as_deref() {
+            Some(declared) if declared == DENY_GLOBAL_ARGS => {}
+            other => found.push(format!(
+                "{ci_path}: the step for {manifest} declares `arguments: {}` and this \
+                 command runs `{}`. These are cargo-deny's GLOBAL flags — they decide \
+                 which crates are in the graph — so a difference here is a different \
+                 audit reporting the same word.",
+                other.map_or("<absent>".to_string(), |a| a.join(" ")),
+                DENY_GLOBAL_ARGS.join(" "),
+            )),
         }
     }
-    None
+    found
 }
 
 pub fn check_deny() -> Fallible<()> {
     let ci_path = ".github/workflows/ci.yml";
     let ci = std::fs::read_to_string(Path::new(".").join(ci_path))
         .map_err(|e| format!("reading {ci_path}: {e}"))?;
-    match deny_checks_in_ci(&ci) {
-        None => {
-            return Err(format!(
-                "{ci_path}: the deny job declares no `arguments:`, so what runs there is \
-                 the action's built-in default and this command cannot reproduce it. \
-                 Declare the check set explicitly — see DENY_CHECKS."
-            )
-            .into());
+    let violations = deny_job_violations(ci_path, &ci);
+    if !violations.is_empty() {
+        for v in &violations {
+            eprintln!("check-deny: {v}");
         }
-        Some(declared) if declared != DENY_CHECKS => {
-            return Err(format!(
-                "{ci_path}: the deny job runs `{}` and this command runs `{}`. A local \
-                 gate that checks a different set from CI is worse than none.",
-                declared.join(" "),
-                DENY_CHECKS.join(" "),
-            )
-            .into());
-        }
-        Some(_) => {}
+        return Err(format!("{} deny job violation(s)", violations.len()).into());
     }
 
-    let out = std::process::Command::new("cargo")
-        .arg("deny")
-        .arg("check")
-        .args(DENY_CHECKS)
-        .status();
-    match out {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-            "cargo-deny is not installed. `cargo install cargo-deny --locked`. \
-             Installing it is the one part of this gate that cannot be an xtask \
-             subcommand — a program that needs the tool cannot be what provides it."
-                .into(),
-        ),
-        Err(e) => Err(e.into()),
-        Ok(status) if !status.success() => {
-            Err(format!("cargo deny check {} failed", DENY_CHECKS.join(" ")).into())
-        }
-        Ok(_) => {
-            println!("check-deny: ok ({})", DENY_CHECKS.join(" "));
-            Ok(())
+    for manifest in DENY_MANIFESTS {
+        let argv = deny_command(manifest);
+        eprintln!("check-deny: cargo deny {}", argv.join(" "));
+        let out = std::process::Command::new("cargo")
+            .arg("deny")
+            .args(&argv)
+            .status();
+        match out {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(
+                    "cargo-deny is not installed. `cargo install cargo-deny --locked`. \
+                     Installing it is the one part of this gate that cannot be an xtask \
+                     subcommand — a program that needs the tool cannot be what provides it."
+                        .into(),
+                );
+            }
+            Err(e) => return Err(e.into()),
+            Ok(status) if !status.success() => {
+                return Err(format!("cargo deny {} failed", argv.join(" ")).into());
+            }
+            Ok(_) => {}
         }
     }
+    println!(
+        "check-deny: ok ({} over {})",
+        DENY_CHECKS.join(" "),
+        DENY_MANIFESTS.join(", "),
+    );
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,8 +2235,96 @@ pub fn fuzz_violations(root: &Path, manifest: &str, ci_path: &str, ci: &str) -> 
     }
 
     found.extend(fuzz_ci_job_violations(ci_path, ci));
+    found.extend(fuzz_crate_gate_violations(ci_path, ci));
     found.extend(packetd_ipc_deferral_violations(root));
     found
+}
+
+/// The job that runs on every push and pull request with no condition on it
+/// — where a gate that reads files belongs.
+pub const FAST_CI_JOB: &str = "test";
+
+/// `fuzz/`'s own fmt, clippy and unit tests have a CI step, in the fast job.
+///
+/// Job-scoped for the same reason as everything else in this file: a step in
+/// the nightly job is a gate that does not run on the pull request that
+/// breaks it. And in the *fast* job specifically, because it needs neither
+/// nightly nor `cargo-fuzz` — putting it in the `fuzz` job would tie a
+/// stable-toolchain lint to a job that installs a nightly one.
+pub fn fuzz_crate_gate_violations(ci_path: &str, ci: &str) -> Vec<String> {
+    let command = "cargo run -p xtask -- check-fuzz-crate";
+    let in_fast_job = job_block(ci, FAST_CI_JOB).is_some_and(|block| {
+        block.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("- run:")
+                .or_else(|| trimmed.strip_prefix("run:"))
+                .is_some_and(|c| c.trim().starts_with(command))
+        })
+    });
+    if in_fast_job {
+        return Vec::new();
+    }
+    vec![format!(
+        "{ci_path}: no `run:` step in the `{FAST_CI_JOB}` job invokes `{command}`, so \
+         `fuzz/`'s ~900 lines are outside `cargo fmt --all`, `cargo clippy --workspace` \
+         and `cargo test --workspace` with nothing but a README sentence in their \
+         place. That is the shape of the MSRV membership rule that had no executable \
+         form and three recorded recurrences."
+    )]
+}
+
+/// The gates the root workspace cannot reach, made into one command.
+///
+/// `fuzz/` is deliberately its own workspace (three reasons, in
+/// `fuzz/Cargo.toml`), and the cost is that `cargo fmt --all`, `cargo clippy
+/// --workspace` and `cargo test --workspace` at the root do not see ~900
+/// lines of Rust. Until this existed, the compensating control was a
+/// sentence in `fuzz/README.md` asking a human to remember to `cd fuzz` —
+/// which is the shape of the MSRV membership rule that had no executable
+/// form and three recorded recurrences, and strictly weaker than the five
+/// inline gates M5 closed. **The gates people run are the gates that have a
+/// command.**
+///
+/// Not a `working-directory:` step in `ci.yml`: `check-ci` refuses those, on
+/// purpose and for this reason — from the repository root, `cargo fmt --all
+/// -- --check` means the *root* workspace, and a workflow step that quietly
+/// means a different one is a gate nobody can reproduce.
+///
+/// Everything here runs on **stable**. Only *building* the fuzz targets
+/// needs nightly; `fmt`, `clippy` and the library's own unit tests do not.
+pub fn check_fuzz_crate() -> Fallible<()> {
+    let runs: &[&[&str]] = &[
+        &["fmt", "--all", "--", "--check"],
+        &["clippy", "--all-targets", "--", "-D", "warnings"],
+        // The library carries the instrumentation every target shares —
+        // `Stats`, and the duplicate-key scan `canonical_json` reports a flag
+        // from. A counter with a unit test is a counter someone can trust;
+        // one without is a number in a report.
+        &["test", "--lib"],
+    ];
+    for args in runs {
+        eprintln!("check-fuzz-crate: (cd fuzz && cargo {})", args.join(" "));
+        let status = std::process::Command::new("cargo")
+            .args(*args)
+            .current_dir("fuzz")
+            .status()
+            .map_err(|e| format!("running `cargo {}` in fuzz/: {e}", args.join(" ")))?;
+        if !status.success() {
+            return Err(format!(
+                "`cargo {}` failed in fuzz/. This is the same gate the root workspace \
+                 runs, pointed at the one package it cannot see.",
+                args.join(" ")
+            )
+            .into());
+        }
+    }
+    println!(
+        "check-fuzz-crate: ok ({} gate(s) over fuzz/, the package outside the root \
+         workspace)",
+        runs.len()
+    );
+    Ok(())
 }
 
 pub fn check_fuzz() -> Fallible<()> {
@@ -2584,44 +2785,128 @@ rust-version = \"1.88\"
 
     // --- The deny job. ---
 
-    #[test]
-    fn the_declared_check_set_is_read_out_of_the_deny_job_only() {
-        let ci = "\
-jobs:
-  test:
-    steps:
-      - uses: x
-        with:
-          arguments: not-this-one
-  deny:
-    steps:
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          command: check
-          arguments: advisories bans licenses sources
-";
-        assert_eq!(
-            deny_checks_in_ci(ci).unwrap(),
-            vec!["advisories", "bans", "licenses", "sources"]
-        );
-        assert_eq!(deny_checks_in_ci("jobs:\n  deny:\n    steps: []\n"), None);
-        assert_eq!(
-            deny_checks_in_ci(
-                "jobs:\n  deny:\n    steps:\n      # `arguments:` were both absent\n"
-            ),
-            None,
-            "a comment discussing the input is not a declaration of it"
-        );
+    fn clean_deny_ci() -> String {
+        let step = |manifest: &str| {
+            format!(
+                "      - uses: EmbarkStudios/cargo-deny-action@v2\n        with:\n          \
+                 manifest-path: {manifest}\n          arguments: {}\n          command: \
+                 check\n          command-arguments: {}\n",
+                DENY_GLOBAL_ARGS.join(" "),
+                DENY_CHECKS.join(" "),
+            )
+        };
+        format!(
+            "jobs:\n  test:\n    steps:\n      - uses: x\n        with:\n          arguments: \
+             not-this-one\n  deny:\n    steps:\n{}{}",
+            step(DENY_MANIFESTS[0]),
+            step(DENY_MANIFESTS[1]),
+        )
     }
 
     #[test]
-    fn this_repositorys_deny_job_declares_the_set_this_command_runs() {
+    fn a_clean_deny_job_passes_and_its_inputs_are_read_out_of_that_job_only() {
+        let ci = clean_deny_ci();
+        let v = deny_job_violations("ci.yml", &ci);
+        assert!(v.is_empty(), "{v:#?}");
+        let steps = deny_steps_in_ci(&ci);
+        assert_eq!(steps.len(), 2, "{steps:#?}");
+        assert_eq!(
+            steps[0].command_arguments.clone().unwrap_or_default(),
+            DENY_CHECKS,
+            "the `arguments: not-this-one` in the neighbouring job is not this job's"
+        );
+    }
+
+    /// The defect this rewrite exists for. The four check names were declared
+    /// in `arguments:`, which the action splices in BEFORE the subcommand --
+    /// `cargo-deny … advisories bans licenses sources check`, which exits 2
+    /// with `unrecognized subcommand 'advisories'` (measured against
+    /// cargo-deny 0.20.2). The old checker read `arguments:`, compared it to
+    /// `DENY_CHECKS`, found it equal and reported ok: it checked the spelling
+    /// of a set and never the position it was spelled in.
+    #[test]
+    fn the_check_set_in_the_global_flag_slot_is_reported() {
+        let ci = clean_deny_ci().replace(
+            &format!(
+                "arguments: {}\n          command: check\n          command-arguments: {}",
+                DENY_GLOBAL_ARGS.join(" "),
+                DENY_CHECKS.join(" ")
+            ),
+            &format!(
+                "arguments: {}\n          command: check",
+                DENY_CHECKS.join(" ")
+            ),
+        );
+        let v = deny_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 4, "one per manifest per input: {v:#?}");
+        assert!(
+            v.iter()
+                .any(|m| m.contains("unrecognized \\\n") || m.contains("unrecognized")),
+            "it must say what actually happens: {v:#?}"
+        );
+    }
+
+    /// `fuzz/` is its own workspace, so root `cargo deny` never sees
+    /// `libfuzzer-sys`, `arbitrary` or `ipnet`. Deleting the second step
+    /// silently returns ~900 lines of Rust and a whole dependency tree to
+    /// being audited by nobody.
+    #[test]
+    fn a_deny_job_that_does_not_audit_the_fuzz_workspace_is_reported() {
+        let ci = clean_deny_ci();
+        let cut = ci.find("manifest-path: fuzz/Cargo.toml").unwrap();
+        let start = ci[..cut].rfind("      - uses:").unwrap();
+        let v = deny_job_violations("ci.yml", &format!("{}{}", &ci[..start], ""));
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("fuzz/Cargo.toml"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_deny_step_whose_global_flags_differ_from_the_local_command_is_reported() {
+        // `--all-features` decides which crates are in the graph at all, so
+        // dropping it in one place is a different audit reporting the same
+        // word.
+        let ci = clean_deny_ci().replacen(
+            &format!("arguments: {}", DENY_GLOBAL_ARGS.join(" ")),
+            "arguments: --config deny.toml",
+            1,
+        );
+        let v = deny_job_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("GLOBAL flags"), "{}", v[0]);
+    }
+
+    #[test]
+    fn a_comment_discussing_the_inputs_is_not_a_declaration_of_them() {
+        let ci = "jobs:\n  deny:\n    steps:\n      - uses: \
+                  EmbarkStudios/cargo-deny-action@v2\n        with:\n          # \
+                  `command-arguments:` and `arguments:` were both absent\n";
+        let steps = deny_steps_in_ci(ci);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0], DenyStep::default(), "{steps:#?}");
+    }
+
+    #[test]
+    fn this_repositorys_deny_job_runs_what_this_command_runs() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let ci = std::fs::read_to_string(root.join(".github/workflows/ci.yml")).unwrap();
+        let v = deny_job_violations(".github/workflows/ci.yml", &ci);
+        assert!(v.is_empty(), "{v:#?}");
+        // And the local argv is the action's argv, in the action's order:
+        // `cargo-deny <arguments> <command> <command-arguments>`.
         assert_eq!(
-            deny_checks_in_ci(&ci).expect("the deny job declares `arguments:`"),
-            DENY_CHECKS,
-            "the local command and the CI job must run the same four checks"
+            deny_command("fuzz/Cargo.toml"),
+            vec![
+                "--manifest-path",
+                "fuzz/Cargo.toml",
+                "--all-features",
+                "--config",
+                "deny.toml",
+                "check",
+                "advisories",
+                "bans",
+                "licenses",
+                "sources"
+            ]
         );
     }
 
@@ -3304,6 +3589,10 @@ jobs:
 
     const CLEAN_FUZZ_CI: &str = "\
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo run -p xtask -- check-fuzz-crate
   fuzz:
     runs-on: ubuntu-latest
     steps:
@@ -3575,6 +3864,35 @@ jobs:
         let v = fuzz_ci_job_violations("ci.yml", &ci);
         assert_eq!(v.len(), 1, "{v:#?}");
         assert!(v[0].contains("pull request"), "{}", v[0]);
+    }
+
+    /// `fuzz/`'s own fmt, clippy and unit tests are ~900 lines outside every
+    /// root gate. Their only defence before this was a sentence in
+    /// `fuzz/README.md`; the defence now is a step, and the step has a check.
+    #[test]
+    fn a_workflow_that_does_not_gate_the_fuzz_crate_itself_is_reported() {
+        let ci = CLEAN_FUZZ_CI.replace("      - run: cargo run -p xtask -- check-fuzz-crate\n", "");
+        let v = fuzz_crate_gate_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("cargo fmt --all"), "{}", v[0]);
+    }
+
+    /// And in the fast job, not wherever. In the schedule-gated job it is a
+    /// lint that does not run on the pull request that breaks it -- the same
+    /// hole as the fuzz run step's, one gate over.
+    #[test]
+    fn a_fuzz_crate_gate_in_a_neighbouring_job_is_reported() {
+        let ci = CLEAN_FUZZ_CI
+            .replace("      - run: cargo run -p xtask -- check-fuzz-crate\n", "")
+            .replace(
+                "  other:\n    runs-on: ubuntu-latest\n",
+                "  other:\n    if: github.event_name == 'schedule'\n    runs-on: ubuntu-latest\n\
+                 \x20   steps:\n      - run: cargo run -p xtask -- check-fuzz-crate\n",
+            );
+        assert!(ci.contains("check-fuzz-crate"), "still in the file");
+        let v = fuzz_crate_gate_violations("ci.yml", &ci);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains(FAST_CI_JOB), "{}", v[0]);
     }
 
     #[test]

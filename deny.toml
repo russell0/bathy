@@ -2,6 +2,23 @@
 allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
 confidence-threshold = 0.9
 
+# `libfuzzer-sys` is `(MIT OR Apache-2.0) AND NCSA`: it vendors LLVM's
+# libFuzzer runtime, whose licence is NCSA, and the `AND` means choosing the
+# MIT/Apache half does not make the NCSA half go away. It was found the first
+# time `cargo deny` was pointed at `fuzz/Cargo.toml` at all -- the fuzz
+# package is its own workspace, so root `cargo metadata` never listed it and
+# no licence check had ever seen this dependency tree.
+#
+# The ruling: NCSA is OSI-approved and FSF-free, permissive, and is BSD-3
+# plus a no-endorsement clause -- nothing this project's allow list rejects
+# in substance. It is admitted as an EXCEPTION rather than added to `allow`
+# so that it applies to this one crate: a second NCSA-licensed dependency,
+# anywhere in either graph, still fails. `bathy-fuzz` is `publish = false`
+# and no shipped artifact links it.
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+allow = ["NCSA"]
+
 [bans]
 multiple-versions = "warn"
 

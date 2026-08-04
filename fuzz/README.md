@@ -38,10 +38,27 @@ would try to compile `libfuzzer-sys` under the pinned toolchain, and both MSRV
 jobs would range over a package that has no MSRV to promise. `check-fuzz`
 fails if the `[workspace]` table is removed.
 
-The cost is that `cargo fmt --all` and `cargo clippy --workspace` at the root
-do not reach these files. Run `cargo fmt` and `cargo clippy` from inside
-`fuzz/` instead — both work on stable there, since only *building* the targets
-needs nightly.
+The cost is that `cargo fmt --all`, `cargo clippy --workspace` and `cargo test
+--workspace` at the root do not reach these files, and root `cargo deny` does
+not reach this dependency tree. Both halves have a command and a CI step:
+
+```sh
+# fmt, clippy and this package's unit tests, run inside fuzz/. Stable: only
+# *building* the targets needs nightly. A step in the fast CI job.
+cargo run -p xtask -- check-fuzz-crate
+
+# advisories, bans, licenses and sources over BOTH graphs -- the root
+# workspace and this one.
+cargo run -p xtask -- check-deny
+```
+
+Until M7 Task 2's fix round the control was this paragraph asking you to
+remember to `cd fuzz` — which is the shape of the MSRV membership rule that
+had no executable form and three recorded recurrences, and strictly weaker
+than the five inline gates M5 closed. The first `cargo deny` run that was
+ever pointed at this workspace found `libfuzzer-sys` is `(MIT OR Apache-2.0)
+AND NCSA`, a licence in nobody's allow list; `deny.toml` carries the scoped
+exception and the ruling.
 
 ## Seeds, and why a fuzz target without them proves nothing
 

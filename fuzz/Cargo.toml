@@ -64,11 +64,15 @@ ipnet = "2"
 
 [lib]
 path = "src/lib.rs"
-# Not a test or doc target: `cargo fuzz` builds this package with sanitizer
-# flags, and there is nothing here to `cargo test`. The counters are asserted
-# by `xtask check-fuzz` reading the sources, not by a unit test that would
-# need a second toolchain to run.
-test = false
+# `test = false` until M7 Task 2's fix round, with the reasoning "there is
+# nothing here to `cargo test`, and a unit test would need a second
+# toolchain". The second half was simply wrong -- this library is ordinary
+# Rust and its tests run on stable; only *building the targets* needs
+# nightly -- and the first half stopped being true the moment the shared
+# instrumentation grew logic of its own: the reported line, and the
+# duplicate-key scan `canonical_json` sets a flag from. Both are now
+# asserted by `cargo run -p xtask -- check-fuzz-crate`, which is a CI step.
+# An instrument nothing checks is what this whole package argues against.
 doctest = false
 
 [[bin]]

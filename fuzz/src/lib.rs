@@ -130,6 +130,22 @@ impl Stats {
     }
 
     fn report(&self, execs: u64) {
+        // `eprintln!` and not `stderr().write_all`: this is a fuzz binary,
+        // not a libtest test, so nothing is capturing stdio and there is no
+        // passing-test capture to be discarded by. (The rule that forbids
+        // the print-macro form -- `captured-skip-message` in
+        // `xtask/src/phrases.rs` -- is about a *skip reason in a test*, and
+        // its roots are `crates` and `xtask`, not this directory.)
+        eprintln!("{}", self.report_line(execs));
+    }
+
+    /// The reported line, as a value.
+    ///
+    /// Split out from the printing so it can be asserted. An instrument
+    /// whose output nothing checks is the thing this module exists to
+    /// argue against, and its most important output -- `reached=0/N` --
+    /// is the one no ordinary run ever shows a reader.
+    pub fn report_line(&self, execs: u64) -> String {
         let mut line = format!("[fuzz-stats {}] execs={execs}", self.target);
         for (i, label) in self.labels.iter().enumerate() {
             let v = self.counts[i].load(Ordering::Relaxed);
@@ -154,13 +170,7 @@ impl Stats {
                 reached.join(",")
             ));
         }
-        // `eprintln!` and not `stderr().write_all`: this is a fuzz binary,
-        // not a libtest test, so nothing is capturing stdio and there is no
-        // passing-test capture to be discarded by. (The rule that forbids
-        // the print-macro form -- `captured-skip-message` in
-        // `xtask/src/phrases.rs` -- is about a *skip reason in a test*, and
-        // its roots are `crates` and `xtask`, not this directory.)
-        eprintln!("{line}");
+        line
     }
 }
 
@@ -176,4 +186,33 @@ fn reporting_interval() -> Option<u64> {
             .unwrap_or(100_000);
         Some(every)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counters_and_flags_are_reported_under_their_own_names() {
+        static S: Stats = Stats::new("t", &["parsed", "loaded"], &["ok:a", "ok:b"]);
+        S.bump(0);
+        S.add(1, 7);
+        S.flag(1);
+        assert_eq!(
+            S.report_line(3),
+            "[fuzz-stats t] execs=3 parsed=1 loaded=7 reached=1/2 [ok:b]"
+        );
+    }
+
+    /// The case the instrument exists for. A target that reached nothing
+    /// must SAY it reached nothing: `reached=0/2` is the most important
+    /// value this line can carry, and a report that omits the clause
+    /// entirely when the count is zero goes quiet in exactly the situation
+    /// it was built to make visible.
+    #[test]
+    fn a_target_that_reached_nothing_still_reports_the_denominator() {
+        static S: Stats = Stats::new("t", &[], &["ok:a", "ok:b"]);
+        let line = S.report_line(1);
+        assert!(line.contains("reached=0/2 []"), "{line}");
+    }
 }
