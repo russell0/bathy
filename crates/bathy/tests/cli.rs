@@ -185,6 +185,35 @@ struct Listener {
     accepts: Arc<AtomicUsize>,
 }
 
+/// Port ranges the tests below hand to a real `bathy scan` as its `--ports`
+/// argument, against this machine's own routable IP.
+///
+/// **They must all sit below 32768, and that is not cosmetic.** Every
+/// [`Listener`] in this file binds `(ip, 0)` and takes whatever ephemeral
+/// port the kernel gives it, on that same address; several of the tests
+/// below then assert that their listener received *zero* connections
+/// ("a denied scan emitted a packet"). Linux's ephemeral range is
+/// 32768-60999 and macOS's is 49152-65535, so a scan range chosen inside
+/// either one can be handed the very port a sibling test is holding, and
+/// that sibling then counts real connections from a scan that was working
+/// exactly as designed.
+///
+/// This is not hypothetical. These three ranges were `40000-40999`,
+/// `40000-40099` and `41000-41999` -- all inside Linux's ephemeral range --
+/// and `an_out_of_scope_target_is_denied_with_a_stable_reason_code_and_exit_2_and_no_packet`
+/// went red once in 20 consecutive `cargo test --workspace` runs in
+/// `rust:1-bookworm` with `a denied scan emitted a packet: left 3, right 0`.
+/// The denial was correct; the three connections came from a neighbour.
+///
+/// Below the ephemeral floor there is no overlap to have: the kernel cannot
+/// hand a `bind(:0)` listener a port in these ranges on either platform, so
+/// the collision is gone by construction rather than by being unlikely.
+/// Each range keeps the exact port *count* it had, because that is what the
+/// tests' pacing arithmetic depends on.
+const SCAN_RANGE_1000: &str = "20000-20999";
+const SCAN_RANGE_100: &str = "20000-20099";
+const SCAN_RANGE_1000_B: &str = "21000-21999";
+
 impl Listener {
     fn bind(ip: Ipv4Addr, serve_http: bool) -> Self {
         let listener = TcpListener::bind((ip, 0)).expect("bind a listener on this machine");
@@ -961,7 +990,7 @@ fn scan_start_prints_a_task_handle_long_before_a_large_scan_could_finish() {
             "--targets",
             &ip.to_string(),
             "--ports",
-            "40000-40999",
+            SCAN_RANGE_1000,
             "--max-packets-per-second",
             "5",
         ])
@@ -1065,7 +1094,7 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
             // Long enough that a cancel half a second in cannot arrive after
             // the plan is exhausted, short enough that the resume below runs
             // the remainder to completion inside this test.
-            "40000-40099",
+            SCAN_RANGE_100,
             "--max-packets-per-second",
             "20",
         ])
@@ -1225,7 +1254,7 @@ fn following_a_scan_whose_writer_died_gives_up_by_a_deadline_instead_of_waiting_
             "--targets",
             &ip.to_string(),
             "--ports",
-            "41000-41999",
+            SCAN_RANGE_1000_B,
             "--max-packets-per-second",
             "20",
         ])
