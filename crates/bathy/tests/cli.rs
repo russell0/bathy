@@ -23,6 +23,13 @@
 //! same listener and the same port: an invocation that *must* reach it. A
 //! zero-accept assertion whose detector cannot detect anything proves
 //! nothing, and this project has shipped twelve tests that proved nothing.
+//!
+//! This is the portable half. The other half is running the binary with the
+//! network denied by the operating system -- `testdata/deny-network.sb` on
+//! macOS, `unshare -rn` on Linux -- which is not in this suite because it
+//! needs a platform-specific wrapper whose own enforcement has to be
+//! confirmed first. That profile's header carries the command that confirms
+//! it, and M5 Task 3's report records the transcript.
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
@@ -787,7 +794,7 @@ fn scan_start_prints_a_task_handle_long_before_a_large_scan_could_finish() {
         .expect("spawn bathy");
 
     let started = Instant::now();
-    let line = read_first_line(child.stdout.as_mut().expect("piped stdout"));
+    let line = first_line_within(&mut child, Duration::from_secs(10));
     let elapsed = started.elapsed();
 
     let handle: serde_json::Value =
@@ -819,16 +826,37 @@ fn scan_start_prints_a_task_handle_long_before_a_large_scan_could_finish() {
     let _ = child.wait();
 }
 
-fn read_first_line(stdout: &mut std::process::ChildStdout) -> String {
-    let mut buf = Vec::new();
-    let mut byte = [0u8; 1];
-    while stdout.read(&mut byte).unwrap_or(0) == 1 {
-        if byte[0] == b'\n' {
-            break;
+/// The child's first line of stdout, or a **failure** if it does not arrive
+/// in time.
+///
+/// The deadline is the point of this helper. A `scan start` that ran the
+/// scan before printing its handle would make an unbounded read block for
+/// as long as the scan takes -- which is a hang, not a test failure, and a
+/// hang in CI reports as a timeout with no named cause. Discovered by
+/// mutation: printing the handle after `run_to_completion` made the
+/// AC-5.12 test never finish rather than fail.
+fn first_line_within(child: &mut Child, limit: Duration) -> String {
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut byte = [0u8; 1];
+        while stdout.read(&mut byte).unwrap_or(0) == 1 {
+            if byte[0] == b'\n' {
+                break;
+            }
+            buf.push(byte[0]);
         }
-        buf.push(byte[0]);
-    }
-    String::from_utf8_lossy(&buf).into_owned()
+        let _ = tx.send(String::from_utf8_lossy(&buf).into_owned());
+    });
+    rx.recv_timeout(limit).unwrap_or_else(|_| {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!(
+            "no line on stdout within {limit:?}: `scan start` blocked on the scan \
+             instead of printing its handle first"
+        )
+    })
 }
 
 // --- Cross-process cancellation, and the read commands --------------------
@@ -865,7 +893,7 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
         .expect("spawn bathy");
 
     let handle: serde_json::Value =
-        serde_json::from_str(&read_first_line(child.stdout.as_mut().unwrap())).unwrap();
+        serde_json::from_str(&first_line_within(&mut child, Duration::from_secs(10))).unwrap();
     let id = handle["task_id"].as_str().unwrap().to_string();
 
     // `scan status` reads the same live state from a second process, while

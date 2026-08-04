@@ -1,0 +1,21 @@
+;; A macOS sandbox profile that denies all network access and nothing else.
+;;
+;; Used to prove by execution that a command emits no packet -- M4 (AC-4.17,
+;; the interpretation replay corpus) established the method, and M5 Task 3
+;; reuses it for AC-5.9 (`bathy scan preview` emits no packet).
+;;
+;; Needs no SIP change, no sudo and no dtruss.
+;;
+;;   # Confirm the profile actually enforces, in BOTH directions. A sandbox
+;;   # that silently no-ops turns any green run inside it into a tautology.
+;;   python3 -c 'import socket;socket.create_connection(("127.0.0.1",PORT),3);print("CONNECTED")'
+;;   sandbox-exec -f testdata/deny-network.sb python3 -c 'import socket;socket.create_connection(("127.0.0.1",PORT),3);print("CONNECTED")'
+;;   # The first must print CONNECTED; the second must fail with
+;;   # PermissionError: [Errno 1] Operation not permitted.
+;;
+;;   # Then the claim itself:
+;;   sandbox-exec -f testdata/deny-network.sb ./target/debug/bathy \
+;;     scan preview --scope <manifest> --targets <t> --ports <p> --json
+(version 1)
+(allow default)
+(deny network*)

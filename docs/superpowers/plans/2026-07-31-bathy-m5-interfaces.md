@@ -398,7 +398,11 @@ git commit -m "feat(cli): bathy binary with mandatory scope and documented exit 
 
 **Acceptance criteria:**
 - **AC-5.8** Every packet-emitting subcommand requires `--scope`; omitting it fails before any network activity.
-- **AC-5.9** `scan preview` computes `plan_hash`, target and probe estimates, and a policy decision **without emitting a packet**. Verify by running it with the network namespace isolated.
+- **AC-5.9** `scan preview` computes `plan_hash`, target and probe estimates, and a policy decision **without emitting a packet**. Verify by running it with the network genuinely denied. On Linux: `unshare -rn`. On macOS: `sandbox-exec -f testdata/deny-network.sb` — the profile is committed, and its header carries the two-direction command that **confirms the profile is actually enforcing** before anything green inside it is believed. A no-network proof that would also pass with the network available proves nothing.
+
+  Discharged 2026-08-04 on macOS. The profile was confirmed enforcing first: the same loopback `socket.create_connection` printed `CONNECTED` outside it and raised `PermissionError: [Errno 1] Operation not permitted` inside it. Inside that sandbox, `bathy scan preview --json` exits 0 with its full document; `bathy scan start` against the same manifest exits 0 having reached nothing (`open_ports: 0`, `local_resource_failures: 1`), which is what the emission path looks like when the sandbox is doing its job.
+
+  The in-suite half is `preview_prints_a_plan_hash_and_estimates_and_reaches_no_listener_that_a_real_scan_reaches` (`crates/bathy/tests/cli.rs`), which is portable and does not need a sandbox: it counts accepts on a real listener bound to this machine's own routable address, and pairs the zero with a positive control — an authorized `scan start` against the same port that must reach it. Mutation-verified in both directions.
 - **AC-5.10** `--json` output is line-delimited valid JSON on stdout, with all diagnostics on stderr.
 - **AC-5.11** Exit codes 0–4 have the documented distinct meanings and appear in `--help`.
 - **AC-5.12** `scan start` returns a `TaskHandle` immediately and does not block until completion.
