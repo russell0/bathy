@@ -167,6 +167,18 @@ pub enum EventBody {
         /// The interpretation rule that produced `observation`, and the name
         /// `fingerprint.explain` takes. `probe_id` names what was sent;
         /// this names what decided, and the two are different namespaces.
+        ///
+        /// Absent means **unattributed**, not "no rule fired": a
+        /// `service.observed` record exists *because* a rule fired, so an
+        /// absent `rule_id` never means there was none. It means only that
+        /// the build which wrote the record did not write down which one.
+        /// Every current build always writes this field, and never writes it
+        /// as null or as an empty string, so absence dates a record rather
+        /// than describing it.
+        //
+        // The build in question is anything older than `bd386e9`; the policy
+        // that governs adding a field to this shape is written out in
+        // `docs/event-log-compatibility.md`.
         //
         // Maintainer note, deliberately a `//` comment so it stays out of the
         // published schema: one probe's bytes can be matched by any of
@@ -176,7 +188,32 @@ pub enum EventBody {
         // so `fingerprint.explain` was reachable only by first listing every
         // rule in the build, and never *from a finding*, which is the one
         // direction an agent holding a result actually needs.
-        rule_id: String,
+        //
+        // `Option` + `#[serde(default)]`, not `String` + `#[serde(default)]`:
+        // the field was added to a record shape that logs already existed in,
+        // and the type is what records that. A defaulted `String` would make
+        // a log written last week load with `rule_id: ""` -- a value its
+        // writer never wrote, materialized on read and written back out on
+        // any re-serialization. `Option` distinguishes "this build did not
+        // record it" from "this build recorded nothing", which are the two
+        // things an agent replaying old evidence has to tell apart, and it
+        // reuses the vocabulary `bathy_query::EndpointState::rule_id` already
+        // publishes (`null` for an endpoint nothing identified) rather than
+        // introducing the empty string as a third state every consumer must
+        // learn. `skip_serializing_if` keeps a re-serialized old record
+        // byte-identical to the old record.
+        //
+        // `probe_id` above is deliberately NOT given the same treatment.
+        // It has been in this variant since `54f7b46`, the commit that
+        // created this file, which is before `b50763a` created the event log
+        // at all -- so no log this project can ever have written lacks it,
+        // and defaulting it would weaken a live guarantee to buy
+        // compatibility with nothing. The rule stated in
+        // `docs/event-log-compatibility.md` is exactly this: a field present
+        // since the log's first byte stays required; a field added later is
+        // optional forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rule_id: Option<String>,
     },
 
     #[serde(rename = "scan.progress")]
@@ -433,7 +470,7 @@ mod tests {
                     },
                     evidence_refs: NonEmpty::new(digest_fixture(4)),
                     probe_id: "tls-http-v3".to_string(),
-                    rule_id: "https.server.nginx.v1".to_string(),
+                    rule_id: Some("https.server.nginx.v1".to_string()),
                 },
             ),
             (
@@ -542,7 +579,7 @@ mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest_fixture(14)),
                 probe_id: "tls-http-v3".to_string(),
-                rule_id: "https.server.nginx.v1".to_string(),
+                rule_id: Some("https.server.nginx.v1".to_string()),
             },
             EventBody::Progress {
                 probes_sent: 100,
@@ -605,7 +642,7 @@ mod tests {
                     .unwrap(),
             ),
             probe_id: "tls-http-v3".to_string(),
-            rule_id: "https.server.nginx.v1".to_string(),
+            rule_id: Some("https.server.nginx.v1".to_string()),
         });
         let event = Event {
             sequence: 1842,
@@ -732,6 +769,122 @@ mod tests {
     #[test]
     fn the_fixture_used_by_the_rejection_tests_parses_on_its_own() {
         assert!(serde_json::from_str::<Event>(SERVICE_OBSERVED_EXAMPLE).is_ok());
+    }
+
+    // --- Forward compatibility of the append-only log. `bd386e9` added a
+    // required `rule_id` to `service.observed`, and from that commit a log
+    // written by the previous commit could not be deserialized at all -- one
+    // unreadable line fails the whole read, so the entire scan became
+    // unreachable through `result query`, `result diff` and `scan events`
+    // while the *derived* SQLite index went on answering. The policy that
+    // governs this is `docs/event-log-compatibility.md`; these two tests are
+    // what makes it a property rather than a paragraph, and they live in this
+    // crate (not only in `bathy-query`'s fixture test) so that `cargo test -p
+    // bathy-types` kills the mutant that removes the attribute. ---
+
+    /// Every field added to an event record **after** the append-only log
+    /// existed, with the JSON text that spells it in the canonical example.
+    ///
+    /// This is a register, in the shape `xtask`'s `ABSENCE_CLAIMS` and the
+    /// deferred-move registry already use here, and it exists because a
+    /// defect found in one file is a defect class. The sweep behind it was
+    /// run by execution, not by memory: `git show
+    /// b50763a:crates/bathy-types/src/event.rs` is this file as it stood at
+    /// the commit that created the event log, and every field of every
+    /// variant there -- including `probe_id`, which the M5 review believed
+    /// was an earlier instance of this defect -- is still present and still
+    /// required. `rule_id` (`bd386e9`) is the only entry, and the only one
+    /// there has ever been.
+    ///
+    /// A field added later goes in here **and** gets `#[serde(default)]`, or
+    /// `an_added_field_is_optional_in_every_direction` fails.
+    const FIELDS_ADDED_AFTER_THE_LOG_EXISTED: &[(&str, &str)] = &[(
+        "service.observed",
+        "\"rule_id\": \"https.server.nginx.v1\",",
+    )];
+
+    #[test]
+    fn an_added_field_is_optional_in_every_direction() {
+        for (event_type, spelling) in FIELDS_ADDED_AFTER_THE_LOG_EXISTED {
+            assert_eq!(
+                *event_type, "service.observed",
+                "the register grew an entry with no example to remove it from; add one"
+            );
+            let json = SERVICE_OBSERVED_EXAMPLE.replacen(spelling, "", 1);
+            assert!(
+                json != SERVICE_OBSERVED_EXAMPLE,
+                "fixture sanity: {spelling} must actually occur in the example"
+            );
+            serde_json::from_str::<Event>(&json).unwrap_or_else(|e| {
+                panic!(
+                    "a log written before {spelling} existed must still load, got {e}. \
+                     A field added to a record shape logs already exist in is optional \
+                     forever -- see docs/event-log-compatibility.md."
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn a_field_that_predates_the_log_is_still_required() {
+        // The other half, and the one that stops the policy from decaying
+        // into "make everything optional". `probe_id` has been in this
+        // variant since the commit that created this file, which predates the
+        // event log itself, so no log can lack it and nothing is bought by
+        // relaxing it. A fixture that satisfies every branch tests none.
+        let json = SERVICE_OBSERVED_EXAMPLE.replacen("\"probe_id\": \"tls-http-v3\",", "", 1);
+        assert!(json != SERVICE_OBSERVED_EXAMPLE, "fixture sanity");
+        let err = serde_json::from_str::<Event>(&json)
+            .expect_err("a field that predates the log must stay required");
+        assert!(
+            err.to_string().contains("probe_id"),
+            "expected a missing-field error naming probe_id, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_service_observed_record_written_before_rule_id_existed_still_deserializes() {
+        let json =
+            SERVICE_OBSERVED_EXAMPLE.replacen("\"rule_id\": \"https.server.nginx.v1\",", "", 1);
+        assert!(
+            !json.contains("rule_id"),
+            "fixture sanity: the field must genuinely be gone, or this tests nothing"
+        );
+        let event: Event = serde_json::from_str(&json)
+            .expect("a record from before the field existed must still load");
+        let EventBody::ServiceObserved {
+            rule_id, probe_id, ..
+        } = &event.body
+        else {
+            panic!("expected a service.observed");
+        };
+        assert_eq!(
+            *rule_id, None,
+            "absent means unattributed: the writer did not record which rule decided. \
+             It does not mean no rule fired -- a service.observed exists because one did."
+        );
+        assert_eq!(
+            probe_id, "tls-http-v3",
+            "probe_id has been in this variant since the file was created, which is \
+             before the event log existed at all, so no log can lack it and it stays \
+             required"
+        );
+    }
+
+    #[test]
+    fn an_unattributed_record_is_written_back_out_exactly_as_it_came_in() {
+        // `skip_serializing_if`, not a defaulted `String`: a defaulted
+        // `String` would re-serialize an old record with `"rule_id":""`, a
+        // value its writer never wrote. Evidence that changes shape on the
+        // way through a reader is not evidence.
+        let json =
+            SERVICE_OBSERVED_EXAMPLE.replacen("\"rule_id\": \"https.server.nginx.v1\",", "", 1);
+        let event: Event = serde_json::from_str(&json).unwrap();
+        let round_tripped = serde_json::to_value(&event).unwrap();
+        assert!(
+            round_tripped.get("rule_id").is_none(),
+            "nothing may be invented on the way out; got {round_tripped}"
+        );
     }
 
     // --- C5: deny codes were defined in `bathy-scope` (`DenyReason::code()`)

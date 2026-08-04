@@ -275,7 +275,7 @@ mod tests {
                     },
                     evidence_refs: NonEmpty::try_from(vec![digest("a"), digest("b")]).unwrap(),
                     probe_id: "http-get-v1".into(),
-                    rule_id: "http.server.nginx.v1".into(),
+                    rule_id: Some("http.server.nginx.v1".into()),
                 },
             ),
             port_state(4, "10.0.0.1", 80, PortState::Open),
@@ -369,7 +369,7 @@ mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest("a")),
                 probe_id: "http-get-v1".into(),
-                rule_id: "http.server.nginx.v1".into(),
+                rule_id: Some("http.server.nginx.v1".into()),
             },
         )]);
         let json = serde_json::to_value(&fold).unwrap();

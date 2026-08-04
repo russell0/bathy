@@ -349,6 +349,48 @@ async fn folding_a_real_scan_log_answers_what_the_scan_actually_found() {
     assert!(fold.hosts_up.is_empty());
 }
 
+/// `EventBody::ServiceObserved::rule_id` is `Option` so that a log written
+/// before the field existed can still be read (`old_log_compatibility.rs`).
+/// That optionality is a statement about *old* records only. This is the
+/// other half of the same policy: what this engine writes today always names
+/// the rule, so `None` dates a record rather than describing one.
+///
+/// Without this, `Option` would quietly relax a live guarantee -- an emitter
+/// that dropped the attribution would type-check, pass, and leave
+/// `fingerprint.explain` unreachable from a finding again, which is the
+/// defect `bd386e9` was written to close.
+#[tokio::test]
+async fn a_freshly_written_log_always_names_the_rule_that_decided() {
+    let (events, nginx_port, _) = scan_two_real_ports().await;
+
+    let observed: Vec<_> = events
+        .iter()
+        .filter_map(|e| match &e.body {
+            bathy_types::event::EventBody::ServiceObserved {
+                endpoint, rule_id, ..
+            } => Some((endpoint.port, rule_id.clone())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        observed.len(),
+        1,
+        "fixture sanity: exactly one endpoint in this scan identifies a service"
+    );
+    assert_eq!(observed[0].0, nginx_port);
+    let rule_id = observed[0]
+        .1
+        .as_deref()
+        .expect("a record this build wrote must name the rule that decided");
+    assert!(
+        !rule_id.is_empty(),
+        "and must not name it with the empty string, which would be a third \
+         state meaning neither attributed nor unattributed"
+    );
+    assert_eq!(rule_id, "http.server.nginx.v1");
+}
+
 #[tokio::test]
 async fn a_real_log_of_a_port_that_closed_supersedes_by_sequence_in_any_order() {
     // AC-5.1 and AC-5.2 against real event shapes.

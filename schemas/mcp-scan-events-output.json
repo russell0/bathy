@@ -149,8 +149,11 @@
               "type": "string"
             },
             "rule_id": {
-              "description": "The interpretation rule that produced `observation`, and the name\n`fingerprint.explain` takes. `probe_id` names what was sent;\nthis names what decided, and the two are different namespaces.",
-              "type": "string"
+              "description": "The interpretation rule that produced `observation`, and the name\n`fingerprint.explain` takes. `probe_id` names what was sent;\nthis names what decided, and the two are different namespaces.\n\nAbsent means **unattributed**, not \"no rule fired\": a\n`service.observed` record exists *because* a rule fired, so an\nabsent `rule_id` never means there was none. It means only that\nthe build which wrote the record did not write down which one.\nEvery current build always writes this field, and never writes it\nas null or as an empty string, so absence dates a record rather\nthan describing it.",
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "target": {
               "$ref": "#/$defs/Target"
@@ -162,8 +165,7 @@
             "endpoint",
             "observation",
             "evidence_refs",
-            "probe_id",
-            "rule_id"
+            "probe_id"
           ],
           "type": "object"
         },

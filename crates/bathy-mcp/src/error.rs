@@ -109,8 +109,23 @@ pub fn log_error(e: LogError) -> ToolFailure {
     ToolFailure::new("log_unreadable", e)
 }
 
+/// `EventLogReader::open` failed. Only an absent file is `no_such_scan_log`.
+///
+/// `open` validates every record on the way in, so a log that *exists* but
+/// holds a record this build cannot read fails here too -- and it used to be
+/// reported as `no_such_scan_log`, telling an agent branching on the code
+/// that the scan is gone when the truth was that the log outlived a shape
+/// change. The `detail` was accurate throughout and the code was not; an
+/// agent branches on the code. They now agree: a log that is there and
+/// unreadable is `log_unreadable`, the same code `read_from` already uses for
+/// the same condition.
 pub fn no_such_log(e: LogError) -> ToolFailure {
-    ToolFailure::new("no_such_scan_log", e)
+    match &e {
+        LogError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound => {
+            ToolFailure::new("no_such_scan_log", e)
+        }
+        _ => log_error(e),
+    }
 }
 
 pub fn evidence_error(e: EvidenceError) -> ToolFailure {
@@ -153,6 +168,43 @@ mod tests {
             result.structured_content.is_none(),
             "a refusal in structuredContent would break the outputSchema promise"
         );
+    }
+
+    #[test]
+    fn a_log_that_exists_but_will_not_read_is_not_reported_as_a_missing_log() {
+        // The two conditions both arrive through `EventLogReader::open`,
+        // because `open` validates every record. An agent branches on the
+        // code, so the code has to tell them apart: "the scan is gone" and
+        // "the scan is there and this build cannot read it" have completely
+        // different remediations.
+        let absent = LogError::Io {
+            path: "/state/scan_x.jsonl".into(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no such file"),
+        };
+        assert_eq!(no_such_log(absent).error, "no_such_scan_log");
+
+        let unreadable = LogError::Malformed {
+            path: "/state/scan_x.jsonl".into(),
+            line: 3,
+            detail: "missing field `rule_id`".into(),
+        };
+        let failure = no_such_log(unreadable);
+        assert_eq!(
+            failure.error, "log_unreadable",
+            "a log that is plainly present must not be reported as absent"
+        );
+        assert!(
+            failure.detail.contains("line 3"),
+            "and the detail must still say which record, got: {}",
+            failure.detail
+        );
+
+        // A permission error is also not absence.
+        let denied = LogError::Io {
+            path: "/state/scan_x.jsonl".into(),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+        };
+        assert_eq!(no_such_log(denied).error, "log_unreadable");
     }
 
     #[test]

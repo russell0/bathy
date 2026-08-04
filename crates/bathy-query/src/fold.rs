@@ -353,7 +353,13 @@ pub fn fold_events(events: &[Event]) -> ScanFold {
                 let entry = fold.endpoints.entry((target.ip, *endpoint)).or_default();
                 entry.observation = Some(observation.clone());
                 entry.probe_id = Some(probe_id.clone());
-                entry.rule_id = Some(rule_id.clone());
+                // `None` here means the *record* did not name a rule -- an
+                // event written before `bd386e9` added the field. It is
+                // carried through as `null` rather than invented, and it
+                // reads the same as the `null` an endpoint nothing
+                // identified already publishes: no rule attribution
+                // available. See `docs/event-log-compatibility.md`.
+                entry.rule_id = rule_id.clone();
                 for digest in evidence_refs.iter() {
                     entry.cite(*digest);
                 }
@@ -515,7 +521,7 @@ fn tie_key(event: &Event) -> TieKey<'_> {
             key.version = observation.version.as_deref();
             key.confidence = Some(observation.confidence.get().to_bits());
             key.probe_id = Some(probe_id.as_str());
-            key.rule_id = Some(rule_id.as_str());
+            key.rule_id = rule_id.as_deref();
             key.digests = evidence_refs.as_slice();
         }
         EventBody::PolicyDenied {
@@ -704,7 +710,7 @@ pub(crate) mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest(&format!("{addr}:{port}:{sequence}"))),
                 probe_id: format!("{name}-probe-v1"),
-                rule_id: format!("{name}.rule.v1"),
+                rule_id: Some(format!("{name}.rule.v1")),
             },
         )
     }
@@ -1168,10 +1174,10 @@ pub(crate) mod tests {
         let mut first = service(1, "10.0.0.1", 443, "https", None, None, 0.9);
         let mut second = service(1, "10.0.0.1", 443, "https", None, None, 0.9);
         if let EventBody::ServiceObserved { rule_id, .. } = &mut first.body {
-            *rule_id = "https.server.a.v1".into();
+            *rule_id = Some("https.server.a.v1".into());
         }
         if let EventBody::ServiceObserved { rule_id, .. } = &mut second.body {
-            *rule_id = "https.server.b.v1".into();
+            *rule_id = Some("https.server.b.v1".into());
         }
         assert_ne!(tie_key(&first), tie_key(&second));
         assert_eq!(
@@ -1322,7 +1328,7 @@ mod proptests {
                         },
                         evidence_refs: NonEmpty::new(digest(&format!("svc-evidence-{refs}"))),
                         probe_id: format!("{name}-probe-v1"),
-                        rule_id: format!("{name}.rule.v1"),
+                        rule_id: Some(format!("{name}.rule.v1")),
                     }
                 }),
             1 => Just(EventBody::Progress {

@@ -547,7 +547,7 @@ mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest(evidence)),
                 probe_id: format!("{service}-probe-v1"),
-                rule_id: format!("{service}.rule.v1"),
+                rule_id: Some(format!("{service}.rule.v1")),
             },
         )
     }
@@ -1417,7 +1417,7 @@ mod proptests {
                         },
                         evidence_refs: NonEmpty::new(digest("evidence")),
                         probe_id: format!("{}-probe-v1", SERVICES[*service]),
-                        rule_id: format!("{}.rule.v1", SERVICES[*service]),
+                        rule_id: Some(format!("{}.rule.v1", SERVICES[*service])),
                     },
                 ));
             }

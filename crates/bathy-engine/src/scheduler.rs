@@ -1236,7 +1236,14 @@ impl Scheduler {
             observation: finding.observation,
             evidence_refs: NonEmpty::new(digest),
             probe_id: finding.probe_id.to_string(),
-            rule_id: finding.rule_id.to_string(),
+            // Always `Some`: `ServiceFinding::rule_id` is a `&'static str`
+            // taken from the interpretation that produced the observation, so
+            // there is no path here that has an observation and no rule. The
+            // `Option` on the wire type is a statement about *old* records,
+            // not about what this emitter may write -- see
+            // `docs/event-log-compatibility.md` and
+            // `a_freshly_written_log_always_names_the_rule_that_decided`.
+            rule_id: Some(finding.rule_id.to_string()),
         })?;
         Ok(())
     }

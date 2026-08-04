@@ -341,6 +341,56 @@ enum TailPolicy {
     SkipPartial,
 }
 
+/// The version this build stamps on every record it writes, and compares
+/// against when one will not load.
+const THIS_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// A record that would not deserialize, reported with the build that wrote it
+/// when that build is not this one.
+///
+/// This is the **only** reader of `Event::engine_version` in the workspace,
+/// and it exists because until the M5 blocker wave there were none: the field
+/// was written on every record and consulted nowhere, so when a record
+/// genuinely failed to load the error could say what was missing but not
+/// *which build's* record it was looking at. `engine_version` is provenance,
+/// not a compatibility switch -- nothing branches on it, and the
+/// compatibility rule is structural rather than version-gated (see
+/// `docs/event-log-compatibility.md`). Its job is to make the one failure
+/// that is not supposed to happen diagnosable when it does, and that job
+/// needs a reader to be a job at all.
+///
+/// Deliberately tolerant: the line is re-parsed as free-form JSON, and if it
+/// is not JSON, or carries no `engine_version`, or carries this build's, the
+/// detail is left exactly as serde reported it. A diagnostic that fails is a
+/// second failure on top of the first.
+fn malformed_record(
+    path: &Path,
+    line: usize,
+    text: &str,
+    detail: impl std::fmt::Display,
+) -> LogError {
+    let written_by = serde_json::from_str::<serde_json::Value>(text)
+        .ok()
+        .and_then(|v| {
+            v.get("engine_version")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        });
+    let detail = match written_by {
+        Some(version) if version != THIS_ENGINE_VERSION => format!(
+            "{detail} (this record was written by bathy {version} and this build is \
+             {THIS_ENGINE_VERSION}; a record is meant to outlive the build that wrote \
+             it, so this is a compatibility defect in this build, not in the log)"
+        ),
+        _ => detail.to_string(),
+    };
+    LogError::Malformed {
+        path: path.to_owned(),
+        line,
+        detail,
+    }
+}
+
 /// Validate a log file in one pass and return `(last_sequence, offsets,
 /// end_offset)` -- see [`EventLog::scan_existing`] for what each means and
 /// what counts as corruption, and [`TailPolicy`] for the one behavioural
@@ -408,11 +458,8 @@ fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), L
                 line: line_number,
                 detail: e.to_string(),
             })?;
-            let event: Event = serde_json::from_str(text).map_err(|e| LogError::Malformed {
-                path: path.to_owned(),
-                line: line_number,
-                detail: e.to_string(),
-            })?;
+            let event: Event = serde_json::from_str(text)
+                .map_err(|e| malformed_record(path, line_number, text, e))?;
             if event.sequence != expected {
                 return Err(LogError::SequenceGap {
                     path: path.to_owned(),
@@ -594,11 +641,8 @@ fn read_records_from(
         if line.is_empty() {
             continue;
         }
-        let event: Event = serde_json::from_str(&line).map_err(|e| LogError::Malformed {
-            path: path.to_owned(),
-            line: after_sequence as usize + i + 1,
-            detail: e.to_string(),
-        })?;
+        let event: Event = serde_json::from_str(&line)
+            .map_err(|e| malformed_record(path, after_sequence as usize + i + 1, &line, e))?;
         // Defensive, not load-bearing for correctness under normal
         // operation (the seek above should already land exactly on
         // sequence `after_sequence + 1`): costs nothing extra, since
@@ -851,6 +895,67 @@ mod tests {
                 }
             ),
             "expected a mid-file gap (expected 3, found 4), got {err:?}"
+        );
+    }
+
+    /// `engine_version` is written on every record. Until this, nothing in
+    /// the workspace read it, so the one field that could say *which build*
+    /// wrote an unloadable record said nothing. It is provenance, not a
+    /// compatibility switch -- and provenance nobody can read is decoration.
+    #[test]
+    fn a_record_this_build_cannot_read_names_the_build_that_wrote_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let lines = append_n_and_read_raw_lines(dir.path(), id, 2);
+
+        // A record from a future build, carrying a field this one has never
+        // heard of. `engine_version` is rewritten to match, because that is
+        // what a future build would have stamped on it.
+        let from_the_future = lines[1]
+            .replace(
+                &format!("\"engine_version\":\"{THIS_ENGINE_VERSION}\""),
+                "\"engine_version\":\"9.9.9\"",
+            )
+            .replace("\"event_type\"", "\"telemetry_budget\":3,\"event_type\"");
+        assert!(
+            from_the_future.contains("9.9.9") && from_the_future.contains("telemetry_budget"),
+            "fixture sanity: the record must genuinely be unreadable and genuinely \
+             claim another build, or this test proves nothing"
+        );
+        std::fs::write(
+            log_path(dir.path(), id),
+            format!("{}\n{}\n", lines[0], from_the_future),
+        )
+        .unwrap();
+
+        let err = EventLog::open(dir.path(), id).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("line 2"), "got {text}");
+        assert!(
+            text.contains("9.9.9") && text.contains(THIS_ENGINE_VERSION),
+            "the error must name both the writing build and this one, got {text}"
+        );
+    }
+
+    #[test]
+    fn a_record_written_by_this_build_is_not_accused_of_being_from_another() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let lines = append_n_and_read_raw_lines(dir.path(), id, 2);
+        // Same corruption, same version. The version note must not appear --
+        // a diagnostic that fires unconditionally carries no information.
+        let corrupt = lines[1].replace("\"event_type\"", "\"telemetry_budget\":3,\"event_type\"");
+        std::fs::write(
+            log_path(dir.path(), id),
+            format!("{}\n{corrupt}\n", lines[0]),
+        )
+        .unwrap();
+
+        let text = EventLog::open(dir.path(), id).unwrap_err().to_string();
+        assert!(text.contains("line 2"), "got {text}");
+        assert!(
+            !text.contains("this build is"),
+            "a same-version record needs no version note, got {text}"
         );
     }
 
