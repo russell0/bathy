@@ -860,6 +860,27 @@ execution, in code that had already passed its task review:**
 - **AC-4.27** Cancellation stops **new probe traffic**, not just new units. `record` runs from an unconditional drain loop, so a `detect_service` with no cancellation token opened a second connection and wrote 135 real bytes after cancel. The converse is equally a bug: the already-paid-for connect probe must still be drained (M3 invariant 2). Both halves need pinning in one test.
 - **AC-4.28** Stored evidence bytes are asserted to be **exactly the bytes that justified the finding**, the `evidence_level` caps are asserted at their exact values (8 KiB / 64 KiB), and `intensity` is asserted to bound the number of probe candidates attempted. Before these, replacing the evidence with `b"not the response"`, setting both caps to `1`, and hardcoding `intensity = 9` each survived the entire 91-test suite.
 
+**Tracked follow-up (M7) — `SMTP_GREETING_RE` cannot match a conformant bare `220\r\n`.**
+The pattern is `^220[ -]`, which requires a space or hyphen after the code. RFC
+5321's ABNF permits a final greeting line of `220` followed directly by CRLF,
+with no text — independently verified during the M4 fix-wave re-review. That is
+a **real false negative against a conformant server**, not a theoretical one.
+It was deliberately not fixed inside the citation-sweep commit, and that
+reasoning was ruled sound: widening a matcher changes what the rule set claims
+about real traffic and needs its own fixture and snapshot, not a ride-along in a
+commit whose purpose was correcting prose. Ruled MINOR — a narrow miss on an
+uncommon server configuration, in a rule that is already only one of several
+SMTP signals. Fix it with a captured fixture exhibiting the bare form.
+
+**Tracked follow-up (M7) — no test can prove a citation is *true*.**
+The clean-room guards check only that a `source:` field is present and that no
+source mentions Nmap. Neither catches a citation that is well-formed, plausible
+and fabricated — which is exactly the defect that occurred twice in this
+milestone, in quotation marks, asserting something stronger than the document
+said. Periodic manual sweeps against fetched primary sources are the only
+control that works, so M7 must schedule one rather than assume the existing
+guards cover it. Ruled MINOR as a code defect and IMPORTANT as a process one.
+
 **Tracked follow-up (M5) — cancelled identification is lost permanently and invisibly.**
 Ruled IMPORTANT by the Task 5 re-review, reproduced against
 `resuming_a_cancelled_scan_identifies_the_untouched_endpoint_without_re_probing`.

@@ -32,7 +32,8 @@ over MCP.
 > emits no `service.observed` at all). Eight protocols: HTTP, TLS, SSH, SMTP,
 > DNS, PostgreSQL, MySQL, Redis. Probe traffic is paced by the same rate limiter
 > and charged to the same packet budget as the connect scan, and the manifest is
-> re-checked before each reconnect. Identification can be turned off
+> re-checked before identification opens any connection at all. Identification
+> can be turned off
 > (`service_detection.enabled = false`), in which case no probe bytes are sent
 > at all.
 >
@@ -42,7 +43,7 @@ over MCP.
 > library call — see `crates/bathy-engine/tests/end_to_end_scan.rs` for exactly
 > that, exercised end to end against real sockets.
 >
-> Plans for all seven milestones — 192 numbered acceptance criteria — are in
+> Plans for all seven milestones — 204 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
 
 ## What works today
@@ -56,7 +57,7 @@ over MCP.
 | `bathy-plan` | Turns a `ScanRequest` into a deterministic, indexable `ScanPlan`: target expansion, port selection, and the content hash idempotency and resumption are built on. |
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by an absolute deadline, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
 | `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every finding carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
-| `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — one extra paced, budgeted, scope-checked connection per open port — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
+| `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
 Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
