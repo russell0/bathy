@@ -86,6 +86,12 @@ pub enum LogError {
     /// file.
     #[error("event log {path} is already open for writing by another process or handle")]
     Locked { path: PathBuf },
+    /// [`EventLog::release_writer_lock`] was called and then `append` was
+    /// tried anyway. Distinct from [`Self::Locked`], which is about a *second*
+    /// opener: this one is about *this* handle, which gave up its claim and
+    /// therefore no longer knows that `last_sequence + 1` is still free.
+    #[error("event log {path} was released by this writer and cannot be appended to")]
+    Released { path: PathBuf },
 }
 
 /// One append-only JSONL file per scan.
@@ -132,6 +138,14 @@ pub struct EventLog {
     /// internal counter would look identical either way. This field is the
     /// ground truth a test can check instead.
     sync_calls: std::sync::atomic::AtomicU64,
+    /// Set by [`Self::release_writer_lock`]. Once set, this handle has given
+    /// up the exclusive claim it took in `open` and another opener may
+    /// already hold it, so [`Self::append`] must refuse rather than write
+    /// into a file a second writer is now numbering records in. Reads
+    /// ([`Self::read_from`], [`Self::last_sequence`]) stay available: they
+    /// never needed the lock in the first place -- `EventLogReader` takes
+    /// none.
+    released: bool,
 }
 
 impl EventLog {
@@ -220,7 +234,37 @@ impl EventLog {
             end_offset,
             durable,
             sync_calls: std::sync::atomic::AtomicU64::new(0),
+            released: false,
         })
+    }
+
+    /// Gives up the exclusive writer lock `open` took, without closing the
+    /// file or dropping this handle.
+    ///
+    /// This exists because "the lock is released when the handle is dropped"
+    /// is not a schedulable event: a caller that has finished writing cannot
+    /// say *when* the drop happens relative to anything else it does. M5 Task
+    /// 4's fix review found the consequence -- a scheduler published
+    /// `cancelled` to the task store while its own log handle was still
+    /// alive several statements (and, detached, a whole `eprintln!` to a
+    /// pipe) away from being dropped, so an agent that polled for `cancelled`
+    /// and immediately resumed raced the release and was told
+    /// `log_unavailable`. An explicit release is orderable; a drop is not.
+    ///
+    /// After this returns, [`Self::append`] refuses with
+    /// [`LogError::Released`] -- the handle is no longer entitled to number
+    /// records, because someone else may now be doing so. Idempotent.
+    pub fn release_writer_lock(&mut self) -> Result<(), LogError> {
+        if self.released {
+            return Ok(());
+        }
+        // UFCS for the reason `open` uses it -- see the comment there.
+        fs4::FileExt::unlock(&self.file).map_err(|source| LogError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.released = true;
+        Ok(())
     }
 
     /// Validates an existing log file (if any) in one pass and returns
@@ -402,6 +446,11 @@ impl EventLog {
         clock: &dyn Clock,
         engine_version: &str,
     ) -> Result<Event, LogError> {
+        if self.released {
+            return Err(LogError::Released {
+                path: self.path.clone(),
+            });
+        }
         let event = Event {
             scan_id: self.scan_id,
             sequence: self.last_sequence + 1,

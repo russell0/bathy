@@ -178,6 +178,21 @@ impl GroupCommitLog {
         Ok(())
     }
 
+    /// Gives up the wrapped log's exclusive writer lock; see
+    /// [`EventLog::release_writer_lock`] for why an explicit, orderable
+    /// release exists at all. Syncs first, unconditionally: anything this
+    /// type is still batching would otherwise be handed to the next writer
+    /// as an un-synced tail. (Nothing is pending on the path `Scheduler::run`
+    /// takes -- it force-syncs immediately before -- so this costs no extra
+    /// syscall there, which is why `sync_calls` assertions elsewhere still
+    /// hold.)
+    pub fn release_writer_lock(&mut self) -> Result<(), LogError> {
+        if self.pending > 0 {
+            self.sync_now()?;
+        }
+        self.log.release_writer_lock()
+    }
+
     pub fn scan_id(&self) -> ScanId {
         self.log.scan_id()
     }

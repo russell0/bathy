@@ -474,6 +474,41 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Announces this run's outcome, and the ONLY place a terminal
+    /// `TaskStatus` is written.
+    ///
+    /// **The contract this function exists to hold: a scan whose stored
+    /// status is terminal has already released its event log's writer
+    /// lock.** The release is the first statement here, before the store
+    /// write, so an observer cannot see the outcome while this run still
+    /// owns the log.
+    ///
+    /// Why that is worth a function rather than two adjacent statements: M5
+    /// Task 4's fix review found `cancel_and_resume_round_trip_through_the_tool_surface`
+    /// failing ~2 runs in 20 under load with `log_unavailable`. `run` wrote
+    /// `Cancelled` to the store and then released the log by *dropping* the
+    /// `Scheduler`, which for a detached scan happens after `watcher.abort()`
+    /// and an `eprintln!` to a pipe. `status == cancelled` therefore did not
+    /// mean the writer had let go, so an agent that polled for `cancelled`
+    /// and resumed -- the documented way to do exactly that -- lost the race
+    /// and was told the log belonged to someone else. That was a defect in
+    /// the product, not in the test: the answer was confusing and the
+    /// request was legitimate.
+    ///
+    /// Keeping the two writes in one function means the ordering cannot be
+    /// broken by editing either one alone, and it puts the reason next to
+    /// the code rather than in a review document.
+    ///
+    /// The converse now holds too, and is what makes `log_unavailable`
+    /// meaningful: a resume refused for a locked log is refused because
+    /// another writer is genuinely live, never because a finished one has
+    /// not got around to closing its file.
+    fn publish_terminal_status(&self, status: TaskStatus) -> Result<(), EngineError> {
+        self.log_guard().release_writer_lock()?;
+        self.store.set_status(self.scan_id, status)?;
+        Ok(())
+    }
+
     /// The TOTAL wall-clock runtime this scan has used, across every run --
     /// this ledger's own resumption baseline (`BudgetLedger::seconds_already_elapsed`,
     /// zero unless this `Scheduler` was built with `BudgetLedger::resumed`)
@@ -545,6 +580,16 @@ impl Scheduler {
     /// `BudgetLedger`) over the same `scan_id`, which this guard does not
     /// and cannot see, since it only inspects the log this instance was
     /// opened against.
+    ///
+    /// **One run per `Scheduler`.** A clean return publishes the terminal
+    /// status, and doing so releases the event log's writer lock (see
+    /// [`Self::publish_terminal_status`]), so a second `run` on the same
+    /// instance would append through a handle that no longer holds the
+    /// exclusive claim -- it is refused with `LogError::Released` rather
+    /// than allowed to interleave with whoever holds the log now. Both
+    /// surfaces already build a fresh `Scheduler` over a freshly opened log
+    /// for every start and every resume; this makes that the only thing
+    /// that works, rather than the thing they happen to do.
     pub async fn run(
         &self,
         plan: &ScanPlan,
@@ -805,7 +850,7 @@ impl Scheduler {
         // (M2's mechanism for telling a repeat idempotency key what
         // happened to the original scan) could therefore never report
         // anything but `Pending`, indistinguishable from "never started".
-        if summary.budget_exhausted {
+        let terminal = if summary.budget_exhausted {
             self.log(EventBody::ScanFailed {
                 reason_code: "budget_exhausted".into(),
                 detail: format!(
@@ -813,7 +858,7 @@ impl Scheduler {
                     summary.units_completed
                 ),
             })?;
-            self.store.set_status(self.scan_id, TaskStatus::Failed)?;
+            TaskStatus::Failed
         } else if summary.time_exhausted {
             self.log(EventBody::ScanFailed {
                 reason_code: "time_exhausted".into(),
@@ -822,24 +867,24 @@ impl Scheduler {
                     summary.units_completed
                 ),
             })?;
-            self.store.set_status(self.scan_id, TaskStatus::Failed)?;
+            TaskStatus::Failed
         } else if let Some((reason_code, detail)) = policy_denial {
             summary.policy_denied = true;
             self.log(EventBody::PolicyDenied {
                 reason_code,
                 detail,
             })?;
-            self.store.set_status(self.scan_id, TaskStatus::Denied)?;
+            TaskStatus::Denied
         } else if summary.cancelled {
-            self.store.set_status(self.scan_id, TaskStatus::Cancelled)?;
+            TaskStatus::Cancelled
         } else {
             self.log(EventBody::ScanCompleted {
                 probes_sent: summary.units_completed,
                 packets_spent: summary.packets_spent,
                 findings: summary.open_ports,
             })?;
-            self.store.set_status(self.scan_id, TaskStatus::Completed)?;
-        }
+            TaskStatus::Completed
+        };
 
         // A clean return from `run` -- of any kind, including cancellation,
         // which emits no terminal event of its own -- always leaves the log
@@ -852,6 +897,9 @@ impl Scheduler {
             summary.packets_spent,
             self.total_elapsed_seconds(started),
         )?;
+        // Everything this run had to write is written; only now is the
+        // outcome announced. See `publish_terminal_status`.
+        self.publish_terminal_status(terminal)?;
 
         Ok(summary)
     }
@@ -1554,7 +1602,33 @@ mod tests {
         /// scheduler's real throttle (IMPORTANT-2), and `manifest` reuses
         /// the SAME authorization boundary `self.scheduler` was built with,
         /// via the `manifest` field above.
-        fn resume(&self, config: SchedulerConfig, budgets: Budgets) -> Scheduler {
+        ///
+        /// M5 Task 4 flake fix: this now **reopens** the log rather than
+        /// handing the previous run's handle to the new `Scheduler`, because
+        /// that is what a real resume does -- `tools::scan::prepare_resume`
+        /// opens a fresh `GroupCommitLog` every time. A run releases its
+        /// writer lock when it publishes its terminal status
+        /// (`publish_terminal_status`), so a handle from a finished run is
+        /// spent: reusing it here would have this harness exercise a
+        /// lifecycle no surface performs. Reopening also refreshes
+        /// `last_sequence`/`offsets`, which is what keeps `events()` able to
+        /// see what the resumed run wrote.
+        fn resume(&mut self, config: SchedulerConfig, budgets: Budgets) -> Scheduler {
+            // The handle currently in hand may be a spent one (its run
+            // published a terminal status and released it) or a live one
+            // (`make_harness`'s own `scheduler` was built but never run).
+            // Releasing is idempotent, so this covers both and models the
+            // one thing a real resume can rely on: the previous writer has
+            // let go before the next one opens.
+            self.log
+                .lock()
+                .unwrap()
+                .release_writer_lock()
+                .expect("releasing an advisory lock this process holds");
+            self.log = Arc::new(Mutex::new(
+                GroupCommitLog::open(self._dir.path(), self.scan_id, GroupCommitConfig::default())
+                    .expect("the previous writer released the log before this open"),
+            ));
             let record = self.store.get(self.scan_id).unwrap().unwrap();
             let ledger =
                 BudgetLedger::resumed(budgets, record.packets_spent, record.elapsed_seconds);
@@ -1943,6 +2017,104 @@ mod tests {
             EventBody::ScanCompleted { .. }
         ));
         assert_eq!(summary.units_completed, 1);
+    }
+
+    /// The contract `Scheduler::publish_terminal_status` exists to hold: by
+    /// the time a scan's stored status is terminal, the run has already let
+    /// go of its event log -- even though the `Scheduler` that wrote it, and
+    /// the log handle it owns, are both still alive here and will stay alive
+    /// until the end of this function.
+    ///
+    /// `EventLog::open` takes the very same exclusive advisory lock the
+    /// scheduler took, so this measures the writer's ground truth rather
+    /// than asserting about it. `fs4`'s lock is per open file description,
+    /// so a second `open` from *this* process is refused exactly as one from
+    /// another process would be -- which is what makes the check
+    /// deterministic instead of a race with a drop.
+    ///
+    /// Both terminal shapes, because they are different code paths: the
+    /// completed one writes a `scan.completed` event first, the cancelled
+    /// one deliberately writes no terminal event at all, and it is the
+    /// cancelled one M5 Task 4's review caught failing under load.
+    ///
+    /// Deleting the `release_writer_lock` call in `publish_terminal_status`
+    /// fails this on every run, not one in ten.
+    #[tokio::test]
+    async fn a_terminal_status_is_not_published_until_the_event_log_is_released() {
+        for (expected, cancel) in [
+            (TaskStatus::Completed, CancellationToken::new()),
+            (TaskStatus::Cancelled, {
+                let token = CancellationToken::new();
+                token.cancel();
+                token
+            }),
+        ] {
+            let port = open_port().await;
+            let h = harness(&["127.0.0.1"], &[port]);
+            h.scheduler.run(&h.plan, 0, cancel).await.unwrap();
+
+            // The status an agent polls for is on disk...
+            assert_eq!(
+                h.store.get(h.scan_id).unwrap().unwrap().status,
+                expected,
+                "the run did not reach the terminal status this case is about"
+            );
+            // ...and the log it would then resume into is already free,
+            // with `h.scheduler` still holding its own handle open.
+            let reopened = bathy_evidence::EventLog::open(h._dir.path(), h.scan_id);
+            assert!(
+                reopened.is_ok(),
+                "the store says {expected:?} but the writer had not released the log: {:?}. \
+                 An agent that polls for a terminal status and resumes -- the documented \
+                 handoff -- would be told `log_unavailable` for no reason it can act on.",
+                reopened.err()
+            );
+            drop(reopened);
+            drop(h);
+        }
+    }
+
+    /// The other half of the same contract, at the layer that enforces it: a
+    /// handle that has given up its claim must not keep numbering records,
+    /// because a second writer may already be doing so. Without the
+    /// `released` check in `EventLog::append` the release would be a way to
+    /// produce exactly the interleaved, duplicated sequence numbers the lock
+    /// exists to prevent.
+    #[test]
+    fn a_released_log_refuses_further_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let clock = bathy_types::clock::FixedClock::new("2026-08-04T00:00:00.000Z", 7).unwrap();
+        let id: ScanId = "scan_01ARZ3NDEKTSV4RRFFQ69G5FAV".parse().unwrap();
+        let mut log = GroupCommitLog::open(dir.path(), id, GroupCommitConfig::default()).unwrap();
+        log.append(
+            EventBody::ScanStarted {
+                plan_hash: Digest::of_bytes(b"x"),
+                estimated_targets: 1,
+                estimated_probes: 1,
+            },
+            &clock,
+            "0.1.0",
+        )
+        .unwrap();
+        log.release_writer_lock().unwrap();
+        let err = log
+            .append(
+                EventBody::ScanCompleted {
+                    probes_sent: 1,
+                    packets_spent: 1,
+                    findings: 0,
+                },
+                &clock,
+                "0.1.0",
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, LogError::Released { .. }),
+            "a released handle appended anyway: {err:?}"
+        );
+        // And releasing twice is not an error -- the caller should not have
+        // to track whether it already did.
+        log.release_writer_lock().unwrap();
     }
 
     // Real-time sleep, flagged per the dispatch's instruction: this exactly
@@ -2600,7 +2772,7 @@ mod tests {
         // slow pacing, only its unspent budget.
         let scan_budgets = budgets(CEILING, 3_600, 3);
         let resume_budgets = budgets(CEILING, 3_600, 1_000_000);
-        let (h, counts) =
+        let (mut h, counts) =
             harness_with_real_listeners(PLAN_SIZE, scan_budgets, small_config()).await;
         assert_eq!(h.plan.len(), PLAN_SIZE);
 
@@ -2690,7 +2862,7 @@ mod tests {
         // time has genuinely passed, so `elapsed_seconds` persists as >= 1
         // -- not calculated by hand, but the scheduler's own
         // `total_elapsed_seconds` doing real `Instant` bookkeeping.
-        let h = harness_with_many_units(5_000);
+        let mut h = harness_with_many_units(5_000);
         let cancel = CancellationToken::new();
         let c = cancel.clone();
         tokio::spawn(async move {
@@ -2760,7 +2932,7 @@ mod tests {
         // third round's cancellation ever fires -- confirmed empirically
         // (5,000 let round 3 exhaust the plan naturally instead of being
         // cancelled).
-        let h = harness_with_many_units(20_000);
+        let mut h = harness_with_many_units(20_000);
         // Generous on packets and runtime, but deliberately paced at 1,000
         // pps -- cancellation (not budget exhaustion) must be what stops
         // every round, so each round's own elapsed time is genuinely under
@@ -3137,7 +3309,7 @@ mod tests {
         // cancel/resume round," and an enabled detection setting would add
         // its own reconnects onto the exact same counters for an unrelated
         // reason.
-        let h = make_harness_with_detection(
+        let mut h = make_harness_with_detection(
             &["127.0.0.1"],
             &spec_refs,
             // pps=8 folded directly into the ceiling-bearing `Budgets`
@@ -3198,8 +3370,20 @@ mod tests {
         assert!(first.units_completed > 0, "must have made progress");
 
         let resume_from = h.store.next_pending_unit(h.scan_id, N).unwrap().unwrap();
+        // A fresh `Scheduler` over a freshly opened log, which is the only
+        // shape a resume takes on either surface: a run releases its event
+        // log when it publishes its terminal status, so the cancelled run's
+        // own `Scheduler` is spent and calling `run` on it again would
+        // exercise a lifecycle nothing performs.
         let second = h
-            .scheduler
+            .resume(
+                SchedulerConfig {
+                    concurrency: 10,
+                    connect_timeout: Duration::from_secs(5),
+                    progress_every: 500,
+                },
+                budgets(1_000_000, 3_600, 8),
+            )
             .run(&h.plan, resume_from, CancellationToken::new())
             .await
             .unwrap();
@@ -4863,7 +5047,7 @@ mod tests {
         // ever needs closing; out of scope for this fix round.
         let stub_a = spawn_http_stub().await;
         let stub_b = spawn_http_stub().await;
-        let h = make_harness_with_detection(
+        let mut h = make_harness_with_detection(
             &["127.0.0.1"],
             &[&stub_a.port().to_string(), &stub_b.port().to_string()],
             budgets(1_000_000, 3_600, 1),

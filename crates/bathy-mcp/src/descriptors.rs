@@ -166,7 +166,10 @@ pub fn all() -> Vec<Tool> {
             "Ask a running scan to stop. Probes already in flight are drained rather than \
              dropped, so the results already obtained stay usable and the scan stays \
              resumable from where it left off. The request is recorded even if the scan is \
-             running in another process.",
+             running in another process. It returns as soon as the request is recorded, \
+             not when the scan has stopped: to resume afterwards, wait for `scan.status` \
+             to report `cancelled` first, which is the point at which the stopped run has \
+             released the log and a resume can take it.",
             input = t::ScanCancelInput,
             output = t::ScanCancelOutput,
             annotations = changes_local_state(),
@@ -200,7 +203,10 @@ pub fn all() -> Vec<Tool> {
              first unfinished unit. **This emits packets**, exactly as starting one does. \
              The manifest is evaluated again rather than trusted: a manifest that has \
              expired or narrowed since the scan began refuses the resume. Budgets already \
-             spent carry over, so a resume cannot be used to escape a ceiling.",
+             spent carry over, so a resume cannot be used to escape a ceiling. A scan that \
+             is still running cannot be resumed and is refused with `log_unavailable`; \
+             that refusal changes nothing, so it is safe to retry, and waiting for \
+             `scan.status` to report a terminal status is what makes it unnecessary.",
             input = t::ScanResumeInput,
             output = t::ScanResumeOutput,
             annotations = emits_packets(false),

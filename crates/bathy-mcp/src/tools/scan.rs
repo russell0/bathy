@@ -1,6 +1,9 @@
 //! `scan.preview`, `scan.start`, `scan.status`, `scan.events`, `scan.cancel`
 //! and `scan.resume`.
 
+use std::sync::{Arc, Mutex};
+
+use bathy_engine::{GroupCommitConfig, GroupCommitLog};
 use bathy_evidence::EventLogReader;
 use bathy_scope::BudgetLedger;
 use bathy_store::{StartOutcome, StartRequest, TaskStore};
@@ -126,6 +129,33 @@ pub struct Work {
     /// a resume.
     pub from_index: u64,
     pub ledger: BudgetLedger,
+    /// The scan's event log, **already open and locked**, handed to whichever
+    /// surface runs the work.
+    ///
+    /// It is opened before this `Work` exists, and therefore before the
+    /// cancel marker is cleared and before the status is written, because
+    /// taking the writer lock is the one step that can still legitimately
+    /// fail at this point -- another process may be running this same scan.
+    /// Opening it afterwards (which is what both surfaces used to do) meant a
+    /// refused resume had already cleared the marker and stamped the scan
+    /// `running`, leaving a scan that no process was running and no poll
+    /// would ever see finish. Acquire first, mutate second: a refusal is now
+    /// a no-op the caller can simply retry.
+    pub log: Arc<Mutex<GroupCommitLog>>,
+}
+
+/// Opens `scan_id`'s event log for writing, taking its exclusive lock.
+///
+/// `log_unavailable` from here means exactly one thing: another writer is
+/// live. It can no longer mean "a run that already finished has not got
+/// around to closing its file" -- see `Scheduler::publish_terminal_status`,
+/// which releases the lock before publishing a terminal status, so a scan
+/// whose status `scan.status` reports as terminal has already let go.
+fn open_log(runtime: &Runtime, scan_id: ScanId) -> ToolResult<Arc<Mutex<GroupCommitLog>>> {
+    Ok(Arc::new(Mutex::new(
+        GroupCommitLog::open(&runtime.state_dir, scan_id, GroupCommitConfig::default())
+            .map_err(|e| ToolFailure::new("log_unavailable", e))?,
+    )))
 }
 
 /// What admitting a scan into the store produced.
@@ -184,16 +214,22 @@ pub fn admit_into_store(authorized: &AuthorizedScan, runtime: &Runtime) -> ToolR
         status,
     };
 
-    let work = fresh.then(|| {
+    let work = if fresh {
+        // The log first -- see `Work::log`: nothing about this scan's state
+        // is touched until the writer lock is actually in hand.
+        let log = open_log(runtime, scan_id)?;
         // Before any work begins, so a marker written for an earlier run of
         // this scan cannot cancel this one on the watcher's first look.
         bathy_engine::cancel::clear(&runtime.state_dir, scan_id);
-        Work {
+        Some(Work {
             scan_id,
             from_index: 0,
             ledger: BudgetLedger::new(authorized.request().budgets),
-        }
-    });
+            log,
+        })
+    } else {
+        None
+    };
 
     Ok(Admission {
         output: ScanStartOutput {
@@ -217,6 +253,7 @@ pub fn begin(authorized: AuthorizedScan, runtime: &Runtime) -> ToolResult<ScanSt
             work.scan_id,
             work.from_index,
             work.ledger,
+            work.log,
         )?;
     }
     Ok(admission.output)
@@ -387,6 +424,11 @@ pub fn prepare_resume(input: &ScanResumeInput, runtime: &Runtime) -> ToolResult<
         });
     };
 
+    // The writer lock first, and only then the two state changes -- see
+    // `Work::log`. A resume refused here leaves the scan exactly as it was,
+    // which is what makes `log_unavailable` a transient the caller can retry
+    // rather than a refusal that also damaged the thing it refused.
+    let log = open_log(runtime, input.scan_id)?;
     // Before any work begins; see `admit_into_store`.
     bathy_engine::cancel::clear(&runtime.state_dir, input.scan_id);
     runtime
@@ -417,6 +459,7 @@ pub fn prepare_resume(input: &ScanResumeInput, runtime: &Runtime) -> ToolResult<
                 scan_id: input.scan_id,
                 from_index,
                 ledger,
+                log,
             },
         )),
     })
@@ -432,6 +475,7 @@ pub fn resume(input: ScanResumeInput, runtime: &Runtime) -> ToolResult<ScanResum
             work.scan_id,
             work.from_index,
             work.ledger,
+            work.log,
         )?;
     }
     Ok(resumption.output)

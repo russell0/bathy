@@ -7,7 +7,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use bathy_engine::{GroupCommitConfig, GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
+use bathy_engine::{GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
 use bathy_evidence::EvidenceStore;
 use bathy_plan::ScanPlan;
 use bathy_probe::ProbeRegistry;
@@ -167,18 +167,18 @@ impl AuthorizedScan {
 /// Detached deliberately: the caller has already written the handle, and this
 /// server stays alive to answer further calls while the scan runs. That is
 /// what makes a start return in well under a second regardless of scan size.
+///
+/// Takes the already-opened event log rather than opening one: the writer
+/// lock has to be acquired before the caller mutates any of this scan's
+/// state, not after. See `tools::scan::Work::log`.
 pub fn spawn_scan(
     runtime: &Runtime,
     authorized: AuthorizedScan,
     scan_id: ScanId,
     from_index: u64,
     ledger: BudgetLedger,
+    log: Arc<Mutex<GroupCommitLog>>,
 ) -> ToolResult<()> {
-    let log = Arc::new(Mutex::new(
-        GroupCommitLog::open(&runtime.state_dir, scan_id, GroupCommitConfig::default())
-            .map_err(|e| ToolFailure::new("log_unavailable", e))?,
-    ));
-
     let scheduler = Scheduler::new(
         ledger,
         Arc::clone(authorized.manifest()),

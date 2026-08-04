@@ -308,6 +308,59 @@ failure document, and both carry the engine's own reason code.
 
 ---
 
+## The cancel/resume handoff
+
+**A scan whose stored status is terminal has already released its event log's
+writer lock.** That is the contract, and it is what makes "poll `scan.status`
+until it reports `cancelled`, then `scan.resume`" — the documented way to stop
+and continue a scan — actually work.
+
+It did not, briefly. `Scheduler::run` wrote `Cancelled` to the task store and
+then released the log by *dropping* the scheduler, which for a detached scan
+happens after the cancellation watcher is aborted and after a line is written
+to standard error. Under load the drop lagged the status, so an agent that
+polled for `cancelled` and immediately resumed opened the log while the
+previous writer still held it and was told `log_unavailable`. M5 Task 4's fix
+review caught this as a test failing about 2 runs in 20, but it was a race in
+the product: the request was legitimate and the answer was confusing.
+
+Three contracts were available and only one of them is right.
+
+- *`scan.cancel` returns only once the writer has released.* Rejected.
+  Cancellation drains probes already in flight, so this would make a cancel
+  block for as long as the scan's longest outstanding probe — and `scan.cancel`
+  is deliberately answerable for a scan running in **another process**, which
+  this process cannot wait on at all.
+- *`scan.resume` waits for the lock.* Rejected. It converts a genuine conflict
+  — someone else really is scanning this — into a timeout, and makes the
+  common, correct case (nobody is) pay a scheduling round-trip for the rare
+  one.
+- *Release before publishing the status.* Taken. The release is the first
+  statement of `Scheduler::publish_terminal_status`, which is the only place a
+  terminal `TaskStatus` is written, so the ordering cannot be broken by editing
+  either write alone. `EventLog::release_writer_lock` exists precisely because
+  a drop is not a schedulable event and an explicit release is.
+
+Two consequences worth writing down:
+
+- `log_unavailable` now means exactly one thing — **another writer is live** —
+  rather than that plus "a finished run has not closed its file yet". A
+  `Scheduler` is single-run: appending through a released handle is refused
+  with `LogError::Released` rather than allowed to interleave.
+- A refused resume is a **no-op**. Both surfaces now take the writer lock
+  *before* clearing the cancel marker and stamping the scan `running`, so a
+  refusal leaves the scan exactly as it was and can simply be retried.
+  Previously the refusal happened after those two writes, leaving a scan marked
+  `running` that no process was running and no poll would ever see finish.
+
+Guarded by `a_terminal_status_is_not_published_until_the_event_log_is_released`
+(both terminal shapes, deterministic — it reopens the log while the scheduler
+that wrote the status is still alive) and by
+`cancel_and_resume_round_trip_through_the_tool_surface`, which is the flake
+this closed.
+
+---
+
 ## Deliberately not implemented
 
 ### The `io.modelcontextprotocol/tasks` extension

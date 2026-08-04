@@ -43,7 +43,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use bathy_engine::{GroupCommitConfig, GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
+use bathy_engine::{GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
 use bathy_mcp::engine::{AuthorizedScan, Runtime};
 use bathy_mcp::tools;
 use bathy_types::clock::Clock;
@@ -189,13 +189,9 @@ async fn run_to_completion(
     scan_id: ScanId,
     from_index: u64,
     ledger: bathy_scope::BudgetLedger,
+    log: Arc<Mutex<GroupCommitLog>>,
     emitter: &Emitter,
 ) -> Result<ExitCode, CliError> {
-    let log = Arc::new(Mutex::new(
-        GroupCommitLog::open(&runtime.state_dir, scan_id, GroupCommitConfig::default())
-            .map_err(|e| CliError::operational("log_unavailable", e))?,
-    ));
-
     let scheduler = Scheduler::new(
         ledger,
         Arc::clone(authorized.manifest()),
@@ -305,6 +301,7 @@ pub async fn start(
         work.scan_id,
         work.from_index,
         work.ledger,
+        work.log,
         emitter,
     )
     .await
@@ -343,6 +340,7 @@ pub async fn resume(
         work.scan_id,
         work.from_index,
         work.ledger,
+        work.log,
         emitter,
     )
     .await
