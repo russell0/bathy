@@ -95,14 +95,20 @@ treats it as such: expect rough edges around the newest features (Multi
 Round-Trip requests, `server/discover`, the Tasks extension) rather than
 parity with the TypeScript reference.
 
-In practice, on the surface this task needed: **`rmcp` expressed everything the
-specification required, with no workaround.** Specifically it provided
-`DiscoverResult` and the `-32022` error with `data.supported`; `resultType`
-including `input_required`; `InputRequiredResult` with `inputRequests` and
-`requestState`; `ttlMs`/`cacheScope` on `tools/list`; all four tool
-annotations; `structuredContent`; and — behind the `request-state` feature —
+The SDK's **vocabulary** is complete: it provided `DiscoverResult` and the
+`-32022` error with `data.supported`; `resultType` including `input_required`;
+`InputRequiredResult` with `inputRequests` and `requestState`;
+`ttlMs`/`cacheScope` on `tools/list`; all four tool annotations;
+`structuredContent`; and — behind the `request-state` feature —
 `RequestStateCodec`, an HMAC-SHA256 seal with associated-data binding and a
-TTL. Two caveats worth writing down rather than discovering later:
+TTL. Every message shape the specification asks for exists as a type.
+
+**Its stdio *behaviour* is not, and this section previously said it was.** The
+sentence that stood here until the M5 whole-branch review — *"`rmcp` expressed
+everything the specification required, with no workaround"* — was false, and it
+was false in the direction that matters: it was the sentence a maintainer would
+have trusted instead of driving the wire. Three deviations, one of which needed
+code:
 
 - **The codec does not, and says it does not, provide single-use.** A copy of a
   valid token is a valid token. Replay prevention is server-side work, and it
@@ -114,6 +120,78 @@ TTL. Two caveats worth writing down rather than discovering later:
   real results from every tool — and that checker is the *only* thing behind
   the declaration on this side of the wire. See "Structured results" below for
   what it checks and what it cannot.
+- **On stdio, the SDK ends the *process* rather than the *request* when the
+  first message cannot open the inline lifecycle.** Worked around, in
+  `crates/bathy-mcp/src/lifecycle.rs`. This is the one that needed code, and it
+  is written out below.
+
+### The opening request: what the SDK does, and what this server does instead
+
+`rmcp::service::server::serve_server_with_ct_inner` peeks at the first message
+and decides once whether the connection is Modern or Legacy. The decision is
+`RequestMetaObject::missing_required_keys`, whose
+`DRAFT_REQUIRED_KEYS` are `io.modelcontextprotocol/protocolVersion` **and**
+`io.modelcontextprotocol/clientCapabilities` — `clientInfo` is optional in this
+revision and its absence is fine. When either required key is absent or does
+not decode, the SDK returns `ServerInitializeError::ExpectedInitializeRequest`
+from `serve()` itself: `bathy serve mcp` exited, **standard output carried
+nothing** — no `-32022`, no error object, a closed pipe — and any scan running
+detached in that process died with it.
+
+That behaviour was reachable from a request a client can send by accident, and
+the sharpest case is a client that names a version this server does not
+implement and nothing else: `-32022` with `data.supported` is exactly the
+answer the specification requires there and exactly the answer it did not get.
+It is also asymmetric within the SDK — `rmcp`'s own Streamable HTTP transport
+validates the same `_meta` at the transport boundary and answers a bad opener
+with a JSON-RPC error while keeping the connection
+(`validate_request_protocol_version_meta` in
+`rmcp::transport::streamable_http_server::tower`). The stdio path is the one
+that does not.
+
+`lifecycle::AnswersTheOpener` supplies it there: a transport wrapper that
+applies the SDK's own validation to the opening request, using the SDK's own
+`missing_required_keys`, the server's own `supported_protocol_versions()`, and
+the SDK's own `ErrorData` constructors in the order
+`rmcp::handler::server::handle_request` applies them to every *later* request.
+So the answer to a given `_meta` does not depend on whether it opened the
+connection, and that is asserted rather than claimed —
+`an_opening_request_is_answered_exactly_as_the_same_request_is_answered_later`
+drives every shape in both positions and compares the whole reply. What the
+shipped server now does:
+
+| Opening request's `_meta` | Answer |
+|---|---|
+| version + capabilities (+ optional `clientInfo`) | served |
+| version present, capabilities absent | `-32602` naming `clientCapabilities` |
+| capabilities present, version absent | `-32602` naming `protocolVersion` |
+| `{}`, or no `_meta` at all | `-32602` naming both |
+| a version this server does not implement, with or without the rest | `-32022` with `data.supported` |
+| a malformed version (a key that does not decode counts as absent) | `-32602` naming `protocolVersion` |
+| an `initialize` handshake | answered, and the session that opens is a Legacy session: its later requests carry no per-request `_meta` and must not be asked for any |
+| a `ping` | answered by the SDK, and the lifecycle stays closed |
+
+In every case the connection stays up and the client may correct itself. A
+client that reads a refusal and hangs up exits `bathy serve mcp` with status 0:
+a session that ended is not a server that failed, and a supervisor must not be
+made to restart-loop by one badly-shaped request.
+
+### `ping` after a non-ping request answers `-32601`
+
+A conformance defect in the SDK's routing, recorded here rather than fixed.
+`rmcp::handler::server::handle_request` answers `ping` only when the request is
+`legacy_request`; on a Modern connection, and on any connection after the first
+request, it returns `method_not_found`. `ping` is a base-protocol utility every
+server must answer, not a capability that may be absent, so `-32601` is the
+wrong answer.
+
+Not fixed here, and the reason is that the two places it could be fixed are
+both worse than the defect. The check runs *before* dispatch, so overriding
+`ServerHandler::ping` does not reach it; the only remaining seam is
+`AnswersTheOpener`, and intercepting `ping` in the transport would answer it
+somewhere the SDK cannot see, so an SDK release that fixes its own routing
+would produce two answers to one request. Impact is low — a `-32601` is still a
+reply, and liveness is what a client pings for. Revisit when `rmcp` moves.
 
 ### Why this crate does not use `rmcp`'s tool macros
 

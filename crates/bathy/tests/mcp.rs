@@ -567,6 +567,246 @@ fn the_server_answers_without_an_initialize_handshake() {
     assert_eq!(tools.len(), 11);
 }
 
+// ---------------------------------------------------------------------------
+// `_meta` shape, as a dimension of the fixture rather than as one value.
+//
+// This block exists because of what its absence hid. Every protocol test in
+// this file used to go through `Server::meta()`, which emits all three keys --
+// the one shape the shipped server could serve. Every other shape a client can
+// send made `bathy serve mcp` exit with **nothing on standard output**: no
+// `-32022`, no error object, a closed pipe, and any detached scan in that
+// process gone with it. Thirty-eight tests passed over a server that did not
+// work against a client shaped differently from the harness.
+//
+// That is the Global Constraint added at this very milestone -- *a fixture
+// that satisfies every branch tests none of them* -- applied to the transport
+// instead of to a filter. So `_meta` is a dimension here: the table below is
+// the set of shapes a client can put on a request, and it is driven twice, as
+// the request that opens the connection and as a request on an open one.
+// ---------------------------------------------------------------------------
+
+/// What the server owes a request carrying a given `_meta`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Owed {
+    /// A result. The shape is complete enough to serve.
+    Result,
+    /// `-32602`, naming exactly these `_meta` keys as missing or malformed.
+    MissingKeys(&'static [&'static str]),
+    /// `-32022`, carrying the list this server does implement.
+    UnsupportedVersion,
+}
+
+const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
+
+/// Every `_meta` shape a client can send, and what each is owed.
+///
+/// The `params` value is the *whole* params object, so "no `_meta` at all" is
+/// a row rather than a special case.
+fn meta_shapes() -> Vec<(&'static str, Value, Owed)> {
+    let info = json!({ "name": "shape", "version": "0.0.0" });
+    vec![
+        (
+            "version, clientInfo and capabilities",
+            json!({ "_meta": { VERSION_KEY: PROTOCOL, INFO_KEY: info, CAPABILITIES_KEY: {} } }),
+            Owed::Result,
+        ),
+        (
+            // `RequestMetaObject::DRAFT_REQUIRED_KEYS` is version and
+            // capabilities; `clientInfo` is optional in this revision. A row
+            // rather than a remark, because the milestone review reported all
+            // three as required and a shape the server accepts must be a shape
+            // some test names.
+            "version and capabilities, no clientInfo",
+            json!({ "_meta": { VERSION_KEY: PROTOCOL, CAPABILITIES_KEY: {} } }),
+            Owed::Result,
+        ),
+        (
+            "declaring capabilities explicitly rather than emptily",
+            json!({ "_meta": { VERSION_KEY: PROTOCOL, CAPABILITIES_KEY: { "elicitation": {} } } }),
+            Owed::Result,
+        ),
+        (
+            "version and clientInfo, no capabilities",
+            json!({ "_meta": { VERSION_KEY: PROTOCOL, INFO_KEY: info } }),
+            Owed::MissingKeys(&[CAPABILITIES_KEY]),
+        ),
+        (
+            "version alone",
+            json!({ "_meta": { VERSION_KEY: PROTOCOL } }),
+            Owed::MissingKeys(&[CAPABILITIES_KEY]),
+        ),
+        (
+            "capabilities alone",
+            json!({ "_meta": { CAPABILITIES_KEY: {} } }),
+            Owed::MissingKeys(&[VERSION_KEY]),
+        ),
+        (
+            "an empty _meta",
+            json!({ "_meta": {} }),
+            Owed::MissingKeys(&[VERSION_KEY, CAPABILITIES_KEY]),
+        ),
+        (
+            "no _meta at all",
+            json!({}),
+            Owed::MissingKeys(&[VERSION_KEY, CAPABILITIES_KEY]),
+        ),
+        (
+            // A key that does not decode counts as absent, not as present and
+            // wrong, so the answer names it missing rather than unsupported.
+            "a malformed version",
+            json!({ "_meta": { VERSION_KEY: 20_260_728, CAPABILITIES_KEY: {} } }),
+            Owed::MissingKeys(&[VERSION_KEY]),
+        ),
+        (
+            "an unsupported version, alone",
+            json!({ "_meta": { "io.modelcontextprotocol/protocolVersion": "2025-11-25" } }),
+            Owed::UnsupportedVersion,
+        ),
+        (
+            "an unsupported version, with the rest of _meta",
+            json!({ "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2025-11-25",
+                INFO_KEY: info,
+                CAPABILITIES_KEY: {},
+            } }),
+            Owed::UnsupportedVersion,
+        ),
+    ]
+}
+
+/// Assert one reply is what the shape is owed, and say which shape when not.
+fn assert_owed(shape: &str, position: &str, owed: Owed, reply: &Value) {
+    match owed {
+        Owed::Result => assert!(
+            reply.get("error").is_none() && reply.get("result").is_some(),
+            "`{shape}` {position} is a shape a conformant client can send and \
+             must be served: {reply}"
+        ),
+        Owed::MissingKeys(keys) => {
+            assert_eq!(
+                reply["error"]["code"],
+                json!(-32602),
+                "`{shape}` {position} must be an invalid-params error naming what \
+                 is missing: {reply}"
+            );
+            let message = reply["error"]["message"].as_str().unwrap_or_default();
+            for key in keys {
+                assert!(
+                    message.contains(key),
+                    "`{shape}` {position}: the refusal must name `{key}`: {reply}"
+                );
+            }
+            for key in [VERSION_KEY, CAPABILITIES_KEY] {
+                assert!(
+                    keys.contains(&key) || !message.contains(key),
+                    "`{shape}` {position}: `{key}` was supplied and must not be \
+                     reported missing: {reply}"
+                );
+            }
+        }
+        Owed::UnsupportedVersion => {
+            assert_eq!(
+                reply["error"]["code"],
+                json!(-32022),
+                "`{shape}` {position} must be refused with \
+                 UnsupportedProtocolVersionError: {reply}"
+            );
+            assert_eq!(
+                reply["error"]["data"]["supported"],
+                json!([PROTOCOL]),
+                "`{shape}` {position}: the refusal must name what the client can \
+                 use instead: {reply}"
+            );
+        }
+    }
+}
+
+#[test]
+fn every_meta_shape_a_client_can_open_the_connection_with_is_answered_on_the_wire() {
+    // One fresh server process per shape, and the shape is the *first* thing
+    // that process ever sees. The harness fails loudly if standard output
+    // closes without an answer, which is what every failing shape used to do.
+    for (shape, params, owed) in meta_shapes() {
+        let mut server = Server::start(64);
+        let reply = server.request("tools/list", params);
+        assert_owed(shape, "as the opening request", owed, &reply);
+    }
+}
+
+#[test]
+fn a_refused_opening_request_leaves_the_connection_serving() {
+    // The other half of "answer the request, not the process". A refusal that
+    // takes the transport down with it is a dead pipe with an error object in
+    // front of it, and a client is meant to be able to correct itself.
+    for (shape, params, owed) in meta_shapes() {
+        if owed == Owed::Result {
+            continue;
+        }
+        let mut server = Server::start(64);
+        let reply = server.request("tools/list", params);
+        assert_owed(shape, "as the opening request", owed, &reply);
+        assert_eq!(
+            server.tools().len(),
+            11,
+            "the connection did not survive `{shape}`, so the client cannot retry"
+        );
+    }
+}
+
+#[test]
+fn an_opening_request_is_answered_exactly_as_the_same_request_is_answered_later() {
+    // The drift guard between this project's transport wrapper and the SDK's
+    // own per-request validation. The wrapper exists only because the SDK
+    // applies that validation to every request *except* the one that opens the
+    // connection; if the two ever disagree about a shape, the position of the
+    // request would change the answer, which is precisely the bug being fixed.
+    let mut open = Server::start(64);
+    assert_eq!(open.tools().len(), 11, "the lifecycle opens");
+
+    for (shape, params, _) in meta_shapes() {
+        let later = open.request("tools/list", params.clone());
+        let mut fresh = Server::start(64);
+        let opening = fresh.request("tools/list", params);
+
+        let strip = |reply: &Value| {
+            let mut reply = reply.clone();
+            // Ids differ by construction; nothing else may.
+            reply.as_object_mut().unwrap().remove("id");
+            reply
+        };
+        assert_eq!(
+            strip(&opening),
+            strip(&later),
+            "`{shape}` was answered differently depending on whether it opened \
+             the connection"
+        );
+    }
+}
+
+#[test]
+fn a_client_that_hangs_up_after_a_refusal_is_not_reported_as_a_server_failure() {
+    // A client may read a refusal and leave. That is a session that ended, and
+    // a supervisor that restarts `bathy serve mcp` on a non-zero exit must not
+    // be made to loop by one badly-shaped request.
+    let (code, stdout, stderr) = serve_once(&[json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    })]);
+    assert!(
+        stdout.contains("-32602"),
+        "the refusal must reach the client before the process ends: {stdout}"
+    );
+    assert_eq!(code, 0, "exit {code}; stderr:\n{stderr}");
+    assert!(
+        !stderr.contains("mcp_server_failed"),
+        "a client hanging up is not a server failure: {stderr}"
+    );
+}
+
 #[test]
 fn server_discover_advertises_the_implemented_version_its_capabilities_and_its_identity() {
     let mut server = Server::start(64);
@@ -768,6 +1008,20 @@ fn an_initialize_from_a_legacy_client_is_answered_with_the_version_we_implement(
         json!("bathy"),
         "{reply}"
     );
+
+    // And the session it opened is a *session*: the per-request `_meta` the
+    // inline lifecycle requires is exactly what a handshake replaces, so a
+    // Legacy client's next request carries none and must still be served.
+    // This is the assertion that fails if the `_meta` validation in front of
+    // the transport is applied to the whole connection rather than to the
+    // request that opens it.
+    let reply = server.request("tools/list", json!({}));
+    assert!(
+        reply.get("error").is_none(),
+        "a handshaken client was then asked for the metadata the handshake \
+         replaced: {reply}"
+    );
+    assert_eq!(reply["result"]["tools"].as_array().unwrap().len(), 11);
 }
 
 #[test]

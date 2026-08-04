@@ -20,7 +20,7 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::PathBuf;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -168,7 +168,18 @@ impl Listener {
 pub struct Server {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    /// Lines the server has written, delivered by a reader thread.
+    ///
+    /// **Not a `BufReader<ChildStdout>` read on this thread, and that is the
+    /// point.** `read_line` on a child that is alive and simply not answering
+    /// blocks forever, so the 30-second deadline in [`Server::request`] --
+    /// whose whole purpose is to fail a server that never answers rather than
+    /// hang on one -- was checked only *between* reads and therefore never
+    /// bound. A mutation that made the server silent turned every protocol
+    /// test into an indefinite hang instead of a failure, which is a fixture
+    /// that cannot report the defect it was written for. A channel makes the
+    /// deadline real: `recv_timeout` returns whether or not anything came.
+    stdout: std::sync::mpsc::Receiver<String>,
     stderr: Arc<Mutex<String>>,
     next_id: u64,
     state: tempfile::TempDir,
@@ -197,7 +208,21 @@ impl Server {
             .expect("the bathy binary runs");
 
         let stdin = child.stdin.take().expect("stdin");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout"));
+        // Read on a thread and delivered by channel, so the deadline in
+        // `request` binds even when the server is alive and silent. See the
+        // field's own comment. The sender is dropped when standard output
+        // closes, which is how `request` tells "the server ended" from "the
+        // server is thinking".
+        let (lines, stdout) = std::sync::mpsc::channel();
+        let out = BufReader::new(child.stdout.take().expect("stdout"));
+        std::thread::spawn(move || {
+            for line in out.lines() {
+                let Ok(line) = line else { return };
+                if lines.send(line).is_err() {
+                    return;
+                }
+            }
+        });
         // Drained on a thread so a chatty server cannot fill the pipe and
         // deadlock the test it is meant to be diagnosing.
         let stderr_buffer = Arc::new(Mutex::new(String::new()));
@@ -263,24 +288,23 @@ impl Server {
 
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
-            assert!(
-                Instant::now() < deadline,
-                "no reply to {method} within 30s. A server built for the session-based \
-                 protocol waits for `initialize` and never answers. stderr:\n{}",
-                self.diagnostics()
-            );
-            let mut line = String::new();
-            let read = self.stdout.read_line(&mut line).unwrap_or_else(|e| {
-                panic!(
-                    "reading a reply to {method}: {e}. stderr:\n{}",
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let line = match self.stdout.recv_timeout(remaining) {
+                Ok(line) => line,
+                // The deadline, and it binds: a server that is alive and
+                // simply not answering fails here rather than hanging the
+                // suite forever. A server built for the session-based
+                // protocol waits for `initialize` and never answers, and so
+                // does one that swallows a request it cannot serve.
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                    "no reply to {method} within 30s. stderr:\n{}",
                     self.diagnostics()
-                )
-            });
-            assert!(
-                read > 0,
-                "the server closed its output without answering {method}. stderr:\n{}",
-                self.diagnostics()
-            );
+                ),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => panic!(
+                    "the server closed its output without answering {method}. stderr:\n{}",
+                    self.diagnostics()
+                ),
+            };
             if line.trim().is_empty() {
                 continue;
             }
@@ -420,6 +444,43 @@ pub fn scan_request(targets: &str, ports: &str, key: &str) -> Value {
         "ports": { "explicit": explicit },
         "idempotency_key": key,
     })
+}
+
+/// Drive a fresh `serve mcp` process with `messages`, close its input, and
+/// wait for it: `(exit code, stdout, stderr)`.
+///
+/// [`Server`] keeps the pipe open for the life of the test, so it cannot see
+/// what the process does when a client *leaves*. That is a distinct question
+/// -- whether ending a session is reported as a failure -- and it needs the
+/// process to be allowed to finish.
+pub fn serve_once(messages: &[Value]) -> (i32, String, String) {
+    let state = tempfile::tempdir().expect("tempdir");
+    let mut child = Command::new(BIN)
+        .args([
+            "--state-dir",
+            state.path().to_str().unwrap(),
+            "serve",
+            "mcp",
+        ])
+        .env_remove("BATHY_STATE_DIR")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the bathy binary runs");
+    {
+        let mut stdin = child.stdin.take().expect("stdin");
+        for message in messages {
+            writeln!(stdin, "{message}").expect("write a request");
+        }
+        // Dropped here: end of input is the client hanging up.
+    }
+    let out = child.wait_with_output().expect("the server exits");
+    (
+        out.status.code().expect("the process exited normally"),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
 }
 
 /// Run the command-line surface, for the tests that assert the two agree.

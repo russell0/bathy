@@ -28,6 +28,7 @@ pub mod config;
 pub mod descriptors;
 pub mod engine;
 pub mod error;
+pub mod lifecycle;
 pub mod server;
 pub mod tools;
 
@@ -39,14 +40,34 @@ pub use server::{BathyMcpServer, PROTOCOL_VERSION};
 ///
 /// Standard output is the transport, so nothing may be written to it that is
 /// not a protocol message. Diagnostics go to standard error.
+///
+/// The transport is wrapped in [`lifecycle::AnswersTheOpener`], because the
+/// SDK ends the process rather than the request when the first message cannot
+/// open the inline lifecycle. That module says what the SDK does and why this
+/// is here; `docs/protocol-notes.md` records it as a deviation.
 pub async fn serve_stdio(config: ServerConfig) -> Result<(), String> {
-    use rmcp::service::ServiceExt;
+    use rmcp::ServerHandler;
+    use rmcp::service::{RoleServer, ServerInitializeError, ServiceExt};
+    use rmcp::transport::IntoTransport;
 
     let server = BathyMcpServer::new(config)?;
-    let running = server
-        .serve(rmcp::transport::stdio())
+    let supported = server.supported_protocol_versions();
+    let stdio =
+        IntoTransport::<RoleServer, std::io::Error, _>::into_transport(rmcp::transport::stdio());
+    let running = match server
+        .serve(lifecycle::AnswersTheOpener::new(stdio, supported))
         .await
-        .map_err(|e| format!("mcp transport: {e}"))?;
+    {
+        Ok(running) => running,
+        // The client hung up before it opened the lifecycle. That is a
+        // session that ended, not a server that failed -- exactly like the
+        // disconnect after the lifecycle *is* open, which `waiting()` below
+        // returns `Ok` for. It is reachable on purpose now: a client whose
+        // opening request is refused may read the refusal and leave, and a
+        // supervisor must not read that as a crash to restart.
+        Err(ServerInitializeError::ConnectionClosed(_)) => return Ok(()),
+        Err(e) => return Err(format!("mcp transport: {e}")),
+    };
     running.waiting().await.map_err(|e| format!("mcp: {e}"))?;
     Ok(())
 }
