@@ -1054,7 +1054,10 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
             "--targets",
             &ip.to_string(),
             "--ports",
-            "40000-40999",
+            // Long enough that a cancel half a second in cannot arrive after
+            // the plan is exhausted, short enough that the resume below runs
+            // the remainder to completion inside this test.
+            "40000-40099",
             "--max-packets-per-second",
             "20",
         ])
@@ -1113,9 +1116,62 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
     status.success();
     let record = status.json();
     assert_eq!(record["status"], "cancelled", "{record}");
+    let stopped_at = record["packets_spent"].as_u64().unwrap();
     assert!(
-        record["packets_spent"].as_u64().unwrap() < 1000,
+        stopped_at < 100,
         "a cancelled scan should not have finished its plan: {record}"
+    );
+
+    // And it resumes where it stopped -- which this test claimed in its name
+    // and did not check. `scan start` and `scan resume` each clear the cancel
+    // marker before beginning, because otherwise the marker written above is
+    // still on disk, `spawn_watcher` finds it on its first look, and the
+    // resumed run is cancelled before it probes anything. Deleting both
+    // `state::clear_cancel` calls used to leave all nineteen tests in this
+    // file passing, exactly as deleting the tool surface's two left all
+    // thirty-two of that suite's passing.
+    //
+    // The summary this run prints is the measurement: `units_completed` is
+    // this run's own count, not the scan's total, so a resume that was
+    // stopped at spawn reports zero and says `cancelled`.
+    let resumed = bathy(&[
+        "--json",
+        "--state-dir",
+        &dir,
+        "scan",
+        "resume",
+        "--scope",
+        scope.path(),
+        "--scan",
+        &id,
+    ]);
+    resumed.success();
+    let summary = resumed.json();
+    assert_eq!(
+        summary["cancelled"],
+        serde_json::json!(false),
+        "the resumed run was cancelled by the marker its own start should have \
+         cleared: {summary}"
+    );
+    assert!(
+        summary["units_completed"].as_u64().unwrap() > 0,
+        "the resumed run probed nothing: {summary}"
+    );
+
+    let after = bathy(&[
+        "--json",
+        "--state-dir",
+        &dir,
+        "scan",
+        "status",
+        "--scan",
+        &id,
+    ]);
+    after.success();
+    let finished = after.json();
+    assert!(
+        finished["packets_spent"].as_u64().unwrap() > stopped_at,
+        "the scan spent no more packets after being resumed: {finished}"
     );
 }
 

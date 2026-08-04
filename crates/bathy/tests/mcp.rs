@@ -1688,6 +1688,11 @@ fn fingerprint_explain_returns_a_rationale_and_a_source_for_every_rule_this_buil
 fn cancel_and_resume_round_trip_through_the_tool_surface() {
     let ip = local_ipv4();
     let scope = Scope::for_local(ip);
+    // The resumed run has to be shown to do *work*, not merely to return a
+    // document saying it is running, and work means a packet. A listener
+    // counting accepts is how the rest of this file measures that, and it is
+    // the only measurement here that a stale cancel marker cannot fake.
+    let listener = Listener::bind(ip, false);
     let mut server = Server::start(64);
 
     let started = server.call(
@@ -1697,9 +1702,17 @@ fn cancel_and_resume_round_trip_through_the_tool_surface() {
             "request": {
                 "targets": [ip.to_string()],
                 "objective": "inventory_exposed_services",
-                "ports": { "explicit": ["1-400"] },
+                // The listener's port is ephemeral, so it sorts after the
+                // low range and is the last unit in the plan: work the
+                // cancelled run cannot have reached at five packets per
+                // second, and work the resumed run has to do. That ordering
+                // is not assumed -- it is asserted below, before the resume.
+                "ports": { "explicit": ["1-20", listener.port()] },
                 "idempotency_key": "cancel-me",
                 "max_packets_per_second": 5,
+                // Off, so the run is paced by the rate limiter alone and a
+                // probe's read timeout on the open port cannot stretch it.
+                "service_detection": { "enabled": false, "intensity": 0 },
             },
         }),
     );
@@ -1722,6 +1735,12 @@ fn cancel_and_resume_round_trip_through_the_tool_surface() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    assert_eq!(
+        listener.accepts(),
+        0,
+        "the cancelled run already reached the endpoint the resume is supposed to \
+         reach, so the assertion below would pass without anything being resumed"
+    );
 
     let resumed = server.call(
         "scan.resume",
@@ -1732,6 +1751,26 @@ fn cancel_and_resume_round_trip_through_the_tool_surface() {
     assert!(
         resumed["resumed_from_unit"].as_u64().unwrap() < resumed["units_total"].as_u64().unwrap(),
         "a resume that starts past the end of the plan resumes nothing: {resumed:#}"
+    );
+
+    // And the resumed scan really runs, which is a different claim from the
+    // document above and is the one that was missing. `scan.resume` clears
+    // the cancel marker before spawning; without that clear the marker is
+    // still on disk, `spawn_watcher` finds it on its very first look, and the
+    // run is cancelled before it probes anything -- while still returning
+    // exactly the `status: running, resumed: true` document asserted above.
+    // Deleting both `bathy_engine::cancel::clear` calls used to leave every
+    // test in this file passing.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while listener.accepts() == 0 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        listener.accepts() >= 1,
+        "the resumed scan reached the listener 0 times: it returned a `running` \
+         document and then did nothing, which is what a stale cancel marker does. \
+         stderr:\n{}",
+        server.diagnostics()
     );
 
     // A cancel through the command line stops a scan this server started.
