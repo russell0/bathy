@@ -86,6 +86,15 @@ tempfile = { workspace = true }
 # in this task's report), so this adds no new supply-chain surface, only a
 # direct `[dev-dependencies]` edge onto a crate already present at this
 # exact version.
+#
+# Second reason, added with `src/test_support.rs`: `closed_port` reserves a
+# loopback port that refuses connections, by holding an established
+# connection whose listener has been closed -- and the listener it starts
+# from must NOT set `SO_REUSEADDR`, or on Linux the reservation can be
+# shared away and the whole fixture is pointless. `std` and `tokio` both set
+# it unconditionally and expose no way off; `socket2` is what lets a
+# listener be created without it. Same argument as above applies unchanged:
+# no new supply-chain surface, an edge onto a crate already in the graph.
 socket2 = "0.6"
 
 [features]
