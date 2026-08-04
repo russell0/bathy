@@ -291,7 +291,8 @@ Two things the encoding must decide explicitly, both inherited from Task 1:
 - **AC-5.6** Diffing a fold against itself yields zero changes.
 - **AC-5.7** Change ordering is deterministic, sorted by target then transport then port. Closed by `changes_are_ordered_deterministically_by_target_then_transport_then_port`, whose sort key is `(c.target, c.endpoint)` and whose fixture contains at least one non-TCP endpoint — a fixture that is all TCP makes the transport half of this criterion untested.
 - **AC-5.33** A first-observed port state (`state: None → Some(_)`) is classified as `StateChanged`, and an endpoint present in both folds is never classified as `EndpointAppeared` or `EndpointDisappeared`. Closed by `a_first_observed_port_state_is_a_state_change_not_an_appearance`. This is a criterion rather than a note because M5 Task 1's report identified the requirement and left it in a report file, and per the Global Constraint *manual verification does not close an acceptance criterion*, a requirement that lives only in prose gets re-derived under time pressure.
-- **AC-5.34** A `ScanFold` whose `terminal` is `Terminal::Denied` is not diffed as every endpoint disappearing. Closed by `a_denied_scan_does_not_diff_as_every_endpoint_disappearing`.
+- **AC-5.34** A `ScanFold` whose `terminal` is `Terminal::Denied` is not diffed as every endpoint disappearing. Closed by `diffing_a_completed_scan_against_a_denied_one_reports_no_endpoint_disappeared`, which **must call `diff()`** and must fail if the denied terminal is ignored. The obvious name for this criterion — `a_denied_scan_does_not_diff_as_every_endpoint_disappearing` — is already taken by a test in Task 1's `fold.rs` that is green today and never calls `diff()`; naming the criterion after it would let AC-5.34 be closed by a test that cannot exercise the behaviour. This is the same shape as M3's tautological budget-ceiling test, which asserted on the ledger's own report.
+- **AC-5.36** The duplicate-sequence tiebreak is re-decided before `ScanFold` is serialized. Task 1 keyed it on `format!("{event:?}")` and scoped the determinism claim to a single build rather than re-keying, because canonical JSON would cost `bathy-query` the minimal dependency graph its purity claim rests on — a trade the Task 1 re-review ruled correct *while `ScanFold` was unserializable and no caller could observe it*. AC-5.35 ends that condition. Either re-key on something with a cross-release guarantee, or state in the published schema's documentation that the ordering of duplicate-sequence events is stable only within a build. Deciding by omission is what this criterion exists to prevent: the obligation was carried in Step 6 prose, and prose is exactly what AC-5.33 was created to escape.
 - **AC-5.35** `ScanFold` and `ScanDiff` have a committed JSON Schema under `schemas/`, `xtask check-schemas` drift-checks it, and a round-trip test proves the entry-array encoding of `endpoints` deserializes back to an equal value — a `BTreeMap` with a tuple key serializes only through such an encoding, and a derived `Serialize` would compile and fail at runtime.
 
 ---
@@ -698,7 +699,7 @@ git commit -m "test(mcp): the ten-call authorized inventory workflow, as an exec
 ## Milestone Exit Criteria
 
 - [ ] `cargo test --workspace` green; clippy clean; `xtask check-deps` and `check-schemas` clean.
-- [ ] AC-5.1 through AC-5.32 each demonstrated by a named passing test.
+- [ ] AC-5.1 through AC-5.36 each demonstrated by a named passing test.
 - [ ] `bathy serve mcp` connects to a real MCP client and lists eleven tools.
 - [ ] `docs/protocol-notes.md` exists and names the verified spec revision.
 - [ ] **This milestone ships the agent-facing product.** Tag `v0.1.0-beta.1`.

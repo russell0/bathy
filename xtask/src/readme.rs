@@ -657,6 +657,15 @@ pub fn check_readme() -> Fallible<()> {
 //     historical account of past reviews, not a property of today's tree.
 //   - The eight IPv4-in-IPv6 embedding schemes and the ISATAP reasoning.
 //   - "Planned scope" and "Out of scope" beyond the protocol list.
+//   - **The crate table's descriptions.** Row *membership* is pinned in both
+//     directions -- a crate with no row, and a row with no crate, both fail --
+//     but what a row *says* is prose and is not read. At least three
+//     checkable claims currently live in those descriptions: the number of
+//     protocol probes, `bathy-interpret`'s "exactly two dependencies", and
+//     `bathy-types`' "zero internal dependencies". All three are true today
+//     and none is enforced here. Omitted from the first version of this list;
+//     added after the Task 1 fix re-review pointed out that a reader could
+//     take "the table is checked" to mean more than it does.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

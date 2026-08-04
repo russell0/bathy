@@ -43,7 +43,7 @@ over MCP.
 > library call — see `crates/bathy-engine/tests/end_to_end_scan.rs` for exactly
 > that, exercised end to end against real sockets.
 >
-> Plans for all seven milestones — 207 numbered acceptance criteria — are in
+> Plans for all seven milestones — 208 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
 
 ## What works today
