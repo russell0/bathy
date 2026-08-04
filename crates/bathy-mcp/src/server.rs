@@ -516,6 +516,167 @@ mod tests {
         );
     }
 
+    // --- AC-5.23. -----------------------------------------------------------
+    //
+    // The criterion is that `docs/protocol-notes.md` records the revision
+    // actually implemented, the `rmcp` beta caveat, and the deliberate
+    // decision not to route through the Tasks extension. Two milestone
+    // reviews closed it by *reading the document*, and the Global Constraint
+    // is explicit that manual verification does not close a criterion: M4
+    // shipped a cancellability property a reviewer had confirmed by hand and a
+    // non-cancellable acquire then survived all 98 tests.
+    //
+    // What a test can and cannot do here is worth stating, because the
+    // temptation is to assert the prose exists and call that coverage. Whether
+    // the *reasoning* in the document is sound is not checkable and is not
+    // claimed. What is checkable is every place the document states a fact
+    // about this code — and those are exactly the sentences that rot, in the
+    // same way and for the same reason `README.md` did three milestones
+    // running. So the three checks below are each a comparison against the
+    // tree, not a search for a paragraph, and the third is the sharp one: it
+    // fails if the *code* starts doing the thing the document says it does
+    // not.
+
+    const PROTOCOL_NOTES: &str = include_str!("../../../docs/protocol-notes.md");
+
+    #[test]
+    fn the_protocol_note_names_the_revision_this_server_actually_implements() {
+        let version = PROTOCOL_VERSION.as_str();
+        let heading = PROTOCOL_NOTES
+            .lines()
+            .find(|line| line.starts_with("## The revision implemented:"))
+            .expect("protocol-notes.md must state which revision is implemented");
+        assert!(
+            heading.contains(version),
+            "protocol-notes.md says `{heading}` and this server advertises \
+             `{version}`. The document is the thing an integrator reads before \
+             writing a client against this server."
+        );
+        // The other direction: no *older* revision may be presented as the one
+        // implemented. `2025-11-25` legitimately appears in the document (it is
+        // the SDK default this server overrides, and the Legacy version an old
+        // client is answered about), so the check is scoped to the heading.
+        assert!(
+            !heading.contains("2025-11-25"),
+            "the heading names a Legacy revision: {heading}"
+        );
+    }
+
+    #[test]
+    fn the_protocol_note_states_the_sdk_version_this_crate_actually_pins() {
+        let manifest = include_str!("../Cargo.toml");
+        let pinned = manifest
+            .lines()
+            .find_map(|line| {
+                let rest = line.trim().strip_prefix("rmcp = { version = \"")?;
+                rest.split('"').next()
+            })
+            .expect("bathy-mcp pins an rmcp version");
+        assert!(
+            PROTOCOL_NOTES.contains(&format!("`rmcp` {pinned}")),
+            "protocol-notes.md does not say ``rmcp` {pinned}`; the pin moved and the \
+             note that explains the SDK's beta rating did not move with it. Every \
+             deviation the note records was measured against one version of the SDK."
+        );
+        // Scoped to the SDK section. `PROTOCOL_NOTES.contains("beta")` was the
+        // first form of this and it survived a mutation that removed the
+        // caveat outright, because the word appears elsewhere in the document
+        // -- a check that passes on a document where the thing it names is
+        // gone. The caveat has to be where a reader of the SDK section finds
+        // it, which is the only place it does any work.
+        // The heading itself reads "and its beta caveat", so it is dropped: a
+        // second mutation removed the caveat's *sentence* and this still
+        // passed on the heading alone. The claim AC-5.23 makes is that the
+        // caveat is recorded, not that a heading promises one.
+        let sdk_section = PROTOCOL_NOTES
+            .split_once("## The SDK:")
+            .expect("the SDK section")
+            .1
+            .split("\n## ")
+            .next()
+            .expect("a section body")
+            .split_once('\n')
+            .expect("a section body below its heading")
+            .1;
+        assert!(
+            sdk_section.contains("beta"),
+            "AC-5.23 requires the `rmcp` beta caveat be recorded, and it is the reason \
+             the stdio deviations in this same section are expected rather than \
+             surprising. It is not in the SDK section."
+        );
+    }
+
+    #[test]
+    fn the_tasks_extension_is_recorded_as_declined_and_this_crate_genuinely_declines_it() {
+        const EXTENSION: &str = "io.modelcontextprotocol/tasks";
+        assert!(
+            PROTOCOL_NOTES.contains(&format!("### The `{EXTENSION}` extension")),
+            "AC-5.23 requires the decision not to route through the Tasks extension \
+             be recorded; the section is gone"
+        );
+        // Whitespace-normalised: the document is hard-wrapped, so a sentence
+        // that spans two lines must not depend on where the wrap falls.
+        let flattened = PROTOCOL_NOTES
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flattened.contains(
+                "This server does not use it, and that omission is a \
+                 decision, not an oversight."
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .as_str()
+            ),
+            "the section must state the decision, not merely mention the extension"
+        );
+
+        // The half that dies when the code changes rather than when the prose
+        // does. A document saying "this server does not use X" while the
+        // server uses X is the failure this criterion is actually about, and
+        // it is the one no amount of reading the document would catch.
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut scanned = 0usize;
+        let mut using: Vec<String> = Vec::new();
+        let mut stack = vec![src.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("this crate's src/ is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("a readable source file");
+                scanned += 1;
+                for (index, line) in text.lines().enumerate() {
+                    // This test names the extension in order to forbid it, so
+                    // its own occurrences are skipped by file rather than by
+                    // marker: `server.rs` is where the assertion lives.
+                    if line.contains(EXTENSION)
+                        && path.file_name().and_then(|n| n.to_str()) != Some("server.rs")
+                    {
+                        using.push(format!("{}:{}", path.display(), index + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            scanned >= 5,
+            "only {scanned} source files were read; the sweep below ranged over too \
+             little to mean anything"
+        );
+        assert!(
+            using.is_empty(),
+            "protocol-notes.md says this server does not use the Tasks extension, and \
+             {using:?} does. One of the two is now false, and a document that \
+             misdescribes the wire is worse than no document."
+        );
+    }
+
     #[test]
     fn canonical_rendering_does_not_depend_on_key_order() {
         let a = serde_json::json!({ "b": 1, "a": [3, { "z": 1, "y": 2 }] });

@@ -323,6 +323,101 @@ fn find_pinned_dependency_prose_drift(root: &Path) -> Vec<String> {
 // The one deferred architecture move, registered mechanically (AC-5.39).
 // ---------------------------------------------------------------------------
 
+/// A decision this project deliberately postponed, together with the condition
+/// under which it stops being postponable.
+///
+/// **This was a hard-coded function pair and a literal `1` in `check-deps`'s
+/// success line**, which the M5 close-out review pointed out is not a
+/// registry: registering a second deferral meant restructuring the function
+/// rather than appending a row, so "it is a one-line entry" understated the
+/// cost by a lot. It is a collection now, the count is `DEFERRALS.len()`
+/// rather than a literal, and the second entry is the one the review was
+/// asking about.
+///
+/// Every entry checks **two directions**, and the second is why these are not
+/// `assert!`s: the condition firing means the deferral is now due, and the
+/// condition becoming *unreachable* means the registration is checking nothing
+/// and should be deleted. A check that has quietly stopped applying is worse
+/// than no check, because it reads as coverage.
+struct Deferral {
+    /// Short, stable, and what a failure message leads with.
+    id: &'static str,
+    check: fn(&Path) -> Vec<String>,
+}
+
+const DEFERRALS: &[Deferral] = &[
+    // AC-5.39. The ops layer (`bathy_mcp::{engine,tools}`) serves both the
+    // command line and the MCP server; the honest home for it is a crate below
+    // both, and the move is deferred for v0.1 with one trigger.
+    Deferral {
+        id: "ops-layer-move",
+        check: |root| find_deferred_move_violations(&scrape_ops_layer(root)),
+    },
+    // The `rmcp` stdio workaround. `crates/bathy-mcp/src/lifecycle.rs` sits
+    // between the transport and the SDK because `rmcp`'s own pre-lifecycle
+    // loop makes a malformed opening `_meta` fatal to the *process* rather
+    // than to the request. The workaround is self-describing and its wrapper
+    // has a divergence test -- but that test catches the wrapper drifting from
+    // the SDK, and says nothing about the workaround having become
+    // unnecessary, which is the thing that actually needs re-measuring.
+    Deferral {
+        id: "rmcp-stdio-workaround",
+        check: find_rmcp_workaround_staleness,
+    },
+];
+
+/// The `rmcp` release the stdio workaround was measured against.
+///
+/// The workaround, its hand-copied `INLINE_LIFECYCLE_VERSION` and every
+/// deviation `docs/protocol-notes.md` records were established against exactly
+/// this version. A newer SDK may have fixed the behaviour, in which case the
+/// wrapper is dead weight that a reader will assume is load-bearing; or it may
+/// have changed the inline-lifecycle rules, in which case the hand-copied
+/// constant rots silently. Either way the answer is a measurement, and the
+/// only thing a checker can honestly do is fire when the pin moves and say so.
+const RMCP_VERSION_THE_WORKAROUND_WAS_MEASURED_AGAINST: &str = "3.1.0";
+
+/// The rmcp deferral's condition: the pin moved, or the workaround is gone.
+fn find_rmcp_workaround_staleness(root: &Path) -> Vec<String> {
+    let manifest =
+        std::fs::read_to_string(root.join("crates/bathy-mcp/Cargo.toml")).unwrap_or_default();
+    let lifecycle =
+        std::fs::read_to_string(root.join("crates/bathy-mcp/src/lifecycle.rs")).unwrap_or_default();
+
+    if lifecycle.is_empty() || !lifecycle.contains("INLINE_LIFECYCLE_VERSION") {
+        return vec![
+            "crates/bathy-mcp/src/lifecycle.rs no longer carries the inline-lifecycle \
+             workaround, so this deferral is checking nothing: remove its entry from \
+             DEFERRALS and the paragraph it points at in docs/protocol-notes.md"
+                .to_string(),
+        ];
+    }
+
+    let pinned = manifest.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("rmcp = { version = \"")?;
+        rest.split('"').next().map(str::to_owned)
+    });
+    match pinned.as_deref() {
+        None => vec![
+            "crates/bathy-mcp/Cargo.toml no longer pins an rmcp version in the form \
+             this check reads, so the staleness condition cannot be evaluated and \
+             would pass over any SDK at all"
+                .to_string(),
+        ],
+        Some(v) if v != RMCP_VERSION_THE_WORKAROUND_WAS_MEASURED_AGAINST => vec![format!(
+            "rmcp moved from {RMCP_VERSION_THE_WORKAROUND_WAS_MEASURED_AGAINST} to {v} \
+             and the stdio workaround in crates/bathy-mcp/src/lifecycle.rs has not been \
+             re-measured against it. The workaround exists because rmcp made a malformed \
+             opening `_meta` fatal to the process; if that is fixed the wrapper is dead \
+             weight a reader will assume is load-bearing, and if the inline-lifecycle \
+             rules changed the hand-copied INLINE_LIFECYCLE_VERSION has rotted. Drive the \
+             opening shapes in docs/protocol-notes.md against the new SDK, then move \
+             RMCP_VERSION_THE_WORKAROUND_WAS_MEASURED_AGAINST in the same commit."
+        )],
+        Some(_) => Vec::new(),
+    }
+}
+
 /// What the tree says about the ops layer and about feature-gating.
 ///
 /// Plain data, like [`PackageInfo`], so [`find_deferred_move_violations`] can
@@ -556,9 +651,13 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
     let mut violations = find_violations(&packages);
     violations.extend(find_pinned_dependency_drift(&packages));
     violations.extend(find_pinned_dependency_prose_drift(Path::new(".")));
-    violations.extend(find_deferred_move_violations(&scrape_ops_layer(Path::new(
-        ".",
-    ))));
+    for deferral in DEFERRALS {
+        violations.extend(
+            (deferral.check)(Path::new("."))
+                .into_iter()
+                .map(|v| format!("[{}] {v}", deferral.id)),
+        );
+    }
 
     if violations.is_empty() {
         let sites: usize = PINNED_DEPENDENCIES
@@ -567,9 +666,10 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
             .sum();
         println!(
             "check-deps: ok ({} crates ranked, {} pinned dependency set(s), {sites} prose \
-             site(s) discovered and checked against them, 1 deferred move registered)",
+             site(s) discovered and checked against them, {} deferral(s) registered)",
             count_ranked(&packages),
             PINNED_DEPENDENCIES.len(),
+            DEFERRALS.len(),
         );
         Ok(())
     } else {
@@ -964,6 +1064,90 @@ mod tests {
             dispatched_sorted, listed,
             "the `match` in `main` and `SUBCOMMANDS` disagree"
         );
+    }
+
+    // --- The deferral registry. ---
+
+    #[test]
+    fn every_registered_deferral_is_reachable_and_the_registry_is_not_empty() {
+        // The count in `check-deps`'s success line used to be the literal `1`,
+        // so a deferral could be deleted and the line would still claim one
+        // was registered. It is `DEFERRALS.len()` now, which makes the count
+        // honest and this assertion the thing that keeps it non-trivial.
+        assert_eq!(
+            DEFERRALS.len(),
+            2,
+            "the deferral registry changed size; the two entries are the ops-layer \
+             move (AC-5.39) and the rmcp stdio workaround"
+        );
+        let ids: Vec<&str> = DEFERRALS.iter().map(|d| d.id).collect();
+        assert_eq!(ids, vec!["ops-layer-move", "rmcp-stdio-workaround"]);
+    }
+
+    #[test]
+    fn the_rmcp_deferral_is_silent_on_the_version_it_was_measured_against() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert!(
+            find_rmcp_workaround_staleness(&root).is_empty(),
+            "{:#?}",
+            find_rmcp_workaround_staleness(&root)
+        );
+        // The premise, asserted rather than assumed: the constant and the pin
+        // agree today. Without this the test above passes just as happily
+        // against a parser that finds no pin at all.
+        let manifest = std::fs::read_to_string(root.join("crates/bathy-mcp/Cargo.toml")).unwrap();
+        assert!(
+            manifest.contains(&format!(
+                "rmcp = {{ version = \"{RMCP_VERSION_THE_WORKAROUND_WAS_MEASURED_AGAINST}\""
+            )),
+            "the pin and the measured-against constant have already diverged"
+        );
+    }
+
+    #[test]
+    fn the_rmcp_deferral_fires_when_the_pin_moves_and_when_the_workaround_goes() {
+        let dir = std::env::temp_dir().join(format!("bathy-xtask-deferral-{}", std::process::id()));
+        let mcp = dir.join("crates/bathy-mcp/src");
+        std::fs::create_dir_all(&mcp).unwrap();
+        let write = |manifest: &str, lifecycle: &str| {
+            std::fs::write(dir.join("crates/bathy-mcp/Cargo.toml"), manifest).unwrap();
+            std::fs::write(mcp.join("lifecycle.rs"), lifecycle).unwrap();
+        };
+        let workaround = "const INLINE_LIFECYCLE_VERSION: ProtocolVersion = X;";
+
+        // Direction 1: the SDK moved, and nobody re-measured.
+        write(
+            "rmcp = { version = \"4.0.0\", default-features = false }",
+            workaround,
+        );
+        let v = find_rmcp_workaround_staleness(&dir);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("3.1.0") && v[0].contains("4.0.0"), "{v:#?}");
+        assert!(
+            v[0].contains("re-measured"),
+            "the message must say what to do, not merely that something changed: {v:#?}"
+        );
+
+        // Direction 2: the workaround is gone, so this registration now guards
+        // nothing and says so rather than passing.
+        write(
+            &format!(
+                "rmcp = {{ version = \"{RMCP_VERSION_THE_WORKAROUND_WAS_MEASURED_AGAINST}\" }}"
+            ),
+            "// the wrapper was deleted\n",
+        );
+        let v = find_rmcp_workaround_staleness(&dir);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("checking nothing"), "{v:#?}");
+
+        // And the unreadable-pin direction, which would otherwise be a silent
+        // pass over any SDK at all.
+        write("rmcp.workspace = true", workaround);
+        let v = find_rmcp_workaround_staleness(&dir);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("cannot be evaluated"), "{v:#?}");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn pkg(name: &str, deps: &[&str]) -> PackageInfo {
