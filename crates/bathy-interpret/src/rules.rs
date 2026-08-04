@@ -1040,6 +1040,69 @@ mod tests {
         );
     }
 
+    // --- The `*_bare_protocol` line-offset gap (M4 whole-branch review,
+    // IMPORTANT-4). `http_bare_protocol` and `smtp_bare_protocol` are the
+    // only two matchers that take `utf8_lines(bytes).first()` rather than
+    // iterating, so in every test above their line offset happens to be 0
+    // and the `start +` term in their span is indistinguishable from a
+    // literal `0` -- dropping it survived the whole suite for both. The
+    // offset is NOT always 0: `utf8_lines` skips lines that are not valid
+    // UTF-8, so `first()` is the first VALID line, which is at a non-zero
+    // offset whenever anything invalid precedes it. That is reachable from
+    // a hostile or merely broken peer, which is exactly the case
+    // `matched_span` -- the "which bytes justified this claim" contract --
+    // must not get wrong.
+    //
+    // The audit that produced these two tests mutated the offset term out
+    // of every one of the ten span constructions in this file, not just the
+    // one reported: `http_nginx`, `ssh_openssh`, `ssh_bare_protocol`,
+    // `smtp_postfix`, `mysql_handshake`, `dns_bind_version`, both redis
+    // matchers and `tls_server_hello` all die already. These two were the
+    // only survivors, and they share one shape. See the fix-wave report. ---
+
+    #[test]
+    fn http_bare_protocol_cites_the_correct_bytes_when_invalid_utf8_precedes_the_status_line() {
+        // A lone 0x80 (an unaccompanied UTF-8 continuation byte, invalid on
+        // its own) makes line 0 undecodable, so `utf8_lines` skips it and
+        // the status line -- the real match -- starts at byte 9, not 0.
+        let bytes = b"\x80garbage\nHTTP/1.1 200 OK\r\n\r\n";
+        let hit = http_bare_protocol(bytes).unwrap();
+        assert_eq!(
+            hit.span,
+            9..25,
+            "the status line begins after the skipped invalid line, not at byte 0"
+        );
+        assert_eq!(
+            &bytes[hit.span.clone()],
+            b"HTTP/1.1 200 OK\r",
+            "span must cite the status line's real bytes; dropping the line-start offset \
+             cites b\"\\x80garbage\\nHTTP/1.\" instead -- the wrong bytes entirely, and \
+             still a perfectly valid range, so no bounds check would ever notice"
+        );
+    }
+
+    #[test]
+    fn smtp_bare_protocol_cites_the_correct_bytes_when_invalid_utf8_precedes_the_greeting() {
+        // Same shape as the HTTP case above, and the same defect: this is
+        // the second of the two matchers that read only the first VALID
+        // line. A real SMTP peer that emits a non-UTF-8 byte before its
+        // greeting is unusual; a hostile one that does it deliberately, to
+        // make bathy cite bytes it did not send, is the threat this
+        // matters for.
+        let bytes = b"\x80junk\n220 mail.example.com ESMTP Sendmail\r\n";
+        let hit = smtp_bare_protocol(bytes).unwrap();
+        assert_eq!(
+            hit.span,
+            6..10,
+            "the greeting begins after the skipped invalid line, not at byte 0"
+        );
+        assert_eq!(
+            &bytes[hit.span.clone()],
+            b"220 ",
+            "span must cite the greeting's real bytes, not b\"\\x80jun\""
+        );
+    }
+
     // --- SSH ---
 
     #[test]
