@@ -55,9 +55,10 @@ over MCP.
 | `bathy-evidence` | The content-addressed blob store and the append-only, gap-free event log that is this project's actual source of truth — SQLite state elsewhere is a derived index rebuildable from it, never the reverse. |
 | `bathy-store` | SQLite-backed scan state: idempotency (a repeated key with an identical plan reuses the scan; a different plan is refused as a conflict), a resumption cursor, and per-scan lifecycle status. A scan starts `pending` and `bathy-engine`'s scheduler transitions it to `completed`, `cancelled`, `failed`, or `denied` on each of its own terminal outcomes; `running`/`paused` are reserved for Milestone 5's pause/resume CLI surface. |
 | `bathy-plan` | Turns a `ScanRequest` into a deterministic, indexable `ScanPlan`: target expansion, port selection, and the content hash idempotency and resumption are built on. |
-| `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by an absolute deadline, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
+| `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by a deadline that covers the whole read rather than each individual `recv`, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. The deadline is per call, not per probe: a probe that writes and then reads can take up to twice it, deliberately, since the hostile case being defended against is on the read path. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
 | `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every finding carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
 | `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
+| `bathy` | Nothing yet, deliberately. It reserves the name on crates.io and will become the CLI binary in Milestone 5; it ships no `[[bin]]`, so `cargo install bathy` correctly reports there is nothing to install rather than installing a stub. |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
 Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
@@ -97,9 +98,15 @@ packet, rate, and runtime budgets.
 
 **What a scanned third party sees on their wire.** Every port is first touched by
 a plain, unprivileged TCP connect that sends no payload. A port that answers then
-receives one *additional* connection carrying a real protocol request — a `GET /`,
-a TLS `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind` query, a
-PostgreSQL `SSLRequest` — chosen by port affinity. Those bytes are fixed and
+receives **up to `intensity` further connections — four by default** — each a
+separate TCP connection carrying one protocol probe, tried in order of port
+affinity and stopping at the first response a rule recognizes. So a port whose
+first probe is recognized receives one additional connection; a port that
+answers but is never identified receives four. Most carry a real request — a
+`GET /`, a TLS `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind`
+query, a PostgreSQL `SSLRequest`. **Two send nothing at all**: the SSH and MySQL
+probes are listen-first, because those protocols have the server speak first and
+sending anything would corrupt the banner being read. Those bytes are fixed and
 public: they are listed, byte for byte, in each probe's own module in
 `crates/bathy-probe/src/probes/`.
 
@@ -127,10 +134,14 @@ a poor fit for typed tool calling. bathy targets the gap:
 
 - **Typed operations.** Every action has JSON Schema inputs and outputs. No agent
   constructs a command line.
-- **Task handles.** Scans start, poll, stream, cancel, pause, and resume. Nothing blocks.
+- **Task handles.** Scans start, poll, stream, cancel, pause, and resume. Nothing
+  blocks. *Today the engine supports cancel and resume as library calls; start,
+  poll, stream and pause arrive with the CLI and MCP surface in Milestone 5.*
 - **Evidence.** Every finding cites content-addressed response bytes. `evidence.get`
   returns exactly what justified a claim; `fingerprint.explain` says which rule fired
-  and why.
+  and why. *Both are Milestone 5 tool names; the evidence store and the rule
+  documentation they will read are built and tested today, but neither is a
+  callable operation yet.*
 - **Scope enforcement.** Deny-by-default manifests with expiry, checked against
   scope identity, expiry, and per-target authorization on the actual emission
   path — see "Authorized use" above for exactly what runs today versus what is
