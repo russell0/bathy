@@ -46,38 +46,37 @@ jobs:
       # so the checker itself is checked, which a shell pipeline in a workflow
       # never was. This step is the single call site.
       - run: cargo run -p xtask -- check-phrases
-      - name: bathy-interpret's dependency tree is pure (AC-4.10)
-        run: |
-          # `bathy-interpret` (M4 Task 3) may depend on `bathy-types` and
-          # `regex` only -- no async runtime, no filesystem access, no
-          # clock, no randomness of its own. That constraint is what lets
-          # M4 Task 4's replay corpus run with the network interface down
-          # and M7's fuzz target run without sockets (see that crate's own
-          # `src/lib.rs` doc comment). Checked two ways, by execution
-          # against the real dependency graph rather than by inspecting the
-          # Cargo.toml alone (a comment or a stray `path = ...` drifting out
-          # of sync with reality would not be caught by reading the
-          # manifest):
-          #
-          # 1. The *direct* dependency set must be exactly {bathy-types,
-          #    regex} -- nothing added, nothing silently dropped.
-          direct=$(cargo tree -p bathy-interpret --edges normal --depth 1 --prefix none \
-            | tail -n +2 | awk '{print $1}' | sort)
-          expected=$(printf 'bathy-types\nregex\n' | sort)
-          if [ "$direct" != "$expected" ]; then
-            echo "bathy-interpret's direct dependencies changed:"
-            echo "  got:  $(echo "$direct" | tr '\n' ' ')"
-            echo "  want: $(echo "$expected" | tr '\n' ' ')"
-            exit 1
-          fi
-          # 2. Nothing in the *whole* tree (direct + transitive) is an
-          #    async runtime, filesystem, or clock-touching crate this
-          #    pure, in-memory byte-matching decision has no business
-          #    reaching -- guards against a *transitive* dependency of
-          #    `bathy-types` or `regex` growing one of these in the future
-          #    without anyone noticing.
-          ! cargo tree -p bathy-interpret --edges normal --prefix none \
-            | grep -iE '^(tokio|tokio-util|mio|async-trait|fs4|rusqlite|libsqlite3-sys|walkdir|tempfile|filetime)( |$)'
+      # `bathy-interpret` (M4 Task 3) may depend on `bathy-types` and `regex`
+      # only -- no async runtime, no filesystem access, no clock, no randomness
+      # of its own. That constraint is what lets M4 Task 4's replay corpus run
+      # with the network interface down and M7's fuzz target run without
+      # sockets (see that crate's own `src/lib.rs` doc comment).
+      #
+      # This was 32 lines of inline `run: |` shell, and the forbidden-crate
+      # list lived only inside one `grep -iE` alternation -- structurally
+      # identical to the three phrase greps that kept AC-2.1 red for half a
+      # milestone while six reports called it green. The rules, the forbidden
+      # list and the reason each crate is on it now live in
+      # `xtask/src/gates.rs`, with unit tests that feed each forbidden crate in
+      # and assert it is caught with its rationale. This step is the single
+      # call site, and `check-ci` below refuses a new inline block.
+      - run: cargo run -p xtask -- check-purity
+      # The membership rule the two MSRV jobs below state in a comment
+      # (":a crate declaring a floor must appear in exactly one of these two
+      # jobs"), made executable. It had NO executable form at all and three
+      # recorded recurrences -- `bathy-plan` (M3), `crates/bathy` (M4) and
+      # `bathy-mcp` (M5) were each given a floor and named in neither job, so
+      # each promised downstream consumers a compiler version nothing built.
+      # `check-msrv` also verifies that each job removes `rust-toolchain.toml`
+      # (the repo pins `stable`, which otherwise wins and makes the job check
+      # `stable` twice) and prints the exact `cargo +<toolchain> check` lines,
+      # so the local invocation is derived rather than remembered.
+      - run: cargo run -p xtask -- check-msrv
+      # The gate on the gates: every `run:` step in this file must be either a
+      # `cargo run -p xtask -- <subcommand>` that exists or one of a small
+      # named set of cargo built-ins. Closing five inline gates is not closing
+      # the class; this is.
+      - run: cargo run -p xtask -- check-ci
   # The MSRV is a promise to downstream consumers, so it gets its own job.
   # Without this, MSRV rots silently the first time someone uses a newer API.
   #
@@ -209,4 +208,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `command:` and `arguments:` were both absent, so what ran here was the
+      # action's built-in default -- written down nowhere in this repository,
+      # free to change under a floating `@v2`, and impossible to reproduce
+      # locally because nobody could say what it was. The four checks are now
+      # named, `xtask check-deny` runs exactly these four, and
+      # `this_repositorys_deny_job_declares_the_set_this_command_runs`
+      # (xtask/src/gates.rs) fails if the two lists ever differ.
+      #
+      # Still open, deliberately: `@v2` floats. Pinning it to a commit SHA is
+      # the correct fix and is not made here because the SHA has to be
+      # verified against the upstream repository rather than guessed; the
+      # substantive half -- what actually runs -- no longer floats.
       - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: advisories bans licenses sources

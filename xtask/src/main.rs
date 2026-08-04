@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod gates;
 mod phrases;
 mod prose;
 mod readme;
@@ -35,20 +36,46 @@ const FORBIDDEN_SUBSTRINGS: &[&str] = &[
     "tokenizers",
 ];
 
+/// Every subcommand this binary dispatches, in one place.
+///
+/// It is a list rather than only a `match` because `check-ci` needs to know
+/// what exists: a `ci.yml` step that calls `cargo run -p xtask -- <name>` for
+/// a name that is not here fails `check-ci` with the file and line, instead of
+/// failing on a runner with `unknown xtask`. `.publish-deny` documented a
+/// command in exactly that state ("Consumed by `xtask publish-check`") for a
+/// milestone and a half.
+///
+/// Asserted against the `match` below by `the_dispatch_and_the_list_agree`.
+const SUBCOMMANDS: &[&str] = &[
+    "check-deps",
+    "check-schemas",
+    "check-readme",
+    "check-phrases",
+    "check-purity",
+    "check-msrv",
+    "check-deny",
+    "check-ci",
+    "publish-check",
+    "emit-schemas",
+    "gen-ports",
+];
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    match std::env::args().nth(1).as_deref() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
         Some("check-deps") => check_deps(),
         Some("emit-schemas") => emit_schemas(true),
         Some("check-schemas") => emit_schemas(false),
         Some("gen-ports") => gen_ports(),
         Some("check-readme") => readme::check_readme(),
         Some("check-phrases") => phrases::check_phrases(),
+        Some("check-purity") => gates::check_purity(),
+        Some("check-msrv") => gates::check_msrv(args.iter().any(|a| a == "--run")),
+        Some("check-deny") => gates::check_deny(),
+        Some("check-ci") => gates::check_ci(SUBCOMMANDS),
+        Some("publish-check") => gates::publish_check(),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
-        None => Err(
-            "usage: xtask <check-deps|check-phrases|emit-schemas|check-schemas\
-             |check-readme|gen-ports --registry <path>>"
-                .into(),
-        ),
+        None => Err(format!("usage: xtask <{}>", SUBCOMMANDS.join("|")).into()),
     }
 }
 
@@ -908,6 +935,36 @@ fn write_dataset(path: &Path, ports: &[u16]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SUBCOMMANDS` is what `check-ci` validates `ci.yml` against, so a name
+    /// in the list that the `match` does not dispatch would bless a CI step
+    /// that fails on the runner with `unknown xtask` — which is the exact
+    /// state `.publish-deny` documented for a milestone and a half.
+    ///
+    /// Read out of this file's own text, so the two cannot drift.
+    #[test]
+    fn the_dispatch_and_the_list_agree() {
+        let source = include_str!("main.rs");
+        let dispatched: Vec<&str> = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("Some(\""))
+            .filter_map(|rest| rest.split('"').next())
+            .collect();
+        assert!(
+            dispatched.len() >= 11,
+            "only {} `Some(\"…\")` arms were found; the parse broke and this \
+             comparison is vacuous",
+            dispatched.len()
+        );
+        let mut dispatched_sorted = dispatched.clone();
+        dispatched_sorted.sort_unstable();
+        let mut listed = SUBCOMMANDS.to_vec();
+        listed.sort_unstable();
+        assert_eq!(
+            dispatched_sorted, listed,
+            "the `match` in `main` and `SUBCOMMANDS` disagree"
+        );
+    }
 
     fn pkg(name: &str, deps: &[&str]) -> PackageInfo {
         PackageInfo {
