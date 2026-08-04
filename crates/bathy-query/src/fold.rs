@@ -1156,6 +1156,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn two_events_differing_only_in_a_field_the_fold_reads_do_not_tie() {
+        // The other direction of the test above, and the one that keeps
+        // `TieKey` honest as fields are added. `sort_by` is stable, so two
+        // events that *tie* are applied in arrival order -- which means a
+        // field the fold reads but the tiebreak omits makes the answer depend
+        // on how the log was read, which is the whole thing this fold exists
+        // to remove. `rule_id` is the field that added this hole: the fold
+        // began reading it in M5's fix wave, and a `TieKey` that had not
+        // grown with it would tie these two.
+        let mut first = service(1, "10.0.0.1", 443, "https", None, None, 0.9);
+        let mut second = service(1, "10.0.0.1", 443, "https", None, None, 0.9);
+        if let EventBody::ServiceObserved { rule_id, .. } = &mut first.body {
+            *rule_id = "https.server.a.v1".into();
+        }
+        if let EventBody::ServiceObserved { rule_id, .. } = &mut second.body {
+            *rule_id = "https.server.b.v1".into();
+        }
+        assert_ne!(tie_key(&first), tie_key(&second));
+        assert_eq!(
+            fold_events(&[first.clone(), second.clone()]),
+            fold_events(&[second, first]),
+            "the fold's answer depended on the order the log was read"
+        );
+    }
+
+    #[test]
     fn an_empty_log_folds_to_an_empty_result() {
         let f = fold_events(&[]);
         assert!(f.endpoints.is_empty());

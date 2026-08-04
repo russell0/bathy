@@ -3141,3 +3141,172 @@ fn a_scan_at_or_below_the_threshold_needs_no_approval() {
         "a one-address scan under a sixty-four address threshold must not ask: {result:#}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The two things the gate is deliberately NOT in front of.
+//
+// The gate is `scan.start`-only and MCP-only. Both exemptions were ruled
+// acceptable with reasons -- a shell invocation already has a human in it, and
+// a resume is bounded by the one plan a human already approved -- and neither
+// was asserted anywhere, which is the part that is not acceptable. Per the
+// Global Constraint a deliberate exemption needs a test that encodes it,
+// exactly as `a_scan_at_or_below_the_threshold_needs_no_approval` encodes the
+// other direction. These two are those tests: if either exemption stops being
+// deliberate, they fail and say what changed.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_resume_of_an_approved_plan_is_not_asked_for_approval_again_but_is_re_authorized() {
+    // The exemption, and the two properties that make it safe, in one test --
+    // because the exemption is only defensible while both hold.
+    //
+    // A resume can only continue a plan already in the store. It cannot mint
+    // breadth: `prepare_resume` re-authorizes against the manifest it is
+    // handed, enforces `plan_hash` equality, and seeds the budget ledger from
+    // the prior run's counters. So the total work is bounded by the one plan a
+    // human approved, and asking again would ask about a decision already
+    // made.
+    //
+    // What would break it is a `prepare_resume` that rebuilt a plan from a
+    // caller-supplied manifest. That is why the second half is here: the
+    // manifest is still consulted on every resume, so a resume under a
+    // manifest that no longer authorizes the target is refused rather than
+    // continued.
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, false);
+    // Threshold zero: every scan is above it, so nothing here passes because
+    // it happened to be small.
+    let mut server = Server::start(0);
+
+    let challenged = server.call_raw(
+        "scan.start",
+        start_arguments(&scope, ip, &listener, "resume-exemption"),
+    );
+    assert_eq!(
+        challenged["resultType"],
+        json!("input_required"),
+        "the start must be gated, or this test proves nothing: {challenged:#}"
+    );
+    let state = challenged["requestState"].as_str().unwrap().to_string();
+    let started = server.retry_with_inputs(
+        "harness",
+        "scan.start",
+        start_arguments(&scope, ip, &listener, "resume-exemption"),
+        &state,
+        approved(),
+    );
+    let scan_id = started["structuredContent"]["handle"]["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    wait_for_terminal(&mut server, &scan_id);
+
+    // The exemption itself: a resume is answered, not challenged, even though
+    // the same request through `scan.start` was challenged moments ago.
+    let resumed = server.call_raw(
+        "scan.resume",
+        json!({ "manifest_path": scope.path(), "scan_id": &scan_id }),
+    );
+    assert_eq!(
+        resumed["resultType"],
+        json!("complete"),
+        "a resume of an already-approved plan asked for approval a second time; if that \
+         is now intended, this test is what should change: {resumed:#}"
+    );
+    assert_ne!(
+        resumed["isError"],
+        json!(true),
+        "the resume was refused: {resumed:#}"
+    );
+
+    // And the reason the exemption is safe: the manifest still decides. A
+    // resume under a manifest that authorizes nothing is refused, so the
+    // ungated path cannot be used to reach a target the scope no longer
+    // allows.
+    let elsewhere = Scope::new(&["198.51.100.0/32"]);
+    let refused = server.call_expecting_failure(
+        "scan.resume",
+        json!({ "manifest_path": elsewhere.path(), "scan_id": &scan_id }),
+    );
+    assert!(
+        !refused["error"].as_str().unwrap_or_default().is_empty(),
+        "a resume under a manifest that does not authorize the target must be refused: \
+         {refused:#}"
+    );
+}
+
+#[test]
+fn the_command_line_starts_a_scan_above_the_threshold_without_any_approval_token() {
+    // The other exemption, and it is a design decision rather than an
+    // oversight: the threshold exists so an *agent* cannot commit a human's
+    // network without a human, and a shell invocation already has one. The
+    // CLI constructs no `ApprovalGate` at all -- there is nothing to satisfy,
+    // no `--approve` flag, and no token to forge.
+    //
+    // Encoded here because it is the load-bearing asymmetry between the two
+    // surfaces, and until now nothing said so: a reader comparing them had
+    // only `serve.rs`'s "adds no capability" to go on, which reads as though
+    // the two had equal posture.
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, true);
+    let state = tempfile::tempdir().expect("tempdir");
+    let state_dir = state.path().to_str().unwrap().to_string();
+
+    // The same plan the MCP surface refuses to start unasked -- run through a
+    // server whose threshold is zero, above, and it is `input_required`.
+    let (code, stdout) = bathy(&[
+        "--json",
+        "--state-dir",
+        &state_dir,
+        "scan",
+        "start",
+        "--scope",
+        &scope.path(),
+        "--targets",
+        &ip.to_string(),
+        "--ports",
+        &listener.port(),
+        "--idempotency-key",
+        "cli-exemption",
+    ]);
+    assert_eq!(
+        code, 0,
+        "the command surface refused a scan it should run: {stdout}"
+    );
+    assert!(
+        !stdout.contains("input_required") && !stdout.contains("requestState"),
+        "the command surface emitted an approval challenge nothing can answer: {stdout}"
+    );
+    // It really scanned: an approval-shaped no-op would print a document and
+    // touch nothing.
+    assert!(
+        listener.accepts() > 0,
+        "the command surface printed a handle but sent no packet"
+    );
+
+    // And the scope check is what is *not* exempt. The same command against a
+    // manifest that does not authorize the target is refused, so "no approval
+    // gate" is not "no authorization".
+    let elsewhere = Scope::new(&["198.51.100.0/32"]);
+    let (code, stdout) = bathy(&[
+        "--json",
+        "--state-dir",
+        &state_dir,
+        "scan",
+        "start",
+        "--scope",
+        &elsewhere.path(),
+        "--targets",
+        &ip.to_string(),
+        "--ports",
+        &listener.port(),
+        "--idempotency-key",
+        "cli-exemption-denied",
+    ]);
+    assert_ne!(
+        code, 0,
+        "an out-of-scope scan was accepted from the command line: {stdout}"
+    );
+}
