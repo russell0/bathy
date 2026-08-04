@@ -526,91 +526,16 @@ mod tests {
 
     // --- Beyond the brief: many probes in sequence must not leak fds ---
     //
-    // A scan issues one `probe_connect` per port, so any per-call leak
-    // becomes a leak per probe, and a large scan would exhaust local file
-    // descriptors. `open_fd_count`'s `/proc/self/fd` read only works on
-    // Linux (no `/proc` on macOS by default, and counting fds any other
-    // way without `unsafe` -- e.g. `libc::getrlimit` -- would conflict with
-    // this crate's `#![forbid(unsafe_code)]`); CI (`ubuntu-latest`) is
-    // exactly that platform, so the numeric assertion is still enforced as
-    // a merge gate even though it's skipped locally on macOS. The loop
-    // itself still runs on every platform, proving `PROBES` sequential
-    // probes neither hang nor error out.
-    //
-    // M3 Task 7 fix round 2: `PROBES` was 2,000, and review measured this
-    // ONE test as the dominant cause of this crate's real test-suite
-    // flakiness under `cargo test`'s default parallelism -- NOT host load,
-    // which is what fix round 1's report incorrectly attributed it to (see
-    // that round's report and this round's correction). Each of the 2,000
-    // iterations is a real, successful TCP connect immediately closed from
-    // the client side (an `Open` outcome always `drop(stream)`s promptly --
-    // see `probe_connect`'s own doc comment), and an actively-closed TCP
-    // connection's local (ephemeral-port) side sits in TIME_WAIT for a
-    // fixed OS-level interval (30s on macOS) before that port is reusable.
-    // Measured directly: one full `cargo test -p bathy-engine` run consumed
-    // ~2,170 ephemeral ports into TIME_WAIT, ~93% of it (~2,023 ports) from
-    // this one test alone -- unlike a closed-port scan (an immediate
-    // `ECONNREFUSED`, no established connection, no TIME_WAIT at all), an
-    // `Open` outcome's connect-then-close is the expensive case for this
-    // specific resource. macOS's default ephemeral port range is 16,384
-    // ports; at this crate's ~3s-per-parallel-run cadence during iterative
-    // `cargo test` invocations, that is a steady-state consumption rate the
-    // 30s TIME_WAIT interval cannot drain fast enough, and review
-    // reproduced outright exhaustion deterministically (run 8 of a sweep,
-    // twice in a row, 16,108 of 16,384 ephemeral ports in TIME_WAIT).
-    // `PROBES = 300` still proves the same "no fd leak" property (confirmed
-    // by review: it holds at 300 as well as 2,000) at roughly 1/7th the
-    // ephemeral-port cost, without weakening what this test actually
-    // verifies.
-    #[cfg(target_os = "linux")]
-    fn open_fd_count() -> usize {
-        std::fs::read_dir("/proc/self/fd")
-            .map(|d| d.count())
-            .unwrap_or(0)
-    }
-
-    #[tokio::test]
-    async fn many_open_probes_in_sequence_do_not_leak_the_socket() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // A real acceptor, continuously draining the queue -- unlike
-        // `a_full_backlog_reports_filtered_via_the_timeout_path` above,
-        // this test needs many successful connects, not 128, so nothing
-        // may be left unaccepted.
-        let acceptor = tokio::spawn(async move {
-            while let Ok((s, _)) = listener.accept().await {
-                drop(s);
-            }
-        });
-
-        #[cfg(target_os = "linux")]
-        let before = open_fd_count();
-
-        // 300, not 2,000 -- see this test's own comment above
-        // (`PROBES = 300 as well as 2,000`) for why: the fd-leak property
-        // this test proves holds identically at either size, but 2,000
-        // real connect-then-close round trips is what made this crate's
-        // own test suite the dominant consumer of local ephemeral ports
-        // under `cargo test`'s default parallelism.
-        const PROBES: usize = 300;
-        for _ in 0..PROBES {
-            let out = probe_connect(addr.ip(), addr.port(), Duration::from_secs(2)).await;
-            assert_eq!(out, ConnectOutcome::Open);
-        }
-
-        #[cfg(target_os = "linux")]
-        {
-            let after = open_fd_count();
-            // A little slack for the acceptor task and the runtime's own
-            // fds, but PROBES leaked client sockets would show up as
-            // hundreds more, not a handful.
-            assert!(
-                after.saturating_sub(before) < 20,
-                "fd count grew from {before} to {after} after {PROBES} probes \
-                 -- probe_connect is not closing its socket promptly"
-            );
-        }
-
-        acceptor.abort();
-    }
+    // `many_open_probes_in_sequence_do_not_leak_the_socket` used to live
+    // here. It now lives in `crates/bathy-engine/tests/connect_fd_leak.rs`,
+    // alone in its own test binary, and it MUST NOT come back: the only
+    // no-`unsafe` way to count descriptors on Linux is `/proc/self/fd`,
+    // which is process-wide, so inside this binary it measured the whole
+    // suite's descriptors -- the other ~104 tests here bind listeners and
+    // open databases concurrently -- and blamed the difference on
+    // `probe_connect`. It failed on every Linux CI run from 2026-08-01 and
+    // was never reproducible on macOS, where the assertion is
+    // `cfg`-compiled out entirely. See that file's module comment for the
+    // measurement that settles it (the growth scales with `--test-threads`,
+    // not with the probe count).
 }

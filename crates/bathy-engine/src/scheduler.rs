@@ -4350,6 +4350,52 @@ mod tests {
         spawn_http_stub_with_response(NGINX_RESPONSE.to_vec()).await
     }
 
+    /// Two stubs, re-ordered into the PLAN's own unit order: `(unit 0's
+    /// stub, unit 1's stub)`.
+    ///
+    /// Every test below that cares WHICH endpoint the scheduler reaches
+    /// first must go through this, and none may assume the stub it created
+    /// first is unit 0. `spawn_http_stub` binds `127.0.0.1:0` and the kernel
+    /// chooses the port; `ScanPlan` orders its units by port. Whether the
+    /// first-created stub is therefore unit 0 depends entirely on which of
+    /// two ephemeral port numbers the kernel happened to hand out lower --
+    /// which is a platform property, not a property of the scheduler.
+    ///
+    /// macOS hands out ephemeral ports by ascending sequence, so
+    /// `stub_a.port() < stub_b.port()` there essentially always, and tests
+    /// that assumed it passed on every local run. Linux randomises the
+    /// allocation, so the order inverts roughly half the time. That is the
+    /// entire content of the "unit 0's connect ran (paid-for work, correctly
+    /// drained)" and "unit 0's own connect probe is real, already-paid-for
+    /// work" failures that ran red on `ubuntu-latest` from 2026-08-01: the
+    /// M3/M4 drain invariant they guard held on Linux every time (measured:
+    /// `units_completed: 1, packets_spent: 1, open_ports: 1` on every run,
+    /// with the accept landing on whichever stub was genuinely unit 0) --
+    /// the fixture was reading the counter of the wrong listener.
+    fn stubs_in_plan_order<'a>(
+        plan: &ScanPlan,
+        first_created: &'a HttpStub,
+        second_created: &'a HttpStub,
+    ) -> (&'a HttpStub, &'a HttpStub) {
+        let ports: Vec<u16> = plan.units_from(0).map(|u| u.endpoint.port).collect();
+        assert_eq!(
+            ports.len(),
+            2,
+            "stubs_in_plan_order describes a two-unit plan, got {ports:?}"
+        );
+        assert!(
+            ports.contains(&first_created.port()) && ports.contains(&second_created.port()),
+            "plan units {ports:?} are not the two stubs ({}, {})",
+            first_created.port(),
+            second_created.port()
+        );
+        if ports[0] == first_created.port() {
+            (first_created, second_created)
+        } else {
+            (second_created, first_created)
+        }
+    }
+
     /// `service_detection: ServiceDetection::default()` (enabled, intensity
     /// 4), `evidence_level: Headers` -- what most of this section's tests
     /// need.
@@ -4955,7 +5001,7 @@ mod tests {
         // in-flight work" invariant 2 says must still be drained, when the
         // post-`'drive` unconditional drain loop picks it up and calls
         // `record`. Before this fix, that meant `detect_service` would
-        // still open a fresh reconnect and write real bytes to `stub_a`
+        // still open a fresh reconnect and write real bytes to unit 0's stub
         // AFTER cancellation; after it, `detect_service`'s own
         // `cancel.is_cancelled()` check refuses to start anything.
         let stub_a = spawn_http_stub().await;
@@ -4972,6 +5018,12 @@ mod tests {
             ServiceDetection::default(),
             EvidenceLevel::Headers,
         );
+
+        // Which of the two stubs is unit 0 is decided by the kernel's
+        // ephemeral-port allocation, never by the order they were created
+        // in -- see `stubs_in_plan_order` for the platform difference that
+        // made this test read the wrong listener's counter on Linux.
+        let (unit0, unit1) = stubs_in_plan_order(&h.plan, &stub_a, &stub_b);
 
         let cancel = CancellationToken::new();
         let cancel_after = cancel.clone();
@@ -4993,20 +5045,20 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert_eq!(
-            stub_a.accept_count(),
+            unit0.accept_count(),
             1,
             "unit 0's own connect probe is real, already-paid-for work and must still be \
              drained -- but nothing beyond it"
         );
         assert_eq!(
-            stub_a.bytes_received(),
+            unit0.bytes_received(),
             0,
             "detect_service must not write any probe bytes for a unit whose connect probe only \
              completed AFTER cancellation was observed -- {} bytes were sent post-cancel",
-            stub_a.bytes_received()
+            unit0.bytes_received()
         );
         assert_eq!(
-            stub_b.accept_count(),
+            unit1.accept_count(),
             0,
             "test fixture sanity: unit 1 must never even be dispatched"
         );
@@ -5181,6 +5233,12 @@ mod tests {
             EvidenceLevel::Headers,
         );
 
+        // Which of the two stubs is unit 0 is decided by the kernel's
+        // ephemeral-port allocation, never by the order they were created
+        // in -- see `stubs_in_plan_order` for the platform difference that
+        // made this test read the wrong listener's counter on Linux.
+        let (unit0, unit1) = stubs_in_plan_order(&h.plan, &stub_a, &stub_b);
+
         let cancel = CancellationToken::new();
         let cancel_after = cancel.clone();
         tokio::spawn(async move {
@@ -5198,17 +5256,17 @@ mod tests {
         // this section.
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
-            stub_a.accept_count(),
+            unit0.accept_count(),
             1,
             "test fixture sanity: unit 0's connect ran (paid-for work, correctly drained)"
         );
         assert_eq!(
-            stub_a.request_count(),
+            unit0.request_count(),
             0,
             "test fixture sanity: unit 0's identification was correctly refused post-cancel"
         );
         assert_eq!(
-            stub_b.accept_count(),
+            unit1.accept_count(),
             0,
             "test fixture sanity: unit 1 must never have been reached by run1"
         );
@@ -5255,12 +5313,12 @@ mod tests {
         // is never touched again (invariant 3), unit 1 is connected AND
         // identified exactly once, entirely within run2.
         assert_eq!(
-            stub_a.accept_count(),
+            unit0.accept_count(),
             1,
             "unit 0 must not be re-probed on resume, in any form"
         );
         assert_eq!(
-            stub_b.accept_count(),
+            unit1.accept_count(),
             2,
             "unit 1 must be fully connected AND identified during run2, exactly once"
         );
