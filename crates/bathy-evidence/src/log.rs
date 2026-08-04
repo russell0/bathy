@@ -341,9 +341,36 @@ enum TailPolicy {
     SkipPartial,
 }
 
-/// The version this build stamps on every record it writes, and compares
-/// against when one will not load.
-const THIS_ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The version every writer in this build stamps on every record, and the
+/// one the reader compares against when a record will not load.
+///
+/// **This is the only spelling of it.** It is `pub` and re-exported from the
+/// crate root because the two production writers -- `crates/bathy`'s
+/// `scan start` and `bathy-mcp`'s `scan.start` -- must stamp the *same*
+/// string, and until the M5 close-out review they did not: each passed its
+/// own crate's `env!("CARGO_PKG_VERSION")`, so one build wrote `0.1.0-alpha.1`
+/// from the command line and `0.1.0` from the MCP server. The reader below
+/// compares against `bathy-evidence`'s version, matched only the second, and
+/// therefore reported a version skew on **every record the CLI ever wrote** --
+/// a false statement on the most common diagnostic path, telling whoever read
+/// it to go looking for a compatibility problem that did not exist.
+///
+/// A field whose value depends on which surface wrote the record is not
+/// provenance. `engine_version` names the *engine* build, and the workspace
+/// version is the one number every crate in that engine shares:
+/// `crates/bathy`'s `0.1.0-alpha.1` is a crates.io publication version for
+/// the CLI wrapper (it moves when a release train moves, not when the engine
+/// does) and `bathy-mcp`'s literal `0.1.0` was a third spelling of the same
+/// thing. So the constant lives here, in the crate that owns the log format
+/// and is its only reader, and the writers name it rather than restating it.
+///
+/// Guarded end-to-end, through a *production* writer, by
+/// `a_log_written_by_the_real_binary_is_not_accused_of_coming_from_another_build`
+/// in `crates/bathy/tests/cli.rs`. The two tests in this module's own suite
+/// write through this crate's test writer, which stamps this constant by
+/// construction, so they could not see the defect -- they test the model, not
+/// the product.
+pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// A record that would not deserialize, reported with the build that wrote it
 /// when that build is not this one.
@@ -377,9 +404,9 @@ fn malformed_record(
                 .map(str::to_owned)
         });
     let detail = match written_by {
-        Some(version) if version != THIS_ENGINE_VERSION => format!(
+        Some(version) if version != ENGINE_VERSION => format!(
             "{detail} (this record was written by bathy {version} and this build is \
-             {THIS_ENGINE_VERSION}; a record is meant to outlive the build that wrote \
+             {ENGINE_VERSION}; a record is meant to outlive the build that wrote \
              it, so this is a compatibility defect in this build, not in the log)"
         ),
         _ => detail.to_string(),
@@ -913,7 +940,7 @@ mod tests {
         // what a future build would have stamped on it.
         let from_the_future = lines[1]
             .replace(
-                &format!("\"engine_version\":\"{THIS_ENGINE_VERSION}\""),
+                &format!("\"engine_version\":\"{ENGINE_VERSION}\""),
                 "\"engine_version\":\"9.9.9\"",
             )
             .replace("\"event_type\"", "\"telemetry_budget\":3,\"event_type\"");
@@ -932,7 +959,7 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("line 2"), "got {text}");
         assert!(
-            text.contains("9.9.9") && text.contains(THIS_ENGINE_VERSION),
+            text.contains("9.9.9") && text.contains(ENGINE_VERSION),
             "the error must name both the writing build and this one, got {text}"
         );
     }

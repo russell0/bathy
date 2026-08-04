@@ -1649,3 +1649,119 @@ fn a_read_that_is_not_following_returns_the_whole_log_rather_than_a_silent_prefi
         bounded.stderr
     );
 }
+
+// --- Provenance: one build, one `engine_version` --------------------------
+
+/// The version note on an unloadable record must not fire on a record this
+/// build wrote -- checked against a log a **production writer** produced.
+///
+/// `bathy-evidence`'s own suite already has
+/// `a_record_written_by_this_build_is_not_accused_of_being_from_another`, and
+/// it passed while this was broken in production for every scan started from
+/// the command line, because it writes through that crate's *test* writer,
+/// which stamps `ENGINE_VERSION` by construction. It tested the author's
+/// model of what a writer stamps. The two writers that actually exist stamped
+/// their own crates' `CARGO_PKG_VERSION` instead -- `0.1.0-alpha.1` here and
+/// `0.1.0` from the MCP server -- so the reader's "is this my build?" branch
+/// was unreachable on the commonest path and every CLI-written record that
+/// failed to load was accused of a version skew that did not exist.
+///
+/// This test can only be written where a real `bathy` process writes a real
+/// log, which is why it is here and not there. Three assertions, and the
+/// third is the control: without it, deleting the note entirely would pass.
+#[test]
+fn a_log_written_by_the_real_binary_is_not_accused_of_coming_from_another_build() {
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, true);
+    let state = state_dir();
+    let state_path = state.path().to_str().unwrap().to_string();
+
+    let start = bathy(&[
+        "--json",
+        "--state-dir",
+        &state_path,
+        "scan",
+        "start",
+        "--scope",
+        scope.path(),
+        "--idempotency-key",
+        "engine-version-provenance",
+        "--targets",
+        &ip.to_string(),
+        "--ports",
+        &listener.port(),
+    ]);
+    start.success();
+    let scan_id = scan_id_of(&start);
+    let log = PathBuf::from(&state_path).join(format!("{scan_id}.jsonl"));
+    let written = std::fs::read_to_string(&log).expect("the scan wrote its log");
+
+    // 1. The production writer stamps the one constant the reader compares
+    //    against. Asserted on the bytes on disk, not on a constant: this is
+    //    the assertion that fails if a surface goes back to its own version.
+    let stamp = format!("\"engine_version\":\"{}\"", bathy_evidence::ENGINE_VERSION);
+    assert!(
+        written.contains(&stamp),
+        "no record carries {stamp}; the CLI is stamping something else:\n{written}"
+    );
+
+    // 2. A record from this build that will not load draws no version note.
+    //    The corruption is a field this build has never heard of, which is
+    //    the shape the note exists to explain.
+    let mut lines: Vec<String> = written.lines().map(str::to_owned).collect();
+    assert!(lines.len() >= 2, "expected a multi-record log:\n{written}");
+    let last = lines.len() - 1;
+    let corrupt = lines[last].replace("\"event_type\"", "\"telemetry_budget\":3,\"event_type\"");
+    assert_ne!(
+        corrupt, lines[last],
+        "fixture sanity: the record must genuinely have been changed"
+    );
+    lines[last] = corrupt;
+    std::fs::write(&log, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let events = bathy(&[
+        "--json",
+        "--state-dir",
+        &state_path,
+        "scan",
+        "events",
+        "--scan",
+        &scan_id,
+    ]);
+    let said = format!("{}{}", events.stdout, events.stderr);
+    events.code(1);
+    assert!(
+        said.contains("telemetry_budget") || said.contains("unknown field"),
+        "fixture sanity: the log must genuinely be unreadable, got:\n{said}"
+    );
+    assert!(
+        !said.contains("this build is"),
+        "a record this build wrote was accused of coming from another build:\n{said}"
+    );
+
+    // 3. The control. The note is not merely silent -- it still fires when
+    //    there really is a skew, so assertion 2 is about the comparison
+    //    rather than about a diagnostic that has stopped working.
+    lines[last] = lines[last].replace(&stamp, "\"engine_version\":\"9.9.9\"");
+    assert!(
+        lines[last].contains("9.9.9"),
+        "fixture sanity: no stamp to rewrite"
+    );
+    std::fs::write(&log, format!("{}\n", lines.join("\n"))).unwrap();
+    let skewed = bathy(&[
+        "--json",
+        "--state-dir",
+        &state_path,
+        "scan",
+        "events",
+        "--scan",
+        &scan_id,
+    ]);
+    let said = format!("{}{}", skewed.stdout, skewed.stderr);
+    skewed.code(1);
+    assert!(
+        said.contains("9.9.9") && said.contains("this build is"),
+        "a genuine version skew must still be reported, got:\n{said}"
+    );
+}

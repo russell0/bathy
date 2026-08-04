@@ -187,7 +187,13 @@ pub fn spawn_scan(
         Arc::clone(&runtime.store),
         Arc::clone(&runtime.clock),
         scan_id,
-        env!("CARGO_PKG_VERSION"),
+        // The same constant `crates/bathy`'s `scan start` passes, and for the
+        // same reason: these two are the only production writers of the event
+        // log, they write the identical record shape from the identical
+        // engine, and a provenance field that says something different
+        // depending on which surface was in front is not provenance. See the
+        // doc comment on `ENGINE_VERSION`.
+        bathy_evidence::ENGINE_VERSION,
         authorized.request().service_detection,
         authorized.request().evidence_level,
         Arc::clone(&runtime.evidence),

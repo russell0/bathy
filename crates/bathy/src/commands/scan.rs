@@ -200,7 +200,14 @@ async fn run_to_completion(
         Arc::clone(&runtime.store),
         Arc::clone(&runtime.clock),
         scan_id,
-        env!("CARGO_PKG_VERSION"),
+        // Not this crate's `CARGO_PKG_VERSION`, which is `0.1.0-alpha.1` --
+        // a publication version for the CLI wrapper. `bathy-mcp` writes the
+        // same records from the same engine, and when each surface stamped
+        // its own crate version one build wrote two different provenance
+        // strings; the reader in `bathy-evidence` matched only one of them
+        // and accused every CLI-written record of a version skew. See the
+        // doc comment on `ENGINE_VERSION`.
+        bathy_evidence::ENGINE_VERSION,
         authorized.request().service_detection,
         authorized.request().evidence_level,
         Arc::clone(&runtime.evidence),

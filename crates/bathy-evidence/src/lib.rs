@@ -45,5 +45,5 @@
 pub mod log;
 pub mod store;
 
-pub use log::{EventLog, EventLogReader, LogError};
+pub use log::{ENGINE_VERSION, EventLog, EventLogReader, LogError};
 pub use store::{EvidenceError, EvidenceStore, blob_path};

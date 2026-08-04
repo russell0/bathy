@@ -2268,8 +2268,20 @@ fn every_advertised_tool_and_its_subcommand_answer_the_same_question_the_same_wa
     // reported a twelfth tool nobody compared.
 
     let mut compared = 0;
+    let mut uncompared: Vec<&str> = Vec::new();
     for name in &advertised {
-        for case in parity_cases(name, &fixture) {
+        let cases = parity_cases(name, &fixture);
+        // Per tool, not in aggregate. `compared >= advertised.len()` at the
+        // bottom is an aggregate and a tool contributing two cases masks a
+        // tool contributing none -- which is precisely the "every advertised
+        // tool has a comparison" claim the comment above makes and the
+        // aggregate does not establish. The M5 close-out review found this
+        // shape (a check made vacuous by the shape of its own guard) in
+        // `bathy-types`; this is the same shape with eleven tools behind it.
+        if cases.is_empty() {
+            uncompared.push(name);
+        }
+        for case in cases {
             let from_tool = server.call(name, case.arguments.clone());
             let argv: Vec<&str> = case.argv.iter().map(String::as_str).collect();
             let (code, stdout) = bathy(&argv);
@@ -2334,6 +2346,11 @@ fn every_advertised_tool_and_its_subcommand_answer_the_same_question_the_same_wa
             compared += 1;
         }
     }
+    assert!(
+        uncompared.is_empty(),
+        "{uncompared:?} are advertised and have no parity case at all; the aggregate \
+         count below cannot see this, because another tool's second case pays for it"
+    );
     assert!(
         compared >= advertised.len(),
         "{compared} comparisons for {} tools",
@@ -3309,4 +3326,98 @@ fn the_command_line_starts_a_scan_above_the_threshold_without_any_approval_token
         code, 0,
         "an out-of-scope scan was accepted from the command line: {stdout}"
     );
+}
+
+/// One build stamps one `engine_version`, whichever surface wrote the record.
+///
+/// The MCP server and the command line are the only two production writers of
+/// the event log. Until the M5 close-out review each passed its own crate's
+/// `env!("CARGO_PKG_VERSION")` into `Scheduler::new` -- `0.1.0` here and
+/// `0.1.0-alpha.1` there -- so a single build wrote two different provenance
+/// strings, and `bathy-evidence`'s "was this record written by me?" comparison
+/// matched only one of them. A field that says something different depending
+/// on which front door was used is not provenance, and the half of the reader
+/// that stayed silent for this build's own records was unreachable from the
+/// command line entirely.
+///
+/// Asserted on the bytes both surfaces put on disk, and against each other:
+/// a constant compared with itself would pass on any pair of writers.
+#[test]
+fn both_production_surfaces_stamp_the_same_engine_version_on_the_records_they_write() {
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, true);
+    let mut server = Server::start(64);
+
+    let started = server.call(
+        "scan.start",
+        json!({
+            "manifest_path": scope.path(),
+            "request": scan_request(&ip.to_string(), &listener.port(), "provenance-parity"),
+        }),
+    );
+    let scan_id = started["handle"]["task_id"].as_str().unwrap().to_string();
+    wait_for_terminal(&mut server, &scan_id);
+    let by_the_server = engine_versions_in(&server.state_dir(), &scan_id);
+
+    let cli_state = tempfile::tempdir().expect("tempdir");
+    let cli_state = cli_state.path().to_str().unwrap().to_string();
+    let (code, stdout) = bathy(&[
+        "--json",
+        "--state-dir",
+        &cli_state,
+        "scan",
+        "start",
+        "--scope",
+        &scope.path(),
+        "--idempotency-key",
+        "provenance-parity-cli",
+        "--targets",
+        &ip.to_string(),
+        "--ports",
+        &listener.port(),
+    ]);
+    assert_eq!(code, 0, "{stdout}");
+    let cli_scan_id: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+    let cli_scan_id = cli_scan_id["handle"]["task_id"].as_str().unwrap();
+    let by_the_cli = engine_versions_in(&cli_state, cli_scan_id);
+
+    assert_eq!(
+        by_the_server, by_the_cli,
+        "the two production writers stamped different provenance on the same build's records"
+    );
+    assert_eq!(
+        by_the_server,
+        vec![bathy_evidence::ENGINE_VERSION.to_string()],
+        "the writers agree with each other but not with the constant the reader compares against"
+    );
+}
+
+/// Every distinct `engine_version` in a scan's log, in first-seen order.
+///
+/// Returns a set rather than one value on purpose: a writer that changed its
+/// mind mid-scan is as much a defect as two writers disagreeing, and a helper
+/// that read only the first record could not tell.
+fn engine_versions_in(state_dir: &str, scan_id: &str) -> Vec<String> {
+    let path = std::path::Path::new(state_dir).join(format!("{scan_id}.jsonl"));
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let mut seen: Vec<String> = Vec::new();
+    let mut records = 0usize;
+    for line in text.lines() {
+        let value: Value = serde_json::from_str(line).expect("every log line is a record");
+        records += 1;
+        let version = value["engine_version"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a record with no engine_version: {line}"))
+            .to_string();
+        if !seen.contains(&version) {
+            seen.push(version);
+        }
+    }
+    assert!(
+        records > 0,
+        "{} is empty; a log nobody wrote proves nothing",
+        path.display()
+    );
+    seen
 }
