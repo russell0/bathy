@@ -174,6 +174,119 @@ impl Stats {
     }
 }
 
+/// Whether any object in `text` carries the same key twice.
+///
+/// # Why this is a scanner and not a `serde_json` call
+///
+/// `serde_json::Value` keeps the last of a repeated key, so by the time a
+/// document is a `Value` the evidence is gone -- which is exactly why a
+/// duplicate key is the one input shape whose canonical output is not a
+/// permutation of the input's own tokens, and worth counting.
+///
+/// The first version of this counted punctuation: `opens > 0 &&
+/// colons > commas + opens - 1`. A review fed it `{"a":"x:y"}` -- one object,
+/// no duplicate key anywhere -- and the `duplicate_keys` flag came up set. So
+/// the reported "9/9 JSON shapes" was 8 shapes plus a heuristic that any
+/// colon inside a string value satisfies: a coverage claim a decoration input
+/// meets, which is the defect class the whole instrumentation argues against.
+///
+/// # What it assumes
+///
+/// That `text` is already valid JSON -- every caller checks that first, by
+/// parsing it. A scanner is allowed to be simple about malformed input
+/// because malformed input never reaches it; what it may NOT be is wrong
+/// about the shapes it names. Keys are compared *unescaped*, because `"a"`
+/// and `"a"` are the same key and `serde_json` collapses them.
+pub fn has_duplicate_keys(text: &str) -> bool {
+    // One frame per open `{` or `[`. `Some(keys)` is an object.
+    let mut stack: Vec<Option<Vec<String>>> = Vec::new();
+    let mut expecting_key = false;
+    let mut chars = text.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        match c {
+            '{' => {
+                stack.push(Some(Vec::new()));
+                expecting_key = true;
+            }
+            '[' => {
+                stack.push(None);
+                expecting_key = false;
+            }
+            '}' | ']' => {
+                stack.pop();
+                expecting_key = false;
+            }
+            // Whether this comma separates members or array elements is
+            // decided by the frame, at the point of use, and not here: an
+            // extra `matches!` on the frame at this line is a second copy of
+            // the same decision, and a copy no fixture can make disagree
+            // with the original is a branch nothing tests.
+            ',' => expecting_key = true,
+            '"' => {
+                let mut key = String::new();
+                while let Some((_, c)) = chars.next() {
+                    match c {
+                        '"' => break,
+                        '\\' => match chars.next().map(|(_, e)| e) {
+                            Some('u') => {
+                                let mut hex = String::new();
+                                for _ in 0..4 {
+                                    if let Some((_, h)) = chars.next() {
+                                        hex.push(h);
+                                    }
+                                }
+                                let unit = u32::from_str_radix(&hex, 16).unwrap_or(0xFFFD);
+                                // A surrogate pair is one character; a lone
+                                // surrogate cannot occur in valid JSON, and
+                                // is folded to the replacement character
+                                // rather than guessed at.
+                                let decoded = if (0xD800..0xDC00).contains(&unit) {
+                                    let mut low = String::new();
+                                    if chars.peek().map(|(_, c)| *c) == Some('\\') {
+                                        chars.next();
+                                        chars.next();
+                                        for _ in 0..4 {
+                                            if let Some((_, h)) = chars.next() {
+                                                low.push(h);
+                                            }
+                                        }
+                                    }
+                                    u32::from_str_radix(&low, 16)
+                                        .ok()
+                                        .map(|low| {
+                                            0x10000 + ((unit - 0xD800) << 10) + (low - 0xDC00)
+                                        })
+                                        .unwrap_or(0xFFFD)
+                                } else {
+                                    unit
+                                };
+                                key.push(char::from_u32(decoded).unwrap_or('\u{FFFD}'));
+                            }
+                            Some('b') => key.push('\u{8}'),
+                            Some('f') => key.push('\u{c}'),
+                            Some('n') => key.push('\n'),
+                            Some('r') => key.push('\r'),
+                            Some('t') => key.push('\t'),
+                            Some(other) => key.push(other),
+                            None => break,
+                        },
+                        other => key.push(other),
+                    }
+                }
+                if expecting_key && let Some(Some(keys)) = stack.last_mut() {
+                    if keys.contains(&key) {
+                        return true;
+                    }
+                    keys.push(key);
+                    expecting_key = false;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 /// `None` when stats are off. Read once: this is on the hot path.
 fn reporting_interval() -> Option<u64> {
     static INTERVAL: OnceLock<Option<u64>> = OnceLock::new();
@@ -209,6 +322,47 @@ mod tests {
     /// value this line can carry, and a report that omits the clause
     /// entirely when the count is zero goes quiet in exactly the situation
     /// it was built to make visible.
+    /// Each case names a way the punctuation heuristic this replaced was
+    /// wrong, or a way a naive scanner would be. The first is the review's
+    /// own reproduction.
+    #[test]
+    fn duplicate_keys_are_the_thing_detected_and_not_a_colon() {
+        for (json, expected) in [
+            (r#"{"a":"x:y"}"#, false),
+            (r#"{"a":1,"a":2}"#, true),
+            // Same key in two DIFFERENT objects is not a duplicate.
+            (r#"{"a":{"b":1},"c":{"b":2}}"#, false),
+            // Nested inside an array, which a depth-blind scanner misses.
+            (r#"{"a":[{"b":1,"b":2}]}"#, true),
+            // A key equal only after unescaping. `serde_json` collapses
+            // these, so the canonical form is short one member.
+            (r#"{"a":1,"a":2}"#, true),
+            // Braces, colons, commas and quotes inside a STRING VALUE are
+            // not structure. This is the shape a text heuristic reads as a
+            // duplicated key.
+            (r#"{"a":"{\"b\":1,\"b\":2}"}"#, false),
+            (r#"{"a:b":1,"c":2}"#, false),
+            // An array of objects that each repeat nothing.
+            (r#"[{"a":1},{"a":2}]"#, false),
+            // Array ELEMENTS are not keys, however many times they repeat --
+            // three of them, because two can pass a scanner that starts
+            // recording one element late.
+            (r#"{"k":["a","a"]}"#, false),
+            (r#"["a","a","a"]"#, false),
+            // A nested object must be POPPED: the outer `"b"` here belongs to
+            // the outer object, which does not have one, and a scanner that
+            // never closes a frame reads it as a repeat of the inner one.
+            (r#"{"a":{"b":1},"b":2}"#, false),
+            // A value equal to its own key is not a repeated key.
+            (r#"{"a":"a"}"#, false),
+            (r#"{}"#, false),
+            (r#""just a string""#, false),
+            (r#"{"a":1,"b":{"c":2,"c":3}}"#, true),
+        ] {
+            assert_eq!(has_duplicate_keys(json), expected, "{json}");
+        }
+    }
+
     #[test]
     fn a_target_that_reached_nothing_still_reports_the_denominator() {
         static S: Stats = Stats::new("t", &[], &["ok:a", "ok:b"]);

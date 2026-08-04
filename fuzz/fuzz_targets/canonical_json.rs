@@ -102,11 +102,17 @@ fuzz_target!(|data: &[u8]| {
     // `serde_json` keeps the last of a repeated key, so a canonical form can
     // never carry one. Worth counting: it is the one input shape where the
     // canonical output is not a permutation of the input's own tokens.
-    if let Ok(text) = std::str::from_utf8(data) {
-        let opens = text.matches('{').count();
-        if opens > 0 && text.matches(':').count() > text.matches(',').count() + opens - 1 {
-            STATS.flag(8);
-        }
+    //
+    // This was `opens > 0 && colons > commas + opens - 1` -- a punctuation
+    // count that `{"a":"x:y"}` alone satisfies, with no duplicate key
+    // anywhere, so `reached=9/9` was eight shapes and one heuristic. The
+    // scanner behind `has_duplicate_keys` measures what the flag is named
+    // after, and has its own unit tests (`cargo run -p xtask --
+    // check-fuzz-crate`), including that exact input.
+    if let Ok(text) = std::str::from_utf8(data)
+        && bathy_fuzz::has_duplicate_keys(text)
+    {
+        STATS.flag(8);
     }
 
     let canonical = match canonical_json(&value) {

@@ -1838,6 +1838,10 @@ pub fn check_lab() -> Fallible<()> {
 
 pub const FUZZ_MANIFEST: &str = "fuzz/Cargo.toml";
 
+/// The statement in `interpret.rs` that names the flag bits, which must run
+/// once per execution rather than once per match. See the check that uses it.
+pub const INTERPRET_NAMES_THE_RULES: &str = "let rules = rule_ids();";
+
 /// One function that consumes bytes this project did not write, and the fuzz
 /// target that drives it (AC-7.7).
 ///
@@ -2232,6 +2236,42 @@ pub fn fuzz_violations(root: &Path, manifest: &str, ci_path: &str, ci: &str) -> 
                  (AC-7.9)"
             ));
         }
+    }
+
+    // AC-7.8's other half: the target must report what it reached, including
+    // when that is nothing. `rule_ids()` is what names the flag bits, and
+    // while it was called only from inside `for i in &out`, an execution that
+    // matched nothing left the labels empty and `Stats::report` dropped the
+    // entire `reached=` clause — the instrument went silent in precisely the
+    // case it exists for. The fix is one line and the position IS the fix, so
+    // the check is about the position: the call has to be outside the loop.
+    //
+    // Over the CODE, not the file: the comment above the call quotes `for i
+    // in &out` to explain itself, and a check that read the comment would
+    // find the loop before the call and report a defect in the fix. This is
+    // the third time in this file that prose about a gate has satisfied or
+    // broken the gate.
+    let code: String = interpret
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let names_the_rules_at = code.find(INTERPRET_NAMES_THE_RULES);
+    let matches_at = code.find("for i in &out");
+    match (names_the_rules_at, matches_at) {
+        (Some(names), Some(loops)) if names < loops => {}
+        (None, _) => found.push(format!(
+            "fuzz/fuzz_targets/interpret.rs no longer calls `{INTERPRET_NAMES_THE_RULES}`, \
+             which is what supplies the `reached=` denominator. Without it a run that \
+             matched nothing prints no `reached=` clause at all, and `reached=0/13` is \
+             the most important thing this target can say (AC-7.8)."
+        )),
+        _ => found.push(format!(
+            "fuzz/fuzz_targets/interpret.rs calls `{INTERPRET_NAMES_THE_RULES}` only \
+             inside the match loop, so an execution that matched nothing never names the \
+             flag bits and the `reached=` clause disappears — in exactly the case it \
+             exists to report (AC-7.8). Hoist it above `for i in &out`."
+        )),
     }
 
     found.extend(fuzz_ci_job_violations(ci_path, ci));
@@ -3564,10 +3604,15 @@ jobs:
         for surface in FUZZ_SURFACES.iter().filter(|s| s.deferred.is_none()) {
             std::fs::write(
                 root.join(format!("fuzz/fuzz_targets/{}.rs", surface.name)),
-                // The three fragments AC-7.9 is about, present verbatim.
-                "assert!(i.matched_span.start <= i.matched_span.end);\n\
+                // The three fragments AC-7.9 is about, present verbatim, and
+                // the flag naming AC-7.8 needs, above the loop where it
+                // belongs.
+                "let rules = rule_ids();\n\
+                 for i in &out {\n\
+                 assert!(i.matched_span.start <= i.matched_span.end);\n\
                  assert!(i.matched_span.end <= capture.response.len());\n\
-                 let m = &capture.response[i.matched_span.clone()];\n",
+                 let m = &capture.response[i.matched_span.clone()];\n\
+                 }\n",
             )
             .unwrap();
             let seeds = root.join("fuzz/seeds").join(surface.name);
@@ -3710,6 +3755,61 @@ jobs:
             assert_eq!(v.len(), 1, "removing `{fragment}` produced {v:#?}");
             assert!(v[0].contains("AC-7.9"), "{}", v[0]);
         }
+    }
+
+    /// The counter that goes quiet in the one case it exists for. Both
+    /// failures are checked, and they are different failures: deleting the
+    /// call, and putting it back where it was -- inside the match loop, where
+    /// an execution that matched nothing never reaches it, `flag_labels`
+    /// stays empty and `Stats::report` drops the whole `reached=` clause.
+    #[test]
+    fn naming_the_rules_only_inside_the_match_loop_is_reported() {
+        let root = scratch("reached");
+        clean_fuzz_tree(&root);
+        let path = root.join("fuzz/fuzz_targets/interpret.rs");
+        let clean = std::fs::read_to_string(&path).unwrap();
+
+        std::fs::write(&path, clean.replace(INTERPRET_NAMES_THE_RULES, "")).unwrap();
+        let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(v[0].contains("reached=0/13"), "{}", v[0]);
+
+        let inside = clean.replace(INTERPRET_NAMES_THE_RULES, "").replace(
+            "for i in &out {",
+            &format!("for i in &out {{\n{INTERPRET_NAMES_THE_RULES}"),
+        );
+        std::fs::write(&path, &inside).unwrap();
+        assert!(
+            inside.contains(INTERPRET_NAMES_THE_RULES),
+            "the call is still in the file, which is the point"
+        );
+        let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+        assert_eq!(v.len(), 1, "{v:#?}");
+        assert!(
+            v[0].contains("only \\\n") || v[0].contains("only"),
+            "{}",
+            v[0]
+        );
+        assert!(v[0].contains("Hoist it"), "{}", v[0]);
+    }
+
+    /// ...and the comment that explains the hoist quotes the loop it must sit
+    /// above, so the check reads code and not prose. This is the third time
+    /// in this file that a gate's own documentation could satisfy or break
+    /// the gate.
+    #[test]
+    fn a_comment_quoting_the_loop_does_not_decide_where_the_call_is() {
+        let root = scratch("reached-comment");
+        clean_fuzz_tree(&root);
+        let path = root.join("fuzz/fuzz_targets/interpret.rs");
+        let clean = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(
+            &path,
+            format!("// hoisted above `for i in &out` on purpose\n{clean}"),
+        )
+        .unwrap();
+        let v = fuzz_violations(&root, &clean_fuzz_manifest(), "ci.yml", CLEAN_FUZZ_CI);
+        assert!(v.is_empty(), "{v:#?}");
     }
 
     #[test]

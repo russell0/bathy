@@ -73,6 +73,16 @@ fn rule_ids() -> &'static [&'static str] {
 static STATS: Stats = Stats::new("interpret", LABELS, &[]);
 
 fuzz_target!(|data: &[u8]| {
+    // Once per execution, BEFORE anything can fail to match. `rule_ids()` is
+    // what supplies `Stats` with its flag labels, and it used to be called
+    // only from inside the `for i in &out` loop below -- so a run in which
+    // nothing ever matched left `flag_labels` empty and `Stats::report`
+    // skipped the whole `reached=` clause. The instrument built to make
+    // "this target reached nothing" visible printed nothing in exactly that
+    // case, and `fuzz/README.md` calls `reached=13/13` the load-bearing
+    // figure. Zero is the most important value it can report.
+    let rules = rule_ids();
+
     // Every probe id the rule set knows, read from the rule set itself
     // rather than written out here. A ninth protocol added in v0.2 is
     // fuzzed by this target the day it lands; a hard-coded list would have
@@ -149,7 +159,7 @@ fuzz_target!(|data: &[u8]| {
             if i.observation.version.is_some() {
                 STATS.bump(NAMED_VERSION);
             }
-            if let Some(bit) = rule_ids().iter().position(|id| *id == i.rule_id) {
+            if let Some(bit) = rules.iter().position(|id| *id == i.rule_id) {
                 STATS.flag(bit);
             }
         }

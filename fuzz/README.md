@@ -101,7 +101,22 @@ AC-7.8 runs are in this task's report.
 For `interpret` the load-bearing figure is `reached=13/13` — which of the
 thirteen registered rules fired at all — followed by `matched_inputs` and
 `deep_spans`. A run where every input lands in `interpret`'s empty-vector path
-has fuzzed a `for` loop.
+has fuzzed a `for` loop, and it says so: `reached=0/13` is printed on every
+report, including when nothing matched. (It was not, until M7 Task 2's fix
+round: the flag names were supplied from inside the match loop, so the one
+case the counter exists for was the one case it went silent in.)
+
+Two of these numbers say less than their names suggest, and both are labelled
+in the source rather than left to be discovered:
+
+- `event_log`'s **`opened`** counts "the reader did not reject it". An empty
+  file opens successfully with zero events — a measured run had
+  `opened=93,728` against `events_parsed=6,610`. The figures that carry weight
+  are `events_parsed`, `opened_multi_record` and `folded_endpoints`.
+- `canonical_json`'s **`duplicate_keys`** was a punctuation heuristic that
+  `{"a":"x:y"}` alone satisfied, so `reached=9/9` was eight shapes and one
+  guess. It is now a scanner over the raw document (`bathy_fuzz::
+  has_duplicate_keys`) with unit tests, that input among them.
 
 ## When a target finds something
 

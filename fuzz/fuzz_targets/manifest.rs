@@ -124,9 +124,31 @@ fuzz_target!(|data: &[u8]| {
     };
     STATS.bump(LOADED);
 
+    // The clock comes from the INPUT, not from a date written here.
+    //
+    // It was `"2026-08-04T00:00:00.000Z"`, which partitions `ok:expired` and
+    // `ok:unexpired` on a frozen instant: as the tree ages and new seeded
+    // manifests are written with later expiries, every document drifts to one
+    // side and one of the two flags stops being reached, with nothing to say
+    // the split has gone vacuous. Deriving the year from the input keeps both
+    // branches reachable for any document, forever, and costs one byte.
+    //
     // `is_expired` parses its argument every call and fails closed; a clock
     // string it cannot read must never read as "still valid".
-    if manifest.is_expired("2026-08-04T00:00:00.000Z") {
+    // Over ALL the bytes, not the first one: every document that reaches
+    // this line starts with `{`, so a clock derived from `data[0]` is a
+    // frozen clock with extra steps -- measured, not assumed (it put all
+    // twelve committed seeds in the same year and left `ok:expired`
+    // unreached). A cheap hash of the whole input spreads the seeds across
+    // the range and stays deterministic per input, which is what a fuzzer
+    // needs to reproduce a crash.
+    let year = 1970
+        + data
+            .iter()
+            .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(u32::from(*b)))
+            % 120;
+    let clock = format!("{year:04}-06-15T12:00:00.000Z");
+    if manifest.is_expired(&clock) {
         STATS.flag(5);
     } else {
         STATS.flag(6);

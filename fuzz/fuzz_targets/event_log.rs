@@ -25,7 +25,7 @@
 use std::path::PathBuf;
 use std::sync::OnceLock;
 
-use bathy_evidence::log::EventLogReader;
+use bathy_evidence::log::{EventLogReader, LogError};
 use bathy_fuzz::Stats;
 use bathy_query::{diff, fold_events};
 use bathy_types::ids::ScanId;
@@ -37,30 +37,46 @@ const EVENTS: usize = 2;
 const TAIL_READS: usize = 3;
 const FOLDED_ENDPOINTS: usize = 4;
 const FOLDED_OBSERVATIONS: usize = 5;
+const OPENED_EMPTY: usize = 6;
+const OPENED_ONE: usize = 7;
+const OPENED_MANY: usize = 8;
 
 const LABELS: &[&str] = &[
-    // The number that says whether this target reached the parser at all:
-    // an input that never opens is an input that was rejected by the very
-    // first record.
+    // Weaker than it reads, and named here so a report cannot lead with it
+    // without the next three: an EMPTY file opens successfully with zero
+    // events, so this counts "the reader did not reject it", not "a log was
+    // parsed". A measured run had opened=93,728 against events_parsed=6,610
+    // -- 0.07 events per opened log, so the overwhelming majority of
+    // "opened" inputs carried no records at all. `events_parsed`,
+    // `opened_multi_record` and `folded_endpoints` are the load-bearing
+    // figures for this target.
     "opened",
     "rejected",
     "events_parsed",
     "tail_reads",
     "folded_endpoints",
     "folded_observations",
+    // The `ok:` flags below say each of these happened at least once; these
+    // say how often, which is the difference between "the corpus can reach a
+    // multi-record log" and "the corpus is multi-record logs".
+    "opened_empty",
+    "opened_one_record",
+    "opened_multi_record",
 ];
 
 /// Which outcomes the corpus has actually produced. A run that only ever
 /// reaches `Malformed` has not exercised the sequence-continuity logic, and
 /// the sequence-continuity logic is where the interesting indexing lives.
 ///
-/// `LogError::Io` and `LogError::Locked` are deliberately collapsed into
-/// `err:unexpected` rather than given bits of their own: neither is
-/// reachable through this door (the file is written immediately before it is
-/// opened, and `EventLogReader` takes no lock by design), so listing them
-/// would make the denominator a target nothing could ever hit and every
+/// `LogError::Io`, `LogError::Locked` and `LogError::Released` are
+/// deliberately collapsed into `err:unexpected` rather than given bits of
+/// their own: none is reachable through this door (the file is written
+/// immediately before it is opened, `EventLogReader` takes no lock by design,
+/// and `Released` is about a *writer* that gave up its claim), so listing
+/// them would make the denominator a target nothing could ever hit and every
 /// report read as under-covered. If `err:unexpected` ever appears, that is
-/// itself the finding.
+/// itself the finding. The collapsing is written out variant by variant in
+/// the `match` below rather than as `_`, so a new variant breaks the build.
 const FLAGS: &[&str] = &[
     "err:malformed",
     "err:sequence_gap",
@@ -106,10 +122,16 @@ fuzz_target!(|data: &[u8]| {
         Ok(reader) => reader,
         Err(e) => {
             STATS.bump(REJECTED);
+            // Exhaustive, with no `_` arm. `Io`, `Locked` and `Released` are
+            // collapsed into `err:unexpected` deliberately and for the reason
+            // FLAGS gives -- but written out, so a sixth `LogError` variant
+            // breaks this build instead of landing silently in a catch-all
+            // and reading as covered. `manifest`'s equivalent match was
+            // already exhaustive; this one was `_ => 2`.
             STATS.flag(match e {
-                bathy_evidence::log::LogError::Malformed { .. } => 0,
-                bathy_evidence::log::LogError::SequenceGap { .. } => 1,
-                _ => 2,
+                LogError::Malformed { .. } => 0,
+                LogError::SequenceGap { .. } => 1,
+                LogError::Io { .. } | LogError::Locked { .. } | LogError::Released { .. } => 2,
             });
             STATS.tick();
             return;
@@ -126,9 +148,18 @@ fuzz_target!(|data: &[u8]| {
     };
     STATS.add(EVENTS, events.len() as u64);
     match events.len() {
-        0 => STATS.flag(3),
-        1 => STATS.flag(4),
-        _ => STATS.flag(5),
+        0 => {
+            STATS.flag(3);
+            STATS.bump(OPENED_EMPTY);
+        }
+        1 => {
+            STATS.flag(4);
+            STATS.bump(OPENED_ONE);
+        }
+        _ => {
+            STATS.flag(5);
+            STATS.bump(OPENED_MANY);
+        }
     }
 
     // The reader's own contract: sequences are exactly 1..=last_sequence,
