@@ -120,6 +120,26 @@ const PATTERNS: &[&str] = &[
     // A snake_case identifier with three or more underscores: a Rust item
     // name, not a wire field.
     r"\b\w*_\w*_\w*_\w*\b",
+    // H1, closed. **An imperative maintenance obligation** -- an instruction
+    // to whoever is editing this repository, sitting in a document read by a
+    // caller who cannot act on it. That is the same harm as the original
+    // `scope-manifest.json` leak, and it defeated every marker above.
+    //
+    // The shape, not the person. A previous round proposed bare `\byou\b`
+    // and was right to reject it: a description legitimately says "you can
+    // pass a digest", and legitimately says "if you change the port
+    // selection the plan hash changes" -- a conditional about *the caller's*
+    // input, not an instruction to edit a second file. What is never
+    // caller-facing is the **second, imperative clause**: also change the
+    // other thing. So the markers are the second clause and its idioms, not
+    // the second person.
+    //
+    // `keep in sync` and `by hand` are already covered by SUBJECT_MARKERS;
+    // these are the family's remaining spellings.
+    r"\b(also|likewise) (change|update|edit|regenerate|re-generate)\b",
+    r"\b(change|update|edit|regenerate|re-generate) (it|them|this|that|the [a-z-]{2,24}) too\b",
+    r"\b(is|are) not generated from\b",
+    r"\b(remember to|don'?t forget|do not forget)\b",
 ];
 
 fn patterns() -> &'static [Regex] {
@@ -260,20 +280,23 @@ pub fn check_dir(dir: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> 
 // the defeats is the point: a green `check-schemas` means no description
 // trips a marker, never that every description is contract text.
 //
-// The four below are the ones I could still write after widening the list.
+// The three below are the ones I could still write after widening the list.
 // `tests::HOLES` holds them verbatim and
 // `the_documented_holes_are_still_open_and_this_test_is_the_list` asserts
 // they still pass, so this section cannot drift away from the code.
 //
-//   - H1. **A maintenance obligation in the imperative.** *"If you change
-//     this, change the loader too. They are not generated from one source."*
-//     No layout noun, no `in sync`, no `by hand`. This is the same harm as
-//     the original `scope-manifest.json` leak -- an obligation on us, stated
-//     to an agent that cannot act on it -- and it is the hole I would close
-//     first if this list grows again. `\byou\b` would catch it; it is not a
-//     marker because a caller-facing description may legitimately address
-//     the caller, and no committed description does today, so the marker
-//     would be untested against real text.
+// **H1 was here and is closed** (M5 Task 3). It was "a maintenance
+// obligation in the imperative": *"If you change this, change the loader
+// too. They are not generated from one source."* The argument for leaving
+// it open was that `\byou\b` is the obvious marker and is too broad --
+// which is right -- and that any narrower marker would ship untested,
+// which is not: `find_maintainer_prose` takes a synthetic value, and every
+// marker in this file is tested that way. It is now closed by markers for
+// the *second, imperative clause* rather than for the second person; see
+// the H1 block in `PATTERNS`, and
+// `the_imperative_maintenance_obligation_is_caught_and_ordinary_conditionals_are_not`
+// for both directions.
+//
 //   - H2. **History as a date and a shape.** *"The two-field form used
 //     before June is still accepted and will be dropped in the next
 //     release."* `revision`, `_v[0-9]` and `milestone` all miss it.
@@ -504,6 +527,58 @@ mod tests {
         );
     }
 
+    /// H1, closed. Both directions, because the whole objection to closing
+    /// it was that the narrow marker would be too broad.
+    #[test]
+    fn the_imperative_maintenance_obligation_is_caught_and_ordinary_conditionals_are_not() {
+        // The hole's own text, verbatim from what `WHAT STILL GETS THROUGH`
+        // used to list. Each of its two sentences is caught by its own
+        // marker, so deleting either one does not leave the paragraph
+        // passing.
+        let h1 = "If you change this, change the loader too. \
+                  They are not generated from one source.";
+        let hits = markers_in(h1);
+        assert!(
+            hits.iter().any(|h| h.contains("too")),
+            "the imperative second clause must be caught: {hits:?}"
+        );
+        assert!(
+            hits.iter().any(|h| h.contains("not generated from")),
+            "the hand-sync admission must be caught: {hits:?}"
+        );
+
+        // ...through a real published document, not only through
+        // `markers_in`: the same leak reaching a `$defs` description has to
+        // be reported with its location.
+        let schema = serde_json::json!({
+            "title": "ScopeManifest",
+            "$defs": {
+                "Budgets": { "description": "If you change this, change the loader too." },
+            },
+        });
+        let found = find_maintainer_prose("scope-manifest.json", &schema);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("Budgets"), "{found:?}");
+
+        // And the direction the previous round was right about. Every line
+        // below addresses the caller, or states a conditional about the
+        // caller's own input, and none of them is a maintenance obligation.
+        for text in [
+            "You can pass a digest here instead of the bytes.",
+            "If you change the port selection, the plan hash changes and this scan is \
+             no longer comparable with the previous one.",
+            "Change this only when the two scans covered the same ports.",
+            "The value is generated from the request, canonicalized first.",
+            "Update your manifest before the expiry in `not_after`.",
+        ] {
+            assert!(
+                markers_in(text).is_empty(),
+                "caller-facing text was flagged by {:?}: {text}",
+                markers_in(text)
+            );
+        }
+    }
+
     #[test]
     fn the_documented_holes_are_still_open_and_this_test_is_the_list() {
         // These are the paraphrases that survive the widened list, written
@@ -521,10 +596,6 @@ mod tests {
 
     /// The surviving defeats, kept next to the list that documents them.
     const HOLES: &[(&str, &str)] = &[
-        (
-            "H1 a maintenance obligation in the imperative",
-            "If you change this, change the loader too. They are not generated from one source.",
-        ),
         (
             "H2 history as a date and a shape",
             "The two-field form used before June is still accepted and will be dropped in \
