@@ -31,6 +31,12 @@
 //!    opener for the same scan fails cleanly with [`LogError::Locked`]
 //!    instead of interleaving appends with the first and silently violating
 //!    property 1 above.
+//!
+//! Property 4 is about *writers*. [`EventLogReader`] is the read-only,
+//! lock-free view a second process needs to tail a scan that is still
+//! running -- `bathy scan events --follow` is exactly that situation, and
+//! through [`EventLog::open`] it would fail with [`LogError::Locked`] every
+//! time. See that type's doc comment for what it does and does not tolerate.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
@@ -262,86 +268,123 @@ impl EventLog {
     /// behavior, rather than surfacing as a generic `io::Error` the way
     /// `read_line`'s own built-in UTF-8 check would.
     fn scan_existing(path: &Path) -> Result<(u64, Vec<u64>, u64), LogError> {
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok((0, Vec::new(), 0));
-            }
-            Err(source) => {
-                return Err(LogError::Io {
-                    path: path.to_owned(),
-                    source,
-                });
-            }
-        };
-        let mut reader = BufReader::new(file);
-        let mut offsets = Vec::new();
-        let mut expected = 1u64;
-        let mut pos: u64 = 0;
-        let mut line_number = 0usize;
-        let mut raw_line = Vec::new();
-        loop {
-            raw_line.clear();
-            let n = reader
-                .read_until(b'\n', &mut raw_line)
-                .map_err(|source| LogError::Io {
-                    path: path.to_owned(),
-                    source,
-                })?;
-            if n == 0 {
-                // True end of file: nothing left to read, not even a blank
-                // trailing line (that would have come through as a single
-                // `\n` byte, `n == 1`, handled by the ordinary loop body
-                // below instead).
-                break;
-            }
-            line_number += 1;
-            if raw_line.last() != Some(&b'\n') {
-                // Only ever true on the FINAL call to `read_until` (every
-                // earlier line, by definition, kept reading until it found
-                // a `\n`), so `line_number` here is exactly "count of
-                // already-complete lines + 1" -- the same value the
-                // previous whole-file-read version computed by counting
-                // `\n` bytes across the entire file up front.
-                return Err(LogError::Malformed {
-                    path: path.to_owned(),
-                    line: line_number,
-                    detail: "record is not newline-terminated (truncated or an interrupted write)"
-                        .to_string(),
-                });
-            }
-            let line_len = raw_line.len() as u64;
-            let content = &raw_line[..raw_line.len() - 1]; // strip the trailing `\n`
-            if !content.is_empty() {
-                let text = std::str::from_utf8(content).map_err(|e| LogError::Malformed {
-                    path: path.to_owned(),
-                    line: line_number,
-                    detail: e.to_string(),
-                })?;
-                let event: Event = serde_json::from_str(text).map_err(|e| LogError::Malformed {
-                    path: path.to_owned(),
-                    line: line_number,
-                    detail: e.to_string(),
-                })?;
-                if event.sequence != expected {
-                    return Err(LogError::SequenceGap {
-                        path: path.to_owned(),
-                        expected,
-                        found: event.sequence,
-                    });
-                }
-                offsets.push(pos);
-                expected += 1;
-            }
-            pos += line_len;
-        }
-        Ok((expected - 1, offsets, pos))
+        scan_records(path, TailPolicy::RejectPartial)
     }
 
     pub fn scan_id(&self) -> ScanId {
         self.scan_id
     }
+}
 
+/// What [`scan_records`] does with a final line that has no terminating
+/// newline.
+///
+/// The two answers are both correct, for different callers, and the
+/// difference is not a stylistic one:
+///
+/// - [`TailPolicy::RejectPartial`] is [`EventLog`]'s. A writer that accepted
+///   an unterminated tail would glue its next record onto that line and
+///   corrupt a record that was fine on its own (this module's property 2).
+/// - [`TailPolicy::SkipPartial`] is [`EventLogReader`]'s. A reader holds no
+///   lock and is expected to run *while* a writer is appending, so an
+///   unterminated tail is the ordinary sight of a record mid-write, not
+///   corruption. Skipping it yields the records that are complete; the next
+///   poll picks the rest up. Rejecting it would make `scan events --follow`
+///   fail intermittently against a healthy scan.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TailPolicy {
+    RejectPartial,
+    SkipPartial,
+}
+
+/// Validate a log file in one pass and return `(last_sequence, offsets,
+/// end_offset)` -- see [`EventLog::scan_existing`] for what each means and
+/// what counts as corruption, and [`TailPolicy`] for the one behavioural
+/// difference between the writer's and the reader's use of this.
+///
+/// `end_offset` counts only bytes belonging to complete lines, so a skipped
+/// partial tail is never included in it.
+fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), LogError> {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, Vec::new(), 0));
+        }
+        Err(source) => {
+            return Err(LogError::Io {
+                path: path.to_owned(),
+                source,
+            });
+        }
+    };
+    let mut reader = BufReader::new(file);
+    let mut offsets = Vec::new();
+    let mut expected = 1u64;
+    let mut pos: u64 = 0;
+    let mut line_number = 0usize;
+    let mut raw_line = Vec::new();
+    loop {
+        raw_line.clear();
+        let n = reader
+            .read_until(b'\n', &mut raw_line)
+            .map_err(|source| LogError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        if n == 0 {
+            // True end of file: nothing left to read, not even a blank
+            // trailing line (that would have come through as a single
+            // `\n` byte, `n == 1`, handled by the ordinary loop body
+            // below instead).
+            break;
+        }
+        line_number += 1;
+        if raw_line.last() != Some(&b'\n') {
+            // Only ever true on the FINAL call to `read_until` (every
+            // earlier line, by definition, kept reading until it found
+            // a `\n`), so `line_number` here is exactly "count of
+            // already-complete lines + 1" -- the same value the
+            // previous whole-file-read version computed by counting
+            // `\n` bytes across the entire file up front.
+            if tail == TailPolicy::SkipPartial {
+                break;
+            }
+            return Err(LogError::Malformed {
+                path: path.to_owned(),
+                line: line_number,
+                detail: "record is not newline-terminated (truncated or an interrupted write)"
+                    .to_string(),
+            });
+        }
+        let line_len = raw_line.len() as u64;
+        let content = &raw_line[..raw_line.len() - 1]; // strip the trailing `\n`
+        if !content.is_empty() {
+            let text = std::str::from_utf8(content).map_err(|e| LogError::Malformed {
+                path: path.to_owned(),
+                line: line_number,
+                detail: e.to_string(),
+            })?;
+            let event: Event = serde_json::from_str(text).map_err(|e| LogError::Malformed {
+                path: path.to_owned(),
+                line: line_number,
+                detail: e.to_string(),
+            })?;
+            if event.sequence != expected {
+                return Err(LogError::SequenceGap {
+                    path: path.to_owned(),
+                    expected,
+                    found: event.sequence,
+                });
+            }
+            offsets.push(pos);
+            expected += 1;
+        }
+        pos += line_len;
+    }
+    Ok((expected - 1, offsets, pos))
+}
+
+impl EventLog {
     pub fn last_sequence(&self) -> u64 {
         self.last_sequence
     }
@@ -447,48 +490,161 @@ impl EventLog {
     /// be impossible if it fell back to scanning from the start of the file
     /// the way a naive `File::open` + filter implementation would.
     pub fn read_from(&self, after_sequence: u64) -> Result<Vec<Event>, LogError> {
-        if after_sequence >= self.last_sequence {
-            return Ok(Vec::new());
-        }
-        let start_offset = self.offsets[after_sequence as usize];
-        let mut file = File::open(&self.path).map_err(|source| LogError::Io {
-            path: self.path.clone(),
+        read_records_from(
+            &self.path,
+            &self.offsets,
+            self.last_sequence,
+            after_sequence,
+        )
+    }
+}
+
+/// The tail read shared by [`EventLog::read_from`] and
+/// [`EventLogReader::read_from`]. See the former's doc comment for the
+/// seek-don't-rescan contract this implements.
+fn read_records_from(
+    path: &Path,
+    offsets: &[u64],
+    last_sequence: u64,
+    after_sequence: u64,
+) -> Result<Vec<Event>, LogError> {
+    if after_sequence >= last_sequence {
+        return Ok(Vec::new());
+    }
+    let start_offset = offsets[after_sequence as usize];
+    let mut file = File::open(path).map_err(|source| LogError::Io {
+        path: path.to_owned(),
+        source,
+    })?;
+    file.seek(SeekFrom::Start(start_offset))
+        .map_err(|source| LogError::Io {
+            path: path.to_owned(),
             source,
         })?;
-        file.seek(SeekFrom::Start(start_offset))
-            .map_err(|source| LogError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut out = Vec::with_capacity((self.last_sequence - after_sequence) as usize);
-        // Line numbers in any `Malformed` error here are relative to
-        // `after_sequence`'s record, not the whole file: correct under this
-        // type's own writing (append never emits a blank line), which is
-        // the only way this path is ever populated.
-        for (i, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|source| LogError::Io {
-                path: self.path.clone(),
-                source,
-            })?;
-            if line.is_empty() {
-                continue;
-            }
-            let event: Event = serde_json::from_str(&line).map_err(|e| LogError::Malformed {
-                path: self.path.clone(),
-                line: after_sequence as usize + i + 1,
-                detail: e.to_string(),
-            })?;
-            // Defensive, not load-bearing for correctness under normal
-            // operation (the seek above should already land exactly on
-            // sequence `after_sequence + 1`): costs nothing extra, since
-            // every event in the tail is parsed anyway, and it turns any
-            // future bug in how `offsets` is built or indexed into a
-            // dropped record instead of a duplicated or out-of-range one.
-            if event.sequence > after_sequence {
-                out.push(event);
-            }
+    let wanted = last_sequence - after_sequence;
+    let mut out = Vec::with_capacity(wanted as usize);
+    // Line numbers in any `Malformed` error here are relative to
+    // `after_sequence`'s record, not the whole file: correct under this
+    // type's own writing (append never emits a blank line), which is
+    // the only way this path is ever populated.
+    for (i, line) in BufReader::new(file).lines().enumerate() {
+        // Stop at the snapshot this read was scoped to, before the next
+        // line is even parsed. For [`EventLog`] that is simply the end of
+        // the file. For [`EventLogReader`] the file is being extended
+        // underneath us, and the very next line may be a record caught
+        // mid-write: `open` already decided (see [`TailPolicy`]) that such
+        // a line is not this reader's to report, and parsing it here would
+        // turn a healthy live scan into a `Malformed` error.
+        if out.len() as u64 == wanted {
+            break;
         }
-        Ok(out)
+        let line = line.map_err(|source| LogError::Io {
+            path: path.to_owned(),
+            source,
+        })?;
+        if line.is_empty() {
+            continue;
+        }
+        let event: Event = serde_json::from_str(&line).map_err(|e| LogError::Malformed {
+            path: path.to_owned(),
+            line: after_sequence as usize + i + 1,
+            detail: e.to_string(),
+        })?;
+        // Defensive, not load-bearing for correctness under normal
+        // operation (the seek above should already land exactly on
+        // sequence `after_sequence + 1`): costs nothing extra, since
+        // every event in the tail is parsed anyway, and it turns any
+        // future bug in how `offsets` is built or indexed into a
+        // dropped record instead of a duplicated or out-of-range one.
+        //
+        // It is load-bearing for [`EventLogReader`], which reads a file a
+        // writer is still extending: `last_sequence` is a snapshot taken at
+        // `open`, and the bytes past it that arrived since must not be
+        // returned as if this reader had counted them.
+        if event.sequence > after_sequence && event.sequence <= last_sequence {
+            out.push(event);
+        }
+    }
+    Ok(out)
+}
+
+/// A **read-only, lock-free** view of one scan's event log.
+///
+/// [`EventLog::open`] is the writer, and property 4 in this module's doc
+/// comment is why it takes an exclusive advisory lock for its whole
+/// lifetime. That lock is exactly what makes reading through `EventLog`
+/// impossible while a scan is running: `bathy scan events --follow`, and
+/// `scan status`/`result query` against a live scan, are a *second process*
+/// reading a file the scanning process still holds open. Through
+/// [`EventLog::open`] every one of them would fail with
+/// [`LogError::Locked`].
+///
+/// This type is that reader. It cannot append -- there is no method to --
+/// so it needs no lock to preserve the single-writer invariant, and it is
+/// the only supported way to read a log this process is not itself writing.
+/// Reading the JSONL file directly instead would put a second parser for
+/// the source of truth outside the crate that owns it.
+///
+/// `last_sequence` is a snapshot taken at [`Self::open`]. A live log grows
+/// past it; call `open` again to advance. That is what `--follow` does, and
+/// it is why an in-progress record at the tail is skipped rather than
+/// treated as corruption (see [`TailPolicy`]).
+#[derive(Debug)]
+pub struct EventLogReader {
+    path: PathBuf,
+    scan_id: ScanId,
+    last_sequence: u64,
+    offsets: Vec<u64>,
+}
+
+impl EventLogReader {
+    /// Opens `dir/<scan_id>.jsonl` for reading.
+    ///
+    /// A log file that does not exist is an error, **not** an empty log --
+    /// unlike [`EventLog::open`], which creates one. A caller asking to read
+    /// a scan that was never written has almost certainly mistyped a scan
+    /// id, and answering "this scan observed nothing" would be a wrong
+    /// answer rather than a missing one.
+    pub fn open(dir: &Path, scan_id: ScanId) -> Result<Self, LogError> {
+        let path = dir.join(format!("{scan_id}.jsonl"));
+        if !path.exists() {
+            return Err(LogError::Io {
+                path: path.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "no event log for this scan",
+                ),
+            });
+        }
+        let (last_sequence, offsets, _end) = scan_records(&path, TailPolicy::SkipPartial)?;
+        Ok(Self {
+            path,
+            scan_id,
+            last_sequence,
+            offsets,
+        })
+    }
+
+    pub fn scan_id(&self) -> ScanId {
+        self.scan_id
+    }
+
+    /// The highest sequence this reader saw *when it opened*. See the type's
+    /// doc comment.
+    pub fn last_sequence(&self) -> u64 {
+        self.last_sequence
+    }
+
+    /// Every complete event with `sequence > after_sequence`, in order --
+    /// the same contract as [`EventLog::read_from`], bounded above by
+    /// [`Self::last_sequence`].
+    pub fn read_from(&self, after_sequence: u64) -> Result<Vec<Event>, LogError> {
+        read_records_from(
+            &self.path,
+            &self.offsets,
+            self.last_sequence,
+            after_sequence,
+        )
     }
 }
 
@@ -1151,6 +1307,147 @@ mod tests {
             reopened.last_sequence(),
             2,
             "no state was lost or duplicated across the locked-out window"
+        );
+    }
+
+    // --- `EventLogReader`: the lock-free reader (M5 Task 3). ---
+    //
+    // `scan events --follow` is a second process reading a log the scanning
+    // process still holds locked. Every test below is about that situation
+    // specifically, because through `EventLog::open` alone it is not
+    // expressible at all.
+
+    #[test]
+    fn a_reader_opens_a_log_the_writer_still_holds_locked() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let mut writer = EventLog::open(dir.path(), id).unwrap();
+        writer.append(progress(1), &clock(), "0.1.0").unwrap();
+        writer.append(progress(2), &clock(), "0.1.0").unwrap();
+
+        // The premise: the writer's lock is real and still held.
+        assert!(
+            EventLog::open(dir.path(), id).is_err(),
+            "test premise: a second writer must still be locked out"
+        );
+
+        let reader = EventLogReader::open(dir.path(), id).unwrap();
+        assert_eq!(reader.last_sequence(), 2);
+        assert_eq!(reader.scan_id(), id);
+        let events = reader.read_from(0).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].sequence, 1);
+        assert_eq!(events[1].sequence, 2);
+    }
+
+    #[test]
+    fn a_reader_takes_no_lock_of_its_own_so_the_writer_keeps_appending() {
+        // The inverse of the test above, and the one that actually matters
+        // for a live tail: opening a reader must not lock the writer out of
+        // its own log, nor a second reader out.
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let mut writer = EventLog::open(dir.path(), id).unwrap();
+        writer.append(progress(1), &clock(), "0.1.0").unwrap();
+
+        let first = EventLogReader::open(dir.path(), id).unwrap();
+        let second = EventLogReader::open(dir.path(), id).unwrap();
+        assert_eq!(first.last_sequence(), 1);
+        assert_eq!(second.last_sequence(), 1);
+
+        writer.append(progress(2), &clock(), "0.1.0").unwrap();
+        assert_eq!(writer.last_sequence(), 2);
+
+        // A reader opened before the append still reports its own snapshot;
+        // a freshly opened one sees the new record. This is the whole
+        // `--follow` contract.
+        assert_eq!(first.read_from(0).unwrap().len(), 1);
+        assert_eq!(
+            EventLogReader::open(dir.path(), id)
+                .unwrap()
+                .read_from(1)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_reader_skips_an_unterminated_tail_record_that_the_writer_rejects() {
+        // A record caught mid-write is the ordinary sight for a lock-free
+        // reader and corruption for a writer. Both behaviours are asserted
+        // here on the same bytes, so neither can be changed without this
+        // failing.
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        {
+            let mut writer = EventLog::open(dir.path(), id).unwrap();
+            writer.append(progress(1), &clock(), "0.1.0").unwrap();
+        }
+        let path = log_path(dir.path(), id);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"sequence\":2,\"partial");
+        std::fs::write(&path, &text).unwrap();
+
+        let reader = EventLogReader::open(dir.path(), id).unwrap();
+        assert_eq!(
+            reader.last_sequence(),
+            1,
+            "a half-written record must not be counted"
+        );
+        assert_eq!(reader.read_from(0).unwrap().len(), 1);
+
+        assert!(
+            matches!(
+                EventLog::open(dir.path(), id),
+                Err(LogError::Malformed { .. })
+            ),
+            "the writer must still refuse the same file: it would glue its next record on"
+        );
+    }
+
+    #[test]
+    fn a_reader_refuses_a_log_with_a_sequence_gap_exactly_as_the_writer_does() {
+        // Tolerating a partial *tail* is not tolerating corruption. A hole
+        // in the middle is still an unaccounted-for observation.
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        {
+            let mut writer = EventLog::open(dir.path(), id).unwrap();
+            for i in 1..=3 {
+                writer.append(progress(i), &clock(), "0.1.0").unwrap();
+            }
+        }
+        let path = log_path(dir.path(), id);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let kept: Vec<&str> = text
+            .lines()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, l)| l)
+            .collect();
+        std::fs::write(&path, format!("{}\n", kept.join("\n"))).unwrap();
+
+        assert!(matches!(
+            EventLogReader::open(dir.path(), id),
+            Err(LogError::SequenceGap { .. })
+        ));
+    }
+
+    #[test]
+    fn a_reader_on_a_log_that_does_not_exist_is_an_error_not_an_empty_scan() {
+        // `EventLog::open` creates a missing log, which is right for a
+        // writer and a wrong *answer* for a reader: a mistyped scan id must
+        // never read as "this scan observed nothing".
+        let dir = tempfile::tempdir().unwrap();
+        let err = EventLogReader::open(dir.path(), scan_id()).unwrap_err();
+        assert!(
+            matches!(&err, LogError::Io { source, .. } if source.kind() == std::io::ErrorKind::NotFound),
+            "{err}"
+        );
+        assert!(
+            !log_path(dir.path(), scan_id()).exists(),
+            "a reader must not create the file it failed to find"
         );
     }
 }

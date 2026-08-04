@@ -38,10 +38,12 @@
 //! from it, never the other way around. See [`log`]'s module doc comment for
 //! the two properties that carry that claim, and its own `durable`/
 //! [`EventLog::open_without_durability_barrier`] for the same guarantee on
-//! the append path.
+//! the append path. [`EventLogReader`] is the same log read without the
+//! writer's exclusive lock -- the only supported way to read a scan another
+//! process is still writing.
 
 pub mod log;
 pub mod store;
 
-pub use log::{EventLog, LogError};
+pub use log::{EventLog, EventLogReader, LogError};
 pub use store::{EvidenceError, EvidenceStore, blob_path};
