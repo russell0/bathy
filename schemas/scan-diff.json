@@ -89,14 +89,14 @@
       ]
     },
     "Confidence": {
-      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched a rule in `bathy-interpret`.",
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched an interpretation rule.",
       "format": "double",
       "maximum": 1.0,
       "minimum": 0.0,
       "type": "number"
     },
     "DenyReason": {
-      "description": "Stable, machine-readable reasons a scan request can be denied by policy.\nWire values are exactly [`DenyReason::code`]'s four strings -- agents\nbranch on them, so they are part of the public contract and must not be\nreworded without a version bump.",
+      "description": "Stable, machine-readable reasons a scan request can be denied by policy.\nThe four wire strings below are the whole set -- agents branch on them, so\nthey are part of the public contract and must not be reworded without a\nversion bump.",
       "enum": [
         "scope_mismatch",
         "scope_expired",
@@ -384,7 +384,7 @@
           "type": "null"
         }
       ],
-      "description": "See [`ScanDiff::before_terminal`]."
+      "description": "How the later scan ended, on the same terms as `before_terminal`."
     },
     "before_terminal": {
       "anyOf": [

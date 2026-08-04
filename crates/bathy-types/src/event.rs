@@ -84,9 +84,13 @@ pub struct Observation {
 }
 
 /// Stable, machine-readable reasons a scan request can be denied by policy.
-/// Wire values are exactly [`DenyReason::code`]'s four strings -- agents
-/// branch on them, so they are part of the public contract and must not be
-/// reworded without a version bump.
+/// The four wire strings below are the whole set -- agents branch on them, so
+/// they are part of the public contract and must not be reworded without a
+/// version bump.
+//
+// Said "exactly [`DenyReason::code`]'s four strings" until the M5 Task 2
+// residual round. rustdoc resolves an intra-doc link; a JSON Schema consumer
+// receives the literal brackets and a Rust path it cannot follow.
 // Proven to match code(), not just documented to match: see
 // `deny_reason_wire_values_match_code` below.
 //

@@ -62,8 +62,8 @@ use bathy_types::ids::Digest;
 
 use crate::fold::{EndpointState, ScanFold, Terminal};
 
-/// One endpoint's record, addressed by the `(target, endpoint)` pair this
-/// crate spells the same way everywhere.
+/// One endpoint's record, addressed by the `(target, endpoint)` pair that is
+/// spelled the same way in every document published here.
 // `required` is stated explicitly because `schemars` marks every `Option`
 // field optional, while this crate's encoder never omits a field (see the
 // module docs: `null` is how an unknown value is spelled, not absence). The

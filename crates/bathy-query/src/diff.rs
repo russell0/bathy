@@ -66,7 +66,11 @@ pub struct ScanDiff {
     /// expired" is a sentence an agent can act on, and "2 endpoints could not
     /// be compared" on its own is not.
     pub before_terminal: Option<Terminal>,
-    /// See [`ScanDiff::before_terminal`].
+    /// How the later scan ended, on the same terms as `before_terminal`.
+    //
+    // Was `See [`ScanDiff::before_terminal`].`, which rustdoc renders as a
+    // link and a schema consumer receives as literal brackets around a Rust
+    // path. A `description` has no links; it has to say the thing.
     pub after_terminal: Option<Terminal>,
 }
 

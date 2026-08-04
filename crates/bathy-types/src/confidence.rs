@@ -4,7 +4,12 @@ use serde::{Deserialize, Deserializer, Serialize};
 /// A probability in the closed interval [0.0, 1.0].
 ///
 /// Confidence is reported, never inferred by a model at runtime: it comes from
-/// how specifically a probe's response matched a rule in `bathy-interpret`.
+/// how specifically a probe's response matched an interpretation rule.
+//
+// Was "matched a rule in `bathy-interpret`" until the M5 Task 2 residual
+// round widened the prose check with crate names. Which crate owns the rules
+// is not something a caller can see or act on; how the number is arrived at
+// is.
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Serialize, JsonSchema)]
 #[serde(transparent)]
 #[schemars(transparent)]

@@ -16,24 +16,156 @@
 //! (`scope-manifest.json`, which told an agent which crate the type lives in
 //! and why). One mechanism, every document, at the point where
 //! `check-schemas` already reads them.
+//!
+//! # What this enforces, and what it does not
+//!
+//! It matches a marker list against every published `description`. It does
+//! not understand the sentences, so it is a filter, not the rule. See the
+//! `WHAT STILL GETS THROUGH` list at the bottom of this file, written out in
+//! the same spirit as `readme.rs`'s `NOT MECHANICALLY CHECKED`: a check whose
+//! limits are known and stated is worth more than one assumed complete, and
+//! this one has been defeated once already by a reviewer on his first
+//! attempt.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
+use regex::Regex;
 use serde_json::Value;
 
-/// Substrings that never legitimately appear in contract text. Every one of
-/// them is a way of naming something a caller cannot see: a source file, a
-/// Rust path, a plan criterion, a task, a derive, an attribute, a function
-/// call, or a superseded revision of a type.
-const MARKERS: &[&str] = &[
-    ".rs", "crate::", "AC-", "Task ", "schemars", "serde", "#[", "impl ", "()", "_v1",
+/// **Rust syntax.** Case-sensitive substrings: a source file, a path
+/// separator, a plan criterion, a task, a derive, an attribute, a call.
+///
+/// `crate::` was here and is gone: `::` subsumes it, and `::` also catches
+/// the rustdoc intra-doc links (`[`DenyReason::code`]`, `See
+/// [`ScanDiff::before_terminal`]`) that rustdoc resolves and a JSON Schema
+/// consumer receives as literal broken brackets. Both were in the committed
+/// contract when this list was widened.
+const SYNTAX_MARKERS: &[&str] = &[
+    ".rs", "::", "AC-", "Task ", "schemars", "serde", "#[", "impl ", "()", "src/", ".toml", ".yml",
+    ".md",
 ];
+
+/// **Subject matter.** Case-insensitive substrings, and the half the first
+/// version of this check did not have.
+///
+/// The M5 Task 2 fix re-review defeated the syntax list on its first attempt
+/// with a paragraph that named two workspace crates, gave the layout
+/// rationale, stated a hand-sync maintenance contract and cited a superseded
+/// revision -- the four things this check exists to catch -- and tripped
+/// nothing, because it spelled `bathy-scope` without backticks, `revision
+/// two` instead of `_v1` and `the manifest loader` instead of
+/// `ScopeManifest::load()`. Every marker below is subject matter rather than
+/// syntax, and between them they catch all four.
+///
+/// `bathy-` is the one the reviewer singled out: naming a crate is the
+/// commonest way to describe workspace layout, and it would have caught the
+/// original `scope-manifest.json` leak on the leak's own words.
+///
+/// Not here, deliberately: `supersed`. `scan-diff.json` legitimately says
+/// *"Superseded observations' evidence stays reachable"*, which is contract
+/// text about the data. `revision` covers the maintainer sense on its own.
+const SUBJECT_MARKERS: &[&str] = &[
+    // Workspace layout: crate and module names a caller never sees.
+    "bathy-",
+    "bathy_",
+    // A maintenance contract, which is an obligation on us and not on the
+    // caller.
+    "by hand",
+    "in sync",
+    "hand-sync",
+    "maintainer",
+    // Process and history.
+    "milestone",
+    "revision",
+    "refactor",
+    "rationale",
+    "workspace",
+    "see also",
+    // Prose that dates itself.
+    "for now",
+    // A description is not a file to the caller, so nothing caller-facing
+    // has occasion to say this. `R6` below defeats every marker above with
+    // "lives beside this file, one directory up".
+    "this file",
+];
+
+/// **Shapes**, as regular expressions, for the markers that need a word
+/// boundary or a form rather than a literal.
+///
+/// Word boundaries matter: `internally tagged` and `deduplicated` and
+/// `latest` are all legitimate contract text, and plain `internal` / `test`
+/// substrings would flag them. Case-insensitive.
+///
+/// The three-underscore rule is the cheap way to catch a maintainer citing a
+/// test or a function by name -- `every_required_property_is_physically_
+/// present_in_a_maximally_null_document` is unmistakable, and no published
+/// field name in this contract has more than one underscore.
+const PATTERNS: &[&str] = &[
+    // The whole vocabulary for "where this code lives". `crate` alone is
+    // avoidable by anyone who knows the marker list -- `library` and
+    // `package` are what the paraphrase reaches for next -- and none of the
+    // four has any caller-facing use in a JSON Schema description.
+    r"\bcrates?\b",
+    r"\bmodules?\b",
+    r"\blibrar(y|ies)\b",
+    r"\bpackages?\b",
+    r"\binternal\b",
+    r"\btests?\b",
+    r"\b(todo|fixme|xxx|hack)\b",
+    // A tracker reference: an obligation the caller cannot see or follow.
+    r"\b(issue|ticket|bug)s?\s+#?[0-9]",
+    // A superseded revision of a type: `ScanFold_v1`, `_v2`.
+    r"_v[0-9]",
+    // A snake_case identifier with three or more underscores: a Rust item
+    // name, not a wire field.
+    r"\b\w*_\w*_\w*_\w*\b",
+];
+
+fn patterns() -> &'static [Regex] {
+    static COMPILED: OnceLock<Vec<Regex>> = OnceLock::new();
+    COMPILED.get_or_init(|| {
+        PATTERNS
+            .iter()
+            .map(|p| {
+                Regex::new(&format!("(?i){p}")).unwrap_or_else(|e| panic!("marker `{p}`: {e}"))
+            })
+            .collect()
+    })
+}
+
+/// Every marker one description trips, named the way a maintainer can search
+/// for it. Empty means the text is clean.
+fn markers_in(description: &str) -> Vec<String> {
+    let lower = description.to_lowercase();
+    let mut hits = Vec::new();
+    for marker in SYNTAX_MARKERS {
+        if description.contains(marker) {
+            hits.push(format!("{marker:?}"));
+        }
+    }
+    for marker in SUBJECT_MARKERS {
+        if lower.contains(marker) {
+            hits.push(format!("{marker:?}"));
+        }
+    }
+    for (source, compiled) in PATTERNS.iter().zip(patterns()) {
+        if compiled.is_match(description) {
+            hits.push(format!("/{source}/"));
+        }
+    }
+    hits
+}
 
 /// Scan one parsed schema document, reporting every `description` that
 /// carries a marker. `file` is the document's name and each message names it,
-/// the type (or type and field) the description hangs off, the marker that
+/// the type (or type and field) the description hangs off, every marker that
 /// matched, and the offending text -- everything needed to find and fix the
-/// doc comment without re-running the check by hand.
+/// doc comment without re-running the check.
+///
+/// One message per offending description, listing its markers, rather than
+/// one message per marker: a maintainer paragraph trips several at once and
+/// three copies of the same 700-character description is not three findings.
 pub fn find_maintainer_prose(file: &str, schema: &Value) -> Vec<String> {
     let root = schema["title"].as_str().unwrap_or(file).to_string();
     let mut found = Vec::new();
@@ -45,12 +177,12 @@ fn walk(node: &Value, file: &str, location: &str, found: &mut Vec<String>) {
     match node {
         Value::Object(map) => {
             if let Some(Value::String(description)) = map.get("description") {
-                for marker in MARKERS {
-                    if description.contains(marker) {
-                        found.push(format!(
-                            "{file}: {location}: description contains {marker:?}: {description}"
-                        ));
-                    }
+                let markers = markers_in(description);
+                if !markers.is_empty() {
+                    found.push(format!(
+                        "{file}: {location}: description contains {}: {description}",
+                        markers.join(", ")
+                    ));
                 }
             }
             for (key, value) in map {
@@ -118,6 +250,58 @@ pub fn check_dir(dir: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> 
     }
     Ok(found)
 }
+
+// ---------------------------------------------------------------------------
+// WHAT STILL GETS THROUGH -- written out deliberately.
+//
+// This is a substring and pattern filter, not a reader. It catches the way
+// maintainer prose is usually *spelled*, and a paragraph that avoids every
+// spelling above still lands in the published contract at exit 0. Listing
+// the defeats is the point: a green `check-schemas` means no description
+// trips a marker, never that every description is contract text.
+//
+// The four below are the ones I could still write after widening the list.
+// `tests::HOLES` holds them verbatim and
+// `the_documented_holes_are_still_open_and_this_test_is_the_list` asserts
+// they still pass, so this section cannot drift away from the code.
+//
+//   - H1. **A maintenance obligation in the imperative.** *"If you change
+//     this, change the loader too. They are not generated from one source."*
+//     No layout noun, no `in sync`, no `by hand`. This is the same harm as
+//     the original `scope-manifest.json` leak -- an obligation on us, stated
+//     to an agent that cannot act on it -- and it is the hole I would close
+//     first if this list grows again. `\byou\b` would catch it; it is not a
+//     marker because a caller-facing description may legitimately address
+//     the caller, and no committed description does today, so the marker
+//     would be untested against real text.
+//   - H2. **History as a date and a shape.** *"The two-field form used
+//     before June is still accepted and will be dropped in the next
+//     release."* `revision`, `_v[0-9]` and `milestone` all miss it.
+//     Deliberately not chased: `scope-manifest.json` legitimately says
+//     *"Reserved for v0.2 detached-signature verification"*, and a version
+//     or a deprecation IS caller-facing, so the line between the two is
+//     meaning, not spelling.
+//   - H3. **A guard cited without naming it.** *"A property nobody may
+//     break: it is checked on every build."* The three-underscore rule
+//     catches a maintainer who names the test; nothing catches one who does
+//     not. Low harm -- the sentence is merely useless rather than
+//     misleading.
+//   - H4. **Layout in a synonym nobody listed.** `crate`, `module`,
+//     `library` and `package` are markers; *"the lower of the two
+//     components"* is not, and neither is *"the other half of the
+//     workspace"* spelled without the word. This family is closable only up
+//     to the next synonym, which is the honest limit of a word list. The
+//     four markers do cover every spelling actually used in this tree.
+//
+// And two structural limits that are not paraphrase attacks at all:
+//
+//   - **A `//` comment that should have been `///`.** The inverse defect --
+//     contract text a caller needs, hidden from them -- is invisible here
+//     and to every other check in the tree.
+//   - **A description that is accurate, marker-free and simply wrong about
+//     the behaviour.** Nothing mechanical reaches that; it is what review is
+//     for.
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -203,6 +387,159 @@ mod tests {
             "contract prose must not be flagged"
         );
     }
+
+    /// Real contract text, every line of it either committed today or of a
+    /// shape the committed text uses, chosen because each one brushes a
+    /// marker. This is the line between the two lists: the widening is only
+    /// worth having if it leaves these alone.
+    const LEGITIMATE: &[(&str, &str)] = &[
+        // The task statement's own example. A description may name another
+        // tool the agent can call.
+        (
+            "names another tool",
+            "Fetch the bytes behind a digest with `evidence.get`.",
+        ),
+        (
+            "field cross-reference",
+            "See `before_terminal` for how the earlier scan ended.",
+        ),
+        // `internally` is JSON Schema vocabulary; `\binternal\b` must not
+        // reach it.
+        (
+            "schema vocabulary",
+            "On the wire this is an internally tagged object with an \
+          `outcome` discriminator; unknown members are rejected.",
+        ),
+        // `Superseded` here is about the data, not about this type's own
+        // history -- which is why `supersed` is not a marker.
+        (
+            "supersession as data",
+            "Superseded observations' evidence stays reachable: the \
+          digests accumulate rather than being replaced by the latest event's.",
+        ),
+        (
+            "a reserved future field",
+            "Reserved for v0.2 detached-signature verification; \
+          accepted on the wire but NOT cryptographically checked today.",
+        ),
+        // `constructed`, `enumerated`, `deduplicated`, `latest` all contain a
+        // marker as a substring and none of them is one.
+        (
+            "words that merely contain a marker",
+            "A vector guaranteed to hold at least one \
+          element, deduplicated and never enumerated; a Finding cannot be constructed \
+          without evidence.",
+        ),
+    ];
+
+    #[test]
+    fn contract_text_that_brushes_a_marker_is_still_not_flagged() {
+        for (label, text) in LEGITIMATE {
+            let hits = markers_in(text);
+            assert!(
+                hits.is_empty(),
+                "{label}: legitimate contract text was flagged by {hits:?}: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_paragraph_that_defeated_the_first_version_is_caught() {
+        // Verbatim from the M5 Task 2 fix re-review, section 2. It passed
+        // `emit-schemas` and `check-schemas` at exit 0 and landed in the
+        // published contract. It names two workspace crates, gives the
+        // layout rationale, states a hand-sync contract and cites a
+        // superseded revision, and the syntax-only list saw none of it.
+        let text = "Defined in bathy-types rather than in bathy-scope so the contract crate \
+                    stays free of internal dependencies; the CIDR fields are therefore plain \
+                    strings. This mirror is kept in sync with the manifest loader by hand, and \
+                    the loader wins if the two ever drift. Superseded revision two of this \
+                    type is still accepted for one more milestone.";
+        let hits = markers_in(text);
+        // Each of the four things it leaks is caught by its own marker, so
+        // deleting any one does not silently leave the paragraph passing.
+        for expected in [
+            "\"bathy-\"",       // the crate names
+            "/\\bcrates?\\b/",  // the layout rationale
+            "/\\binternal\\b/", //   "
+            "\"in sync\"",      // the maintenance contract
+            "\"by hand\"",      //   "
+            "\"revision\"",     // the superseded revision
+            "\"milestone\"",    // the process reference
+        ] {
+            assert!(
+                hits.contains(&expected.to_string()),
+                "{expected} missed: {hits:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_marker_is_caught_wherever_the_sentence_capitalises_it() {
+        // The subject-matter list is matched case-insensitively precisely
+        // because a maintainer sentence starts with its marker as often as
+        // not, and a case-sensitive `contains` would miss every one.
+        let hits = markers_in("Milestone five moved this. Revision one is gone. TODO: drop it.");
+        assert!(hits.contains(&"\"milestone\"".to_string()), "{hits:?}");
+        assert!(hits.contains(&"\"revision\"".to_string()), "{hits:?}");
+        assert!(
+            hits.iter().any(|h| h.contains("todo")),
+            "an upper-case TODO must be caught: {hits:?}"
+        );
+    }
+
+    #[test]
+    fn a_rust_item_name_is_caught_by_its_shape_not_by_a_literal() {
+        // Nobody can list the test names in advance; the shape is the rule.
+        let hits =
+            markers_in("Guarded by every_required_property_is_physically_present, which dies.");
+        assert!(
+            hits.iter().any(|h| h.contains('_')),
+            "a snake_case item name must be caught by shape: {hits:?}"
+        );
+        // ...and a one-underscore wire field must not be.
+        assert!(
+            markers_in("`before_terminal` is null when the earlier scan never ended.").is_empty(),
+            "a published field name is not a Rust item name"
+        );
+    }
+
+    #[test]
+    fn the_documented_holes_are_still_open_and_this_test_is_the_list() {
+        // These are the paraphrases that survive the widened list, written
+        // out in `WHAT STILL GETS THROUGH` below. The test asserts they
+        // still pass, so the disclosure cannot quietly become wrong in
+        // either direction: widening the markers until one of these is
+        // caught fails here and forces the list to be edited.
+        for (label, text) in HOLES {
+            assert!(
+                markers_in(text).is_empty(),
+                "{label} is no longer a hole -- update WHAT STILL GETS THROUGH: {text}"
+            );
+        }
+    }
+
+    /// The surviving defeats, kept next to the list that documents them.
+    const HOLES: &[(&str, &str)] = &[
+        (
+            "H1 a maintenance obligation in the imperative",
+            "If you change this, change the loader too. They are not generated from one source.",
+        ),
+        (
+            "H2 history as a date and a shape",
+            "The two-field form used before June is still accepted and will be dropped in \
+             the next release.",
+        ),
+        (
+            "H3 a guard cited without naming it",
+            "A property nobody may break: it is checked on every build.",
+        ),
+        (
+            "H4 layout in a synonym nobody listed",
+            "This shape is declared in the lower of the two components so the upper one \
+             need not be built to read it.",
+        ),
+    ];
 
     #[test]
     fn every_committed_schema_is_free_of_maintainer_prose() {
