@@ -1,0 +1,4 @@
+# Drop-in scanner binaries are the runner's, not the repository's.
+*
+!.gitignore
+!README.md
