@@ -1119,6 +1119,159 @@ fn cancel_from_another_process_stops_a_running_scan_and_it_resumes_where_it_stop
     );
 }
 
+/// A follower must stop even when the thing it follows is gone.
+///
+/// `scan events --follow` had exactly one stopping condition, a terminal
+/// event, and a scan whose process was killed never writes one -- so the
+/// follower polled a log nothing would ever append to, forever. An agent
+/// that shelled out has no interrupt to send.
+///
+/// The scan here is killed with `SIGKILL` so nothing can run on its way
+/// out: the log ends mid-scan, which is the state a crash leaves behind.
+/// The follower is then given one second of patience, and this test fails
+/// by *timing out with a named message* rather than by hanging.
+#[test]
+fn following_a_scan_whose_writer_died_gives_up_by_a_deadline_instead_of_waiting_forever() {
+    let ip = local_ipv4();
+    let scope = Scope::new(&[&format!("{ip}/32")], &[], 20);
+    let state = state_dir();
+    let dir = state.path().to_str().unwrap().to_string();
+
+    let mut child = Command::new(BIN)
+        .args([
+            "--json",
+            "--state-dir",
+            &dir,
+            "scan",
+            "start",
+            "--scope",
+            scope.path(),
+            "--idempotency-key",
+            "kill-me",
+            "--targets",
+            &ip.to_string(),
+            "--ports",
+            "41000-41999",
+            "--max-packets-per-second",
+            "20",
+        ])
+        .env_remove("BATHY_STATE_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn bathy");
+
+    let handle: serde_json::Value =
+        serde_json::from_str(&first_line_within(&mut child, Duration::from_secs(10))).unwrap();
+    let id = handle["task_id"].as_str().unwrap().to_string();
+
+    // Let a few events land, then kill the writer outright. No terminal
+    // event will ever be written for this scan.
+    std::thread::sleep(Duration::from_millis(500));
+    child.kill().expect("kill the scanning process");
+    child.wait().expect("reap");
+
+    let mut follower = Command::new(BIN)
+        .args([
+            "--json",
+            "--state-dir",
+            &dir,
+            "scan",
+            "events",
+            "--scan",
+            &id,
+            "--follow",
+            "--idle-timeout-seconds",
+            "1",
+        ])
+        .env_remove("BATHY_STATE_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the follower");
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = follower.try_wait().expect("try_wait") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = follower.kill();
+            let _ = follower.wait();
+            panic!(
+                "`scan events --follow --idle-timeout-seconds 1` was still running 20s after \
+                 the scan it follows was killed: an unbounded follower waits for a terminal \
+                 event that will never be written"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let out = follower.wait_with_output().expect("collect the follower");
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "giving up is an operational error, not a success:\n{stdout}\n{stderr}"
+    );
+    let last: serde_json::Value = serde_json::from_str(
+        stdout
+            .lines()
+            .rfind(|l| !l.is_empty())
+            .unwrap_or_else(|| panic!("nothing on stdout; stderr was {stderr}")),
+    )
+    .expect("the last stdout line is JSON");
+    assert_eq!(last["error"], "follow_idle_timeout", "{last}");
+    assert_eq!(last["exit_code"], 1, "{last}");
+    assert!(!stderr.trim().is_empty(), "gave up silently");
+
+    // The control: the timeout is not the only way this command ends, and
+    // exit 1 above was caused by the missing terminal event rather than by
+    // `--follow` now always failing. A scan that completes normally is
+    // followed to its terminal event and exits 0 -- with the same one-second
+    // patience, so the two runs differ only in whether the writer survived.
+    let listener = Listener::bind(ip, false);
+    let complete = bathy(&[
+        "--json",
+        "--state-dir",
+        &dir,
+        "scan",
+        "start",
+        "--scope",
+        scope.path(),
+        "--idempotency-key",
+        "let-me-finish",
+        "--targets",
+        &ip.to_string(),
+        "--ports",
+        &listener.port(),
+    ]);
+    complete.success();
+    let finished = scan_id_of(&complete);
+    let followed = bathy(&[
+        "--json",
+        "--state-dir",
+        &dir,
+        "scan",
+        "events",
+        "--scan",
+        &finished,
+        "--follow",
+        "--idle-timeout-seconds",
+        "1",
+    ]);
+    followed.success();
+    assert!(
+        followed
+            .json_lines()
+            .iter()
+            .any(|e| e["event_type"] == "scan.completed"),
+        "the control never reached a terminal event, so the failure above proves nothing: {}",
+        followed.stdout
+    );
+}
+
 fn wait_for(child: &mut Child, limit: Duration) -> bool {
     let start = Instant::now();
     while start.elapsed() < limit {

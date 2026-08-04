@@ -6,7 +6,7 @@
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bathy_engine::{GroupCommitConfig, GroupCommitLog, RunSummary, Scheduler, SchedulerConfig};
 use bathy_evidence::{EventLogReader, EvidenceStore};
@@ -504,6 +504,17 @@ pub fn events(
 ) -> Result<ExitCode, CliError> {
     let scan_id = state::parse_scan_id(&args.scan)?;
     let mut cursor = args.after;
+    // A follower's only stopping condition used to be a terminal event, and
+    // a scan whose process was killed never writes one -- so `--follow`
+    // polled forever against a log nothing would ever append to. An agent
+    // that shelled out has no interrupt to send, so it hangs. `0` restores
+    // the old behaviour, but only when a caller asks for it in writing.
+    let idle_limit = if args.idle_timeout_seconds == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(args.idle_timeout_seconds))
+    };
+    let mut last_event = Instant::now();
     loop {
         // Reopened on each poll rather than held: `EventLogReader`'s
         // `last_sequence` is a snapshot, and reopening is how a follower
@@ -514,6 +525,9 @@ pub fn events(
             .read_from(cursor)
             .map_err(|e| CliError::operational("log_unreadable", e))?;
         let mut saw_terminal = false;
+        if !batch.is_empty() {
+            last_event = Instant::now();
+        }
         for event in &batch {
             cursor = event.sequence;
             saw_terminal |= is_terminal(event);
@@ -528,6 +542,21 @@ pub fn events(
         }
         if !args.follow || saw_terminal {
             return Ok(ExitCode::Success);
+        }
+        if let Some(limit) = idle_limit
+            && last_event.elapsed() >= limit
+        {
+            // Operational, not success: the caller asked to be followed to
+            // a terminal event and is not getting one, and the events
+            // already on stdout are a prefix, not an answer.
+            return Err(CliError::operational(
+                "follow_idle_timeout",
+                format!(
+                    "no event for {}s while following {scan_id} (last sequence {cursor}); \
+                     the writing process may have exited without a terminal event",
+                    args.idle_timeout_seconds
+                ),
+            ));
         }
         std::thread::sleep(Duration::from_millis(200));
     }

@@ -213,6 +213,18 @@ pub struct EventsArgs {
     /// Keep reading as the scan writes, until it reaches a terminal event.
     #[arg(long)]
     pub follow: bool,
+
+    /// Give up after this many seconds with no new event, and say so.
+    /// 0 waits forever. Ignored without --follow.
+    ///
+    /// A scan whose process was killed never writes its terminal event, so
+    /// an unbounded follower waits for something that will never arrive --
+    /// and an agent that shelled out to `scan events --follow` has no
+    /// interrupt to send. The default is far longer than any gap a live
+    /// scan produces (probe timeouts are seconds, not minutes), so reaching
+    /// it means the writer is gone, not slow.
+    #[arg(long, value_name = "SECONDS", default_value_t = 300)]
+    pub idle_timeout_seconds: u64,
 }
 
 #[derive(Debug, Subcommand)]

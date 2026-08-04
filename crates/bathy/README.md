@@ -15,7 +15,7 @@ bathy scope validate  --scope <PATH>
 bathy scan preview    --scope <PATH> --targets <T,...> --ports <P,...>
 bathy scan start      --scope <PATH> --idempotency-key <KEY> --targets ... --ports ...
 bathy scan status     --scan <SCAN_ID>
-bathy scan events     --scan <SCAN_ID> [--follow]
+bathy scan events     --scan <SCAN_ID> [--follow [--idle-timeout-seconds <N>]]
 bathy scan cancel     --scan <SCAN_ID>
 bathy scan resume     --scope <PATH> --scan <SCAN_ID>
 bathy result query    --scan <SCAN_ID>
@@ -25,9 +25,17 @@ bathy explain         <RULE_ID> | --list
 ```
 
 `--json` puts line-delimited JSON on stdout and every diagnostic on stderr,
-including when a command fails. Exit codes: `0` success, `1` operational error,
-`2` policy denial, `3` budget or time exhaustion, `4` idempotency conflict —
-`bathy --help` carries the same table.
+including when a command fails, and including `--help` and `--version`, which
+become documents rather than prose so that stdout is JSON without exception.
+Exit codes: `0` success, `1` operational error, `2` policy denial, `3` budget or
+time exhaustion, `4` idempotency conflict — `bathy --help` carries the same
+table, and `bathy --json --help` carries it as data. An argument mistake is
+always `1`: it is never reported as success, whatever shape it takes.
+
+`scan events --follow` stops at the scan's terminal event, or after
+`--idle-timeout-seconds` (default 300) with nothing new — a scan whose process
+was killed never writes a terminal event, and a follower with no deadline waits
+for it forever. `0` waits forever, for a caller who wants that.
 
 ## Authorization
 
