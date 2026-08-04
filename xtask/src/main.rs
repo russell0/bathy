@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod readme;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -37,11 +39,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("emit-schemas") => emit_schemas(true),
         Some("check-schemas") => emit_schemas(false),
         Some("gen-ports") => gen_ports(),
+        Some("check-readme") => readme::check_readme(),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
-        None => Err(
-            "usage: xtask <check-deps|emit-schemas|check-schemas|gen-ports --registry <path>>"
-                .into(),
-        ),
+        None => Err("usage: xtask \
+             <check-deps|emit-schemas|check-schemas|check-readme|gen-ports --registry <path>>"
+            .into()),
     }
 }
 

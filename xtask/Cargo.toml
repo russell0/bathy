@@ -13,6 +13,22 @@ serde_json = { workspace = true }
 # forbidden-substring rule still applies to it like any other workspace
 # member.
 bathy-types = { path = "../crates/bathy-types" }
+# `check-readme` (src/readme.rs) proves README.md's protocol claims against
+# `ProbeRegistry::standard()` by CALLING it, not by parsing framework.rs: the
+# set of probes that exist is then compile-checked, and adding a ninth probe
+# fails the check with its id named instead of quietly leaving the README's
+# "eight protocols" wrong for a milestone. `bathy-probe` is a 1.88-tier crate
+# (its only dependency is `bathy-types`), so this edge keeps `xtask` in the
+# `msrv` CI job rather than dragging it up to the 1.95 tier -- which is also
+# why the evidence caps, owned by the 1.95-tier `bathy-engine`, are read from
+# source text instead.
+bathy-probe = { path = "../crates/bathy-probe" }
+# `check-readme` matches every phrasing of a pinned claim across the whole
+# document, so that a number corrected in two places out of three fails. That
+# is regex work; `regex` is already in this workspace's tree via
+# `bathy-interpret` and needs no exemption from check-deps' forbidden-substring
+# rule.
+regex = { workspace = true }
 # `gen-ports`: the IANA registry CSV embeds commas, quotes, and (in a handful
 # of multi-paragraph Description fields) literal newlines inside quoted
 # fields -- verified against the real downloaded file, see the task report.

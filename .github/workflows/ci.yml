@@ -13,6 +13,23 @@ jobs:
       - run: cargo test --workspace
       - run: cargo run -p xtask -- check-deps
       - run: cargo run -p xtask -- check-schemas
+      # `README.md` was factually wrong at three consecutive milestone
+      # reviews, and twice inside the fixes for those reviews -- the last
+      # audit found the same connection-count error still standing in a third
+      # location after two had been corrected, in the paragraph describing
+      # what a scanned third party receives on their wire. Every other
+      # invariant in this project is enforced by a test that dies; this one
+      # was enforced by whoever last remembered to look. `check-readme` pins
+      # the claims that are numbers with a source of truth in the tree
+      # (connections per open port, the acceptance-criterion count, the
+      # milestone count, the protocol count and set, which probes send no
+      # bytes, the committed-schema count, the evidence caps) and the "What
+      # works today" table against the actual membership of `crates/`. It
+      # does not and cannot cover the prose guarantees -- `xtask/src/readme.rs`
+      # ends with the list of what stays human-verified, and the Global
+      # Constraint requiring a README audit at every milestone exit still
+      # stands in full.
+      - run: cargo run -p xtask -- check-readme
       - name: no direct time/id generation outside Clock (AC-2.1)
         run: |
           # `Clock` (crates/bathy-types/src/clock.rs) is the only place

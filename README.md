@@ -43,7 +43,7 @@ over MCP.
 > library call — see `crates/bathy-engine/tests/end_to_end_scan.rs` for exactly
 > that, exercised end to end against real sockets.
 >
-> Plans for all seven milestones — 204 numbered acceptance criteria — are in
+> Plans for all seven milestones — 207 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
 
 ## What works today
@@ -58,6 +58,7 @@ over MCP.
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by a deadline that covers the whole read rather than each individual `recv`, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. The deadline is per call, not per probe: a probe that writes and then reads can take up to twice it, deliberately, since the hostile case being defended against is on the read path. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
 | `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every finding carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
 | `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
+| `bathy-query` | Milestone 5, in progress. Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Nothing calls it yet; the diff, the CLI and the MCP server are the rest of Milestone 5. |
 | `bathy` | Nothing yet, deliberately. It reserves the name on crates.io and will become the CLI binary in Milestone 5; it ships no `[[bin]]`, so `cargo install bathy` correctly reports there is nothing to install rather than installing a stub. |
 | `xtask` | Enforces the dependency layering, the "no inference client on the packet path" rule, and schema drift against the committed `schemas/`. |
 
