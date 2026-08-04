@@ -902,6 +902,18 @@ pub fn check_deny() -> Fallible<()> {
 /// Directories never scanned for publish-denied strings.
 const NEVER_SCANNED: &[&str] = &[".git", "target", "node_modules", "mutants.out"];
 
+/// Directories that are never scanned, by PATH rather than by name.
+///
+/// `fuzz/corpus` and `fuzz/artifacts` are libFuzzer's working state:
+/// git-ignored, thousands of generated files, present or absent depending on
+/// whether someone has run the fuzzer locally. Scanning them made this gate's
+/// own reported evidence unreproducible -- the same commit reported 5,375
+/// file reads on one machine and 14,920 on another, and the whole difference
+/// was local fuzz state. A count printed as evidence must not depend on that.
+/// By path and not by name, because `corpus` and `artifacts` are ordinary
+/// words that a real source directory may well be called.
+const NEVER_SCANNED_PATHS: &[&str] = &["fuzz/corpus", "fuzz/artifacts"];
+
 /// Where the denied strings live. Git-ignored on purpose: the list itself is
 /// the thing that must not be published.
 pub const PUBLISH_DENY_FILE: &str = ".publish-deny";
@@ -992,7 +1004,9 @@ fn walk(dir: &Path, into: &mut Vec<std::path::PathBuf>) -> Fallible<()> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if NEVER_SCANNED.contains(&name.as_str()) {
+            if NEVER_SCANNED.contains(&name.as_str())
+                || NEVER_SCANNED_PATHS.iter().any(|skip| path.ends_with(skip))
+            {
                 continue;
             }
             walk(&path, into)?;
@@ -1851,6 +1865,20 @@ pub const INTERPRET_NAMES_THE_RULES: &str = "let rules = rule_ids();";
 /// target. `run_fuzz` runs exactly this list and CI calls `run_fuzz`, so a
 /// target added here is fuzzed in CI without anyone editing `ci.yml` — the
 /// drift that a hand-maintained second list in a workflow file guarantees.
+///
+/// # What this list is and is not
+///
+/// It is **hand-maintained**, and no checker derives it from the code. So
+/// "every function that consumes untrusted bytes is registered" is asserted
+/// by this list, not proved by it — the completeness claim is exactly the
+/// kind of second registry the rest of this file objects to, and saying so is
+/// the only honest option available. What IS enforced: every entry has a
+/// target or an expiring deferral, every target has seeds, and every declared
+/// `[[bin]]` is an entry.
+///
+/// The M7 Task 2 review named the one candidate it could find that was
+/// missing — the MCP stdio boundary — and it is registered below rather than
+/// left in a report.
 pub struct FuzzSurface {
     /// The target's name: `fuzz/fuzz_targets/<name>.rs`, and the `[[bin]]`
     /// that declares it.
@@ -1906,7 +1934,77 @@ pub const FUZZ_SURFACES: &[FuzzSurface] = &[
              deferral.",
         ),
     },
+    FuzzSurface {
+        name: "mcp_stdio",
+        parser: "bathy_mcp::lifecycle::classify + the JSON-RPC frame it is handed — the \
+                 opening message from a calling agent, which the threat model treats as \
+                 possibly adversarial",
+        // Named by the M7 Task 2 review as the one unregistered surface it
+        // could find, and it is right: this boundary EXISTS because a
+        // malformed opening `_meta` was fatal to the process rather than to
+        // the request (see `crates/bathy-mcp/src/lifecycle.rs` and
+        // `docs/protocol-notes.md`). "It is only a confused agent" is not the
+        // discriminator AC-7.7 uses.
+        deferred: Some(
+            "`bathy_mcp::lifecycle::classify` is `pub(crate)` and takes an already \
+             deserialized `ClientJsonRpcMessage`, so there is no entry point a fuzz \
+             target can reach from outside the crate, and the byte-level parse belongs \
+             to `rmcp`'s transport. Widening the visibility to fuzz it would also drag \
+             the whole engine — `bathy-store` and `libsqlite3-sys`'s build script — into \
+             a nightly sanitizer build. The `mcp-stdio-fuzz-target` deferral fires the \
+             day `classify` becomes reachable, and reports itself stale the day the \
+             target lands.",
+        ),
+    },
 ];
+
+/// The MCP surface's blocker, as a fact about the source: while `classify` is
+/// `pub(crate)` there is no entry point to fuzz.
+pub const MCP_LIFECYCLE: &str = "crates/bathy-mcp/src/lifecycle.rs";
+/// The target that would discharge it.
+pub const MCP_STDIO_FUZZ_TARGET: &str = "fuzz/fuzz_targets/mcp_stdio.rs";
+
+/// The `mcp-stdio-fuzz-target` deferral's condition, in both directions.
+///
+/// The trigger is the blocker itself rather than a date: a deferral whose
+/// condition is "when someone remembers" is a note. When `classify` becomes
+/// reachable from outside its crate, the stated reason for the gap is gone
+/// and the target is due; when the target lands, this reports itself stale.
+pub fn mcp_stdio_deferral_violations(root: &Path) -> Vec<String> {
+    let lifecycle = std::fs::read_to_string(root.join(MCP_LIFECYCLE)).unwrap_or_default();
+    let reachable = lifecycle.contains("pub fn classify");
+    let target_exists = root.join(MCP_STDIO_FUZZ_TARGET).is_file();
+    let registered_deferred = FUZZ_SURFACES
+        .iter()
+        .any(|s| s.name == "mcp_stdio" && s.deferred.is_some());
+
+    let mut found = Vec::new();
+    if reachable && !target_exists {
+        found.push(format!(
+            "{MCP_LIFECYCLE} now exports `classify`, so the reason AC-7.7's MCP stdio \
+             surface has no fuzz target is gone: write {MCP_STDIO_FUZZ_TARGET}, seed \
+             `fuzz/seeds/mcp_stdio/` from real opening frames, and clear `deferred` on \
+             the `mcp_stdio` entry in `FUZZ_SURFACES`. This boundary exists because a \
+             malformed opening `_meta` was fatal to the process rather than to the \
+             request."
+        ));
+    }
+    if target_exists && registered_deferred {
+        found.push(format!(
+            "{MCP_STDIO_FUZZ_TARGET} exists but the `mcp_stdio` entry in `FUZZ_SURFACES` \
+             is still marked `deferred`, so `run_fuzz` skips the target it has. Clear \
+             `deferred` and delete this deferral's entry from `DEFERRALS`."
+        ));
+    }
+    if !reachable && !registered_deferred && !target_exists {
+        found.push(format!(
+            "the `mcp_stdio` entry in `FUZZ_SURFACES` is no longer marked `deferred` and \
+             no {MCP_STDIO_FUZZ_TARGET} exists, so AC-7.7's MCP stdio surface is neither \
+             covered nor recorded as outstanding"
+        ));
+    }
+    found
+}
 
 /// The crate whose arrival makes the `ipc` target due.
 pub const PACKETD_CRATE: &str = "crates/bathy-packetd";
@@ -2277,6 +2375,7 @@ pub fn fuzz_violations(root: &Path, manifest: &str, ci_path: &str, ci: &str) -> 
     found.extend(fuzz_ci_job_violations(ci_path, ci));
     found.extend(fuzz_crate_gate_violations(ci_path, ci));
     found.extend(packetd_ipc_deferral_violations(root));
+    found.extend(mcp_stdio_deferral_violations(root));
     found
 }
 
@@ -2553,6 +2652,56 @@ pub fn run_fuzz(seconds: u64, only: Option<&str>) -> Fallible<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate's own evidence must not depend on whether someone has run the
+    /// fuzzer. `fuzz/corpus` is git-ignored working state of thousands of
+    /// generated files, and walking it made the reported file count differ
+    /// by three times between two checkouts of the same commit.
+    #[test]
+    fn the_fuzzers_working_state_is_not_walked_and_a_real_corpus_directory_still_is() {
+        let root = std::env::temp_dir().join(format!(
+            "bathy-walk-{}-{}",
+            std::process::id(),
+            NEVER_SCANNED_PATHS.len()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "fuzz/corpus/interpret",
+            "fuzz/artifacts/interpret",
+            "fuzz/seeds",
+            "crates/corpus",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("a.txt"), "x").unwrap();
+        }
+        let mut found = Vec::new();
+        walk(&root, &mut found).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("fuzz/corpus")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("fuzz/artifacts")),
+            "{names:?}"
+        );
+        assert!(names.contains(&"fuzz/seeds/a.txt".to_string()), "{names:?}");
+        // `corpus` is an ordinary word: only the fuzz one is skipped, which
+        // is why the skip list is paths and not names.
+        assert!(
+            names.contains(&"crates/corpus/a.txt".to_string()),
+            "{names:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     // --- The registries themselves. See the M5 residual wave: a loop over an
     // emptied register reports success, and `phrases.rs` has asserted its own
@@ -3726,9 +3875,11 @@ jobs:
     fn the_fuzz_registry_is_not_empty_and_names_every_surface_the_plan_does() {
         assert_eq!(
             FUZZ_SURFACES.len(),
-            5,
-            "AC-7.7 names five surfaces: interpretation, event-log parsing, canonical \
-             JSON, manifest loading and the packetd IPC protocol"
+            6,
+            "AC-7.7 names five surfaces -- interpretation, event-log parsing, canonical \
+             JSON, manifest loading and the packetd IPC protocol -- and the M7 Task 2 \
+             review named a sixth the criterion's own wording covers and the list had \
+             missed: the MCP stdio boundary"
         );
         let names: Vec<&str> = FUZZ_SURFACES.iter().map(|s| s.name).collect();
         assert_eq!(
@@ -3738,7 +3889,8 @@ jobs:
                 "event_log",
                 "canonical_json",
                 "manifest",
-                "ipc"
+                "ipc",
+                "mcp_stdio"
             ]
         );
         assert!(
@@ -4072,6 +4224,51 @@ jobs:
     fn a_workflow_with_no_fuzz_job_at_all_is_reported() {
         let v = fuzz_ci_job_violations("ci.yml", "jobs:\n  test:\n    runs-on: ubuntu-latest\n");
         assert!(v.iter().any(|m| m.contains("no `fuzz:` job")), "{v:#?}");
+    }
+
+    /// The sixth surface's deferral, in both directions. The trigger is the
+    /// blocker itself -- `classify`'s visibility -- because a deferral whose
+    /// condition is "when someone remembers" is a note, and this repository
+    /// has three recorded recurrences of exactly that.
+    #[test]
+    fn the_mcp_deferral_fires_when_classify_becomes_reachable_and_when_the_target_lands() {
+        let root = scratch("mcp-stdio");
+        std::fs::create_dir_all(root.join("crates/bathy-mcp/src")).unwrap();
+        let lifecycle = root.join(MCP_LIFECYCLE);
+
+        // As shipped: `pub(crate)`, no target. Registered and silent.
+        std::fs::write(
+            &lifecycle,
+            "pub(crate) fn classify(message: &ClientJsonRpcMessage) -> Opener {}\n",
+        )
+        .unwrap();
+        assert!(mcp_stdio_deferral_violations(&root).is_empty());
+
+        // The blocker goes: the target is due, and it says why without
+        // anyone having to remember AC-7.7.
+        std::fs::write(
+            &lifecycle,
+            "pub fn classify(message: &ClientJsonRpcMessage) -> Opener {}\n",
+        )
+        .unwrap();
+        let due = mcp_stdio_deferral_violations(&root);
+        assert_eq!(due.len(), 1, "{due:#?}");
+        assert!(due[0].contains(MCP_STDIO_FUZZ_TARGET), "{}", due[0]);
+
+        // The target lands: the deferral reports ITSELF stale, so a
+        // discharged obligation does not stay on the books reading as
+        // coverage.
+        std::fs::create_dir_all(root.join("fuzz/fuzz_targets")).unwrap();
+        std::fs::write(
+            root.join(MCP_STDIO_FUZZ_TARGET),
+            "fuzz_target!(|_: &[u8]| {});",
+        )
+        .unwrap();
+        let stale = mcp_stdio_deferral_violations(&root);
+        assert!(
+            stale.iter().any(|m| m.contains("still marked `deferred`")),
+            "{stale:#?}"
+        );
     }
 
     #[test]

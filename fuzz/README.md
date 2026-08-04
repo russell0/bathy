@@ -1,8 +1,19 @@
 # Fuzzing bathy's parsers
 
-Every function in this repository that consumes bytes it did not write has a
-libFuzzer target here. That is the whole of AC-7.7: interpretation, event-log
-parsing, canonical JSON, manifest loading, and `bathy-packetd`'s IPC protocol.
+Every untrusted-input surface registered in `gates::FUZZ_SURFACES` has a
+libFuzzer target here, or a deferral that expires by itself. That is AC-7.7:
+interpretation, event-log parsing, canonical JSON and manifest loading have
+targets; `bathy-packetd`'s IPC protocol and the MCP stdio boundary are
+registered and deferred, each with a mechanical trigger (see the last two
+sections).
+
+Note the wording. The registry is hand-maintained, so "every function that
+consumes untrusted bytes is covered" is a claim the list *asserts* rather than
+one anything derives from the code — and a completeness claim maintained by
+hand is the same pattern this repository objects to everywhere else. What is
+enforced, by `check-fuzz`: every registered surface has a target or a live
+deferral, every target has committed seeds, every `[[bin]]` is a registered
+surface, and the fuzz package stays out of the root workspace.
 
 ## Running them
 
@@ -180,3 +191,20 @@ and `packetd-ipc-fuzz-target` is an entry in `xtask`'s `DEFERRALS`, so
 lands. A stub target was the alternative and is worse: it would fuzz nothing
 while registering as coverage, which is the exact failure this milestone
 already measured once.
+
+## `mcp_stdio` — the target that has nothing to call yet
+
+The opening JSON-RPC frame from a calling agent is untrusted input by this
+project's own threat model, and `crates/bathy-mcp/src/lifecycle.rs` exists
+*because* a malformed opening `_meta` was fatal to the process rather than to
+the request. It has no target for one reason: `classify` is `pub(crate)` and
+takes an already-deserialized `ClientJsonRpcMessage`, so there is no entry
+point a fuzz target can reach, and widening it would also pull the engine —
+`bathy-store` and `libsqlite3-sys`'s build script — into a nightly sanitizer
+build.
+
+That blocker *is* the deferral's trigger: `mcp-stdio-fuzz-target` fires the
+day `classify` becomes reachable, and reports itself stale the day
+`fuzz/fuzz_targets/mcp_stdio.rs` lands. The M7 Task 2 review named this
+surface as the one thing AC-7.7's wording covers that the registry had
+missed; it is registered rather than recorded in a report.

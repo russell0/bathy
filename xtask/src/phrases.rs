@@ -84,6 +84,18 @@ pub struct Rule {
 /// disabled rather than obeyed.
 const NEVER_SCANNED: &[&str] = &["target", ".git", ".superpowers"];
 
+/// Directories that are never scanned, by PATH rather than by name.
+///
+/// `fuzz/corpus` and `fuzz/artifacts` are libFuzzer's working state:
+/// git-ignored, thousands of generated files, present or absent depending on
+/// whether someone has run the fuzzer locally. Scanning them made this gate's
+/// own reported evidence unreproducible -- the same commit reported 5,375
+/// file reads on one machine and 14,920 on another, and the whole difference
+/// was local fuzz state. A count printed as evidence must not depend on that.
+/// By path and not by name, because `corpus` and `artifacts` are ordinary
+/// words that a real source directory may well be called.
+const NEVER_SCANNED_PATHS: &[&str] = &["fuzz/corpus", "fuzz/artifacts"];
+
 pub const RULES: &[Rule] = &[
     Rule {
         id: "clock-only-time-and-ids",
@@ -320,7 +332,9 @@ fn walk(dir: &Path, into: &mut Vec<PathBuf>) -> Fallible<()> {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         if path.is_dir() {
-            if NEVER_SCANNED.contains(&name.as_str()) {
+            if NEVER_SCANNED.contains(&name.as_str())
+                || NEVER_SCANNED_PATHS.iter().any(|skip| path.ends_with(skip))
+            {
                 continue;
             }
             walk(&path, into)?;
@@ -414,6 +428,56 @@ pub fn check_phrases() -> Fallible<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate's own evidence must not depend on whether someone has run the
+    /// fuzzer. `fuzz/corpus` is git-ignored working state of thousands of
+    /// generated files, and walking it made the reported file count differ
+    /// by three times between two checkouts of the same commit.
+    #[test]
+    fn the_fuzzers_working_state_is_not_walked_and_a_real_corpus_directory_still_is() {
+        let root = std::env::temp_dir().join(format!(
+            "bathy-walk-{}-{}",
+            std::process::id(),
+            NEVER_SCANNED_PATHS.len()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [
+            "fuzz/corpus/interpret",
+            "fuzz/artifacts/interpret",
+            "fuzz/seeds",
+            "crates/corpus",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("a.txt"), "x").unwrap();
+        }
+        let mut found = Vec::new();
+        walk(&root, &mut found).unwrap();
+        let names: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.starts_with("fuzz/corpus")),
+            "{names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("fuzz/artifacts")),
+            "{names:?}"
+        );
+        assert!(names.contains(&"fuzz/seeds/a.txt".to_string()), "{names:?}");
+        // `corpus` is an ordinary word: only the fuzz one is skipped, which
+        // is why the skip list is paths and not names.
+        assert!(
+            names.contains(&"crates/corpus/a.txt".to_string()),
+            "{names:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     fn rule(id: &str) -> &'static Rule {
         RULES

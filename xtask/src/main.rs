@@ -407,6 +407,18 @@ const DEFERRALS: &[Deferral] = &[
         id: "packetd-ipc-fuzz-target",
         check: gates::packetd_ipc_deferral_violations,
     },
+    // AC-7.7's MCP stdio surface: the opening JSON-RPC frame from a calling
+    // agent, which the threat model treats as possibly adversarial and which
+    // `crates/bathy-mcp/src/lifecycle.rs` exists to handle because a
+    // malformed `_meta` there was fatal to the *process*. It has no fuzz
+    // target because `classify` is `pub(crate)` and its input is already
+    // deserialized, so there is nothing a target can call; the deferral's
+    // condition is that blocker rather than a date, and it fires the day
+    // `classify` becomes reachable.
+    Deferral {
+        id: "mcp-stdio-fuzz-target",
+        check: gates::mcp_stdio_deferral_violations,
+    },
 ];
 
 /// The `rmcp` release the stdio workaround was measured against.
@@ -1119,10 +1131,11 @@ mod tests {
         // honest and this assertion the thing that keeps it non-trivial.
         assert_eq!(
             DEFERRALS.len(),
-            3,
-            "the deferral registry changed size; the three entries are the ops-layer \
-             move (AC-5.39), the rmcp stdio workaround, and the `packetd` IPC fuzz \
-             target that AC-7.7 names and M6 has not yet made writable"
+            4,
+            "the deferral registry changed size; the four entries are the ops-layer \
+             move (AC-5.39), the rmcp stdio workaround, the `packetd` IPC fuzz target \
+             that AC-7.7 names and M6 has not yet made writable, and the MCP stdio fuzz \
+             target whose blocker is `classify`'s visibility"
         );
         let ids: Vec<&str> = DEFERRALS.iter().map(|d| d.id).collect();
         assert_eq!(
@@ -1130,7 +1143,8 @@ mod tests {
             vec![
                 "ops-layer-move",
                 "rmcp-stdio-workaround",
-                "packetd-ipc-fuzz-target"
+                "packetd-ipc-fuzz-target",
+                "mcp-stdio-fuzz-target"
             ]
         );
     }
