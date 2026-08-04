@@ -25,6 +25,12 @@ bathy-types = { path = "../bathy-types" }
 regex = { workspace = true }
 
 [dev-dependencies]
+# M7 Task 3 (AC-7.15): the criterion micro-benchmarks. `default-features =
+# false` drops `plotters` and `rayon` -- this project publishes numbers, not
+# HTML reports, and every crate admitted to the graph has to clear
+# `cargo deny`'s licence check. `cargo_bench_support` is what lets
+# `cargo bench` drive it at all.
+criterion = { workspace = true }
 # M4 Task 4 (`tests/replay.rs`): fixtures on disk store request/response
 # bytes as base64 (the brief's own fixture shape), decoded once at load
 # time. Dev-only, like everything else below -- see the note on `insta`.
@@ -50,3 +56,7 @@ proptest = { workspace = true }
 # these two crates are what that deserialization needs.
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+
+[[bench]]
+name = "interpret"
+harness = false

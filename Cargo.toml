@@ -128,3 +128,19 @@ async-trait = "0.1.91"
 # so it does not push `bathy` into a higher MSRV tier (`bathy-engine` does
 # that; see `crates/bathy/Cargo.toml`).
 clap = { version = "4.6", features = ["derive"] }
+# M7 Task 3 (AC-7.15): the criterion micro-benchmarks over `interpret`,
+# `canonical_json`, plan construction and event-log append. A dev-dependency
+# of four 1.88-tier crates, which is why the version floor matters: the
+# `msrv` CI job builds those crates with `--all-targets`, so criterion is
+# compiled at 1.88 and anything needing more turns that job red.
+#
+# `default-features = false` drops `plotters` (HTML report rendering, which
+# pulls a chart stack this project has no use for) and `rayon` (a thread pool
+# for the analysis phase). `cargo_bench_support` is the feature that lets
+# `cargo bench` drive the harness at all; without it criterion refuses to run
+# outside its own CLI. Fewer crates in the graph is also fewer licences for
+# `cargo deny` to rule on, and the graph a benchmark drags in is a graph the
+# shipped binary never links.
+criterion = { version = "0.5", default-features = false, features = [
+    "cargo_bench_support",
+] }

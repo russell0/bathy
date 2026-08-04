@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod bench;
 mod gates;
 mod phrases;
 mod prose;
@@ -56,6 +57,13 @@ const SUBCOMMANDS: &[&str] = &[
     "check-msrv",
     "check-deny",
     "check-lab",
+    // AC-7.11 to AC-7.15. `check-bench` reads text -- the committed
+    // `bench/results.json`, the document it renders to, and the four
+    // criterion benchmark files -- so it runs in CI, where there is no lab
+    // and no Nmap. `bench-compare` is the one that needs both and is NOT a
+    // CI step: it is `bench/compare.sh`'s payload.
+    "check-bench",
+    "bench-compare",
     "check-fuzz",
     // `fuzz/` is its own workspace, so root `fmt --all`, `clippy --workspace`
     // and `test --workspace` do not reach it. This is the command that does.
@@ -94,6 +102,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("check-msrv") => gates::check_msrv(args.iter().any(|a| a == "--run")),
         Some("check-deny") => gates::check_deny(),
         Some("check-lab") => gates::check_lab(),
+        Some("check-bench") => bench::check_bench(),
+        Some("bench-compare") => bench::bench_compare(args.iter().any(|a| a == "--render-only")),
         Some("check-fuzz") => gates::check_fuzz(),
         Some("check-fuzz-crate") => gates::check_fuzz_crate(),
         Some("fuzz") => {

@@ -8,6 +8,13 @@ publish = false
 
 [dependencies]
 serde_json = { workspace = true }
+# `bench-compare` writes `bench/results.json` and `check-bench` reads it back
+# and re-renders `docs/benchmarks.md` from it. Derive, rather than hand-rolled
+# `serde_json::Value` walking: the record has eleven fields per run and a
+# typo in one of them would silently publish a table with a column missing.
+# `serde` is already in this workspace's tree and is a 1.88-tier dependency,
+# so this keeps `xtask` in the `msrv` job.
+serde = { workspace = true }
 # xtask is not part of the crates/ layer order (see LAYERS in src/main.rs) and
 # is allowed to depend on it for schema emission/drift-checking; check-deps'
 # forbidden-substring rule still applies to it like any other workspace
