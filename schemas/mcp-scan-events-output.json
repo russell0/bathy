@@ -148,6 +148,10 @@
             "probe_id": {
               "type": "string"
             },
+            "rule_id": {
+              "description": "The interpretation rule that produced `observation`, and the name\n`fingerprint.explain` takes. `probe_id` names what was sent;\nthis names what decided, and the two are different namespaces.",
+              "type": "string"
+            },
             "target": {
               "$ref": "#/$defs/Target"
             }
@@ -158,7 +162,8 @@
             "endpoint",
             "observation",
             "evidence_refs",
-            "probe_id"
+            "probe_id",
+            "rule_id"
           ],
           "type": "object"
         },

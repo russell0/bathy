@@ -1648,6 +1648,88 @@ fn fingerprint_explain_returns_a_rationale_and_a_source_for_every_rule_this_buil
 }
 
 #[test]
+fn a_finding_from_a_real_scan_names_a_rule_and_that_name_explains_itself() {
+    // AC-5.21 as written: "`fingerprint.explain` returns a rationale and a
+    // non-empty source for **every rule that can appear in a finding**". The
+    // test above is a different and weaker set -- every rule *this build has*
+    // -- and it passed while the set the criterion names was **empty**, which
+    // made the criterion vacuously true. Nothing bathy emitted named a rule
+    // at all: the interpretation's `rule_id` was dropped at the point of
+    // emission, so an agent holding a finding had nothing to pass to
+    // `fingerprint.explain`, and the only id a finding gave it -- `probe_id`
+    // -- is a different namespace and answers `no_such_rule`.
+    //
+    // So this test starts from a finding, not from the rule registry, and
+    // fails if the round trip is broken at any link: real listener, real
+    // packets, real bytes, the finding's own `rule_id`, the tool that
+    // explains it.
+    let ip = local_ipv4();
+    let scope = Scope::for_local(ip);
+    let listener = Listener::bind(ip, true);
+    let mut server = Server::start(64);
+
+    let started = server.call(
+        "scan.start",
+        json!({
+            "manifest_path": scope.path(),
+            "request": {
+                "targets": [ip.to_string()],
+                "objective": "inventory_exposed_services",
+                "ports": { "explicit": [listener.port()] },
+                "idempotency_key": "explain-round-trip",
+                "service_detection": { "enabled": true, "intensity": 9 },
+            },
+        }),
+    );
+    let scan_id = started["handle"]["task_id"].as_str().unwrap().to_string();
+    wait_for_terminal(&mut server, &scan_id);
+
+    let fold = server.call("result.query", json!({ "scan_id": &scan_id }));
+    let identified: Vec<&Value> = fold["endpoints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| !e["observation"].is_null())
+        .collect();
+    assert!(
+        !identified.is_empty(),
+        "the scan identified nothing, so this test would prove nothing: {fold:#}"
+    );
+
+    for endpoint in identified {
+        let rule_id = endpoint["rule_id"].as_str().unwrap_or_else(|| {
+            panic!("a finding that names no rule cannot reach fingerprint.explain: {endpoint:#}")
+        });
+        // Not the probe id. They are different namespaces, and conflating
+        // them is what made `explain` unreachable in the first place.
+        assert_ne!(
+            Some(rule_id),
+            endpoint["probe_id"].as_str(),
+            "rule_id must name the rule that decided, not the probe that was sent: {endpoint:#}"
+        );
+
+        let explained = server.call("fingerprint.explain", json!({ "rule_id": rule_id }));
+        assert_eq!(explained["rule_id"], json!(rule_id));
+        assert!(
+            !explained["rationale"].as_str().unwrap().is_empty(),
+            "{rule_id} explains nothing"
+        );
+        assert!(
+            !explained["source"].as_str().unwrap().is_empty(),
+            "{rule_id} cites no source; an identification nobody can check is a guess"
+        );
+
+        // And the command surface reaches it from the same name, so an
+        // operator can reproduce what the agent was told.
+        let (code, stdout) = bathy(&["--json", "explain", rule_id]);
+        assert_eq!(code, 0, "bathy explain {rule_id}: {stdout}");
+        let from_cli: Value = serde_json::from_str(stdout.lines().next().unwrap()).unwrap();
+        assert_eq!(from_cli["rationale"], explained["rationale"]);
+        assert_eq!(from_cli["source"], explained["source"]);
+    }
+}
+
+#[test]
 fn cancel_and_resume_round_trip_through_the_tool_surface() {
     let ip = local_ipv4();
     let scope = Scope::for_local(ip);

@@ -79,7 +79,7 @@ pub struct ScanFold {
 // See `crate::wire`'s note on `required`: this crate's encoder never omits a
 // field, so the schema says so rather than inheriting `schemars`' default
 // treatment of `Option` as optional.
-#[schemars(extend("required" = ["state", "observation", "evidence_refs", "probe_id"]))]
+#[schemars(extend("required" = ["state", "observation", "evidence_refs", "probe_id", "rule_id"]))]
 pub struct EndpointState {
     /// The last observed reachability of this endpoint, or `null` if the log
     /// contains no `port.state` event for it.
@@ -124,6 +124,17 @@ pub struct EndpointState {
     /// The probe that produced `observation`, or `null` if nothing
     /// identified this endpoint.
     pub probe_id: Option<String>,
+    /// The interpretation rule that produced `observation`, or `null` if
+    /// nothing identified this endpoint.
+    ///
+    /// This is the name `fingerprint.explain` takes. `probe_id` is not: it
+    /// names what was sent, and asking `explain` for a probe id gets
+    /// `no_such_rule`, because the two live in different namespaces
+    /// (`http-get-v1` against `http.server.nginx.v1`). Carrying only
+    /// `probe_id` -- which is what every fold published until M5's
+    /// whole-branch review -- left `fingerprint.explain` unreachable from a
+    /// finding, which is the one direction an agent actually needs it in.
+    pub rule_id: Option<String>,
 }
 
 /// The three ways a scan's log can end: it completed, it failed, or it was
@@ -337,10 +348,12 @@ pub fn fold_events(events: &[Event]) -> ScanFold {
                 observation,
                 evidence_refs,
                 probe_id,
+                rule_id,
             } => {
                 let entry = fold.endpoints.entry((target.ip, *endpoint)).or_default();
                 entry.observation = Some(observation.clone());
                 entry.probe_id = Some(probe_id.clone());
+                entry.rule_id = Some(rule_id.clone());
                 for digest in evidence_refs.iter() {
                     entry.cite(*digest);
                 }
@@ -492,6 +505,7 @@ fn tie_key(event: &Event) -> TieKey<'_> {
             observation,
             evidence_refs,
             probe_id,
+            rule_id,
         } => {
             key.kind = SERVICE;
             key.target = Some(target.ip);
@@ -501,6 +515,7 @@ fn tie_key(event: &Event) -> TieKey<'_> {
             key.version = observation.version.as_deref();
             key.confidence = Some(observation.confidence.get().to_bits());
             key.probe_id = Some(probe_id.as_str());
+            key.rule_id = Some(rule_id.as_str());
             key.digests = evidence_refs.as_slice();
         }
         EventBody::PolicyDenied {
@@ -544,6 +559,7 @@ struct TieKey<'a> {
     version: Option<&'a str>,
     confidence: Option<u64>,
     probe_id: Option<&'a str>,
+    rule_id: Option<&'a str>,
     text: (&'a str, &'a str),
     digests: &'a [Digest],
     counters: [u64; 3],
@@ -688,6 +704,7 @@ pub(crate) mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest(&format!("{addr}:{port}:{sequence}"))),
                 probe_id: format!("{name}-probe-v1"),
+                rule_id: format!("{name}.rule.v1"),
             },
         )
     }
@@ -1279,6 +1296,7 @@ mod proptests {
                         },
                         evidence_refs: NonEmpty::new(digest(&format!("svc-evidence-{refs}"))),
                         probe_id: format!("{name}-probe-v1"),
+                        rule_id: format!("{name}.rule.v1"),
                     }
                 }),
             1 => Just(EventBody::Progress {

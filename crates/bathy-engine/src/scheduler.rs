@@ -63,13 +63,24 @@
 //!    but `run` had no check at all for the other two things `evaluate`
 //!    validates: that `manifest` is *the* manifest this `scan_id` was
 //!    actually started under (not merely *a* manifest satisfying the type
-//!    system), and that it is still active. Since `evaluate` has zero
-//!    callers anywhere in this workspace as of this milestone, those two
-//!    were not belt-and-braces the way the per-target check is -- they were
-//!    the only belt, and there wasn't one. `run` now checks scope identity
+//!    system), and that it is still active. `evaluate` had zero callers
+//!    anywhere in this workspace at M3, so those two were not
+//!    belt-and-braces the way the per-target check is -- they were the only
+//!    belt, and there wasn't one. `run` now checks scope identity
 //!    (against the scan record's own `scope_id`) and expiry up front, before
 //!    `scan.started` or any unit is even considered, refusing the whole scan
 //!    exactly like the per-target check does. See `run`'s own doc comment.
+//!
+//!    **M5 gave `evaluate` its callers**, and this paragraph is kept rather
+//!    than deleted because the memorial is to the shape of the defect, not
+//!    to the caller count. `bathy_scope::evaluate` now has three production
+//!    callers, all through `AuthorizedScan::authorize`
+//!    (`crates/bathy-mcp/src/engine.rs`), reached from `scan.preview`,
+//!    `scan.start` and `scan.resume` on both surfaces -- so the per-target
+//!    `allows` re-check below is belt-and-braces at last. Scope identity and
+//!    expiry are still checked here as well, and still must be: `Scheduler`
+//!    is a library type, and its guarantee has to hold for a caller that
+//!    never went through `authorize` at all.
 //!
 //!    M4 Task 5 extends this same posture to the second connection service
 //!    detection opens on an already-`Open` endpoint: [`Scheduler::detect_service`]
@@ -326,14 +337,16 @@ pub struct Scheduler {
     /// `id` against the scan record's own `scope_id`), that it is still
     /// active (`is_expired`), and that each individual target is inside its
     /// allow set (`allows`). Only the last of those three is a genuine
-    /// re-check of an upstream `bathy_scope::evaluate` call a future
-    /// orchestrator (M5) is expected to make over the plan's full expanded
-    /// target list -- the first two are not belt-and-braces on anything:
-    /// `evaluate` has no caller anywhere in this workspace as of this
-    /// milestone, so for scope identity and expiry, `run`'s own checks are
-    /// currently the *only* enforcement that exists. Constructibility alone
-    /// (this field being required) never proved either of those two; only
-    /// `run`'s own checks do.
+    /// re-check of an upstream `bathy_scope::evaluate` call -- which M5's
+    /// orchestrator now makes, through `AuthorizedScan::authorize`
+    /// (`crates/bathy-mcp/src/engine.rs`), over the plan's full expanded
+    /// target list, from all three of `scan.preview`, `scan.start` and
+    /// `scan.resume`. All three checks stay here anyway. `Scheduler` is a
+    /// library type: a caller that builds one directly has made no upstream
+    /// call at all, and constructibility alone (this field being required)
+    /// never proved scope identity or expiry -- only `run`'s own checks do.
+    /// At M3, when `evaluate` had no caller anywhere in this workspace,
+    /// these were the only enforcement that existed.
     manifest: Arc<ScopeManifest>,
     config: SchedulerConfig,
     log: Arc<Mutex<GroupCommitLog>>,
@@ -392,7 +405,21 @@ struct ServiceFinding {
     /// the real, complete evidence regardless of what a caller later
     /// chooses to keep.
     evidence: Vec<u8>,
+    /// What was sent.
     probe_id: &'static str,
+    /// What decided. Carried separately from `probe_id` because they answer
+    /// different questions and only this one reaches `fingerprint.explain`.
+    ///
+    /// `bathy_interpret::Interpretation` also carries `matched_span`, and it
+    /// is deliberately **not** carried here. The span indexes the full,
+    /// untruncated response; `emit_service_observed` stores evidence capped
+    /// at the level's byte count, so a span into the response is not always a
+    /// span into the bytes `evidence.get` can return. Publishing a range that
+    /// may point past the end of the evidence an agent can fetch is a
+    /// provenance claim that does not resolve, which is worse than not making
+    /// it. It becomes carryable the moment a finding's evidence is stored
+    /// uncapped or the span is expressed relative to the stored blob.
+    rule_id: &'static str,
 }
 
 impl Scheduler {
@@ -629,12 +656,15 @@ impl Scheduler {
         // manifest expiry -- the third, per-target authorization, is the
         // `allows` re-check inside the dispatch loop below) had NO check
         // anywhere on the emission path at all. That is a materially
-        // different defect from CRITICAL-1's per-target gate: `evaluate`
-        // has zero callers anywhere in this workspace, so the per-target
-        // `allows` re-check below is genuinely belt-and-braces (a backstop
-        // behind an upstream call that is expected, eventually, to exist),
-        // but for scope identity and expiry THIS is currently the only
-        // check that will ever run, upstream or not. `record` (already
+        // different defect from CRITICAL-1's per-target gate: at M3
+        // `evaluate` had zero callers anywhere in this workspace, so for
+        // scope identity and expiry THIS was the only check that would ever
+        // run, upstream or not. M5 supplied the upstream call
+        // (`AuthorizedScan::authorize`, three production callers), which
+        // makes all three checks here belt-and-braces for a scan started
+        // through either surface -- and the only belt for a caller that
+        // builds a `Scheduler` directly, which is why none of them moved
+        // out. `record` (already
         // loaded above for the plan_hash check) carries the scope_id this
         // scan_id was actually started under; `self.manifest` is merely *a*
         // manifest handed to `Scheduler::new` -- constructibility alone
@@ -1163,6 +1193,7 @@ impl Scheduler {
                 observation: top.observation,
                 evidence: capture.response,
                 probe_id: capture.probe_id,
+                rule_id: top.rule_id,
             }));
         }
 
@@ -1205,6 +1236,7 @@ impl Scheduler {
             observation: finding.observation,
             evidence_refs: NonEmpty::new(digest),
             probe_id: finding.probe_id.to_string(),
+            rule_id: finding.rule_id.to_string(),
         })?;
         Ok(())
     }
@@ -3689,11 +3721,14 @@ mod tests {
     // before this fix ever checked it was *the* manifest this scan was
     // actually authorized under (`record.scope_id`), or that it was still
     // active (`is_expired`). `bathy_scope::evaluate` -- the upfront check
-    // that validates both -- has zero callers anywhere in this workspace,
-    // so unlike the per-target re-check, these two are not belt-and-braces:
-    // they are the only belt. Both proven the same way CRITICAL-1's own
-    // headline defect was: a real bound listener, and a real accept count
-    // that must stay at zero.
+    // that validates both -- had zero callers anywhere in this workspace at
+    // M3, so unlike the per-target re-check, these two were not
+    // belt-and-braces: they were the only belt. M5 supplied the upstream
+    // call (`AuthorizedScan::authorize`), and these tests stay exactly as
+    // they were, because what they assert is a property of `Scheduler` --
+    // which any caller can build without going near that constructor. Both
+    // proven the same way CRITICAL-1's own headline defect was: a real bound
+    // listener, and a real accept count that must stay at zero.
     // ------------------------------------------------------------------
 
     #[tokio::test]

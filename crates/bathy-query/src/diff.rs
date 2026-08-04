@@ -266,10 +266,13 @@ impl ScanDiff {
 ///   well as coverage, so this also fires on two runs that looked at exactly
 ///   the same endpoints under a different rate limit. See
 ///   [`Undecidable::CoverageDiffers`].
-/// - **Evidence digests and `probe_id` are not compared.** The same
-///   conclusion reached from different bytes (an HTTP `Date` header moves
-///   every second) or by a different probe is the same conclusion. Comparing
-///   them would make every re-scan a wall of changes.
+/// - **Evidence digests, `probe_id` and `rule_id` are not compared.** The
+///   same conclusion reached from different bytes (an HTTP `Date` header
+///   moves every second), by a different probe, or by a different rule is
+///   the same conclusion. Comparing them would make every re-scan a wall of
+///   changes. What a `Change` is *about* is the observation; `rule_id` rides
+///   along on `before`/`after` so an agent looking at a change can still ask
+///   why either side was believed.
 pub fn diff(before: &ScanFold, after: &ScanFold) -> ScanDiff {
     let plans_agree = before.plan_hash.is_some() && before.plan_hash == after.plan_hash;
     let undecidable = comparability(&before.terminal, &after.terminal, plans_agree);
@@ -519,6 +522,7 @@ mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest(evidence)),
                 probe_id: format!("{service}-probe-v1"),
+                rule_id: format!("{service}.rule.v1"),
             },
         )
     }
@@ -1388,6 +1392,7 @@ mod proptests {
                         },
                         evidence_refs: NonEmpty::new(digest("evidence")),
                         probe_id: format!("{}-probe-v1", SERVICES[*service]),
+                        rule_id: format!("{}.rule.v1", SERVICES[*service]),
                     },
                 ));
             }

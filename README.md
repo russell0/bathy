@@ -57,7 +57,7 @@ over MCP.
 | `bathy-store` | SQLite-backed scan state: idempotency (a repeated key with an identical plan reuses the scan; a different plan is refused as a conflict), a resumption cursor, and per-scan lifecycle status. A scan starts `pending` and `bathy-engine`'s scheduler transitions it to `completed`, `cancelled`, `failed`, or `denied` on each of its own terminal outcomes. `bathy scan start` and `bathy scan resume` set `running` before the first probe, so a handle that says `running` and a `scan status` read from another process agree; `paused` is still written by nothing. |
 | `bathy-plan` | Turns a `ScanRequest` into a deterministic, indexable `ScanPlan`: target expansion, port selection, and the content hash idempotency and resumption are built on. |
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by a deadline that covers the whole read rather than each individual `recv`, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. The deadline is per call, not per probe: a probe that writes and then reads can take up to twice it, deliberately, since the hostile case being defended against is on the read path. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
-| `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every finding carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
+| `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every interpretation carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. The rule id travels with the observation all the way to the wire — `service.observed`, the fold, and `result.query`'s `rule_id` — so `fingerprint.explain` is reachable *from a finding* and not only from a listing. The byte range is not carried past this crate: it indexes the full response, and stored evidence is capped at the evidence level, so a span that could point past the bytes `evidence.get` returns would be a citation that does not resolve. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
 | `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
 | `bathy-query` | Milestone 5, in progress. Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Diffs two of those folds into a classified list of what changed, and refuses to call an endpoint appeared or disappeared unless both scans ran the same plan to completion — a refused, cancelled or budget-exhausted scan is not a scan that found less. Both types are published schemas, and `bathy result query` / `bathy result diff` are this crate, called through the CLI and by the `result.query` / `result.diff` tools with no second fold anywhere. |
 | `bathy-mcp` | Milestone 5. The MCP server: eleven typed tools — `scope.validate`, `scan.preview/start/status/events/cancel/resume`, `result.query/diff`, `evidence.get`, `fingerprint.explain` — over protocol revision `2026-07-28` on stdio. That revision has no `initialize` handshake and no protocol-level sessions, so the server implements `server/discover` and takes the protocol version from each request's `_meta`. Every tool declares an output schema and returns a conforming structured result with a JSON text mirror. No tool's input schema has a `command`, `args`, `flags`, `argv` or `raw` field, and no tool accepts a scope manifest inline or by id — a scope is named by a path, exactly as `--scope` takes one, so a caller cannot author its own authorization. A scan wider than the server's configured approval threshold returns a Multi Round-Trip `input_required` result carrying an `elicitation/create`, and starts nothing until a retry brings back an approval token that is HMAC-sealed, bound to the caller and to the arguments it was issued for, time-limited and single-use. It contains no scanning logic. |
@@ -66,9 +66,13 @@ over MCP.
 
 27 schemas are committed under [`schemas/`](schemas/) and CI fails if a type
 changes without regenerating them — they are the published contract, not a
-by-product. Twenty-one of them are the MCP tool surface: every tool's input and
-its output, so the schema an agent is shown is the one the Rust type generates
-rather than a second copy someone wrote out.
+by-product. 21 of them are the MCP tool surface: 11 tool input schemas and 10
+tool output schemas. The eleventh output is `result.diff`'s, which *is*
+[`schemas/scan-diff.json`](schemas/scan-diff.json) rather than a copy of it —
+the tool advertises the committed document itself, so the diff an agent is
+handed and the diff the CLI prints cannot be two shapes. Either way the schema
+an agent is shown is the one the Rust type generates rather than a second copy
+someone wrote out.
 
 ### Verified properties, not just tested ones
 
@@ -99,20 +103,28 @@ on the actual emission path. Scope identity and expiry are checked once per
 per unit, immediately before each probe. A manifest that expires mid-scan does
 not halt the run in progress. The CLI adds an earlier refusal in front of that:
 `bathy scan preview`, `scan start` and `scan resume` each call
-`bathy_scope::evaluate` over the fully expanded target list before anything is
-written and before a scheduler exists, and each takes `--scope` as a required
+`bathy_scope::evaluate` over the fully expanded target list before a scan record
+is written and before a scheduler exists, and each takes `--scope` as a required
 argument, so a scan with no manifest fails during argument parsing rather than
-reaching any code that could open a socket. `scan resume` is re-evaluated
+reaching any code that could open a socket. (`preview` and `start` refuse before
+the state directory is opened at all. `resume` has to open it first — the plan
+it is re-authorizing is the one already in the store — so a refused resume
+leaves behind a created state directory and its empty stores, and no scan
+record, no plan and no packet.) `scan resume` is re-evaluated
 against the manifest handed to it, not against the decision the original `scan
 start` got. Scans carry hard packet, rate, and runtime budgets.
 
 **What a scanned third party sees on their wire.** Every port is first touched by
 a plain, unprivileged TCP connect that sends no payload. A port that answers then
-receives **up to `intensity` further connections — four by default** — each a
-separate TCP connection carrying one protocol probe, tried in order of port
-affinity and stopping at the first response a rule recognizes. So a port whose
-first probe is recognized receives one additional connection; a port that
-answers but is never identified receives four. Most carry a real request — a
+receives **up to `intensity` further connections — four by default, and never
+fewer than one** — each a separate TCP connection carrying one protocol probe,
+tried in order of port affinity and stopping at the first response a rule
+recognizes. So a port whose first probe is recognized receives one additional
+connection; a port that answers but is never identified receives four.
+`--intensity 0` is accepted and means one, not none: the floor is one probe,
+because "identify this service" with no probe at all is a request the flag
+cannot express and `bathy scan preview` is what sends nothing. Most carry a
+real request — a
 `GET /`, a TLS `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind`
 query, a PostgreSQL `SSLRequest`. **Two send nothing at all**: the SSH and MySQL
 probes are listen-first, because those protocols have the server speak first and
@@ -150,8 +162,8 @@ a poor fit for typed tool calling. bathy targets the gap:
   cancel` and `scan resume` all work from a separate process against a live
   scan. `pause` is not implemented.*
 - **Evidence.** Every finding cites content-addressed response bytes. `evidence.get`
-  returns exactly what justified a claim; `fingerprint.explain` says which rule fired
-  and why. *Callable both ways: as `bathy evidence get` and `bathy explain`, and as
+  returns exactly what justified a claim; `fingerprint.explain` takes the `rule_id` a finding
+  carries and says why that rule fired. *Callable both ways: as `bathy evidence get` and `bathy explain`, and as
   the `evidence.get` and `fingerprint.explain` tools, which return the same
   documents.*
 - **Scope enforcement.** Deny-by-default manifests with expiry, checked against

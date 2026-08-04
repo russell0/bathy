@@ -164,6 +164,19 @@ pub enum EventBody {
         observation: Observation,
         evidence_refs: NonEmpty<Digest>,
         probe_id: String,
+        /// The interpretation rule that produced `observation`, and the name
+        /// `fingerprint.explain` takes. `probe_id` names what was sent;
+        /// this names what decided, and the two are different namespaces.
+        //
+        // Maintainer note, deliberately a `//` comment so it stays out of the
+        // published schema: one probe's bytes can be matched by any of
+        // several rules, so the probe id does not determine this. Until M5's
+        // whole-branch review nothing bathy emitted ever named a rule -- the
+        // interpretation's `rule_id` was dropped at the point of emission --
+        // so `fingerprint.explain` was reachable only by first listing every
+        // rule in the build, and never *from a finding*, which is the one
+        // direction an agent holding a result actually needs.
+        rule_id: String,
     },
 
     #[serde(rename = "scan.progress")]
@@ -286,6 +299,7 @@ mod tests {
       },
       "evidence_refs": ["blake3:9c37000000000000000000000000000000000000000000000000000000000000"],
       "probe_id": "tls-http-v3",
+      "rule_id": "https.server.nginx.v1",
       "engine_version": "0.1.0",
       "timestamp": "2026-08-01T15:04:31.182Z"
     }"#;
@@ -317,6 +331,7 @@ mod tests {
           "observation": { "service": "https", "confidence": 0.9 },
           "evidence_refs": [],
           "probe_id": "tls-http-v3",
+          "rule_id": "https.server.nginx.v1",
           "engine_version": "0.1.0",
           "timestamp": "2026-08-01T15:04:31.182Z"
         }"#;
@@ -418,6 +433,7 @@ mod tests {
                     },
                     evidence_refs: NonEmpty::new(digest_fixture(4)),
                     probe_id: "tls-http-v3".to_string(),
+                    rule_id: "https.server.nginx.v1".to_string(),
                 },
             ),
             (
@@ -526,6 +542,7 @@ mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest_fixture(14)),
                 probe_id: "tls-http-v3".to_string(),
+                rule_id: "https.server.nginx.v1".to_string(),
             },
             EventBody::Progress {
                 probes_sent: 100,
@@ -588,6 +605,7 @@ mod tests {
                     .unwrap(),
             ),
             probe_id: "tls-http-v3".to_string(),
+            rule_id: "https.server.nginx.v1".to_string(),
         });
         let event = Event {
             sequence: 1842,
@@ -612,6 +630,8 @@ mod tests {
             ])
         );
         assert_eq!(value["probe_id"], "tls-http-v3");
+        // What was sent, and what decided. Two questions, two fields.
+        assert_eq!(value["rule_id"], "https.server.nginx.v1");
         assert_eq!(value["engine_version"], "0.1.0");
         assert_eq!(value["timestamp"], "2026-08-01T15:04:31.182Z");
 
@@ -633,6 +653,7 @@ mod tests {
             "observation",
             "evidence_refs",
             "probe_id",
+            "rule_id",
             "engine_version",
             "timestamp",
         ];

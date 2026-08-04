@@ -148,6 +148,7 @@ mod tests {
             }),
             evidence_refs: Vec::new(),
             probe_id: None,
+            rule_id: None,
         }
     }
 

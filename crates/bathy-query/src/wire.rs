@@ -8,7 +8,8 @@
 //! "key must be a string" -- which is why M5 Task 1 deliberately shipped
 //! `ScanFold` with no `Serialize` at all rather than a derive that looked
 //! right. The encoding is therefore an **entry array**: `endpoints` is a JSON
-//! array of `{ target, endpoint, state, observation, evidence_refs, probe_id }`
+//! array of
+//! `{ target, endpoint, state, observation, evidence_refs, probe_id, rule_id }`
 //! objects, in the map's own key order (target, then transport, then port).
 //!
 //! # One spelling of `(target, endpoint)`
@@ -73,7 +74,8 @@ use crate::fold::{EndpointState, ScanFold, Terminal};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 #[schemars(extend("required" = [
-    "target", "endpoint", "state", "observation", "evidence_refs", "probe_id"
+    "target", "endpoint", "state", "observation", "evidence_refs", "probe_id",
+    "rule_id"
 ]))]
 pub struct FoldEntry {
     /// The host this endpoint lives on.
@@ -91,6 +93,9 @@ pub struct FoldEntry {
     pub evidence_refs: Vec<Digest>,
     /// The probe that produced `observation`, or `null`.
     pub probe_id: Option<String>,
+    /// The interpretation rule that produced `observation`, or `null`. This
+    /// is the name `fingerprint.explain` takes; `probe_id` is not.
+    pub rule_id: Option<String>,
 }
 
 /// The wire form of [`ScanFold`]. See this module's documentation.
@@ -145,6 +150,7 @@ impl From<&ScanFold> for ScanFoldWire {
                     observation: state.observation.clone(),
                     evidence_refs: state.evidence_refs.clone(),
                     probe_id: state.probe_id.clone(),
+                    rule_id: state.rule_id.clone(),
                 })
                 .collect(),
             hosts_up: fold.hosts_up.iter().copied().collect(),
@@ -181,6 +187,7 @@ impl TryFrom<ScanFoldWire> for ScanFold {
                 observation: entry.observation,
                 evidence_refs: entry.evidence_refs,
                 probe_id: entry.probe_id,
+                rule_id: entry.rule_id,
             };
             if endpoints.insert(key, state).is_some() {
                 return Err(WireError::DuplicateEndpoint {
@@ -268,6 +275,7 @@ mod tests {
                     },
                     evidence_refs: NonEmpty::try_from(vec![digest("a"), digest("b")]).unwrap(),
                     probe_id: "http-get-v1".into(),
+                    rule_id: "http.server.nginx.v1".into(),
                 },
             ),
             port_state(4, "10.0.0.1", 80, PortState::Open),
@@ -361,6 +369,7 @@ mod tests {
                 },
                 evidence_refs: NonEmpty::new(digest("a")),
                 probe_id: "http-get-v1".into(),
+                rule_id: "http.server.nginx.v1".into(),
             },
         )]);
         let json = serde_json::to_value(&fold).unwrap();
@@ -425,6 +434,7 @@ mod tests {
             observation: None,
             evidence_refs: Vec::new(),
             probe_id: None,
+            rule_id: None,
         };
         let before = ScanFold {
             endpoints: BTreeMap::from([
@@ -763,7 +773,13 @@ mod tests {
         // And the record half: a `FoldEntry` is a `(target, endpoint)` pair
         // plus exactly the fields of the `EndpointState` that a `Change`
         // carries as `before`/`after`.
-        const RECORD: &[&str] = &["state", "observation", "evidence_refs", "probe_id"];
+        const RECORD: &[&str] = &[
+            "state",
+            "observation",
+            "evidence_refs",
+            "probe_id",
+            "rule_id",
+        ];
         assert_eq!(
             structure(&fold, "FoldEntry", RECORD),
             structure(&scan_diff, "EndpointState", RECORD),

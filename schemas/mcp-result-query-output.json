@@ -74,6 +74,13 @@
             "null"
           ]
         },
+        "rule_id": {
+          "description": "The interpretation rule that produced `observation`, or `null`. This\nis the name `fingerprint.explain` takes; `probe_id` is not.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "state": {
           "anyOf": [
             {
@@ -97,7 +104,8 @@
         "state",
         "observation",
         "evidence_refs",
-        "probe_id"
+        "probe_id",
+        "rule_id"
       ],
       "type": "object"
     },

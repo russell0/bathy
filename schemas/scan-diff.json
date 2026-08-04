@@ -158,6 +158,13 @@
             "null"
           ]
         },
+        "rule_id": {
+          "description": "The interpretation rule that produced `observation`, or `null` if\nnothing identified this endpoint.\n\nThis is the name `fingerprint.explain` takes. `probe_id` is not: it\nnames what was sent, and asking `explain` for a probe id gets\n`no_such_rule`, because the two live in different namespaces\n(`http-get-v1` against `http.server.nginx.v1`). Carrying only\n`probe_id` -- which is what every fold published until M5's\nwhole-branch review -- left `fingerprint.explain` unreachable from a\nfinding, which is the one direction an agent actually needs it in.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "state": {
           "anyOf": [
             {
@@ -174,7 +181,8 @@
         "state",
         "observation",
         "evidence_refs",
-        "probe_id"
+        "probe_id",
+        "rule_id"
       ],
       "type": "object"
     },
