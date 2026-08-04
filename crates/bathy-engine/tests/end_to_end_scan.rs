@@ -69,6 +69,13 @@ fn manifest() -> Arc<ScopeManifest> {
 /// accepts (and immediately drops) every connection made to it, for the
 /// lifetime of the test process -- exactly what the exit criterion's own
 /// words describe: "two locally bound ports."
+///
+/// A port that answers nothing at all: the scheduler's connect probe sees
+/// it `Open`, then every service-detection candidate gets
+/// `ProbeError::EmptyResponse` and no `service.observed` can be produced
+/// for it. Kept deliberately alongside [`open_port_serving_nginx`] below,
+/// so this one test proves identification happens where it should AND does
+/// not happen where it should not.
 async fn open_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -80,10 +87,60 @@ async fn open_port() -> u16 {
     port
 }
 
+/// The exact response bytes captured from `docker.io/library/nginx:1.27-alpine`
+/// (digest `sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10`)
+/// in M4 Task 2, and the same constant `bathy-engine`'s own unit tests and
+/// `testdata/captures/http-nginx-with-version.json` use.
+///
+/// The `Server: nginx/1.26.0` header is the load-bearing part: the
+/// milestone's final exit criterion names a **version** explicitly, and
+/// nothing at the engine layer asserted `observation.version` before.
+const NGINX_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nServer: nginx/1.26.0\r\nConnection: close\r\n\r\n<html></html>";
+
+/// A real listener that plays both roles the same endpoint is put through
+/// by a detection-enabled scan: the scheduler's bare connect probe (writes
+/// nothing, so this replies nothing and the connection is simply seen as
+/// `Open`), and `http-get-v1`'s own reconnect (writes a real `GET /`, so
+/// this replies with [`NGINX_RESPONSE`]). The two are distinguished by
+/// whether any byte arrives, never by accept order.
+///
+/// This is a hermetic stub, not a Docker container, and that is a
+/// deliberate choice the M4 whole-branch review ruled on: it serves
+/// byte-identical captured nginx bytes over a real loopback socket through
+/// the real `ProbeRegistry::standard()`, the real `bathy_interpret`, a real
+/// `EvidenceStore` and a real `GroupCommitLog`. It exercises the same chain
+/// as a live container while being deterministic and adding no Docker
+/// dependency to the test suite.
+async fn open_port_serving_nginx() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        while let Ok((mut sock, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let n = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    sock.read(&mut buf),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(0);
+                if n > 0 {
+                    let _ = sock.write_all(NGINX_RESPONSE).await;
+                }
+            });
+        }
+    });
+    port
+}
+
 #[tokio::test]
 async fn scanning_127_0_0_1_against_two_open_ports_produces_a_gap_free_log_matching_the_exit_criteria()
  {
-    let port_a = open_port().await;
+    let port_a = open_port_serving_nginx().await;
     let port_b = open_port().await;
     // Two distinct ports, named explicitly, as the exit criteria's own text
     // ("two locally bound ports") requires -- not a range that might
@@ -131,6 +188,9 @@ async fn scanning_127_0_0_1_against_two_open_ports_produces_a_gap_free_log_match
     ));
 
     let evidence = Arc::new(EvidenceStore::open(dir.path()).unwrap());
+    // Kept for the `evidence.get` half of the exit criterion below; the
+    // `Arc` itself is moved into the scheduler.
+    let evidence_for_assertions = Arc::clone(&evidence);
     let probes = Arc::new(ProbeRegistry::standard());
 
     let ledger = BudgetLedger::new(budgets);
@@ -212,9 +272,92 @@ async fn scanning_127_0_0_1_against_two_open_ports_produces_a_gap_free_log_match
     );
     assert_eq!(
         events.len(),
-        4,
-        "exactly scan.started, port.state x2, scan.completed -- nothing else \
-         (no host.discovered, no scan.progress, no policy.denied), got {events:#?}"
+        5,
+        "exactly scan.started, port.state x2, ONE service.observed (port_a serves nginx; \
+         port_b answers nothing, so nothing can be identified for it), scan.completed -- \
+         nothing else (no host.discovered, no scan.progress, no policy.denied), got {events:#?}"
+    );
+
+    // --- Service identification, end to end through the public API (M4
+    // whole-branch review, IMPORTANT-6).
+    //
+    // This assertion block is why the count above is 5 rather than 4.
+    // Before it, this file -- the workspace's only test outside a crate's
+    // own `#[cfg(test)]`, and the one README.md points to as how a scan is
+    // invoked -- bound two listeners that accepted and immediately dropped
+    // every connection, so every probe got `ProbeError::EmptyResponse` and
+    // the hard `events.len() == 4` encoded "no `service.observed` ever
+    // occurs" as expected public-API behaviour. Replacing the entire body
+    // of `Scheduler::detect_service` with `return Ok(None)` -- deleting all
+    // of M4's identification -- left it green.
+    //
+    // It now covers the milestone's final exit criterion directly: "An
+    // end-to-end run against a local nginx reports `http` / `nginx` / a
+    // version, and `evidence.get` on the cited digest returns the exact
+    // response bytes." All four clauses, in the public-API sense of
+    // end-to-end, against a real socket. ---
+    let service_events: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(&e.body, EventBody::ServiceObserved { .. }))
+        .collect();
+    assert_eq!(
+        service_events.len(),
+        1,
+        "exactly the nginx-serving port is identified; the silent one is not"
+    );
+    let (observation, evidence_refs, probe_id, service_endpoint) = match &service_events[0].body {
+        EventBody::ServiceObserved {
+            observation,
+            evidence_refs,
+            probe_id,
+            endpoint,
+            ..
+        } => (observation, evidence_refs, probe_id, endpoint),
+        other => unreachable!("filtered above, got {other:?}"),
+    };
+    assert_eq!(service_endpoint.port, port_a, "identified the nginx port");
+    assert_eq!(probe_id, "http-get-v1");
+    assert_eq!(observation.service, "http");
+    assert_eq!(observation.product.as_deref(), Some("nginx"));
+    // The version clause of the exit criterion. Named explicitly by the
+    // criterion and, until this line, asserted nowhere at the engine layer
+    // -- `NGINX_RESPONSE` has always carried `Server: nginx/1.26.0` and
+    // `observation.version` was simply never checked.
+    assert_eq!(observation.version.as_deref(), Some("1.26.0"));
+    assert!(observation.confidence.get() > 0.0);
+
+    // `evidence.get` on the cited digest returns the exact response bytes
+    // -- not merely a resolvable reference, the literal bytes the peer
+    // sent, which is what "every finding cites content-addressed response
+    // bytes" means. `EvidenceLevel::Headers` caps at 8 KiB and this
+    // response is far smaller, so nothing is truncated.
+    let digest = evidence_refs.first();
+    assert!(
+        evidence_for_assertions.contains(digest),
+        "service.observed cites evidence {digest} that the store does not have"
+    );
+    assert_eq!(
+        evidence_for_assertions.get(digest).unwrap(),
+        NGINX_RESPONSE,
+        "evidence.get must return exactly the bytes that justified the finding"
+    );
+
+    // Ordering: reachability is established before identification, for the
+    // endpoint that got both.
+    let state_at = events
+        .iter()
+        .position(|e| {
+            matches!(&e.body,
+                EventBody::PortStateObserved { endpoint, .. } if endpoint.port == port_a)
+        })
+        .unwrap();
+    let service_at = events
+        .iter()
+        .position(|e| matches!(&e.body, EventBody::ServiceObserved { .. }))
+        .unwrap();
+    assert!(
+        state_at < service_at,
+        "port.state must precede service.observed for the same endpoint"
     );
 
     // Gap-freeness, asserted directly against the exit criterion's own
