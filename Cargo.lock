@@ -116,6 +116,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "bathy-query"
+version = "0.1.0"
+dependencies = [
+ "bathy-engine",
+ "bathy-evidence",
+ "bathy-plan",
+ "bathy-probe",
+ "bathy-scope",
+ "bathy-store",
+ "bathy-types",
+ "proptest",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "bathy-scope"
 version = "0.1.0"
 dependencies = [

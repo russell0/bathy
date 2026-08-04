@@ -1,0 +1,67 @@
+[package]
+name = "bathy-query"
+version.workspace = true
+edition.workspace = true
+# 1.88 MSRV tier, and the tier is a claim about *this library*, which is what
+# a consumer of it builds: `[dependencies]` below is `bathy-types` and
+# nothing else, and `bathy-types` is itself 1.88 (see the workspace
+# `Cargo.toml`'s own MSRV comment for why 1.88 rather than edition 2024's
+# bare minimum). Verified by execution against a real 1.88 toolchain, not
+# assumed -- see this task's report for the command and its output. M3 found
+# `bathy-plan` had sat unverified against its claimed floor since creation,
+# and M4 reintroduced the identical defect with `crates/bathy`.
+#
+# `[dev-dependencies]` below is a different matter and is deliberately NOT
+# covered by this number. `tests/real_log_fold.rs` drives a real scan
+# through `bathy-engine`, which transitively needs `bathy-store` and so
+# `libsqlite3-sys`, whose build script needs 1.95. That raises the floor for
+# `cargo check --all-targets` on this package while leaving the floor for
+# `cargo build -p bathy-query` -- the only one a downstream consumer ever
+# experiences, and the only one `rust-version` governs -- at 1.88. CI checks
+# both, in two different jobs, and `.github/workflows/ci.yml` says which and
+# why.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The only dependency, and deliberately the only one: this crate is a pure
+# fold over an immutable event log (see `src/lib.rs`). It reads `Event` /
+# `EventBody` and produces plain data. It must not reach the store, the
+# network, the clock or the filesystem, and the shortest way to keep that
+# true is to depend on nothing that could.
+bathy-types = { path = "../bathy-types" }
+
+[dev-dependencies]
+# Determinism and order-independence (AC-5.1) are universally quantified
+# claims -- "for any permutation of any event log" -- so they are property
+# tests over generated logs, not two hand-written cases. See
+# `src/fold.rs`'s `proptests` module, including the strategy-coverage test
+# that proves the generator actually reaches the shapes it claims to.
+proptest = { workspace = true }
+
+# --- Everything below exists for `tests/real_log_fold.rs` only: folding an
+# event log produced by a REAL scan against REAL loopback sockets, rather
+# than one built by hand out of `Event` literals that could all share the
+# same wrong assumption about what the engine actually emits. These are the
+# same crates `crates/bathy-engine/tests/end_to_end_scan.rs` uses to drive
+# that scan, and every one of them sits strictly below `bathy-query` in
+# `xtask`'s `LAYERS`, so these edges are downhill and `check-deps` accepts
+# them. They are the reason this package's `--all-targets` floor is 1.95
+# while its library floor is 1.88; see the `rust-version` comment above. ---
+bathy-engine = { path = "../bathy-engine" }
+bathy-evidence = { path = "../bathy-evidence" }
+bathy-plan = { path = "../bathy-plan" }
+bathy-probe = { path = "../bathy-probe" }
+# `test-util` is what exposes `ScopeManifest::for_tests_allowing_loopback`,
+# the only door through which a manifest can authorize `127.0.0.1` -- see
+# that constructor's doc comment in `bathy-scope`.
+bathy-scope = { path = "../bathy-scope", features = ["test-util"] }
+bathy-store = { path = "../bathy-store" }
+tempfile = { workspace = true }
+# `io-util` on top of the workspace feature set: the nginx fixture below
+# reads the probe's request and writes the captured response by hand, which
+# needs `AsyncReadExt`/`AsyncWriteExt` -- the same reason `bathy-engine`
+# declares it. `macros`/`rt`/`net` come from the workspace entry.
+tokio = { workspace = true, features = ["io-util"] }
+tokio-util = { workspace = true }

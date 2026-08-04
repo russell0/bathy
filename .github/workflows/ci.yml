@@ -125,6 +125,35 @@ jobs:
       # nothing but this list enforces that today. Adding a crate to the
       # workspace means adding it here.
       - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p bathy -p xtask --all-targets
+      # `bathy-query` joined this job in M5 Task 1 -- and it is the first
+      # crate whose floor these two jobs, as previously written, could not
+      # express. Its `[dependencies]` is `bathy-types` and nothing else, so
+      # `1.88` is the floor a *consumer* of the library gets and is what its
+      # `rust-version` declares. Its `[dev-dependencies]` are another matter:
+      # `tests/real_log_fold.rs` folds a log produced by a REAL scan, which
+      # needs `bathy-engine` -> `bathy-store` -> `libsqlite3-sys`, whose
+      # build script needs `1.95`.
+      #
+      # Both floors are real and both are now checked, in the job that can
+      # actually check each:
+      #
+      #   - here, WITHOUT `--all-targets`: the library floor, which is the
+      #     only one a downstream consumer ever experiences and the only one
+      #     `rust-version` governs. `--all-targets` would build the dev-deps
+      #     and turn this into a check of the test harness instead.
+      #   - in `msrv-bathy-store` below, WITH `--all-targets`: the floor the
+      #     test harness needs.
+      #
+      # Root cause, stated because a future crate will hit it again: these
+      # two jobs previously assumed every crate has exactly one floor, and a
+      # crate whose tests reach further down the stack than its library does
+      # has two. Naming `bathy-query` in only one of them would have made a
+      # claim nobody checks -- the precise defect M3 found in `bathy-plan`
+      # and M4 reintroduced in `crates/bathy`. Verified against real 1.88 and
+      # 1.95 toolchains before being written here: `cargo +1.88 check -p
+      # bathy-query` passes and `cargo +1.88 check -p bathy-query
+      # --all-targets` fails with "bathy-engine@0.1.0 requires rustc 1.95".
+      - run: cargo check -p bathy-query
 
   msrv-bathy-store:
     runs-on: ubuntu-latest
@@ -136,7 +165,11 @@ jobs:
       # its `Cargo.toml`): it now depends on `bathy-store` transitively via
       # `scheduler.rs`'s `TaskStore` usage, so it needs this same `1.95`
       # floor to build at all, not just `bathy-store` itself.
-      - run: cargo check -p bathy-store -p bathy-engine --all-targets
+      #
+      # `bathy-query` is here for its TEST targets only; its library floor is
+      # `1.88` and is checked in the `msrv` job above. See the longer note
+      # there for why one crate is named in both jobs.
+      - run: cargo check -p bathy-store -p bathy-engine -p bathy-query --all-targets
 
   deny:
     runs-on: ubuntu-latest
