@@ -23,6 +23,14 @@ bathy-types = { path = "../crates/bathy-types" }
 # why the evidence caps, owned by the 1.95-tier `bathy-engine`, are read from
 # source text instead.
 bathy-probe = { path = "../crates/bathy-probe" }
+# `check-schemas`/`emit-schemas` merges this crate's two published schemas
+# (`ScanFold`, `ScanDiff`, M5 Task 2 AC-5.35) with `bathy-types`'s four.
+# `schemars::schema_for!` needs the concrete type, and these two are defined
+# in `bathy-query`. It is a 1.88-tier library (its dependencies are
+# `bathy-types`, `serde`, `serde_json` and `schemars`), so this edge keeps
+# `xtask` in the `msrv` CI job -- verified by execution, see the M5 Task 2
+# report.
+bathy-query = { path = "../crates/bathy-query" }
 # `check-readme` matches every phrasing of a pinned claim across the whole
 # document, so that a number corrected in two places out of three fails. That
 # is regex work; `regex` is already in this workspace's tree via

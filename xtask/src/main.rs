@@ -151,14 +151,30 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
 /// promised (AC-1.22).
 ///
 /// `write == true` ("emit-schemas") regenerates every file under `dir` from
-/// `bathy_types::schema::all()`, unconditionally. `write == false`
+/// the union of every crate's `schema::all()`, unconditionally. `write == false`
 /// ("check-schemas") instead compares what's on disk against what
 /// regeneration would produce and fails — naming every drifted file — if
 /// they differ. A missing file is treated as drift too (surfaced as an `Err`
 /// naming the path, same as any other read failure), not silently skipped,
 /// so a schema that was never committed at all is still caught.
 fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let schemas = bathy_types::schema::all();
+    // Every crate that publishes a wire type owns its own `schema::all()`,
+    // and this is the one place they are merged -- so a new published type is
+    // drift-checked by the same gate as the first four, rather than growing a
+    // second mechanism. `schemars::schema_for!` needs a concrete type, so a
+    // type defined in `bathy-query` (M5: `ScanFold`, `ScanDiff`) cannot be
+    // named from `bathy-types` without moving the fold below the layer that
+    // owns it.
+    let mut schemas = bathy_types::schema::all();
+    for (name, schema) in bathy_query::schema::all() {
+        if let Some(previous) = schemas.insert(name, schema) {
+            // Two crates claiming one filename would silently overwrite one
+            // published contract with another.
+            return Err(
+                format!("two crates both publish `schemas/{name}.json`: {previous}").into(),
+            );
+        }
+    }
     let drift = diff_or_write(&schemas, Path::new("schemas"), write)?;
     if drift.is_empty() {
         Ok(())

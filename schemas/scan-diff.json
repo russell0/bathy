@@ -1,0 +1,442 @@
+{
+  "$defs": {
+    "Change": {
+      "additionalProperties": false,
+      "description": "One endpoint that changed, and how, with its full record on each side.",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The endpoint's record in the later fold, or `None` if it was absent\nfrom it."
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The endpoint's record in the earlier fold, or `None` if it was absent\nfrom it."
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint",
+          "description": "The transport and port."
+        },
+        "kind": {
+          "$ref": "#/$defs/ChangeKind"
+        },
+        "target": {
+          "description": "The host this endpoint lives on.",
+          "format": "ip",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "endpoint",
+        "kind",
+        "before",
+        "after"
+      ],
+      "type": "object"
+    },
+    "ChangeKind": {
+      "description": "How one endpoint changed. Exactly one kind is reported per endpoint: the\nfirst that matches, in the order below, which runs from the most\nconsequential to the least. An endpoint whose reachability *and* version\nboth moved is reported as the state change -- the thing an operator acts\non -- rather than as a version bump on a port that is no longer open.\n`before` and `after` carry the full records either way, so nothing is\nlost.",
+      "oneOf": [
+        {
+          "const": "endpoint_appeared",
+          "description": "The endpoint is in the later scan and not in the earlier one, and the\nearlier scan proved it looked. Never inferred from a scan that did not\ncomplete, or from two scans of different plans.",
+          "type": "string"
+        },
+        {
+          "const": "endpoint_disappeared",
+          "description": "The endpoint is in the earlier scan and not in the later one, and the\nlater scan proved it looked. Never inferred from a scan that did not\ncomplete, or from two scans of different plans.",
+          "type": "string"
+        },
+        {
+          "const": "state_changed",
+          "description": "The endpoint's reachability differs -- including to or from `null`,\nwhich is a transition into or out of \"we never observed this port's\nreachability\". The endpoint is present in both scans either way, so\nthis is never an appearance or a disappearance.",
+          "type": "string"
+        },
+        {
+          "const": "service_changed",
+          "description": "The identified service differs -- `ssh` answering where `http` used\nto, or an endpoint identified for the first time.",
+          "type": "string"
+        },
+        {
+          "const": "product_changed",
+          "description": "The product differs -- `apache` where `nginx` used to answer, or a\nproduct named for the first time.",
+          "type": "string"
+        },
+        {
+          "const": "version_changed",
+          "description": "The version differs and the product does not -- a patched or upgraded\nservice.",
+          "type": "string"
+        },
+        {
+          "const": "confidence_only",
+          "description": "Nothing differs except the confidence.\n\nSeparated from every other kind because confidence legitimately\nwobbles between runs -- a slow response, a truncated banner -- and an\noperator asking \"what changed since Monday\" does not want that in the\nsame bucket as a version bump. It is the single loudest source of\nfalse positives in a differential scanner.",
+          "type": "string"
+        }
+      ]
+    },
+    "Confidence": {
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched a rule in `bathy-interpret`.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "DenyReason": {
+      "description": "Stable, machine-readable reasons a scan request can be denied by policy.\nWire values are exactly [`DenyReason::code`]'s four strings -- agents\nbranch on them, so they are part of the public contract and must not be\nreworded without a version bump.",
+      "enum": [
+        "scope_mismatch",
+        "scope_expired",
+        "target_out_of_scope",
+        "budget_exceeds_ceiling"
+      ],
+      "type": "string"
+    },
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "Endpoint": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "required": [
+        "transport",
+        "port"
+      ],
+      "type": "object"
+    },
+    "EndpointState": {
+      "additionalProperties": false,
+      "description": "What the log knows about one endpoint.",
+      "properties": {
+        "evidence_refs": {
+          "description": "Every distinct evidence digest any event cited for this endpoint, in\nfirst-cited order, deduplicated. Superseded observations' evidence\nstays reachable: the digests accumulate rather than being replaced by\nthe latest event's.",
+          "items": {
+            "$ref": "#/$defs/Digest"
+          },
+          "type": "array"
+        },
+        "observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Observation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last service identification for this endpoint, or `null` if\nnothing identified it."
+        },
+        "probe_id": {
+          "description": "The probe that produced `observation`, or `null` if nothing\nidentified this endpoint.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last observed reachability of this endpoint, or `null` if the log\ncontains no `port.state` event for it.\n\n`null` is not `closed` and not `filtered`: \"we probed it and it was\nshut\" and \"we never observed its reachability\" are different answers,\nand neither may impersonate the other. A scan that identified a\nservice without ever recording a port state leaves this `null`."
+        }
+      },
+      "required": [
+        "state",
+        "observation",
+        "evidence_refs",
+        "probe_id"
+      ],
+      "type": "object"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "description": "What a probe concluded about one endpoint. Every field beyond `service` is\noptional because partial identification is normal and honest.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "product": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "service",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "PortState": {
+      "description": "The observed reachability of one endpoint.\n\n`Filtered` and `Closed` are distinct on purpose: a closed port is positive\nevidence that a host is up, a filtered port is evidence of a middlebox.",
+      "oneOf": [
+        {
+          "enum": [
+            "open",
+            "closed",
+            "filtered"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "Probed, but the response was contradictory across retries.",
+          "type": "string"
+        }
+      ]
+    },
+    "Terminal": {
+      "description": "The three ways a scan's log can end: it completed, it failed, or it was\nrefused by policy.\n\nOn the wire this is an internally tagged object -- `{\"outcome\":\n\"completed\" | \"failed\" | \"denied\", ...}` -- and `null` in place of the\nwhole object means the scan is still running or was cancelled mid-flight.\n`null` never means \"refused\": a refused scan is `denied`, and the\ndifference decides whether an endpoint missing from the scan is a service\nthat went away or a packet that was never sent.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "findings": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "outcome": {
+              "const": "completed",
+              "type": "string"
+            },
+            "packets_spent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "probes_sent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "outcome",
+            "probes_sent",
+            "packets_spent",
+            "findings"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "outcome": {
+              "const": "failed",
+              "type": "string"
+            },
+            "reason_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason_code",
+            "detail"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The scan was refused by policy and no packet was emitted under it.\n`reason_code` is one of the four stable deny codes; it is not an\nengine error, and retrying it without changing the authorization will\nbe refused again.",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "outcome": {
+              "const": "denied",
+              "type": "string"
+            },
+            "reason_code": {
+              "$ref": "#/$defs/DenyReason"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason_code",
+            "detail"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Transport": {
+      "enum": [
+        "tcp",
+        "udp"
+      ],
+      "type": "string"
+    },
+    "Undecidable": {
+      "description": "Why an endpoint's fate could not be decided.",
+      "oneOf": [
+        {
+          "const": "scan_incomplete",
+          "description": "One of the two scans did not run to completion -- it was refused,\nit failed, it exhausted its budget, or it was cancelled -- so its\nsilence about an endpoint is not evidence that the endpoint is gone.",
+          "type": "string"
+        },
+        {
+          "const": "coverage_differs",
+          "description": "Both scans completed, but they did not run the same plan, so an\nendpoint one of them never mentions may simply never have been in its\nplan. A re-run of the same request against the same scope produces the\nsame `plan_hash` and is comparable; a scan of a different port range\nis not.",
+          "type": "string"
+        }
+      ]
+    },
+    "Undetermined": {
+      "additionalProperties": false,
+      "description": "An endpoint one scan reported and the other did not, where the silent\nscan never proved it looked. Exactly one of `before`/`after` is present.",
+      "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The endpoint's record in the later fold, or `None` if it was absent\nfrom it."
+        },
+        "before": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/EndpointState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The endpoint's record in the earlier fold, or `None` if it was absent\nfrom it."
+        },
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint",
+          "description": "The transport and port."
+        },
+        "target": {
+          "description": "The host this endpoint lives on.",
+          "format": "ip",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "endpoint",
+        "before",
+        "after"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "What changed between two scans, and what could not be decided.",
+  "properties": {
+    "after_terminal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Terminal"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "See [`ScanDiff::before_terminal`]."
+    },
+    "before_terminal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Terminal"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "How each side's scan ended, copied through from the folds.\n\nCarried on the result rather than left for the caller to fetch\nseparately because it is *the* thing that makes `undetermined`\nactionable: \"the later scan was refused because the scope manifest had\nexpired\" is a sentence an agent can act on, and \"2 endpoints could not\nbe compared\" on its own is not."
+    },
+    "changes": {
+      "description": "Every classified change, ordered by target, then transport, then\nport. At most one entry per endpoint.",
+      "items": {
+        "$ref": "#/$defs/Change"
+      },
+      "type": "array"
+    },
+    "unchanged": {
+      "description": "Endpoints present in both folds that the classifier found no\ndifference in. A count rather than a list: \"nothing changed here\" is\nthe answer for most of a network most of the time, and an agent\npaying by the token does not want it enumerated.",
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "undecidable": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Undecidable"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Whether an endpoint's absence from one fold counted as evidence, and\nif not, why not.\n\n`null` means both scans ran the same plan to completion, so absence\nis evidence and `undetermined` is empty. Any other value is the reason\nevery one-sided endpoint was reported as undetermined instead of being\nclassified. It is a property of the *pair* of scans, not of any one\nendpoint, which is why it is recorded once."
+    },
+    "undetermined": {
+      "description": "Endpoints one scan reported and the other did not, where the silent\nscan never proved it looked.\n\n**These are not changes, and they are not \"no change\" either.** They\nare the honest answer to a question the two scans cannot settle.",
+      "items": {
+        "$ref": "#/$defs/Undetermined"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "changes",
+    "unchanged",
+    "undetermined",
+    "undecidable",
+    "before_terminal",
+    "after_terminal"
+  ],
+  "title": "ScanDiff",
+  "type": "object"
+}

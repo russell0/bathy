@@ -700,7 +700,7 @@ mod tests {
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer. |
 | `xtask` | Checks. |
 
-Four schemas are committed under [`schemas/`](schemas/) and CI fails if a type
+Six schemas are committed under [`schemas/`](schemas/) and CI fails if a type
 changes without regenerating them.
 
 **What a scanned third party sees on their wire.** A port that answers then
@@ -744,7 +744,7 @@ identification, structured event output.
                 "Redis",
             ]),
             silent_protocols: names(&["SSH", "MySQL"]),
-            committed_schemas: 4,
+            committed_schemas: 6,
             evidence_cap_headers_kib: 8,
             evidence_cap_full_kib: 64,
         }
@@ -945,12 +945,12 @@ identification, structured event output.
 
     #[test]
     fn a_wrong_schema_count_is_caught() {
-        let readme = readme().replace("Four schemas are committed", "Five schemas are committed");
+        let readme = readme().replace("Six schemas are committed", "Five schemas are committed");
         fails_naming(
             &readme,
             "number of committed schemas",
             "README says 5",
-            "the tree says 4",
+            "the tree says 6",
         );
     }
 
@@ -1020,8 +1020,8 @@ identification, structured event output.
     #[test]
     fn rewording_a_claim_out_of_the_checkers_reach_fails_loudly() {
         let readme = readme().replace(
-            "Four schemas are committed under",
-            "There are four schemas living beneath",
+            "Six schemas are committed under",
+            "There are six schemas living beneath",
         );
         let joined = violations(&readme, &truth()).join("\n");
         assert!(

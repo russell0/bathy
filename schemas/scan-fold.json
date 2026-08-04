@@ -1,0 +1,288 @@
+{
+  "$defs": {
+    "Confidence": {
+      "description": "A probability in the closed interval [0.0, 1.0].\n\nConfidence is reported, never inferred by a model at runtime: it comes from\nhow specifically a probe's response matched a rule in `bathy-interpret`.",
+      "format": "double",
+      "maximum": 1.0,
+      "minimum": 0.0,
+      "type": "number"
+    },
+    "DenyReason": {
+      "description": "Stable, machine-readable reasons a scan request can be denied by policy.\nWire values are exactly [`DenyReason::code`]'s four strings -- agents\nbranch on them, so they are part of the public contract and must not be\nreworded without a version bump.",
+      "enum": [
+        "scope_mismatch",
+        "scope_expired",
+        "target_out_of_scope",
+        "budget_exceeds_ceiling"
+      ],
+      "type": "string"
+    },
+    "Digest": {
+      "description": "BLAKE3 content digest of stored evidence bytes.",
+      "pattern": "^blake3:[0-9a-f]{64}$",
+      "type": "string"
+    },
+    "Endpoint": {
+      "additionalProperties": false,
+      "properties": {
+        "port": {
+          "format": "uint16",
+          "maximum": 65535,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "transport": {
+          "$ref": "#/$defs/Transport"
+        }
+      },
+      "required": [
+        "transport",
+        "port"
+      ],
+      "type": "object"
+    },
+    "FoldEntry": {
+      "additionalProperties": false,
+      "description": "One endpoint's record, addressed by the `(target, endpoint)` pair this\ncrate spells the same way everywhere.",
+      "properties": {
+        "endpoint": {
+          "$ref": "#/$defs/Endpoint",
+          "description": "The transport and port."
+        },
+        "evidence_refs": {
+          "description": "Every distinct evidence digest cited for this endpoint, in\nfirst-cited order.",
+          "items": {
+            "$ref": "#/$defs/Digest"
+          },
+          "type": "array"
+        },
+        "observation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Observation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last service identification, or `null` if nothing identified it."
+        },
+        "probe_id": {
+          "description": "The probe that produced `observation`, or `null`.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "state": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PortState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last observed reachability, or `null` if the log contained no\n`port.state` event for this endpoint. `null` is not `closed`: it means\nnothing was ever observed."
+        },
+        "target": {
+          "description": "The host this endpoint lives on.",
+          "format": "ip",
+          "type": "string"
+        }
+      },
+      "required": [
+        "target",
+        "endpoint",
+        "state",
+        "observation",
+        "evidence_refs",
+        "probe_id"
+      ],
+      "type": "object"
+    },
+    "Observation": {
+      "additionalProperties": false,
+      "description": "What a probe concluded about one endpoint. Every field beyond `service` is\noptional because partial identification is normal and honest.",
+      "properties": {
+        "confidence": {
+          "$ref": "#/$defs/Confidence"
+        },
+        "product": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "service": {
+          "type": "string"
+        },
+        "version": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "service",
+        "confidence"
+      ],
+      "type": "object"
+    },
+    "PortState": {
+      "description": "The observed reachability of one endpoint.\n\n`Filtered` and `Closed` are distinct on purpose: a closed port is positive\nevidence that a host is up, a filtered port is evidence of a middlebox.",
+      "oneOf": [
+        {
+          "enum": [
+            "open",
+            "closed",
+            "filtered"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "Probed, but the response was contradictory across retries.",
+          "type": "string"
+        }
+      ]
+    },
+    "Terminal": {
+      "description": "The three ways a scan's log can end: it completed, it failed, or it was\nrefused by policy.\n\nOn the wire this is an internally tagged object -- `{\"outcome\":\n\"completed\" | \"failed\" | \"denied\", ...}` -- and `null` in place of the\nwhole object means the scan is still running or was cancelled mid-flight.\n`null` never means \"refused\": a refused scan is `denied`, and the\ndifference decides whether an endpoint missing from the scan is a service\nthat went away or a packet that was never sent.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "findings": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "outcome": {
+              "const": "completed",
+              "type": "string"
+            },
+            "packets_spent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "probes_sent": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "outcome",
+            "probes_sent",
+            "packets_spent",
+            "findings"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "outcome": {
+              "const": "failed",
+              "type": "string"
+            },
+            "reason_code": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason_code",
+            "detail"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The scan was refused by policy and no packet was emitted under it.\n`reason_code` is one of the four stable deny codes; it is not an\nengine error, and retrying it without changing the authorization will\nbe refused again.",
+          "properties": {
+            "detail": {
+              "type": "string"
+            },
+            "outcome": {
+              "const": "denied",
+              "type": "string"
+            },
+            "reason_code": {
+              "$ref": "#/$defs/DenyReason"
+            }
+          },
+          "required": [
+            "outcome",
+            "reason_code",
+            "detail"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "Transport": {
+      "enum": [
+        "tcp",
+        "udp"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "description": "A scan's event log folded into per-endpoint state. `endpoints` is an entry array rather than an object because its key is a (target, endpoint) pair and JSON object keys must be strings; entries are in key order -- target, then transport, then port -- and no two entries may share a key. Where a log contains two events with the same `sequence` (which an append-only bathy event log cannot produce), the fold orders them by the events' own typed fields, so this document is stable across builds and toolchain releases.",
+  "properties": {
+    "endpoints": {
+      "description": "Every endpoint the log says anything about -- including the ones found\nclosed or filtered, which are findings in their own right -- in key\norder: target, then transport, then port.",
+      "items": {
+        "$ref": "#/$defs/FoldEntry"
+      },
+      "type": "array"
+    },
+    "hosts_up": {
+      "description": "Hosts a `host.discovered` event named.\n\n**Empty is not evidence that no host is up.** No scan emits\n`host.discovered` in v0.1, so this array is empty for every log the\nengine produces today; read it as \"the log said nothing about host\nliveness\", never as \"these are all the hosts that were up\".",
+      "items": {
+        "format": "ip",
+        "type": "string"
+      },
+      "type": "array"
+    },
+    "plan_hash": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Digest"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The plan the scan announced when it started, or `null` if it never\nstarted. Two scans of the same plan cover the same work, which is what\nmakes an endpoint missing from one of them meaningful."
+    },
+    "terminal": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Terminal"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "How the scan ended, or `null` if it is still running or was cancelled\nmid-flight. `null` never means \"refused\"."
+    }
+  },
+  "required": [
+    "endpoints",
+    "hosts_up",
+    "terminal",
+    "plan_hash"
+  ],
+  "title": "ScanFold",
+  "type": "object"
+}
