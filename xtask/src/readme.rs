@@ -16,7 +16,7 @@
 //! The structural cause is not carelessness. **Every other invariant in this
 //! project is enforced by a test that dies, and this one was enforced by
 //! whoever last remembered to look.** The README-asserting tests that already
-//! existed cover `data/ports/README.md` and the interpret provenance corpus.
+//! existed cover `crates/bathy-plan/data/ports/README.md` and the interpret provenance corpus.
 //! Nothing covered the root README.
 //!
 //! # The design, and the one decision that matters

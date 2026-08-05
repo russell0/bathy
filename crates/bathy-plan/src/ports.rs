@@ -5,7 +5,7 @@
 //!
 //! [`TOP_100`] and [`COMMON_1000`] are derived solely from the IANA *Service
 //! Name and Transport Protocol Port Number Registry*, following the
-//! heuristic documented in `data/ports/README.md`: system ports (1-1023)
+//! heuristic documented in `crates/bathy-plan/data/ports/README.md`: system ports (1-1023)
 //! with a TCP assignment, ascending, then user ports (1024-49151) with a TCP
 //! assignment, ascending. IANA records *assignments*, not *observed
 //! prevalence* -- this is a reasonable starting set, not a measurement of
@@ -14,8 +14,8 @@
 
 use bathy_types::request::{PortPreset, PortSelection};
 
-const TOP_100: &str = include_str!("../../../data/ports/top-100.txt");
-const COMMON_1000: &str = include_str!("../../../data/ports/common-1000.txt");
+const TOP_100: &str = include_str!("../data/ports/top-100.txt");
+const COMMON_1000: &str = include_str!("../data/ports/common-1000.txt");
 
 #[derive(Debug, thiserror::Error)]
 pub enum PortError {
@@ -351,7 +351,7 @@ mod tests {
     // prevalence measurement.
     #[test]
     fn readme_states_iana_provenance_no_nmap_consultation_and_the_heuristic_disclaimer() {
-        const README: &str = include_str!("../../../data/ports/README.md");
+        const README: &str = include_str!("../data/ports/README.md");
         let lower = README.to_lowercase();
         assert!(
             README.contains("IANA"),

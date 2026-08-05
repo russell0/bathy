@@ -28,6 +28,6 @@ measurement study and is tracked as issue #1 for v0.2.
 
     cargo run -p xtask -- gen-ports --registry path/to/service-names-port-numbers.csv
 
-`--out-dir` overrides where the two files are written (default `data/ports`).
+`--out-dir` overrides where the two files are written (default `crates/bathy-plan/data/ports`).
 Fetch the registry CSV yourself from the URL above; `gen-ports` never fetches
 it and never reads any Nmap data file.
