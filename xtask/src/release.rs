@@ -434,11 +434,23 @@ pub fn versions_in_index(body: &str) -> Vec<String> {
 // The workflow file, held to the claims it makes.
 // ---------------------------------------------------------------------------
 
-/// The job blocks of a workflow file, as `(name, text)`.
+/// The job blocks of a workflow file, as `(name, text)`, **with comment lines
+/// removed**.
 ///
 /// Text, not YAML: `xtask` has no YAML crate and `gates.rs` reads `ci.yml` the
 /// same way for the same reason. A job starts at a two-space-indented `name:`
 /// key and runs to the next one.
+///
+/// Dropping comments is not tidiness, it is the whole correctness of every
+/// check built on this. The first version kept them, and deleting the
+/// `publish-check` STEP from the publish job did not fail
+/// [`workflow_violations`] — because the paragraph of comment above the step
+/// still contained the word, and the check was a `contains` over the job's
+/// text. The gate was satisfied by prose describing the gate. That is this
+/// repository's signature defect (a README asserting three times that the MCP
+/// server did not exist, in the commit range that shipped it), reproduced
+/// inside the checker written to prevent the release version of it, and it was
+/// found by mutating the workflow rather than by reading the code.
 fn job_blocks(workflow: &str) -> Vec<(String, String)> {
     let mut jobs: Vec<(String, String)> = Vec::new();
     let mut in_jobs = false;
@@ -452,10 +464,10 @@ fn job_blocks(workflow: &str) -> Vec<(String, String)> {
         }
         let trimmed = line.trim_start();
         let indent = line.len() - trimmed.len();
-        let is_job_key = indent == 2
-            && !trimmed.starts_with('#')
-            && trimmed.ends_with(':')
-            && !trimmed.contains(' ');
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        let is_job_key = indent == 2 && trimmed.ends_with(':') && !trimmed.contains(' ');
         if is_job_key {
             jobs.push((trimmed.trim_end_matches(':').to_owned(), String::new()));
         } else if let Some((_, body)) = jobs.last_mut() {
@@ -464,6 +476,22 @@ fn job_blocks(workflow: &str) -> Vec<(String, String)> {
         }
     }
     jobs
+}
+
+/// The commands a job's `run:` steps actually execute.
+///
+/// The checks about *what a job does* are phrased over these rather than over
+/// the job's text, so that they cannot be satisfied by a mention. See
+/// [`job_blocks`] for the mutation that made this necessary.
+fn run_commands(body: &str) -> Vec<String> {
+    body.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start().trim_start_matches("- ");
+            trimmed
+                .strip_prefix("run:")
+                .map(|rest| rest.trim().to_owned())
+        })
+        .collect()
 }
 
 /// The guard this whole module exists to keep: **nothing publishes for real
@@ -483,9 +511,17 @@ pub fn workflow_violations(path: &str, workflow: &str) -> Vec<String> {
         return found;
     }
 
+    // `run_commands` rather than the job's text, throughout: a check that a job
+    // DOES something must not be satisfiable by a comment saying it does.
+    let runs = |body: &str, needle: &str| {
+        run_commands(body)
+            .iter()
+            .any(|command| command.contains(needle))
+    };
+
     let executing: Vec<&(String, String)> = jobs
         .iter()
-        .filter(|(_, body)| body.contains("release --execute"))
+        .filter(|(_, body)| runs(body, "release --execute"))
         .collect();
     if executing.is_empty() {
         found.push(format!(
@@ -502,7 +538,7 @@ pub fn workflow_violations(path: &str, workflow: &str) -> Vec<String> {
                  to a tag ref. Guard it with `if: startsWith(github.ref, 'refs/tags/{TAG_PREFIX}')`."
             ));
         }
-        if !body.contains("publish-check") {
+        if !runs(body, "publish-check") {
             found.push(format!(
                 "{path}: job `{name}` publishes without running `publish-check` first. That \
                  gate is what reads the history for leaked identifiers and runs every other \
@@ -511,7 +547,7 @@ pub fn workflow_violations(path: &str, workflow: &str) -> Vec<String> {
         }
     }
 
-    if !workflow.contains("release --dry-run") {
+    if !jobs.iter().any(|(_, body)| runs(body, "release --dry-run")) {
         found.push(format!(
             "{path}: nothing runs `release --dry-run`. A release workflow whose first real \
              execution is the release is the same defect class as a CI gate nobody ran."
@@ -521,7 +557,7 @@ pub fn workflow_violations(path: &str, workflow: &str) -> Vec<String> {
     // The dry run has to be reachable without a tag, or it is not a rehearsal.
     let rehearsing = jobs
         .iter()
-        .filter(|(_, body)| body.contains("release --dry-run"))
+        .filter(|(_, body)| runs(body, "release --dry-run"))
         .any(|(_, body)| !body.contains("refs/tags/"));
     if !rehearsing {
         found.push(format!(
@@ -1220,6 +1256,54 @@ mod tests {
                 .iter()
                 .any(|v| v.contains("without running `publish-check`")),
             "{found:#?}"
+        );
+    }
+
+    /// The defect a mutation found and reading did not: deleting the
+    /// `publish-check` STEP left the word behind in the comment above it, and
+    /// the check -- a `contains` over the job's text -- was satisfied by prose
+    /// describing the gate it was meant to find. Every "this job does X" check
+    /// is phrased over `run:` commands now, and this is what keeps it that way.
+    #[test]
+    fn a_gate_named_only_in_a_comment_does_not_satisfy_the_check() {
+        let workflow = "jobs:\n\
+             \x20 rehearse:\n\
+             \x20   steps:\n\
+             \x20     - run: cargo run -p xtask -- release --dry-run\n\
+             \x20 publish:\n\
+             \x20   if: startsWith(github.ref, 'refs/tags/v')\n\
+             \x20   steps:\n\
+             \x20     # the pre-publication gate, publish-check, runs here\n\
+             \x20     - run: cargo run -p xtask -- release --execute\n";
+        let found = workflow_violations("release.yml", workflow);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("without running `publish-check`")),
+            "a commented-out gate is not a gate: {found:#?}"
+        );
+    }
+
+    /// The same failure in the other direction: a job that only *mentions*
+    /// `release --execute` in a comment is not a publishing job, and must not
+    /// be made to look like one.
+    #[test]
+    fn a_comment_mentioning_execute_does_not_make_a_job_a_publisher() {
+        let workflow = "jobs:\n\
+             \x20 rehearse:\n\
+             \x20   steps:\n\
+             \x20     # unlike release --execute, this never uploads\n\
+             \x20     - run: cargo run -p xtask -- release --dry-run\n\
+             \x20 publish:\n\
+             \x20   if: startsWith(github.ref, 'refs/tags/v')\n\
+             \x20   steps:\n\
+             \x20     - run: cargo run -p xtask -- publish-check\n\
+             \x20     - run: cargo run -p xtask -- release --execute\n";
+        let found = workflow_violations("release.yml", workflow);
+        assert!(
+            found.is_empty(),
+            "`rehearse` only mentions --execute in a comment and has no tag guard; \
+             treating it as a publishing job would be a false positive: {found:#?}"
         );
     }
 
