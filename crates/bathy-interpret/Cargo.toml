@@ -1,5 +1,6 @@
 [package]
 name = "bathy-interpret"
+description = "The pure interpretation layer for bathy: turns recorded probe bytes into structured, evidence-backed claims."
 version.workspace = true
 edition.workspace = true
 # 1.88 MSRV tier: this crate depends on nothing that needs more than the
@@ -15,7 +16,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 # The one dependency this crate needs to interpret text-shaped protocol
 # banners (HTTP `Server:` headers, SSH identification strings, SMTP
 # greetings) without hand-rolling ad hoc string scanning for each one.

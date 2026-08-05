@@ -3,7 +3,20 @@ resolver = "3"
 members = ["crates/*", "xtask"]
 
 [workspace.package]
-version = "0.1.0"
+# Every publishable crate in this workspace carries THIS version and no other
+# -- see `xtask check-release`, which fails if any of them disagrees. The
+# lockstep is not tidiness: `bathy` is an alpha, and a `bathy-engine` released
+# as a bare `0.1.0` beside it would carry a stronger compatibility promise
+# than the binary that is its only consumer. Cargo treats `0.1.0` as a release
+# and `0.1.0-alpha.N` as a pre-release it will not select without an explicit
+# opt-in, so the pre-release suffix is the part that keeps the promise honest.
+#
+# `alpha.2`, not `alpha.1`: `bathy 0.1.0-alpha.1` is ALREADY on crates.io as a
+# lib-only name reservation. A version on crates.io cannot be replaced, only
+# yanked, so the first release that actually ships the binary has to be a new
+# version. Bumping the whole workspace rather than only `bathy` is what keeps
+# the lockstep true.
+version = "0.1.0-alpha.2"
 edition = "2024"
 # 1.88, not the lowest number that happens to build: the patched `time`
 # release that fixes RUSTSEC-2026-0009 (stack exhaustion via RFC 2822
@@ -19,6 +32,38 @@ license = "Apache-2.0 OR MIT"
 repository = "https://github.com/russell0/bathy"
 
 [workspace.dependencies]
+# --- This workspace's own crates. ---
+#
+# `version` beside `path` is what makes them publishable AT ALL, and its
+# absence is not a warning: `cargo publish` refuses outright with "all
+# dependencies must have a version requirement specified when publishing",
+# because the published manifest has the `path` stripped out and would
+# otherwise name a dependency with no way to resolve it. Every one of these
+# edges lacked a version until the release workflow was built, so every crate
+# above `bathy-types` was unpublishable and nothing said so.
+#
+# Declared here rather than inline in each member because the version has to
+# match `[workspace.package].version` above, in all 33 places these edges
+# appear. One place to change is one place to get wrong; `xtask check-release`
+# still verifies the match, because "it is obviously the same string" is how
+# the other lists in this repository rotted.
+#
+# `[dev-dependencies]` edges deliberately keep their bare `path` form and are
+# NOT listed here. Cargo strips a versionless dev-dependency out of the
+# published manifest entirely, which is exactly right for a workspace-internal
+# test helper: `bathy-query`'s six dev-dependencies are how its tests build a
+# real engine, and no consumer of the published crate needs them to resolve.
+bathy-types = { path = "crates/bathy-types", version = "0.1.0-alpha.2" }
+bathy-scope = { path = "crates/bathy-scope", version = "0.1.0-alpha.2" }
+bathy-evidence = { path = "crates/bathy-evidence", version = "0.1.0-alpha.2" }
+bathy-store = { path = "crates/bathy-store", version = "0.1.0-alpha.2" }
+bathy-plan = { path = "crates/bathy-plan", version = "0.1.0-alpha.2" }
+bathy-interpret = { path = "crates/bathy-interpret", version = "0.1.0-alpha.2" }
+bathy-probe = { path = "crates/bathy-probe", version = "0.1.0-alpha.2" }
+bathy-engine = { path = "crates/bathy-engine", version = "0.1.0-alpha.2" }
+bathy-query = { path = "crates/bathy-query", version = "0.1.0-alpha.2" }
+bathy-mcp = { path = "crates/bathy-mcp", version = "0.1.0-alpha.2" }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"

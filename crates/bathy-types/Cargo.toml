@@ -1,5 +1,6 @@
 [package]
 name = "bathy-types"
+description = "Core wire types and canonical JSON for bathy, the agent-native network scanner."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

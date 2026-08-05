@@ -1,5 +1,6 @@
 [package]
 name = "bathy-query"
+description = "Queryable views over a bathy scan's event log: folds and diffs derived from evidence, never from mutable state."
 version.workspace = true
 edition.workspace = true
 # 1.88 MSRV tier, and the tier is a claim about *this library*, which is what
@@ -31,7 +32,7 @@ repository.workspace = true
 # `Event` / `EventBody` and produces plain data. It must not reach the store,
 # the network, the clock or the filesystem, and the shortest way to keep that
 # true is to depend on nothing that could.
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 # Added in M5 Task 2: four crates, for two reasons. AC-5.35 publishes
 # `ScanFold` and `ScanDiff` as committed, drift-checked JSON Schemas, which
 # needs the derives (`serde`, `schemars`) and a `Value` to hand `xtask`

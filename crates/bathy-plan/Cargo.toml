@@ -1,5 +1,6 @@
 [package]
 name = "bathy-plan"
+description = "Scan planning for bathy: target expansion, port selection, and the deterministic indexable scan plan."
 version.workspace = true
 edition.workspace = true
 # MSRV tiering: this crate depends on nothing that needs more than the
@@ -12,7 +13,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 ipnet = { workspace = true }
 thiserror = { workspace = true }
 # `plan.rs` assembles the canonical JSON document `plan_digest` hashes

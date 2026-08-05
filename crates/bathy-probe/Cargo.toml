@@ -1,5 +1,6 @@
 [package]
 name = "bathy-probe"
+description = "The bounded probe framework for bathy: turns a live socket into raw, uninterpreted bytes. Never interprets them."
 version.workspace = true
 edition.workspace = true
 # MSRV tiering: this crate depends on nothing that needs more than the
@@ -19,7 +20,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 # `ProbeIo` (`src/framework.rs`) wraps `tokio::net::TcpStream` and uses
 # `tokio::time::timeout`/`Instant` to bound both `read_bounded` and
 # `write_all` by a deadline -- `net` and `time`. `select_probes`'s and

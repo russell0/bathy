@@ -1,5 +1,6 @@
 [package]
 name = "bathy-evidence"
+description = "Content-addressed blob store and append-only event log: bathy's source of truth for scan provenance."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }
 fs4 = { workspace = true }

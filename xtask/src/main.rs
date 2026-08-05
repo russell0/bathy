@@ -8,6 +8,7 @@ mod phrases;
 mod prose;
 mod publish;
 mod readme;
+mod release;
 mod visibility;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -114,6 +115,21 @@ const SUBCOMMANDS: &[&str] = &[
     "check-ci-status",
     "linux-gate",
     "publish-check",
+    // Whether this workspace COULD be released, decided offline: the publish
+    // order derived from the real dependency graph, the manifest fields
+    // crates.io rejects an upload for lacking, the version lockstep, and the
+    // release workflow's own guards. A `check-*` name on purpose -- CI runs it
+    // on every push and `publish-check` runs it automatically -- because every
+    // intra-workspace dependency in this repository was a versionless `path`
+    // dependency, which makes `cargo publish` refuse outright, and nothing in
+    // the tree could say so.
+    "check-release",
+    // NOT a `check-*`: it talks to crates.io and to `cargo publish`, takes
+    // minutes, and must never run as a side effect of `publish-check`.
+    // `--dry-run` is its default and `--execute` is the only thing that
+    // uploads; `check-release` asserts the workflow only reaches `--execute`
+    // from a tag ref.
+    "release",
     "emit-schemas",
     "gen-ports",
     // Not a `check-*`: it runs the fuzz targets rather than reading the tree,
@@ -172,6 +188,15 @@ fn run(command: Option<&str>, args: &[String]) -> Result<(), Box<dyn std::error:
             gates::run_fuzz(seconds, flag_value(args, "--target"))
         }
         Some("check-ci") => gates::check_ci(SUBCOMMANDS),
+        Some("check-release") => release::check_release(LAYERS, SUBCOMMANDS),
+        Some("release") => release::release(
+            release::ReleaseMode {
+                execute: args.iter().any(|a| a == "--execute"),
+                resume: args.iter().any(|a| a == "--resume"),
+            },
+            flag_value(args, "--tag"),
+            LAYERS,
+        ),
         Some("check-ci-status") => visibility::check_ci_status(),
         Some("linux-gate") => visibility::linux_gate(args.iter().any(|a| a == "--fresh")),
         // The gate that runs immediately before the repository is made

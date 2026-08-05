@@ -1,0 +1,91 @@
+name: release
+
+# Two jobs, and the split between them is the whole design.
+#
+# `rehearse` runs on EVERY push, every pull request and on demand. It does the
+# entire release except the upload: derives the publish order from the real
+# dependency graph, checks the manifest fields crates.io rejects an upload for
+# lacking, and runs `cargo publish --dry-run` over all eleven crates. It needs
+# no secrets, so it runs on fork pull requests too.
+#
+# `publish` runs on nothing but a `v*` tag. It is the only job that uploads,
+# it `needs: rehearse`, and it runs `publish-check` before touching crates.io.
+#
+# Why this shape rather than one job with a flag: crates.io publication is
+# irreversible -- a version cannot be unpublished, only yanked -- so the run
+# that can do it must be reachable from as few conditions as possible, while
+# the run that rehearses it must be reachable from as many as possible. A
+# release workflow first executed on the day it matters is the same defect
+# class as a CI gate nobody ran, and this project had one red for five days.
+#
+# Every `run:` step below is `cargo run -p xtask -- <subcommand>`, with no
+# inline shell anywhere. `xtask check-release` enforces that, using the same
+# `ci_steps_without_a_local_form` rule `check-ci` applies to `ci.yml`: every
+# gate this project has lost was an inline `run: |` block.
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing here writes to the repository. Publication is
+# authorized by CARGO_REGISTRY_TOKEN, which is scoped to crates.io and read
+# only by the one job that uploads.
+permissions:
+  contents: read
+
+jobs:
+  rehearse:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # Offline, and the reason it is a separate step from the dry run below:
+      # this is what fails when a manifest is not publishable, and it fails in
+      # milliseconds with the crate and the field named. `cargo publish` would
+      # report the same defect only after packaging, and in a real release only
+      # after the crates before it were already public and unrecallable.
+      - run: cargo run -p xtask -- check-release
+      # The rehearsal. ONE `cargo publish` invocation naming every crate in the
+      # derived order -- see the comment in `xtask/src/release.rs` for why a
+      # per-crate loop cannot work: cargo builds a temporary local registry for
+      # the packages in a single command, which is the only way a crate whose
+      # dependency is not yet on crates.io can resolve at all. `--dry-run` is
+      # this command's default; `--execute` is a separate flag and only the
+      # tag-gated job below passes it.
+      - run: cargo run -p xtask -- release --dry-run
+
+  publish:
+    # The one guard that makes everything else in this file safe. `check-release`
+    # asserts this line exists: it is one line to delete, and deleting it would
+    # publish on every push to every branch.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: rehearse
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The pre-publication gate, in full: the working tree AND the history
+      # scanned for leaked identifiers, the commit identities, the required
+      # files and the sentences they carry, every other `check-*` gate, and
+      # `cargo test --workspace`. It fails the job, and the job is `publish`,
+      # so a failure here is a release that does not happen.
+      #
+      # A runner has no `.publish-deny` (it is git-ignored by design), so the
+      # list arrives through BATHY_PUBLISH_DENY. If the secret is missing the
+      # variable is empty, an empty deny list is already a hard error in
+      # `publish-check`, and this step fails -- which is the correct outcome.
+      # The gate is fail-closed here for the same reason it is locally.
+      - run: cargo run -p xtask -- publish-check
+        env:
+          BATHY_PUBLISH_DENY: ${{ secrets.PUBLISH_DENY }}
+      # The upload. `--tag` is not optional: `release` refuses `--execute`
+      # without one, and with one it verifies that the tag names exactly the
+      # version in the manifests before anything is sent. It also refuses a
+      # dirty tree and refuses a version that is already on crates.io, and it
+      # never passes `--allow-dirty`.
+      - run: cargo run -p xtask -- release --execute --tag ${{ github.ref_name }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

@@ -1,5 +1,6 @@
 [package]
 name = "bathy-scope"
+description = "The scope manifest: bathy's deny-by-default authorization boundary for every address a packet may reach."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

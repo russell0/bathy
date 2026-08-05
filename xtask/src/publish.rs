@@ -26,9 +26,24 @@
 //! itself checked for being ignored and untracked, because the one edit that
 //! would undo all of this is somebody adding it.
 //!
-//! That is also why this gate is **local-only and not a CI step**: the list it
-//! reads does not exist in a fresh clone, so a CI run of it would either fail
-//! on every runner or, worse, pass while checking nothing.
+//! That is also why this gate is **not a step in `ci.yml`**: the list it reads
+//! does not exist in a fresh clone, so an ordinary CI run of it would either
+//! fail on every runner or, worse, pass while checking nothing.
+//!
+//! # The one place it does run off this machine
+//!
+//! `.github/workflows/release.yml` runs it, because a release is the moment
+//! this gate exists for and a publication that skipped it would be the gate
+//! being decoration. A runner has no `.publish-deny`, so the workflow supplies
+//! the list through [`PUBLISH_DENY_ENV`] from a repository secret.
+//!
+//! This does **not** reintroduce the failure the paragraph above describes, and
+//! the reason is worth stating because it is the whole argument: the fallback
+//! only ever *adds* a source for the list, never a way to proceed without one.
+//! An absent secret yields an empty string, an empty list is already a hard
+//! error here ("an empty deny list is not an empty risk"), and that error fails
+//! the workflow before anything is uploaded. The gate is fail-closed in CI for
+//! exactly the same reason it is fail-closed locally.
 //!
 //! # What it covers
 //!
@@ -69,6 +84,15 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 /// Where the denied strings live. Git-ignored on purpose: the list itself is
 /// the thing that must not be published.
 pub const PUBLISH_DENY_FILE: &str = ".publish-deny";
+
+/// Where the deny list comes from when there is no file — that is, on a CI
+/// runner, which has no git-ignored files at all.
+///
+/// Read **only** when [`PUBLISH_DENY_FILE`] is absent, never merged with it: a
+/// machine that has the file is the machine whose file is authoritative, and a
+/// gate whose input silently depends on an environment variable is a gate whose
+/// result cannot be reproduced by running the same command.
+pub const PUBLISH_DENY_ENV: &str = "BATHY_PUBLISH_DENY";
 
 /// The marker that acknowledges commit authorship as intentionally published.
 ///
@@ -1011,13 +1035,19 @@ pub fn publish_check(
     dispatch: &dyn Fn(&str) -> Fallible<()>,
 ) -> Fallible<()> {
     let root = Path::new(".");
-    let deny_text = std::fs::read_to_string(root.join(PUBLISH_DENY_FILE)).map_err(|e| {
-        format!(
-            "{PUBLISH_DENY_FILE}: {e}. This file is git-ignored, so a fresh clone does \
-             not have one and this gate is local-only by construction -- which is why it \
-             is not a step in ci.yml."
-        )
-    })?;
+    let deny_text = match std::fs::read_to_string(root.join(PUBLISH_DENY_FILE)) {
+        Ok(text) => text,
+        Err(e) => std::env::var(PUBLISH_DENY_ENV).map_err(|_| {
+            format!(
+                "{PUBLISH_DENY_FILE}: {e}, and {PUBLISH_DENY_ENV} is not set either. The \
+                 file is git-ignored, so a fresh clone does not have one -- which is why \
+                 this gate is not a step in ci.yml. The release workflow, which MUST run \
+                 it, supplies the list through {PUBLISH_DENY_ENV} from a repository \
+                 secret. If you are seeing this on a runner, that secret is missing, and \
+                 this gate failing is the correct outcome: nothing publishes."
+            )
+        })?,
+    };
     let denied = publish_denied_strings(&deny_text);
     if denied.is_empty() {
         return Err(format!(

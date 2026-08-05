@@ -1,6 +1,6 @@
 [package]
 name = "bathy"
-version = "0.1.0-alpha.1"
+version.workspace = true
 description = "Agent-native network discovery: typed MCP tools, evidence-backed findings, deny-by-default scope enforcement."
 readme = "README.md"
 keywords = ["network", "scanner", "mcp", "security", "discovery"]
@@ -34,21 +34,21 @@ name = "bathy"
 path = "src/main.rs"
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
-bathy-scope = { path = "../bathy-scope" }
-bathy-evidence = { path = "../bathy-evidence" }
-bathy-store = { path = "../bathy-store" }
-bathy-plan = { path = "../bathy-plan" }
-bathy-interpret = { path = "../bathy-interpret" }
-bathy-probe = { path = "../bathy-probe" }
-bathy-engine = { path = "../bathy-engine" }
-bathy-query = { path = "../bathy-query" }
+bathy-types = { workspace = true }
+bathy-scope = { workspace = true }
+bathy-evidence = { workspace = true }
+bathy-store = { workspace = true }
+bathy-plan = { workspace = true }
+bathy-interpret = { workspace = true }
+bathy-probe = { workspace = true }
+bathy-engine = { workspace = true }
+bathy-query = { workspace = true }
 # `bathy serve mcp` fronts this crate, and `scope validate` renders the same
 # typed answer the `scope.validate` tool returns rather than a second one.
 # The plan's Task 3 edit #1 assigned the subcommand to Task 4, "in the commit
 # that adds the server it fronts"; `xtask`'s layer table already ranks
 # `bathy-mcp` below `bathy` for exactly this edge.
-bathy-mcp = { path = "../bathy-mcp" }
+bathy-mcp = { workspace = true }
 # `derive` for the command tree. `wrap_help` deliberately NOT enabled: it
 # reflows help text to the terminal it is rendered in, and `--help` is where
 # this CLI's exit-code table lives (AC-5.11) -- a documented contract a test

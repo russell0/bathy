@@ -113,7 +113,7 @@ checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
 
 [[package]]
 name = "bathy"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-engine",
  "bathy-evidence",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-engine"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-evidence",
  "bathy-interpret",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-evidence"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-types",
  "criterion",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-interpret"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "base64",
  "bathy-types",
@@ -182,7 +182,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-mcp"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-engine",
  "bathy-evidence",
@@ -205,7 +205,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-packetd"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-types",
  "ipnet",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-plan"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-types",
  "criterion",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-probe"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "async-trait",
  "bathy-types",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-query"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-engine",
  "bathy-evidence",
@@ -260,7 +260,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-scope"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-types",
  "ipnet",
@@ -273,7 +273,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-store"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-evidence",
  "bathy-types",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "bathy-types"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "blake3",
  "criterion",
@@ -2051,7 +2051,7 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "xtask"
-version = "0.1.0"
+version = "0.1.0-alpha.2"
 dependencies = [
  "bathy-interpret",
  "bathy-probe",

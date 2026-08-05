@@ -1,5 +1,6 @@
 [package]
 name = "bathy-store"
+description = "SQLite-backed task store for bathy: scan state, database-enforced idempotency, and the resumption cursor."
 version.workspace = true
 edition.workspace = true
 # MSRV tiering: this crate, alone in the workspace, needs a rustc newer than
@@ -24,7 +25,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
+bathy-types = { workspace = true }
 rusqlite = { workspace = true }
 thiserror = { workspace = true }
 serde_json = { workspace = true }

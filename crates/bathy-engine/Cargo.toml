@@ -1,5 +1,6 @@
 [package]
 name = "bathy-engine"
+description = "bathy's emission path: the rate limiter, budget governance, and scheduler that put probes on the wire."
 version.workspace = true
 edition.workspace = true
 # MSRV tiering: this crate now depends on `bathy-store` (`TaskStore`, needed
@@ -45,18 +46,18 @@ tokio = { workspace = true, features = ["io-util"] }
 # AC-3.24-3.30 (`scheduler.rs`): cooperative cancellation.
 tokio-util = { workspace = true }
 thiserror = { workspace = true }
-bathy-types = { path = "../bathy-types" }
-bathy-scope = { path = "../bathy-scope" }
-bathy-evidence = { path = "../bathy-evidence" }
-bathy-store = { path = "../bathy-store" }
-bathy-plan = { path = "../bathy-plan" }
+bathy-types = { workspace = true }
+bathy-scope = { workspace = true }
+bathy-evidence = { workspace = true }
+bathy-store = { workspace = true }
+bathy-plan = { workspace = true }
 # M4 Task 5: the probe framework and rule registry `scheduler.rs`'s
 # `Scheduler::detect_service` wires into the scan loop. Both sit below
 # `bathy-engine` in `xtask`'s `LAYERS` (`..., bathy-interpret, bathy-probe,
 # bathy-engine, ...`), so this is a downhill dependency, not a violation of
 # the layer order `check-deps` enforces.
-bathy-probe = { path = "../bathy-probe" }
-bathy-interpret = { path = "../bathy-interpret" }
+bathy-probe = { workspace = true }
+bathy-interpret = { workspace = true }
 # OPTIONAL, and pulled in by nothing but the `test-util` feature below --
 # `cargo build -p bathy-engine` and every consumer that does not ask for
 # `test-util` resolve exactly the graph they did before, which is checkable

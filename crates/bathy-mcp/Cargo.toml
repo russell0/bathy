@@ -1,6 +1,6 @@
 [package]
 name = "bathy-mcp"
-version = "0.1.0"
+version.workspace = true
 description = "Agent-native network discovery over the Model Context Protocol: eleven typed tools, no command strings."
 edition.workspace = true
 # MSRV tiering, decided by execution rather than by assumption. The M5 plan
@@ -24,15 +24,15 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-bathy-types = { path = "../bathy-types" }
-bathy-scope = { path = "../bathy-scope" }
-bathy-evidence = { path = "../bathy-evidence" }
-bathy-store = { path = "../bathy-store" }
-bathy-plan = { path = "../bathy-plan" }
-bathy-interpret = { path = "../bathy-interpret" }
-bathy-probe = { path = "../bathy-probe" }
-bathy-engine = { path = "../bathy-engine" }
-bathy-query = { path = "../bathy-query" }
+bathy-types = { workspace = true }
+bathy-scope = { workspace = true }
+bathy-evidence = { workspace = true }
+bathy-store = { workspace = true }
+bathy-plan = { workspace = true }
+bathy-interpret = { workspace = true }
+bathy-probe = { workspace = true }
+bathy-engine = { workspace = true }
+bathy-query = { workspace = true }
 # The official Rust MCP SDK, pinned. `default-features = false` because the
 # default set enables `macros`, which this crate does not use: the eleven tool
 # descriptors are built from schemas derived in `bathy-types`/`bathy-query`,
