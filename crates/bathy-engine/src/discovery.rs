@@ -42,32 +42,38 @@
 //! `Objective::HostInventory` should actually DO differently, does not
 //! exist yet and is out of this fix wave's scope).
 //!
-//! Wiring `discover_host` into the scheduler now would be premature for a
-//! second reason: `docs/superpowers/plans/2026-07-31-bathy-m6-packetd.md`
-//! already specifies `discover_host_combined`, which tries privileged ICMP
-//! first (via `bathy-packetd`) and falls back to exactly this module's TCP
-//! method on an inconclusive result -- recording whichever method actually
-//! produced the answer on `host.discovered`. That is the real integration
-//! point for `host.discovered` events; wiring this crate's TCP-only method
-//! into the scheduler ahead of it would mean redoing the same wiring twice,
-//! once here and once in M6, or shipping a "discovery" that silently never
-//! uses ICMP even once packetd exists. M3's own exit-criteria end-to-end
-//! test (`crates/bathy-engine/tests/`) reflects this directly: it expects
-//! exactly `scan.started`, `port.state` x2, `scan.completed` for a plain
-//! port scan -- no `host.discovered` -- which is what a scheduler that
-//! does not call this module at all correctly produces.
+//! M6 Task 5 delivered the other half: [`discover_host_combined`] tries
+//! privileged ICMP first (via `bathy-packetd`) and falls back to exactly this
+//! module's TCP method on an inconclusive result, returning whichever method
+//! actually produced the answer in [`DiscoveryResult::method`].
 //!
-//! `discover_host`/[`DiscoveryConfig`]/[`DiscoveryResult`] therefore ship in
-//! v0.1 as a correct, independently tested library building block, publicly
-//! exported from this crate (see `crate::lib`'s own doc comment), with no
-//! production caller yet -- exactly the shape M6's plan already expects to
-//! consume.
+//! **`EventBody::HostDiscovered` is still constructed nowhere in production,
+//! and that is now the only part of AC-6.20 left open.** The remaining step
+//! is not in this module and could not be: an emitter needs the event log,
+//! the evidence store (`HostDiscovered::evidence_refs` is a
+//! `NonEmpty<Digest>`, so there is no event without a stored blob) and a
+//! decision about *when* discovery runs -- and that last one still does not
+//! exist. `bathy_plan::ScanPlan` carries no
+//! [`bathy_types::request::Objective`], so `crate::scheduler` cannot tell a
+//! `HostInventory` scan from an `InventoryExposedServices` one, and running
+//! discovery unconditionally would change the packet cost and the event
+//! stream of every scan this engine has ever run -- three tests pin the
+//! current shape (`crates/bathy-engine/tests/end_to_end_scan.rs`,
+//! `crates/bathy/tests/lab_conformance.rs`,
+//! `crates/bathy-query/tests/real_log_fold.rs`). See M6 Task 5's report for
+//! the recommendation.
+//!
+//! `discover_host`/[`discover_host_combined`]/[`DiscoveryConfig`]/
+//! [`DiscoveryResult`] therefore ship as correct, independently tested
+//! library building blocks, publicly exported from this crate (see
+//! `crate::lib`'s own doc comment), with no production caller yet.
 
 use std::net::IpAddr;
 
 use tokio::time::Duration;
 
 use crate::connect::{ConnectOutcome, probe_connect};
+use crate::packetd::{HostState, PacketdClient, PacketdError};
 use crate::rate::RateLimiter;
 
 /// [`DiscoveryConfig::new`]'s single failure mode.
@@ -138,15 +144,36 @@ impl Default for DiscoveryConfig {
     }
 }
 
+/// A TCP connect that was accepted: the host is up and something is
+/// listening.
+pub const METHOD_TCP_OPEN: &str = "tcp-connect-open";
+/// A TCP connect that was refused. Still positive evidence the host is up --
+/// something answered, even to say no.
+pub const METHOD_TCP_REFUSED: &str = "tcp-connect-refused";
+/// Every configured TCP port tried and none of them conclusive.
+pub const METHOD_NO_RESPONSE: &str = "no-response";
+/// An ICMP echo reply: the host answered a ping (AC-6.18, AC-6.20).
+pub const METHOD_ICMP_UP: &str = "icmp-echo-reply";
+/// An ICMP destination unreachable: somebody on the path said there is
+/// nothing at that address. A *conclusive negative*, and therefore not a
+/// fallback case -- see [`discover_host_combined`].
+pub const METHOD_ICMP_DOWN: &str = "icmp-unreachable";
+
 /// The outcome of one [`discover_host`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscoveryResult {
     pub up: bool,
     /// Recorded on the `host.discovered` event so a finding can be
-    /// explained. Exactly one of `"tcp-connect-open"`,
-    /// `"tcp-connect-refused"`, or `"no-response"` -- these three strings
-    /// are a contract other components branch on, not incidental logging
-    /// text, and must not be reworded without a version bump.
+    /// explained. Exactly one of [`METHOD_TCP_OPEN`],
+    /// [`METHOD_TCP_REFUSED`], [`METHOD_NO_RESPONSE`], [`METHOD_ICMP_UP`] or
+    /// [`METHOD_ICMP_DOWN`] -- these strings are a contract other components
+    /// branch on, not incidental logging text, and must not be reworded
+    /// without a version bump.
+    ///
+    /// It names the method that **decided**, never the method that was
+    /// tried first (AC-6.20). A combined discovery that pinged, got nothing,
+    /// and then found an open port reports the TCP method, because that is
+    /// what the finding rests on.
     pub method: String,
     /// The number of probes actually attempted -- i.e. the number of times
     /// `limiter.acquire` and `probe_connect` were called -- not a count
@@ -186,14 +213,14 @@ pub async fn discover_host(
             ConnectOutcome::Open => {
                 return DiscoveryResult {
                     up: true,
-                    method: "tcp-connect-open".into(),
+                    method: METHOD_TCP_OPEN.into(),
                     packets_spent: spent,
                 };
             }
             ConnectOutcome::Closed => {
                 return DiscoveryResult {
                     up: true,
-                    method: "tcp-connect-refused".into(),
+                    method: METHOD_TCP_REFUSED.into(),
                     packets_spent: spent,
                 };
             }
@@ -206,8 +233,79 @@ pub async fn discover_host(
     }
     DiscoveryResult {
         up: false,
-        method: "no-response".into(),
+        method: METHOD_NO_RESPONSE.into(),
         packets_spent: spent,
+    }
+}
+
+/// AC-6.20. ICMP first when there is a privileged daemon to do it, TCP when
+/// there is not and when ICMP was **inconclusive**.
+///
+/// # Which answers end it, and which fall through
+///
+/// | ICMP said | what happens | `method` |
+/// |---|---|---|
+/// | [`HostState::Up`] | done -- the host answered | [`METHOD_ICMP_UP`] |
+/// | [`HostState::Down`] | done -- somebody refused for it | [`METHOD_ICMP_DOWN`] |
+/// | [`HostState::Unknown`] | the TCP method decides | whatever it returns |
+///
+/// Only `Unknown` is inconclusive, and that is the whole reason
+/// [`HostState`] has three values rather than two. A `Down` is a router
+/// saying there is nothing at that address; spending the TCP probe list on it
+/// would be paying three more packets to learn what has already been said.
+/// Silence is the opposite: dropping echo requests is the single most common
+/// firewall policy there is, so `Unknown` about a host says almost nothing
+/// about the host and everything about the network in front of it.
+///
+/// # The ICMP probe is not free, and is not exempt from the limiter
+///
+/// It costs one packet, it goes through `limiter.acquire` like every other
+/// probe this module issues (see [`discover_host`]), and it is counted in
+/// [`DiscoveryResult::packets_spent`] whether or not it decided anything --
+/// so a caller can tell a cheap discovery from one that pinged, waited out
+/// the deadline and then probed three ports.
+///
+/// # Why this returns a `Result` when [`discover_host`] does not
+///
+/// A [`PacketdError`] here is not "ICMP did not answer". It is one of the two
+/// situations M6 Task 4 made terminal: the daemon **refused** the target,
+/// meaning its own independent scope check (AC-6.9, AC-6.10) disagrees with
+/// the engine's about an authorization boundary, or the daemon is **gone**
+/// (AC-6.16). Falling back to TCP on either would be this engine emitting
+/// connect probes at an address a privileged process just declined to touch,
+/// or silently changing method mid-scan -- the exact two defects
+/// `PacketdError::terminal_reason` exists to keep separate from a fallback.
+/// The plan's own sketch for this function returns a bare `DiscoveryResult`
+/// and therefore cannot express either; see M6 Task 5's report.
+pub async fn discover_host_combined(
+    target: IpAddr,
+    config: &DiscoveryConfig,
+    limiter: &RateLimiter,
+    packetd: Option<&PacketdClient>,
+) -> Result<DiscoveryResult, PacketdError> {
+    let Some(client) = packetd else {
+        return Ok(discover_host(target, config, limiter).await);
+    };
+    limiter.acquire(1).await;
+    match client.icmp_probe(target).await? {
+        HostState::Up => Ok(DiscoveryResult {
+            up: true,
+            method: METHOD_ICMP_UP.into(),
+            packets_spent: 1,
+        }),
+        HostState::Down => Ok(DiscoveryResult {
+            up: false,
+            method: METHOD_ICMP_DOWN.into(),
+            packets_spent: 1,
+        }),
+        HostState::Unknown => {
+            let mut tcp = discover_host(target, config, limiter).await;
+            // The echo request was still sent and still cost a packet. A
+            // count that dropped it would report an ICMP-filtering host as
+            // costing the same as one that was never pinged.
+            tcp.packets_spent = tcp.packets_spent.saturating_add(1);
+            Ok(tcp)
+        }
     }
 }
 
@@ -405,6 +503,218 @@ mod tests {
     // refill at 1 pps. If `discover_host` skipped `limiter.acquire` for any
     // probe, total elapsed time would be a small fraction of this -- just
     // the three ~100ms probe timeouts, no rate-limiter wait at all.
+    // --- M6 AC-6.20: combined discovery -----------------------------------
+    //
+    // The daemon is scripted here rather than real, and deliberately: the
+    // subject is the ENGINE's fallback decision, and a real `packetd` cannot
+    // be asked to answer `down` on demand -- that answer depends on a router
+    // on the path. The half these cannot check (that the daemon's three wire
+    // strings are the three this side parses) is checked by execution in
+    // `crates/bathy-engine/tests/packetd_integration.rs`, which runs the real
+    // binary. Each test below is built so that the TCP path, if it ran, would
+    // give a DIFFERENT answer -- that is what makes "did not fall back"
+    // observable rather than assumed.
+
+    #[cfg(unix)]
+    mod combined {
+        use std::net::TcpListener as StdTcpListener;
+
+        use super::*;
+        use crate::packetd::PacketdClient;
+        use crate::packetd::tests::{LAB_MANIFEST, manifest, probing_responder};
+
+        /// A daemon that answers one ICMP probe with `state`.
+        fn daemon(dir: &std::path::Path, name: &str, answer: &str) -> PacketdClient {
+            let path = probing_responder(dir, name, &[answer]);
+            PacketdClient::start(&path, &manifest(LAB_MANIFEST)).expect("the script says ready")
+        }
+
+        /// A listener whose port a TCP probe would find **open**, held for
+        /// the life of the test. It is the falsifier for every "no fallback"
+        /// assertion below: if the TCP method ran, `up` and `method` change.
+        fn open_port() -> (StdTcpListener, DiscoveryConfig) {
+            let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let config = DiscoveryConfig::new(vec![port], Duration::from_secs(2)).unwrap();
+            (listener, config)
+        }
+
+        #[tokio::test]
+        async fn an_echo_reply_answers_discovery_without_a_tcp_probe() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = daemon(
+                dir.path(),
+                "up.sh",
+                r#"{"type":"host_result","id":1,"state":"up"}"#,
+            );
+            let (_held, cfg) = open_port();
+            let r = discover_host_combined(
+                "127.0.0.1".parse().unwrap(),
+                &cfg,
+                &limiter(),
+                Some(&client),
+            )
+            .await
+            .unwrap();
+            assert!(r.up);
+            assert_eq!(r.method, METHOD_ICMP_UP);
+            assert_eq!(
+                r.packets_spent, 1,
+                "one echo request and no TCP probe: ICMP was conclusive"
+            );
+        }
+
+        /// The criterion's sharpest case. `Down` is a conclusive negative, so
+        /// discovery stops -- and the configured TCP port is one that WOULD
+        /// answer, so an implementation that fell back on anything other than
+        /// `Unknown` reports `up: true` here and fails.
+        #[tokio::test]
+        async fn an_unreachable_is_conclusive_and_does_not_fall_back_to_tcp() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = daemon(
+                dir.path(),
+                "down.sh",
+                r#"{"type":"host_result","id":1,"state":"down"}"#,
+            );
+            let (_held, cfg) = open_port();
+            let r = discover_host_combined(
+                "127.0.0.1".parse().unwrap(),
+                &cfg,
+                &limiter(),
+                Some(&client),
+            )
+            .await
+            .unwrap();
+            assert!(
+                !r.up,
+                "a destination unreachable is evidence of absence; falling back to a port \
+                 that answers turns it into the opposite finding"
+            );
+            assert_eq!(r.method, METHOD_ICMP_DOWN);
+            assert_eq!(r.packets_spent, 1);
+        }
+
+        /// And the fallback itself: `Unknown` is the one state that hands the
+        /// question to TCP, and the method recorded is TCP's, not ICMP's.
+        #[tokio::test]
+        async fn an_unknown_falls_back_to_tcp_and_reports_the_method_that_decided() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = daemon(
+                dir.path(),
+                "unknown.sh",
+                r#"{"type":"host_result","id":1,"state":"unknown"}"#,
+            );
+            let (_held, cfg) = open_port();
+            let r = discover_host_combined(
+                "127.0.0.1".parse().unwrap(),
+                &cfg,
+                &limiter(),
+                Some(&client),
+            )
+            .await
+            .unwrap();
+            assert!(r.up);
+            assert_eq!(
+                r.method, METHOD_TCP_OPEN,
+                "the method recorded is the one that DECIDED, not the one tried first"
+            );
+            assert_eq!(
+                r.packets_spent, 2,
+                "the echo request was still sent and still cost a packet"
+            );
+        }
+
+        /// A refusal is the daemon's own independent scope check disagreeing
+        /// with the engine's about an authorization boundary (M6 Task 4).
+        /// Falling back would mean this engine sending connect probes at an
+        /// address a privileged process just declined to touch -- so it is an
+        /// error, with the same terminal reason a refused port probe carries.
+        ///
+        /// The control that makes "no TCP probe was sent" observable rather
+        /// than asserted: the listener is asked, after the fact, whether
+        /// anything connected to it.
+        #[tokio::test]
+        async fn a_refused_icmp_probe_is_terminal_and_sends_no_tcp_probe() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = daemon(
+                dir.path(),
+                "refused.sh",
+                r#"{"type":"refused","id":1,"reason":"out_of_session_scope"}"#,
+            );
+            let (held, cfg) = open_port();
+            held.set_nonblocking(true).unwrap();
+            let e = discover_host_combined(
+                "127.0.0.1".parse().unwrap(),
+                &cfg,
+                &limiter(),
+                Some(&client),
+            )
+            .await
+            .expect_err("a refusal is not a discovery result");
+            assert_eq!(e.terminal_reason(), Some("packetd_refused"), "{e}");
+            assert!(
+                held.accept().is_err(),
+                "nothing may have connected: the daemon refused this address, and probing \
+                 it by another method is the disagreement being papered over"
+            );
+        }
+
+        /// A daemon that has stopped answering is terminal too, for AC-6.16's
+        /// reason: quietly finishing by another method produces one result
+        /// set assembled two ways.
+        #[tokio::test]
+        async fn a_daemon_that_stops_answering_is_terminal_rather_than_a_fallback() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = daemon(
+                dir.path(),
+                "gone.sh",
+                r#"{"type":"host_result","id":1,"state":"unknown"}"#,
+            );
+            let (_held, cfg) = open_port();
+            let target: IpAddr = "127.0.0.1".parse().unwrap();
+            // The control: while it answers, it answers.
+            discover_host_combined(target, &cfg, &limiter(), Some(&client))
+                .await
+                .expect("the first probe is answered");
+            // The script has no second answer, so the next read is the end.
+            client.kill();
+            let e = discover_host_combined(target, &cfg, &limiter(), Some(&client))
+                .await
+                .expect_err("a dead daemon cannot report a host state");
+            assert_eq!(e.terminal_reason(), Some("packetd_unavailable"), "{e}");
+        }
+    }
+
+    /// Without a daemon there is nothing to try first, and combined discovery
+    /// is exactly the TCP method -- same answer, same packet count. This is
+    /// the control that says the ICMP path is what costs the extra packet
+    /// above, rather than the combined wrapper always adding one.
+    #[tokio::test]
+    async fn without_a_daemon_combined_discovery_is_the_tcp_method_alone() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let cfg = DiscoveryConfig::new(vec![port], Duration::from_secs(2)).unwrap();
+        let target: IpAddr = "127.0.0.1".parse().unwrap();
+        let combined = discover_host_combined(target, &cfg, &limiter(), None)
+            .await
+            .unwrap();
+        let plain = discover_host(target, &cfg, &limiter()).await;
+        assert_eq!(combined, plain);
+        assert_eq!(combined.method, METHOD_TCP_OPEN);
+        assert_eq!(combined.packets_spent, 1);
+    }
+
+    /// The five method strings are a wire contract other components branch
+    /// on. Spelled out rather than derived, so a rename is a failing test.
+    #[test]
+    fn the_method_strings_are_the_contract_they_are_documented_as() {
+        assert_eq!(METHOD_TCP_OPEN, "tcp-connect-open");
+        assert_eq!(METHOD_TCP_REFUSED, "tcp-connect-refused");
+        assert_eq!(METHOD_NO_RESPONSE, "no-response");
+        assert_eq!(METHOD_ICMP_UP, "icmp-echo-reply");
+        assert_eq!(METHOD_ICMP_DOWN, "icmp-unreachable");
+    }
+
     #[tokio::test]
     async fn every_probe_passes_through_the_rate_limiter() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

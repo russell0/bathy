@@ -37,15 +37,18 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bathy_engine::packetd::PacketdConfig;
-use bathy_engine::{GroupCommitConfig, GroupCommitLog, Scheduler, SchedulerConfig};
+use bathy_engine::packetd::{PacketdClient, PacketdConfig};
+use bathy_engine::{
+    DiscoveryConfig, GroupCommitConfig, GroupCommitLog, METHOD_ICMP_UP, METHOD_TCP_OPEN,
+    RateLimiter, Scheduler, SchedulerConfig, discover_host_combined,
+};
 use bathy_evidence::EvidenceStore;
 use bathy_plan::ScanPlan;
 use bathy_probe::ProbeRegistry;
 use bathy_scope::{BudgetLedger, ScopeManifest};
 use bathy_store::{StartRequest, TaskStore};
 use bathy_types::clock::{Clock, FixedClock};
-use bathy_types::event::{EventBody, ScanMode};
+use bathy_types::event::{EventBody, PortState, ScanMode};
 use bathy_types::ids::ScopeId;
 use bathy_types::nonempty::NonEmpty;
 use bathy_types::request::{
@@ -174,11 +177,198 @@ impl Harness {
     }
 
     fn port_state_count(&self) -> usize {
-        self.events()
-            .iter()
-            .filter(|e| matches!(e.body, EventBody::PortStateObserved { .. }))
-            .count()
+        self.port_states().len()
     }
+
+    /// Every `port.state` the scan recorded, in order.
+    fn port_states(&self) -> Vec<PortState> {
+        self.events()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::PortStateObserved { state, .. } => Some(state),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// A daemon that accepts the `Init`, answers each subsequent line with the
+/// next entry of `answers`, and then reads its input to end.
+///
+/// Scripted rather than real, and only where the real daemon *cannot*
+/// produce the line: `PortState::Indeterminate` is what `packetd` reports
+/// when its own `sendto` fails, which cannot be arranged from outside the
+/// process. The subject of the test that uses it is the **engine**.
+fn scripted_daemon(dir: &std::path::Path, name: &str, answers: &[&str]) -> PathBuf {
+    let path = dir.join(name);
+    let mut script = String::from(
+        "#!/bin/sh\n[ \"$1\" = \"--warmup\" ] && exit 0\nread init\n\
+         echo '{\"type\":\"ready\",\"dropped_capabilities\":true}'\n",
+    );
+    for answer in answers {
+        script.push_str(&format!("read probe\necho '{answer}'\n"));
+    }
+    script.push_str("cat >/dev/null\n");
+    let mut file = std::fs::File::create(&path).expect("the script is writable");
+    file.write_all(script.as_bytes())
+        .expect("the script writes");
+    drop(file);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+        .expect("the script is executable");
+    // The same ETXTBSY race `pid_announcing_shim` documents.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(&path).arg("--warmup").status() {
+            Ok(status) if status.success() => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "{} never became executable: {other:?}",
+                path.display()
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    path
+}
+
+/// `PortState::Indeterminate` became reachable in M6 Task 4 -- `packetd`
+/// reports it for a local send failure, and the connect path cannot produce
+/// it -- and nothing tested that it survived the trip into the log.
+///
+/// It matters because the three obvious wrong things are all silent: dropping
+/// the endpoint, recording it as `filtered` (a claim about the network that
+/// nothing observed), or failing the scan. The narrowing control is the
+/// second daemon, identical but for the one word, whose `closed` must come
+/// through as `closed` -- without it a `record` that wrote `indeterminate`
+/// for everything would pass.
+#[tokio::test]
+async fn an_indeterminate_from_packetd_is_recorded_as_indeterminate() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let ports: Vec<u16> = vec![listener.local_addr().expect("an address").port()];
+
+    for (name, line, expected) in [
+        (
+            "indeterminate.sh",
+            r#"{"type":"result","id":1,"state":"indeterminate"}"#,
+            PortState::Indeterminate,
+        ),
+        (
+            "closed.sh",
+            r#"{"type":"result","id":1,"state":"closed"}"#,
+            PortState::Closed,
+        ),
+    ] {
+        let daemon = scripted_daemon(dir.path(), name, &[line]);
+        let h = harness(
+            "127.0.0.1".parse().expect("loopback parses"),
+            &ports,
+            manifest(r#""127.0.0.0/8""#, "", 1000),
+            PacketdConfig::syn_via(daemon),
+            1000,
+        );
+        let summary = h
+            .scheduler
+            .run(&h.plan, 0, CancellationToken::new())
+            .await
+            .expect("the run returns");
+        assert_eq!(summary.scan_mode, Some(ScanMode::TcpSyn), "{name}");
+        assert_eq!(h.terminal_reason(), None, "{name}: nothing failed");
+        assert_eq!(
+            h.port_states(),
+            vec![expected],
+            "{name}: the state the daemon reported is the state the log carries"
+        );
+    }
+    assert!(listener.local_addr().is_ok(), "still bound");
+}
+
+/// AC-6.18 and AC-6.20 against the **real daemon**, both ways.
+///
+/// **Privileged**: the daemon holds `CAP_NET_RAW`, this host answers its own
+/// echo request, and combined discovery reports `icmp-echo-reply` for one
+/// packet -- no TCP probe at all. Then the same client is asked about
+/// loopback, which the engine's manifest permits and `packetd`'s own
+/// independent check refuses (AC-6.10): the refusal is terminal, which is
+/// AC-6.19 observed end to end rather than asserted in a unit test. The two
+/// probes go through the same daemon, the same session and the same ceiling.
+///
+/// **Unprivileged**: the daemon exits 69, there is no client to hand to
+/// discovery, and combined discovery is the TCP method alone -- which is the
+/// fallback the criterion asks for, produced by a machine that genuinely
+/// lacks the capability rather than by an injected error.
+#[tokio::test]
+async fn combined_discovery_prefers_icmp_and_records_the_deciding_method() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let tcp_port = listener.local_addr().expect("an address").port();
+    let cfg = DiscoveryConfig::new(vec![tcp_port], Duration::from_millis(500))
+        .expect("one probe port is a valid config");
+    let limiter = RateLimiter::new(1_000);
+
+    if !this_process_holds_cap_net_raw() {
+        let reason = "this process cannot open a raw socket, so packetd cannot hold a session";
+        assert!(
+            std::env::var_os(DEMAND).is_none(),
+            "{DEMAND} is set, so this is a failure and not a skip: {reason}"
+        );
+        // The daemon really is spawned and really does fail, so the fallback
+        // below is the one an operator without the capability would get.
+        let e = PacketdClient::start(&packetd_bin(), &manifest(r#""127.0.0.0/8""#, "", 1000))
+            .expect_err("a daemon with no CAP_NET_RAW cannot start a session");
+        assert!(
+            e.terminal_reason().is_none(),
+            "a failure to start falls back: {e}"
+        );
+        let r =
+            discover_host_combined("127.0.0.1".parse().expect("loopback"), &cfg, &limiter, None)
+                .await
+                .expect("with no daemon there is nothing that can be terminal");
+        assert!(r.up);
+        assert_eq!(r.method, METHOD_TCP_OPEN);
+        assert_eq!(r.packets_spent, 1, "no echo request was sent or charged");
+        let mut err = std::io::stderr().lock();
+        let _ = err.write_all(format!("\nSKIPPED (no CAP_NET_RAW): {reason}\n\n").as_bytes());
+        let _ = err.flush();
+        return;
+    }
+
+    let Some(local) = primary_ipv4() else {
+        panic!(
+            "no non-loopback IPv4 address on this host. packetd refuses loopback (AC-6.10), \
+             so there is nowhere to send an echo request that this host will also receive."
+        );
+    };
+    // Loopback is in the manifest and *not* in `packetd`'s idea of a legal
+    // target, which is what makes the second half of this test possible.
+    let scope = manifest(&format!(r#""{local}/32","127.0.0.0/8""#), "", 1000);
+    let client = PacketdClient::start(&packetd_bin(), &scope).expect("the real daemon starts");
+
+    let r = discover_host_combined(IpAddr::V4(local), &cfg, &limiter, Some(&client))
+        .await
+        .expect("this host is in scope for the daemon");
+    assert!(
+        r.up,
+        "this host did not answer its own echo request; combined discovery reported {}",
+        r.method
+    );
+    assert_eq!(
+        r.method, METHOD_ICMP_UP,
+        "ICMP answered, so ICMP is the deciding method and no TCP probe was needed"
+    );
+    assert_eq!(r.packets_spent, 1);
+
+    // AC-6.19, end to end: the same session, the same daemon, an address its
+    // own scope check refuses however the engine's manifest reads.
+    let e = discover_host_combined(
+        "127.0.0.1".parse().expect("loopback"),
+        &cfg,
+        &limiter,
+        Some(&client),
+    )
+    .await
+    .expect_err("packetd refuses loopback under AC-6.10 whatever the manifest says");
+    assert_eq!(e.terminal_reason(), Some("packetd_refused"), "{e}");
+    assert!(listener.local_addr().is_ok(), "still bound");
 }
 
 fn harness(

@@ -24,10 +24,13 @@
 //! for why `Filtered`/`Unreachable` are never promoted into evidence about
 //! the target -- and (M3 whole-branch review, IMPORTANT-4) for why this
 //! component ships in v0.1 as a correct, independently tested library
-//! building block with no caller in [`scheduler::Scheduler`] yet: M6
-//! (`bathy-packetd`) is the plan's actual integration point for
-//! `host.discovered`, via `discover_host_combined`, which tries privileged
-//! ICMP first and falls back to exactly this module's TCP method.
+//! building block with no caller in [`scheduler::Scheduler`] yet. M6 Task 5
+//! added [`discovery::discover_host_combined`], which tries privileged ICMP
+//! first (via `bathy-packetd`) and falls back to exactly this module's TCP
+//! method on an inconclusive result, reporting whichever one decided --
+//! but nothing in production constructs `EventBody::HostDiscovered` even
+//! now, because `bathy_plan::ScanPlan` carries no objective for the
+//! scheduler to branch on. See the `discovery` module doc.
 //!
 //! The fourth component is [`durable_log::GroupCommitLog`]: the M2-decided
 //! group-commit batching that makes it safe for the fifth component to
@@ -72,8 +75,11 @@ pub mod scheduler;
 pub mod test_support;
 
 pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
-pub use discovery::{DiscoveryConfig, DiscoveryConfigError, DiscoveryResult, discover_host};
+pub use discovery::{
+    DiscoveryConfig, DiscoveryConfigError, DiscoveryResult, METHOD_ICMP_DOWN, METHOD_ICMP_UP,
+    METHOD_NO_RESPONSE, METHOD_TCP_OPEN, METHOD_TCP_REFUSED, discover_host, discover_host_combined,
+};
 pub use durable_log::{GroupCommitConfig, GroupCommitLog};
-pub use packetd::{PacketdClient, PacketdConfig, PacketdError, init_request};
+pub use packetd::{HostState, PacketdClient, PacketdConfig, PacketdError, init_request};
 pub use rate::RateLimiter;
 pub use scheduler::{EngineError, RunSummary, Scheduler, SchedulerConfig};

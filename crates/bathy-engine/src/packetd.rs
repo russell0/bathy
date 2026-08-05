@@ -117,7 +117,27 @@ pub enum Request {
         target: IpAddr,
         port: u16,
     },
+    /// M6 Task 5: one ICMP echo host-discovery probe. No port -- see
+    /// `bathy_packetd::protocol::Request::IcmpProbe`.
+    IcmpProbe {
+        id: u64,
+        target: IpAddr,
+    },
     Shutdown,
+}
+
+/// What one ICMP echo probe established. Mirrors
+/// `bathy_packetd::protocol::HostState`.
+///
+/// `Unknown` is an answer, not a failure: it is what
+/// [`crate::discovery::discover_host_combined`] falls back to TCP on, and
+/// folding it into `Down` would delete the fallback along with the finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostState {
+    Up,
+    Down,
+    Unknown,
 }
 
 /// A line the engine reads. Mirrors `bathy_packetd::protocol::Response`.
@@ -131,8 +151,23 @@ pub enum Request {
 pub enum Response {
     Ready { dropped_capabilities: bool },
     Result { id: u64, state: PortState },
+    HostResult { id: u64, state: HostState },
     Refused { id: u64, reason: String },
     Fatal { detail: String },
+}
+
+/// What the daemon answered, before the caller has said which kind it asked
+/// for.
+///
+/// The two probe kinds share one worker, one pipe and one id sequence, so
+/// they share one reply channel. Keeping the kinds distinct in the answer --
+/// rather than, say, mapping a `HostResult` onto a `PortState` -- is what
+/// lets [`PacketdClient::probe`] treat a host answer to a port question as a
+/// protocol desynchronisation rather than as a state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Answer {
+    Port(PortState),
+    Host(HostState),
 }
 
 impl Request {
@@ -225,7 +260,7 @@ impl PacketdError {
 struct Job {
     request: Request,
     endpoint: String,
-    reply: tokio::sync::oneshot::Sender<Result<PortState, PacketdError>>,
+    reply: tokio::sync::oneshot::Sender<Result<Answer, PacketdError>>,
 }
 
 /// A running `packetd`, initialized and answering.
@@ -360,10 +395,46 @@ impl PacketdClient {
     /// line in, one line out, and the daemon's own rate limiter paces it.
     pub async fn probe(&self, target: IpAddr, port: u16) -> Result<PortState, PacketdError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let endpoint = format!("{target}:{port}");
+        match self
+            .exchange(Request::Probe { id, target, port }, endpoint)
+            .await?
+        {
+            Answer::Port(state) => Ok(state),
+            Answer::Host(state) => Err(PacketdError::Gone(format!(
+                "packetd answered a port probe with the host state {state:?}; the two sides \
+                 disagree about the protocol"
+            ))),
+        }
+    }
+
+    /// One ICMP echo host-discovery probe (M6 AC-6.18).
+    ///
+    /// The daemon charges it to the same session ceiling as a SYN probe and
+    /// checks it against the same session scope (AC-6.19), so a refusal here
+    /// carries exactly the meaning it does for a port probe: the engine asked
+    /// a privileged process to touch something that process's own independent
+    /// check rejected.
+    pub async fn icmp_probe(&self, target: IpAddr) -> Result<HostState, PacketdError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        match self
+            .exchange(Request::IcmpProbe { id, target }, target.to_string())
+            .await?
+        {
+            Answer::Host(state) => Ok(state),
+            Answer::Port(state) => Err(PacketdError::Gone(format!(
+                "packetd answered a host probe with the port state {state:?}; the two sides \
+                 disagree about the protocol"
+            ))),
+        }
+    }
+
+    /// Hand one request to the worker and wait for its answer.
+    async fn exchange(&self, request: Request, endpoint: String) -> Result<Answer, PacketdError> {
         let (reply, answer) = tokio::sync::oneshot::channel();
         let job = Job {
-            request: Request::Probe { id, target, port },
-            endpoint: format!("{target}:{port}"),
+            request,
+            endpoint,
             reply,
         };
         match self.jobs.as_ref() {
@@ -473,22 +544,28 @@ fn exchange(
     stdin: &mut ChildStdin,
     reader: &mut BufReader<ChildStdout>,
     job: &Job,
-) -> Result<PortState, PacketdError> {
+) -> Result<Answer, PacketdError> {
     let line = job.request.to_line()?;
     stdin
         .write_all(line.as_bytes())
         .and_then(|()| stdin.flush())
         .map_err(|e| PacketdError::Gone(format!("writing a probe: {e}")))?;
     let id = match job.request {
-        Request::Probe { id, .. } => id,
+        Request::Probe { id, .. } | Request::IcmpProbe { id, .. } => id,
         _ => 0,
     };
     match read_response(reader) {
         Ok(Some(Response::Result {
             id: answered,
             state,
-        })) if answered == id => Ok(state),
-        Ok(Some(Response::Result { id: answered, .. })) => Err(PacketdError::Gone(format!(
+        })) if answered == id => Ok(Answer::Port(state)),
+        Ok(Some(Response::HostResult {
+            id: answered,
+            state,
+        })) if answered == id => Ok(Answer::Host(state)),
+        Ok(Some(
+            Response::Result { id: answered, .. } | Response::HostResult { id: answered, .. },
+        )) => Err(PacketdError::Gone(format!(
             "packetd answered probe {answered} while probe {id} was outstanding; the line \
              protocol is one request and one response, so a mismatched id means the two \
              sides have lost sync"
@@ -574,10 +651,10 @@ fn finish_and_describe(child: &Arc<Mutex<Child>>, stderr: &Arc<Mutex<String>>) -
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    const LAB_MANIFEST: &str = r#"{
+    pub(crate) const LAB_MANIFEST: &str = r#"{
         "id": "scope_01K2HZ8V5N3QR7BXMC4TDWF9GJ",
         "description": "test",
         "not_after": "2099-01-01T00:00:00.000Z",
@@ -607,7 +684,7 @@ mod tests {
         }
     }"#;
 
-    fn manifest(json: &str) -> ScopeManifest {
+    pub(crate) fn manifest(json: &str) -> ScopeManifest {
         ScopeManifest::load(json).unwrap()
     }
 
@@ -787,7 +864,7 @@ mod tests {
     /// The first line of every script generated by these tests: it makes the
     /// script safe to `exec` as a liveness probe.
     #[cfg(unix)]
-    const WARMUP: &str = r#"[ "$1" = "--warmup" ] && exit 0"#;
+    pub(crate) const WARMUP: &str = r#"[ "$1" = "--warmup" ] && exit 0"#;
 
     /// Execute `path` until the kernel stops answering `ETXTBSY`.
     ///
@@ -799,7 +876,7 @@ mod tests {
     /// with an unrelated one. Bounded, and it fails loudly rather than
     /// looping.
     #[cfg(unix)]
-    fn wait_until_executable(path: &Path) {
+    pub(crate) fn wait_until_executable(path: &Path) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match Command::new(path).arg("--warmup").status() {
@@ -815,7 +892,7 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn responder(dir: &std::path::Path, answer: &str) -> PathBuf {
+    pub(crate) fn responder(dir: &std::path::Path, answer: &str) -> PathBuf {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         let path = dir.join("responder.sh");
@@ -829,6 +906,122 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         wait_until_executable(&path);
         path
+    }
+
+    /// A daemon that accepts the `Init`, then answers each subsequent line
+    /// with the next entry of `answers`, then reads its input to end.
+    ///
+    /// Distinct from [`responder`] above, which answers the *init* itself:
+    /// this one is for tests about what happens after a session is running.
+    /// `name` is a parameter because two of these can live in one temporary
+    /// directory and a shared filename would make them race.
+    #[cfg(unix)]
+    pub(crate) fn probing_responder(
+        dir: &std::path::Path,
+        name: &str,
+        answers: &[&str],
+    ) -> PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join(name);
+        let mut script = format!(
+            "#!/bin/sh\n{WARMUP}\nread init\n\
+             echo '{{\"type\":\"ready\",\"dropped_capabilities\":true}}'\n"
+        );
+        for answer in answers {
+            script.push_str(&format!("read probe\necho '{answer}'\n"));
+        }
+        script.push_str("cat >/dev/null\n");
+        let mut file = std::fs::File::create(&path).unwrap();
+        file.write_all(script.as_bytes()).unwrap();
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        wait_until_executable(&path);
+        path
+    }
+
+    /// The `icmp_probe` line as `packetd`'s `deny_unknown_fields`
+    /// deserializer will see it, and the `host_result` line it writes back.
+    /// This is the half of the M6 Task 5 protocol agreement that can be
+    /// checked without a daemon; the other half is checked by running one.
+    #[test]
+    fn the_icmp_probe_line_and_its_answer_are_the_json_packetd_speaks() {
+        let line = Request::IcmpProbe {
+            id: 4,
+            target: "10.30.0.10".parse().unwrap(),
+        }
+        .to_line()
+        .unwrap();
+        assert_eq!(
+            line,
+            "{\"type\":\"icmp_probe\",\"id\":4,\"target\":\"10.30.0.10\"}\n"
+        );
+        for (json, expected) in [
+            (
+                r#"{"type":"host_result","id":9,"state":"up"}"#,
+                HostState::Up,
+            ),
+            (
+                r#"{"type":"host_result","id":9,"state":"down"}"#,
+                HostState::Down,
+            ),
+            (
+                r#"{"type":"host_result","id":9,"state":"unknown"}"#,
+                HostState::Unknown,
+            ),
+        ] {
+            assert_eq!(
+                serde_json::from_str::<Response>(json).unwrap(),
+                Response::HostResult {
+                    id: 9,
+                    state: expected
+                }
+            );
+        }
+    }
+
+    /// The two probe kinds share one pipe and one id sequence, so an answer
+    /// of the wrong *kind* is the two sides having lost sync -- not a state.
+    /// Reading a `host_result` as a port state (or the reverse) would let a
+    /// desynchronised daemon write a finding into the log.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_answer_of_the_wrong_kind_is_a_desynchronisation_rather_than_a_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let target: IpAddr = "10.30.0.10".parse().unwrap();
+
+        let muddled = probing_responder(
+            dir.path(),
+            "host-for-port.sh",
+            &[r#"{"type":"host_result","id":1,"state":"up"}"#],
+        );
+        let client = PacketdClient::start(&muddled, &manifest(LAB_MANIFEST)).unwrap();
+        let e = client
+            .probe(target, 80)
+            .await
+            .expect_err("a host state is not a port state");
+        assert_eq!(e.terminal_reason(), Some("packetd_unavailable"), "{e}");
+
+        let reversed = probing_responder(
+            dir.path(),
+            "port-for-host.sh",
+            &[r#"{"type":"result","id":1,"state":"open"}"#],
+        );
+        let client = PacketdClient::start(&reversed, &manifest(LAB_MANIFEST)).unwrap();
+        let e = client
+            .icmp_probe(target)
+            .await
+            .expect_err("a port state is not a host state");
+        assert_eq!(e.terminal_reason(), Some("packetd_unavailable"), "{e}");
+
+        // The control: each kind answered with its own kind is accepted.
+        let matched = probing_responder(
+            dir.path(),
+            "matched.sh",
+            &[r#"{"type":"host_result","id":1,"state":"down"}"#],
+        );
+        let client = PacketdClient::start(&matched, &manifest(LAB_MANIFEST)).unwrap();
+        assert_eq!(client.icmp_probe(target).await.unwrap(), HostState::Down);
     }
 
     /// A daemon that says it still holds capabilities is refused.
