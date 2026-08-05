@@ -334,6 +334,64 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: lab/run.sh test
 
+  # M6 AC-6.5, AC-6.6 and AC-6.16 -- the assertions that need a process
+  # holding CAP_NET_RAW.
+  #
+  # `cargo run -p xtask -- packetd-privileged` was M6 Task 2's command and had
+  # no CI job for two tasks. That is the defect class this project has hit
+  # hardest: a check nobody runs goes red and stays red -- CI here was broken
+  # for five days for exactly that reason, and five inline gates had no local
+  # form at all. This job is the second half.
+  #
+  # WHY IT RUNS ON EVERY PUSH, unlike `syn-cross-validation` below. It needs
+  # one image (`rust:1-bookworm`, which this workspace already pulls) and no
+  # lab, so it costs a container start and a build. There is no reason to
+  # defer it.
+  #
+  # WHY IT CANNOT PASS VACUOUSLY. The container sets
+  # BATHY_PACKETD_PRIVILEGED_TESTS=1, which turns every "no capability,
+  # skipping" inside `crates/bathy-packetd/tests/privilege.rs` and
+  # `crates/bathy-engine/tests/packetd_integration.rs` into a failure. A
+  # `--cap-add` that stopped working shows up red rather than green.
+  # `xtask check-packetd` asserts that this step is in THIS job, by name: a
+  # step asserted to exist somewhere in the file has already slipped past this
+  # project's checks once.
+  packetd-privileged:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run -p xtask -- packetd-privileged
+
+  # M6 AC-6.14 -- SYN, connect and the kernel's own bind table, compared on
+  # every endpoint of the lab.
+  #
+  # WHY IT IS NOT PART OF `packetd-privileged`. It needs the lab, and the lab
+  # is eight digest-pinned images and about 2.8 GiB behind Docker Hub's
+  # anonymous pull-rate limit -- the same cost that makes `lab-conformance`
+  # scheduled rather than per-push, and the same reasoning applies unchanged.
+  # Splitting them keeps the privileged unit suite on every push instead of
+  # dragging it down to daily.
+  #
+  # WHY THE CONTAINER JOINS THE LAB'S NETWORK. `10.30.0.0/24` is reachable
+  # from nowhere else, and `docker run --network bathy-lab_labnet` fails
+  # outright if the lab is not up -- which is the correct failure. `lab/run.sh
+  # up` above is what makes it exist.
+  #
+  # WHY IT CANNOT PASS VACUOUSLY. The test is `#[ignore]`d, and the container
+  # sets BATHY_LAB_REQUIRED=1, which turns both of its preconditions (the
+  # capability, and the lab answering) from a skip into a failure. `xtask
+  # check-packetd` asserts that this job runs both steps and that the runner
+  # still sets that variable.
+  syn-cross-validation:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: lab/run.sh up
+      - run: cargo run -p xtask -- syn-cross-validation
+
   # The MSRV is a promise to downstream consumers, so it gets its own job.
   # Without this, MSRV rots silently the first time someone uses a newer API.
   #

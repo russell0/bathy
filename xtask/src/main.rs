@@ -119,6 +119,11 @@ const SUBCOMMANDS: &[&str] = &[
     // `linux-gate` is deliberately non-root, so without this command those
     // tests exist and never run. See `visibility::packetd_privileged`.
     "packetd-privileged",
+    // M6 Task 4. AC-6.14 needs the same container joined to the lab's own
+    // network, because `10.30.0.0/24` is reachable from nowhere else. Kept
+    // separate from `packetd-privileged` so the privileged unit suite still
+    // runs on every push, on a machine with no lab up.
+    "syn-cross-validation",
     "publish-check",
     // Whether this workspace COULD be released, decided offline: the publish
     // order derived from the real dependency graph, the manifest fields
@@ -206,6 +211,9 @@ fn run(command: Option<&str>, args: &[String]) -> Result<(), Box<dyn std::error:
         Some("linux-gate") => visibility::linux_gate(args.iter().any(|a| a == "--fresh")),
         Some("packetd-privileged") => {
             visibility::packetd_privileged(args.iter().any(|a| a == "--fresh"))
+        }
+        Some("syn-cross-validation") => {
+            visibility::syn_cross_validation(args.iter().any(|a| a == "--fresh"))
         }
         // The gate that runs immediately before the repository is made
         // public. `--no-tests` skips only `cargo test --workspace` and makes

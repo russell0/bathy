@@ -419,9 +419,33 @@ pub const PACKETD_PRIVILEGED_DIRS: &[&str] =
 /// to turn a skipped precondition into a failure.
 pub const PACKETD_DEMAND_ENV: &str = "BATHY_PACKETD_PRIVILEGED_TESTS";
 
-/// What runs inside the container. One command, so the failure a contributor
-/// sees is the failure CI would see.
-pub const PACKETD_PRIVILEGED_SCRIPT: &str = "cargo test -p bathy-packetd";
+/// What runs inside the container, so the failure a contributor sees is the
+/// failure CI would see.
+///
+/// Two commands since M6 Task 4. The second is the half of AC-6.16 that
+/// cannot run anywhere else: `packetd_dying_mid_scan_fails_the_scan_rather_
+/// than_silently_degrading` needs a *working* SYN session to lose, which
+/// needs the capability, and it skips (loudly) without one. The engine's own
+/// suite is not run wholesale here -- only the target that needs privilege.
+pub const PACKETD_PRIVILEGED_SCRIPT: &str =
+    "cargo test -p bathy-packetd\ncargo test -p bathy-engine --test packetd_integration";
+
+/// The Docker network `lab/docker-compose.yml` creates (`name: bathy-lab`
+/// plus the `labnet` network). AC-6.14's cross-validation has to be *on* it:
+/// `10.30.0.0/24` is reachable from nowhere else, and on macOS the host
+/// cannot route to it at all.
+pub const LAB_NETWORK: &str = "bathy-lab_labnet";
+
+/// What the cross-validation container runs.
+///
+/// `BATHY_LAB_REQUIRED=1` is the whole reason this is a separate command
+/// from [`PACKETD_PRIVILEGED_SCRIPT`]: the test is `#[ignore]`d, so `cargo
+/// test --workspace` lists it rather than running it, and every precondition
+/// inside it (the capability, the lab's reachability) turns into a failure
+/// rather than a skip when this variable is set. A cross-validation job that
+/// silently skipped would be AC-6.14 closed by a test nothing executes.
+pub const SYN_CROSS_VALIDATION_SCRIPT: &str = "cargo build -p bathy-packetd\n\
+     BATHY_LAB_REQUIRED=1 cargo test -p bathy-engine --test syn_vs_connect -- --ignored";
 
 /// The `docker run` argument vector, as pure data so a test can read it.
 ///
@@ -438,14 +462,32 @@ pub const PACKETD_PRIVILEGED_SCRIPT: &str = "cargo test -p bathy-packetd";
 ///   daemon sets `PR_SET_NO_NEW_PRIVS` itself and a container that had
 ///   already set it would make that call unobservable — the `NoNewPrivs: 1`
 ///   in `/proc/self/status` would be true before `packetd` ran.
-pub fn packetd_privileged_argv(image: &str, repo_root: &str, script: &str) -> Vec<String> {
-    vec![
+/// - `network`, when given, joins the container to a Docker network. M6 Task
+///   3's report flagged its absence: the lab run that produced that task's
+///   evidence was done by hand, in a container joined to `bathy-lab_labnet`,
+///   because this builder could not ask for one. AC-6.14 needs exactly that
+///   container, so it is a parameter now rather than a manual step -- and it
+///   is `Option`, because the privileged unit suite must keep running on a
+///   machine with no lab up at all.
+pub fn packetd_privileged_argv(
+    image: &str,
+    repo_root: &str,
+    script: &str,
+    network: Option<&str>,
+) -> Vec<String> {
+    let mut argv: Vec<String> = vec![
         "run".into(),
         "--rm".into(),
         "--cap-add".into(),
         "NET_RAW".into(),
         "--user".into(),
         "0:0".into(),
+    ];
+    if let Some(network) = network {
+        argv.push("--network".into());
+        argv.push(network.into());
+    }
+    argv.extend::<Vec<String>>(vec![
         "--volume".into(),
         format!("{repo_root}:/w"),
         "--workdir".into(),
@@ -464,7 +506,8 @@ pub fn packetd_privileged_argv(image: &str, repo_root: &str, script: &str) -> Ve
         "pipefail".into(),
         "-c".into(),
         script.into(),
-    ]
+    ]);
+    argv
 }
 
 /// Runs `bathy-packetd`'s suite in a container that holds `CAP_NET_RAW`.
@@ -480,6 +523,38 @@ pub fn packetd_privileged_argv(image: &str, repo_root: &str, script: &str) -> Ve
 /// container those tests fail rather than skip if the capability is absent,
 /// so a `--cap-add` that stopped working shows up as red instead of green.
 pub fn packetd_privileged(fresh: bool) -> Fallible<()> {
+    privileged_container(fresh, "packetd-privileged", PACKETD_PRIVILEGED_SCRIPT, None)
+}
+
+/// AC-6.14: SYN, connect and `lab/ground-truth.json`, compared inside the
+/// lab's own network.
+///
+/// The same container as [`packetd_privileged`] plus `--network
+/// {LAB_NETWORK}`, which is the difference between a test that can reach
+/// `10.30.0.0/24` and one that cannot. It is a separate command, and a
+/// separate CI job, because the lab costs eight digest-pinned images and
+/// about 2.8 GiB -- the same reason `lab-conformance` is scheduled rather
+/// than run per push.
+///
+/// The lab must already be up: `docker run --network` fails outright when
+/// the network does not exist, which is the correct failure. A container
+/// that quietly created its own empty network would run the whole
+/// cross-validation against nothing and report success.
+pub fn syn_cross_validation(fresh: bool) -> Fallible<()> {
+    privileged_container(
+        fresh,
+        "syn-cross-validation",
+        SYN_CROSS_VALIDATION_SCRIPT,
+        Some(LAB_NETWORK),
+    )
+}
+
+fn privileged_container(
+    fresh: bool,
+    label: &str,
+    script: &str,
+    network: Option<&str>,
+) -> Fallible<()> {
     let repo_root = capture("git", &["rev-parse", "--show-toplevel"])?;
     let mut reused = Vec::new();
     for dir in PACKETD_PRIVILEGED_DIRS {
@@ -493,7 +568,7 @@ pub fn packetd_privileged(fresh: bool) -> Fallible<()> {
     }
     if !reused.is_empty() {
         eprintln!(
-            "packetd-privileged: NOT HERMETIC — reusing {}. `--fresh` clears it.",
+            "{label}: NOT HERMETIC — reusing {}. `--fresh` clears it.",
             reused
                 .iter()
                 .map(|d| format!("target/{d}"))
@@ -501,10 +576,11 @@ pub fn packetd_privileged(fresh: bool) -> Fallible<()> {
                 .join(", ")
         );
     }
-    let argv = packetd_privileged_argv(LINUX_IMAGE, &repo_root, PACKETD_PRIVILEGED_SCRIPT);
+    let argv = packetd_privileged_argv(LINUX_IMAGE, &repo_root, script, network);
     eprintln!(
-        "packetd-privileged: `{PACKETD_PRIVILEGED_SCRIPT}` in {LINUX_IMAGE} as root with \
-         CAP_NET_RAW and {PACKETD_DEMAND_ENV}=1"
+        "{label}: `{script}` in {LINUX_IMAGE} as root with CAP_NET_RAW{} and \
+         {PACKETD_DEMAND_ENV}=1",
+        network.map(|n| format!(" on {n}")).unwrap_or_default()
     );
     let status = Command::new("docker").args(&argv).status().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -518,9 +594,12 @@ pub fn packetd_privileged(fresh: bool) -> Fallible<()> {
         }
     })?;
     if !status.success() {
-        return Err("packetd-privileged failed".to_string().into());
+        return Err(format!("{label} failed").into());
     }
-    println!("packetd-privileged: ok ({LINUX_IMAGE}, CAP_NET_RAW, root)");
+    println!(
+        "{label}: ok ({LINUX_IMAGE}, CAP_NET_RAW, root{})",
+        network.map(|n| format!(", {n}")).unwrap_or_default()
+    );
     Ok(())
 }
 
@@ -533,7 +612,7 @@ mod tests {
     /// turns every privileged assertion into a skip and the run stays green.
     #[test]
     fn the_privileged_container_adds_the_capability_runs_as_root_and_demands_the_tests() {
-        let argv = packetd_privileged_argv("img", "/repo", "cargo test -p bathy-packetd");
+        let argv = packetd_privileged_argv("img", "/repo", "cargo test -p bathy-packetd", None);
         let joined = argv.join(" ");
         assert!(joined.contains("--cap-add NET_RAW"), "{joined}");
         assert!(joined.contains("--user 0:0"), "{joined}");
@@ -552,7 +631,7 @@ mod tests {
     /// root and that one does not.
     #[test]
     fn the_privileged_container_does_not_share_a_target_directory_with_linux_gate() {
-        let argv = packetd_privileged_argv("img", "/repo", "x").join(" ");
+        let argv = packetd_privileged_argv("img", "/repo", "x", None).join(" ");
         for dir in LINUX_GATE_DIRS {
             assert!(!argv.contains(&format!("/w/target/{dir}")), "{dir}: {argv}");
         }

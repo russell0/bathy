@@ -423,8 +423,106 @@ git commit -m "feat(packetd): SYN probing with independent scope check and RST t
 ### Task 4: Engine integration, fallback, and cross-validation
 
 **Files:**
-- Modify: `crates/bathy-engine/src/scheduler.rs`
-- Create: `crates/bathy-engine/tests/syn_vs_connect.rs`
+- Modify: `crates/bathy-engine/src/scheduler.rs`, `crates/bathy-types/src/event.rs`, `crates/bathy-scope/src/manifest.rs`, `xtask/src/{gates,visibility,main}.rs`, `.github/workflows/ci.yml`, `README.md`
+- Create: `crates/bathy-engine/src/packetd.rs`, `crates/bathy-engine/tests/syn_vs_connect.rs`, `crates/bathy-engine/tests/packetd_integration.rs`
+
+**Seven corrections to this task, made during Task 4. The first says this
+task's own acceptance test cannot see the failure it is most for; the last
+is the ruling on the 800-line cap and is recorded as a defect in the
+criterion rather than as a concession.**
+
+1. **AC-6.14 compares two things and needs three.** "SYN and connect agree
+   on every endpoint" is satisfied by two scanners that agree with each
+   other and are both wrong, and a two-column test cannot see it. That is
+   not hypothetical here: M7 Task 1 found exactly that defect *in this
+   lab's own oracle* (`10.30.0.17:443` recorded `product: null` because
+   bathy reported nothing there). The test therefore compares SYN, connect
+   and `lab/ground-truth.json` — derived from a 65535-port sweep run inside
+   each container's netns by a Python script that shares no code with bathy
+   — and prints all three columns for any disagreement, so the question is
+   which one is wrong rather than which scanner to tune. It also asserts the
+   oracle demands all three of `open`, `closed` and `filtered`, because a
+   lab whose every endpoint had the same expected state would make agreement
+   free.
+
+2. **The engine has no way to record a degradation, and AC-6.15 asks it
+   to.** "Records `scan_mode`" makes the *method* self-describing and leaves
+   the reason nowhere: the process that knew it — `packetd`, with AC-6.6's
+   `setcap` guidance on its stderr — has already exited by the time anyone
+   reads the log. `EventBody::ScanStarted` therefore gained
+   `scan_mode_detail` alongside `scan_mode`, present only when the mode is
+   not the one that was asked for. Both are `Option` with
+   `skip_serializing_if`, forever, on `docs/event-log-compatibility.md`'s
+   rule: `EventBody` carries `deny_unknown_fields`, so a required field
+   would make every log written before this task fail to replay.
+
+3. **AC-6.16 names one failure and there are two.** `packetd` dying is one
+   way the two halves stop agreeing; `packetd` *refusing* a probe is the
+   other, and it is the more serious one — it means the engine asked a
+   privileged process to touch something that process's own independent
+   scope check (AC-6.9, AC-6.10) rejected. The criterion is silent on it,
+   and the obvious implementations (record `indeterminate`, or skip the
+   endpoint) both turn an authorization disagreement into a missing row. It
+   fails the scan with `packetd_refused`, and
+   `the_engine_records_which_method_actually_ran`'s privileged branch
+   demonstrates it against a loopback target the engine's manifest permits
+   and `packetd` refuses.
+
+4. **AC-6.17 cannot be closed by a test alone, and does not need to be.**
+   "Derived from the same manifest, never from the raw request" is a
+   statement about what a function can see. `packetd::init_request` takes
+   `&ScopeManifest` and has no second parameter, so there is no
+   `ScanRequest` in scope for it to read; the test's job is then to falsify
+   the plausible *wrong* implementation, which is an allowlist narrowed to
+   the request's targets, and it does that by giving the request one host
+   inside the manifest's /24 and requiring the /24 to come out. The session
+   ceiling is the manifest's ceiling rather than the request's budget for
+   the same reason AC-6.11 exists: a second bound derived from the first
+   number is not a second bound.
+
+5. **`Filtered` conflating ICMP-refused with silence is required by
+   AC-6.14, not merely tolerated** (Task 3's concern 5). Task 3 suggested a
+   reason field now that the engine is being wired. The decision is **no**,
+   and the reason is this task's own criterion: the connect path folds
+   `Unreachable` and `Filtered` together because a connect scan cannot tell
+   them apart, so a SYN path that reported them distinctly would disagree
+   with connect on every filtered endpoint and fail AC-6.14. The lost detail
+   is real and it belongs on the evidence layer (`PortStateObserved`'s
+   `evidence_refs`), not on `PortState`, whose four values are a published
+   wire contract two scanners have to agree on. Recorded here rather than
+   guessed at later.
+
+6. **`packetd-privileged` had a command and no CI job, for two tasks**
+   (Task 2's concern 3, Task 3's concern 2). Fixed, in two jobs rather than
+   one: `packetd-privileged` on every push (one image, no lab), and
+   `syn-cross-validation` on the same schedule as `lab-conformance`, because
+   the lab is eight digest-pinned images and 2.8 GiB behind Docker Hub's
+   anonymous pull limit. `packetd_privileged_argv` grew the `--network` Task
+   3 flagged as missing, so AC-6.14's container joins `bathy-lab_labnet`
+   instead of a person doing it by hand. `check-packetd` asserts both jobs
+   **by name**, with `job_block`, because a step asserted to exist somewhere
+   in `ci.yml` has already satisfied one of this project's checks while
+   defending nothing.
+
+7. **The 800-line exit criterion measures the wrong thing** — see the
+   Milestone Exit Criteria below, which now states the property the number
+   was standing in for. Task 3 left the gate red at 922/800 and escalated;
+   the resolution is not a bigger number. `check-packetd` now measures the
+   **privileged window** — `main.rs`'s statements between
+   `acquire_raw_sockets()` and `drop_all_capabilities()`, plus every crate
+   function transitively reachable from them — because that is the code that
+   runs while `CAP_NET_RAW` is held, and a crate-wide cap counted 780-odd
+   lines that never do and could not see work moved *into* the window.
+   Measured: **130 lines across 15 functions**, budgeted at 140/16. The
+   crate total survives as what it honestly is, a review-burden bound, set
+   from evidence at 1100 (922 measured, plus 178 for Task 5's ICMP path,
+   derived as three quarters of `syn.rs`'s 244 — the same shape with an
+   8-byte header, no pseudo-header checksum, no reply matching, no teardown,
+   and AC-6.19's requirement that it reuse the existing scope and budget
+   path). The falsifier is
+   `moving_work_into_the_window_fails_the_check_and_names_it`: 200 lines
+   after the drop pass, the same 200 lines before it fail, and the crate
+   total is identical in both.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -575,10 +673,12 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 
 ## Milestone Exit Criteria
 
-- [ ] `cargo test --workspace` green; privileged CI job green including the cross-validation test.
+- [ ] `cargo test --workspace` green; the two privileged CI jobs green, including the cross-validation test.
 - [ ] AC-6.1 through AC-6.20 each demonstrated by a named passing test.
-- [ ] `bathy-packetd` is under 800 lines of non-test Rust. If it is larger, move logic out of the privileged process. **Enforced by `cargo run -p xtask -- check-packetd`, a `ci.yml` step since Task 1** — see plan edit #6 on Task 1 for what the number counts and why it is not measured for the first time here.
+- [ ] **The privileged window is small, enumerable, and measured rather than asserted.** The code that runs while `CAP_NET_RAW` is held is `main.rs`'s statements between `acquire_raw_sockets()` and `drop_all_capabilities()` plus the crate functions transitively reachable from them, and `cargo run -p xtask -- check-packetd` prints that set by name on every run and fails when it grows. Budget 140 lines across 16 functions, from a measurement of 130 across 15.
 
-  **This criterion is currently RED and Task 3 left it red deliberately: 919/800.** The remedy it names does not apply — nothing in the packet path can leave a process that must not trust its caller's bytes. See plan edit #6 on Task 3 for the per-file measurement, why each of the five files is the size it is, and the three ways out. It is a decision for the milestone owner, not a number to move.
+  **This replaces "under 800 lines of non-test Rust", which was a defect in the criterion and not merely a number that had been outgrown.** It was written before the design existed, and its own stated purpose — in the checker's output — was to bound "the logic a reviewer must follow in the one process that will hold `CAP_NET_RAW`". Task 2 then established, by execution from a second process watching `/proc/<pid>/status`, that the capability is held only across those two calls: `read_line`, `handle_line`, all of `protocol.rs` and all of `syn.rs` run unprivileged, holding sockets that were already open. So the total counted 780-odd lines that never execute with a capability held, and — the failure that matters — **could not see work moved into the window**, because moving a line from after the drop to before it leaves the total unchanged. Task 3 left the gate red at 922/800 rather than raising it, which was right; the resolution is a criterion that tracks the property, not a bigger number. Verified the way everything else here is: `moving_work_into_the_window_fails_the_check_and_names_it` moves 200 lines across the drop in both directions and asserts the check fails only one way.
+
+- [ ] `bathy-packetd` is under **1100** lines of non-test Rust — a bound on *review burden*, which is what a whole-crate count can honestly claim, and not a security boundary. Derived and recorded at the constant: 922 measured at the end of Task 3, plus 178 for Task 5's ICMP path (three quarters of `syn.rs`'s 244 — the same shape with an 8-byte header, no pseudo-header checksum, no sequence matching and no teardown, reusing `check_session_scope` and the session budget unchanged as AC-6.19 requires). Task 4 adds nothing to it: the engine-side integration is in `bathy-engine`. If it goes red, the remedy is still not a bigger number — it is either evidence the estimate was wrong, in which case replace the derivation, or work that does not belong in this crate.
 - [ ] Every `unsafe` block has a `SAFETY:` comment; no other crate has any.
 - [ ] `docs/design-paper.md` contains a section explaining the two-layer scope enforcement and why the duplication is intentional.

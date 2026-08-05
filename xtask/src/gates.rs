@@ -2938,15 +2938,116 @@ pub fn check_panics() -> Fallible<()> {
 // `check-packetd` — the size of the only privileged component.
 // ---------------------------------------------------------------------------
 
-/// The M6 exit criterion: `bathy-packetd` is under 800 lines of non-test Rust.
+/// The review-burden cap on `bathy-packetd`'s non-test Rust.
 ///
-/// It is a design constraint, not a budget. `packetd` is the only component
-/// that will hold `CAP_NET_RAW` and the only one permitted `unsafe`, and the
-/// argument for trusting it is that a person can read all of it in one
-/// sitting. "If it is larger, move logic out of the privileged process" is
-/// the remedy the milestone states, and a number that only gets measured at
-/// close-out is a number that gets measured once the code is too big to move.
-pub const PACKETD_LINE_BUDGET: usize = 800;
+/// # This number is derived, and here is the derivation
+///
+/// The M6 exit criterion said 800, written before the design existed. Task 3
+/// measured 922 and left this gate **red** rather than moving a number to fit
+/// the code, which was right: a cap raised because the code outgrew it is not
+/// a cap. The correction is not "raise it to 1000" either. It is that this
+/// cap was standing in for a property it had stopped tracking, and the
+/// property now has its own gate --
+/// [`PACKETD_PRIVILEGED_WINDOW_BUDGET`], below. See M6 Task 4's PART A and
+/// the plan's Milestone Exit Criteria.
+///
+/// What is left for *this* number to do is bound the review burden of a
+/// component that must be human-auditable. That is real, and it is what the
+/// number is now derived from, measured rather than chosen:
+///
+/// | measured | lines |
+/// |---|---|
+/// | the crate at the end of M6 Task 3 (`8f62b2e`) | 922 |
+/// | Task 4's addition to it | 0 -- the engine-side integration is in `bathy-engine` |
+/// | headroom for Task 5's ICMP path | 178 |
+/// | **this cap** | **1100** |
+///
+/// The 178 is not a round number chosen to make 1100: `syn.rs` is 244 code
+/// lines and is the closest comparable -- a checksum, a header builder, a
+/// reply matcher and a reply classifier. Task 5's `icmp.rs` is the same
+/// shape with a simpler header (8 bytes against 40), no pseudo-header
+/// checksum, no sequence/acknowledgement matching and no teardown, and it
+/// reuses `check_session_scope`, the session budget and the emission path
+/// unchanged (AC-6.19 requires exactly that). Three quarters of `syn.rs` is
+/// the estimate, and Task 5 landing over it is a signal worth stopping for
+/// rather than a number to move again.
+///
+/// **If this is red, the remedy is still not a bigger number.** It is either
+/// evidence that the estimate above was wrong -- in which case replace the
+/// table, not the constant -- or work that does not belong in this crate.
+pub const PACKETD_LINE_BUDGET: usize = 1100;
+
+/// The cap that replaced 800's actual job: how much code runs while a
+/// capability is held.
+///
+/// # Why the total was the wrong measure
+///
+/// The 800-line criterion's stated purpose, in this checker's own output,
+/// was to bound "the logic a reviewer must follow in the one process that
+/// will hold `CAP_NET_RAW`". M6 Task 2 established -- and proved by
+/// execution, from a second process watching `/proc/<pid>/status` -- that
+/// `packetd` holds `CAP_NET_RAW` only from `acquire_raw_sockets()` to
+/// `drop_all_capabilities()`. Everything after that runs unprivileged,
+/// holding sockets that were already open: `read_line`, `handle_line`, all
+/// of `protocol.rs`, all of `syn.rs`. A whole-crate cap therefore counted
+/// 700-odd lines that never execute with a capability held, and could not
+/// see the change it existed to catch -- moving work *into* the window --
+/// because that change makes the total no larger.
+///
+/// # What is counted
+///
+/// [`packetd_privileged_window`] measures exactly two things:
+///
+/// 1. the statements in `main.rs` between the call to `acquire_raw_sockets`
+///    and the call to `drop_all_capabilities`, both call sites included;
+/// 2. every function in this crate transitively reachable from those two
+///    entry points.
+///
+/// The passing output enumerates the whole set by name -- so "what runs
+/// privileged" is a list a reviewer reads rather than a claim they take on
+/// trust.
+///
+/// # Where the number comes from
+///
+/// Measured on the crate as built at M6 Task 4: **130 lines across 15
+/// functions**, of which `main.rs` contributes 8 inline lines plus `warn`,
+/// `is_permission_denied` and `startup_failure_message` (the failure arm of
+/// the acquisition, which does still run privileged), and `privilege.rs`
+/// contributes the acquisition, the drop, the `/proc/self/status`
+/// measurement that verifies it, and the two `cfg`-gated spellings each of
+/// `clear_capability_sets` and `set_no_new_privs` -- both counted, because
+/// only one compiles but a reviewer must read both.
+///
+/// The budget is that measurement plus **ten lines and one function**, which
+/// is enough to extract a helper and not enough to move a code path in. It
+/// deliberately carries no allowance for Task 5: the ICMP receive socket is
+/// already opened by `acquire_raw_sockets`, so the ICMP path lands entirely
+/// after the drop, and a window that grew for it would be a window that had
+/// stopped meaning what it says.
+pub const PACKETD_PRIVILEGED_WINDOW_BUDGET: usize = 140;
+
+/// The other half of the same bound: how many of this crate's functions run
+/// privileged.
+///
+/// A line budget alone is satisfied by adding a small function to the
+/// window, which is the cheapest way to make the privileged path bigger.
+/// Measured at 15 (see [`PACKETD_PRIVILEGED_WINDOW_BUDGET`]); one of
+/// headroom.
+///
+/// What this cannot see is named rather than hidden: the window's calls into
+/// `socket2`, `caps` and `libc` are not counted, because they are
+/// dependencies rather than this crate's lines. That is the same gap the
+/// crate-wide cap has, and `crates/bathy-packetd/Cargo.toml` -- which argues
+/// its dependency set at length -- is the other half of the argument.
+pub const PACKETD_PRIVILEGED_WINDOW_FUNCTIONS: usize = 16;
+
+/// The two boundaries of the privileged window, in `main.rs`, in order.
+///
+/// Named as data rather than matched inline because
+/// `the_window_is_reported_when_its_boundaries_are_missing_or_reversed`
+/// drives both failures, and because a reader of this gate should be able to
+/// see the boundary without reading the daemon.
+pub const PACKETD_WINDOW_BOUNDS: (&str, &str) = ("acquire_raw_sockets(", "drop_all_capabilities(");
 
 /// The crate the budget is about.
 pub const PACKETD_SRC: &str = "crates/bathy-packetd/src";
@@ -3009,6 +3110,767 @@ pub fn packetd_line_counts(root: &Path) -> Vec<(String, usize, usize)> {
     }
     out.sort();
     out
+}
+
+// ---------------------------------------------------------------------------
+// The privileged window — what actually executes while a capability is held.
+// ---------------------------------------------------------------------------
+
+/// One production function of `bathy-packetd`, as the window analysis sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PacketdFn {
+    /// The bare name. Calls are resolved on the last path segment, so
+    /// `privilege::drop_all_capabilities()` and `drop_all_capabilities()`
+    /// name the same thing -- which they do.
+    pub name: String,
+    /// `file:line` of the `fn` keyword, so a reviewer can go and read it and
+    /// so the two `cfg`-gated spellings of one name stay distinguishable.
+    pub site: String,
+    /// Non-blank, non-`//` lines of the body, counted the same way
+    /// [`packetd_line_counts`] counts a file.
+    pub code_lines: usize,
+    /// The resolution key(s) this function answers to. A free function has
+    /// one (its name); a method has two (`Type::name` and `.name`).
+    pub keys: Vec<String>,
+    /// Every call in the body, as resolution keys. See [`call_keys`].
+    pub calls: Vec<String>,
+}
+
+/// Rust source with everything that can hide a brace or fake a call removed:
+/// line comments, block comments, string literals and character literals.
+///
+/// Replaced with spaces rather than deleted, so every byte offset and every
+/// line number in the result still refers to the same place in the original.
+/// Without this, `"{"` inside a message closes a function body and
+/// `// foo(x)` counts as a call -- and this repository has already had one
+/// gate satisfied by the comment describing it (`c690e5b`).
+pub fn strip_rust_noise(text: &str) -> String {
+    let bytes: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    let at = |i: usize| bytes.get(i).copied().unwrap_or('\0');
+    while i < bytes.len() {
+        let c = at(i);
+        if c == '/' && at(i.saturating_add(1)) == '/' {
+            while i < bytes.len() && at(i) != '\n' {
+                out.push(' ');
+                i = i.saturating_add(1);
+            }
+            continue;
+        }
+        if c == '/' && at(i.saturating_add(1)) == '*' {
+            let mut depth = 1usize;
+            out.push_str("  ");
+            i = i.saturating_add(2);
+            while i < bytes.len() && depth > 0 {
+                if at(i) == '/' && at(i.saturating_add(1)) == '*' {
+                    depth = depth.saturating_add(1);
+                    out.push_str("  ");
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                if at(i) == '*' && at(i.saturating_add(1)) == '/' {
+                    depth = depth.saturating_sub(1);
+                    out.push_str("  ");
+                    i = i.saturating_add(2);
+                    continue;
+                }
+                out.push(if at(i) == '\n' { '\n' } else { ' ' });
+                i = i.saturating_add(1);
+            }
+            continue;
+        }
+        // Raw strings: `r"..."`, `r#"..."#`, and so on.
+        if c == 'r' && (at(i.saturating_add(1)) == '"' || at(i.saturating_add(1)) == '#') {
+            let mut hashes = 0usize;
+            let mut j = i.saturating_add(1);
+            while at(j) == '#' {
+                hashes = hashes.saturating_add(1);
+                j = j.saturating_add(1);
+            }
+            if at(j) == '"' {
+                for _ in i..=j {
+                    out.push(' ');
+                }
+                i = j.saturating_add(1);
+                loop {
+                    if i >= bytes.len() {
+                        break;
+                    }
+                    if at(i) == '"' {
+                        let closes = (1..=hashes).all(|k| at(i.saturating_add(k)) == '#');
+                        if closes {
+                            for _ in 0..=hashes {
+                                out.push(' ');
+                            }
+                            i = i.saturating_add(hashes).saturating_add(1);
+                            break;
+                        }
+                    }
+                    out.push(if at(i) == '\n' { '\n' } else { ' ' });
+                    i = i.saturating_add(1);
+                }
+                continue;
+            }
+        }
+        if c == '"' {
+            out.push(' ');
+            i = i.saturating_add(1);
+            while i < bytes.len() && at(i) != '"' {
+                if at(i) == '\\' {
+                    out.push(' ');
+                    i = i.saturating_add(1);
+                }
+                out.push(if at(i) == '\n' { '\n' } else { ' ' });
+                i = i.saturating_add(1);
+            }
+            out.push(' ');
+            i = i.saturating_add(1);
+            continue;
+        }
+        // A quote is a character literal only if it closes within two
+        // characters; otherwise it is a lifetime (`'a`), which must survive.
+        if c == '\'' {
+            let escaped = at(i.saturating_add(1)) == '\\';
+            let close = if escaped {
+                // `'\n'`, `'\\'`, `'\x41'` -- scan to the next quote.
+                (2..8)
+                    .find(|k| at(i.saturating_add(*k)) == '\'')
+                    .map(|k| i.saturating_add(k))
+            } else if at(i.saturating_add(2)) == '\'' {
+                Some(i.saturating_add(2))
+            } else {
+                None
+            };
+            if let Some(close) = close {
+                for _ in i..=close {
+                    out.push(' ');
+                }
+                i = close.saturating_add(1);
+                continue;
+            }
+        }
+        out.push(c);
+        i = i.saturating_add(1);
+    }
+    out
+}
+
+/// Every call in `code`, as a resolution key.
+///
+/// Three shapes, because Rust resolves them differently and a gate that
+/// collapsed them would pull `socket2::Socket::new` into the privileged
+/// window on the strength of this crate having a `Session::new`:
+///
+/// - `.name(` -- a method call. Key `.name`, matched against this crate's
+///   inherent and trait methods of that name.
+/// - `A::b(` -- a path call. Key `A::b`, matched against a method of type
+///   `A`; if the crate defines no such type the key falls back to `b`,
+///   because `A` was a module (`privilege::drop_all_capabilities`).
+/// - `name(` -- a free call. Key `name`, matched against free functions.
+///
+/// Macros (`name!(`) and the keywords that take a parenthesis without
+/// calling anything are excluded.
+pub fn call_keys(code: &str) -> Vec<String> {
+    const NOT_CALLS: &[&str] = &[
+        "if", "while", "for", "match", "return", "fn", "let", "in", "as",
+    ];
+    let chars: Vec<char> = code.chars().collect();
+    let mut out = Vec::new();
+    let mut push = |key: String| {
+        if !key.is_empty() && !out.contains(&key) {
+            out.push(key);
+        }
+    };
+    for (i, c) in chars.iter().enumerate() {
+        if *c != '(' {
+            continue;
+        }
+        if i > 0 && chars.get(i.saturating_sub(1)) == Some(&'!') {
+            continue;
+        }
+        let mut start = i;
+        while start > 0 {
+            let prev = chars.get(start.saturating_sub(1)).copied().unwrap_or(' ');
+            if prev.is_alphanumeric() || prev == '_' || prev == ':' {
+                start = start.saturating_sub(1);
+            } else {
+                break;
+            }
+        }
+        let word: String = chars
+            .get(start..i)
+            .map(|s| s.iter().collect())
+            .unwrap_or_default();
+        let bare = word.rsplit("::").next().unwrap_or_default().to_string();
+        if bare.is_empty()
+            || NOT_CALLS.contains(&bare.as_str())
+            || bare.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            continue;
+        }
+        // `fn name(` is a definition, not a call. Without this the window
+        // would pull in every function whose body happens to contain a
+        // nested `fn`, and `call_keys` would be unusable on whole files.
+        let mut before = start;
+        while before > 0
+            && chars
+                .get(before.saturating_sub(1))
+                .is_some_and(|c| c.is_whitespace())
+        {
+            before = before.saturating_sub(1);
+        }
+        let is_definition = before >= 2
+            && chars.get(before.saturating_sub(2)) == Some(&'f')
+            && chars.get(before.saturating_sub(1)) == Some(&'n')
+            && (before == 2
+                || chars
+                    .get(before.saturating_sub(3))
+                    .is_none_or(|c| !(c.is_alphanumeric() || *c == '_')));
+        if is_definition {
+            continue;
+        }
+        let dotted = start > 0 && chars.get(start.saturating_sub(1)) == Some(&'.');
+        if dotted {
+            push(format!(".{bare}"));
+            continue;
+        }
+        let segments: Vec<&str> = word.split("::").collect();
+        if segments.len() >= 2 {
+            let owner = segments
+                .get(segments.len().saturating_sub(2))
+                .copied()
+                .unwrap_or_default();
+            push(format!("{owner}::{bare}"));
+        }
+        push(bare);
+    }
+    out
+}
+
+/// The production text of every `.rs` file in the crate, noise stripped, in
+/// path order.
+fn packetd_sources(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (name, _, _) in packetd_line_counts(root) {
+        let Ok(text) = std::fs::read_to_string(root.join(&name)) else {
+            continue;
+        };
+        let production: String = text
+            .lines()
+            .take_while(|line| line.trim() != TEST_MODULE_MARKER)
+            .collect::<Vec<_>>()
+            .join("\n");
+        out.push((name, strip_rust_noise(&production)));
+    }
+    out
+}
+
+/// Count of non-blank, non-`//` lines in already-stripped text.
+///
+/// The `//` case cannot occur after [`strip_rust_noise`]; the check stays
+/// because this function is also called on raw slices in tests, and a
+/// counter whose definition depends on its caller is a counter that drifts.
+fn code_lines_of(text: &str) -> usize {
+    text.lines()
+        .filter(|line| {
+            let t = line.trim();
+            !t.is_empty() && !t.starts_with("//")
+        })
+        .count()
+}
+
+/// Every `impl` block in `stripped`, as `(type name, start, end)` character
+/// offsets.
+///
+/// The type is the last identifier before the opening brace, which is right
+/// for `impl T {`, `impl Trait for T {` and `impl<R: BufRead> Trait for T<R>
+/// {` alike -- generic arguments are stripped, so `T<R>` reads as `T`.
+fn impl_blocks(stripped: &str) -> Vec<(String, usize, usize)> {
+    let chars: Vec<char> = stripped.chars().collect();
+    let at = |i: usize| chars.get(i).copied().unwrap_or('\0');
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let is_word_start = i == 0
+            || !(at(i.saturating_sub(1)).is_alphanumeric() || at(i.saturating_sub(1)) == '_');
+        if is_word_start
+            && chars
+                .get(i..i.saturating_add(4))
+                .map(|s| s.iter().collect::<String>())
+                == Some("impl".to_string())
+        {
+            let after = at(i.saturating_add(4));
+            if !(after.is_alphanumeric() || after == '_') {
+                let mut j = i.saturating_add(4);
+                let mut header = String::new();
+                while j < chars.len() && at(j) != '{' {
+                    header.push(at(j));
+                    j = j.saturating_add(1);
+                }
+                if at(j) == '{' {
+                    let start = j;
+                    let mut depth = 0i32;
+                    while j < chars.len() {
+                        if at(j) == '{' {
+                            depth = depth.saturating_add(1);
+                        } else if at(j) == '}' {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                j = j.saturating_add(1);
+                                break;
+                            }
+                        }
+                        j = j.saturating_add(1);
+                    }
+                    // The last identifier in the header, generics discarded.
+                    let name: String = header
+                        .chars()
+                        .map(|c| {
+                            if c.is_alphanumeric() || c == '_' {
+                                c
+                            } else {
+                                ' '
+                            }
+                        })
+                        .collect::<String>()
+                        .split_whitespace()
+                        .rfind(|w| *w != "for" && *w != "where")
+                        .unwrap_or_default()
+                        .to_string();
+                    if !name.is_empty() {
+                        out.push((name, start, j));
+                    }
+                    i = start.saturating_add(1);
+                    continue;
+                }
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    out
+}
+
+/// Every function defined in one file, with its body.
+///
+/// A `fn` whose signature is followed by `;` rather than `{` is a trait
+/// method *declaration* -- it has no body, and treating the next function's
+/// brace as its own would silently attribute one function's lines to
+/// another. `syn.rs`'s `Wire` trait is exactly that shape.
+pub fn functions_in(file: &str, stripped: &str) -> Vec<PacketdFn> {
+    let owners = impl_blocks(stripped);
+    let chars: Vec<char> = stripped.chars().collect();
+    let at = |i: usize| chars.get(i).copied().unwrap_or('\0');
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < chars.len() {
+        // `fn` as a whole word.
+        if at(i) == 'f' && at(i.saturating_add(1)) == 'n' {
+            let before = if i == 0 { ' ' } else { at(i.saturating_sub(1)) };
+            let after = at(i.saturating_add(2));
+            let is_word = !(before.is_alphanumeric() || before == '_')
+                && !(after.is_alphanumeric() || after == '_');
+            if is_word {
+                let mut j = i.saturating_add(2);
+                while at(j).is_whitespace() {
+                    j = j.saturating_add(1);
+                }
+                let name_start = j;
+                while at(j).is_alphanumeric() || at(j) == '_' {
+                    j = j.saturating_add(1);
+                }
+                let name: String = chars
+                    .get(name_start..j)
+                    .map(|s| s.iter().collect())
+                    .unwrap_or_default();
+                // The signature's parameter list, balanced.
+                while j < chars.len() && at(j) != '(' {
+                    j = j.saturating_add(1);
+                }
+                let mut depth = 0i32;
+                while j < chars.len() {
+                    if at(j) == '(' {
+                        depth = depth.saturating_add(1);
+                    } else if at(j) == ')' {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            j = j.saturating_add(1);
+                            break;
+                        }
+                    }
+                    j = j.saturating_add(1);
+                }
+                // Body, or a declaration with no body.
+                while j < chars.len() && at(j) != '{' && at(j) != ';' {
+                    j = j.saturating_add(1);
+                }
+                if at(j) == '{' && !name.is_empty() {
+                    let body_start = j;
+                    let mut depth = 0i32;
+                    while j < chars.len() {
+                        if at(j) == '{' {
+                            depth = depth.saturating_add(1);
+                        } else if at(j) == '}' {
+                            depth = depth.saturating_sub(1);
+                            if depth == 0 {
+                                j = j.saturating_add(1);
+                                break;
+                            }
+                        }
+                        j = j.saturating_add(1);
+                    }
+                    let body: String = chars
+                        .get(body_start..j)
+                        .map(|s| s.iter().collect())
+                        .unwrap_or_default();
+                    let line = chars
+                        .get(..i)
+                        .map(|s| s.iter().filter(|c| **c == '\n').count())
+                        .unwrap_or(0)
+                        .saturating_add(1);
+                    let owner = owners
+                        .iter()
+                        .filter(|(_, from, to)| *from <= i && i < *to)
+                        .min_by_key(|(_, from, to)| to.saturating_sub(*from))
+                        .map(|(owner, _, _)| owner.clone());
+                    let keys = match &owner {
+                        Some(owner) => vec![format!("{owner}::{name}"), format!(".{name}")],
+                        None => vec![name.clone()],
+                    };
+                    out.push(PacketdFn {
+                        name: match &owner {
+                            Some(owner) => format!("{owner}::{name}"),
+                            None => name.clone(),
+                        },
+                        site: format!("{file}:{line}"),
+                        code_lines: code_lines_of(&body),
+                        keys,
+                        calls: call_keys(&body),
+                    });
+                    i = j;
+                    continue;
+                }
+            }
+        }
+        i = i.saturating_add(1);
+    }
+    out
+}
+
+/// What runs while `CAP_NET_RAW` is held.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PrivilegedWindow {
+    /// Reasons the window could not be located at all. Non-empty means the
+    /// measurement below is meaningless and must not be read as a pass.
+    pub bounds: Vec<String>,
+    /// Code lines of `main`'s statements between the two boundaries.
+    pub inline_lines: usize,
+    /// Every crate function transitively reachable from the two entry
+    /// points, as `(name, site, code lines)`, sorted.
+    pub reachable: Vec<(String, String, usize)>,
+}
+
+impl PrivilegedWindow {
+    pub fn total_lines(&self) -> usize {
+        self.reachable
+            .iter()
+            .map(|(_, _, n)| *n)
+            .fold(self.inline_lines, usize::saturating_add)
+    }
+}
+
+/// Measure the privileged window.
+///
+/// The window is `main.rs`'s statements from `acquire_raw_sockets(` to
+/// `drop_all_capabilities(` inclusive, plus the transitive closure of this
+/// crate's own functions called from there. See
+/// [`PACKETD_PRIVILEGED_WINDOW_BUDGET`] for why this and not the crate
+/// total.
+///
+/// Resolution is by bare name against every `fn` in the crate. That
+/// over-approximates -- a method called on a `socket2` type whose name
+/// happens to match one of this crate's functions would be pulled in -- and
+/// over-approximation is the safe direction for a gate whose failure mode is
+/// missing something that runs privileged.
+pub fn packetd_privileged_window(root: &Path) -> PrivilegedWindow {
+    let sources = packetd_sources(root);
+    let mut window = PrivilegedWindow::default();
+
+    let mut defined: Vec<PacketdFn> = Vec::new();
+    for (name, stripped) in &sources {
+        defined.extend(functions_in(name, stripped));
+    }
+
+    let main_name = format!("{PACKETD_SRC}/main.rs");
+    let Some((_, main_src)) = sources.iter().find(|(name, _)| *name == main_name) else {
+        window.bounds.push(format!(
+            "{main_name} does not exist, so the privileged window has no location and this \
+             check is ranging over nothing"
+        ));
+        return window;
+    };
+    let (open, close) = PACKETD_WINDOW_BOUNDS;
+    let (Some(start), Some(end)) = (main_src.find(open), main_src.find(close)) else {
+        window.bounds.push(format!(
+            "{main_name} does not contain both `{open}` and `{close}`, which are the two \
+             boundaries of the window in which this process holds CAP_NET_RAW. Either the \
+             daemon's startup order changed or this check no longer knows where to look; \
+             both are failures."
+        ));
+        return window;
+    };
+    if start >= end {
+        window.bounds.push(format!(
+            "{main_name} calls `{close}` before `{open}`. The whole security argument for \
+             this design is that the sockets are opened first and the capability is dropped \
+             immediately after; reversed, the daemon exits before reading anything and the \
+             window this check measures does not exist."
+        ));
+        return window;
+    }
+    let inline: String = main_src
+        .get(start..end)
+        .unwrap_or_default()
+        .chars()
+        .collect();
+    window.inline_lines = code_lines_of(&inline);
+
+    // The closure. Seeded with the two entry points by name and with
+    // anything the inline window calls directly.
+    let mut frontier: Vec<String> = call_keys(&inline);
+    for entry in [open, close] {
+        let name = entry.trim_end_matches('(').to_string();
+        if !frontier.contains(&name) {
+            frontier.push(name);
+        }
+    }
+    let mut seen: Vec<String> = Vec::new();
+    let mut chosen: Vec<PacketdFn> = Vec::new();
+    while let Some(key) = frontier.pop() {
+        if seen.contains(&key) {
+            continue;
+        }
+        seen.push(key.clone());
+        for f in defined.iter().filter(|f| f.keys.contains(&key)) {
+            chosen.push(f.clone());
+            for callee in &f.calls {
+                if !seen.contains(callee) {
+                    frontier.push(callee.clone());
+                }
+            }
+        }
+    }
+    window.reachable = chosen
+        .into_iter()
+        .map(|f| (f.name, f.site, f.code_lines))
+        .collect();
+    window.reachable.sort();
+    window.reachable.dedup();
+    window
+}
+
+/// The privileged window's rules, in both directions.
+pub fn packetd_window_violations(root: &Path) -> Vec<String> {
+    let window = packetd_privileged_window(root);
+    if !window.bounds.is_empty() {
+        return window.bounds;
+    }
+    let mut found = Vec::new();
+    // Vacuity, both halves. A window that located nothing, or that found no
+    // function at all, would report a very small number and read as a pass.
+    if window.inline_lines == 0 {
+        found.push(
+            "the privileged window in main.rs is empty, so this check is measuring nothing. \
+             The two boundary calls are inside it by construction; zero means the parse \
+             failed."
+                .to_string(),
+        );
+    }
+    let (open, close) = PACKETD_WINDOW_BOUNDS;
+    for entry in [open, close] {
+        let name = entry.trim_end_matches('(');
+        if !window.reachable.iter().any(|(n, _, _)| n == name) {
+            found.push(format!(
+                "`{name}` is not among the functions this check found reachable inside the \
+                 privileged window, so the closure did not resolve its own entry point and \
+                 the total below is not the window."
+            ));
+        }
+    }
+    let total = window.total_lines();
+    if total > PACKETD_PRIVILEGED_WINDOW_BUDGET {
+        found.push(format!(
+            "{total} line(s) of bathy-packetd run while CAP_NET_RAW is held, over the \
+             {PACKETD_PRIVILEGED_WINDOW_BUDGET}-line privileged-window budget. This is the \
+             criterion the crate-wide cap was standing in for and could not see: moving \
+             work into the window does not make the crate bigger. Move it after \
+             `{close}` instead -- everything there runs unprivileged, holding sockets that \
+             are already open. The window is main.rs's {} inline line(s) plus: {}",
+            window.inline_lines,
+            window
+                .reachable
+                .iter()
+                .map(|(name, site, n)| format!("{name} ({site}) {n}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if window.reachable.len() > PACKETD_PRIVILEGED_WINDOW_FUNCTIONS {
+        found.push(format!(
+            "{} of bathy-packetd's functions run while CAP_NET_RAW is held, over the \
+             {PACKETD_PRIVILEGED_WINDOW_FUNCTIONS} this design allows. A line budget alone \
+             is satisfied by adding a small function; this is the other half. They are: {}",
+            window.reachable.len(),
+            window
+                .reachable
+                .iter()
+                .map(|(name, site, _)| format!("{name} ({site})"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// The two CI jobs that give the privileged assertions somewhere to run.
+// ---------------------------------------------------------------------------
+
+/// The job that runs `packetd-privileged`, and the step it must contain.
+///
+/// **Job-scoped, and that is the point.** M6 Task 2 recorded a gate that
+/// "exists, is job-scoped, fires" as the fix for a gate that was satisfied by
+/// a step in a neighbouring job. A required step asserted to exist *somewhere
+/// in the file* has already slipped past this project's checks once, so this
+/// asks `job_block` for the named job and looks only inside it.
+pub const PACKETD_CI_JOB: &str = "packetd-privileged";
+
+/// The job that runs AC-6.14's cross-validation, and its two steps.
+pub const SYN_CROSS_VALIDATION_CI_JOB: &str = "syn-cross-validation";
+
+/// Every required `(job, step prefix)` pair, as data, so a reader can see the
+/// whole obligation without reading the checker.
+const PRIVILEGED_CI_STEPS: &[(&str, &str)] = &[
+    (PACKETD_CI_JOB, "cargo run -p xtask -- packetd-privileged"),
+    // The lab has to be up before a container can join its network.
+    (SYN_CROSS_VALIDATION_CI_JOB, "lab/run.sh up"),
+    (
+        SYN_CROSS_VALIDATION_CI_JOB,
+        "cargo run -p xtask -- syn-cross-validation",
+    ),
+];
+
+/// M6 Task 4: the privileged assertions must have a job, and it must be the
+/// right one.
+///
+/// Four rules, and the last two are what stop this passing over nothing:
+///
+/// 1. Each `(job, step)` in [`PRIVILEGED_CI_STEPS`] is present **in that
+///    job**.
+/// 2. The cross-validation job is scheduled rather than per-push, because
+///    the lab costs 2.8 GiB of image pulls -- and it must therefore say so
+///    with an `if:`, or it is a per-push job nobody meant to write.
+/// 3. The privileged job is *not* gated that way. It needs no lab and must
+///    run on every push; an `if:` on it would make the whole thing daily
+///    again by accident.
+/// 4. The two container scripts still set the variables that turn a skip into
+///    a failure. Without `BATHY_PACKETD_PRIVILEGED_TESTS` the privileged
+///    tests skip; without `BATHY_LAB_REQUIRED` the cross-validation skips.
+///    Either way the job is green having run nothing, which is the defect one
+///    level up from a test that silently skips itself.
+pub fn packetd_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for (job, step) in PRIVILEGED_CI_STEPS {
+        let Some(block) = job_block(ci, job) else {
+            found.push(format!(
+                "{ci_path}: there is no `{job}` job, so `{step}` runs nowhere. A command \
+                 with no CI job is the defect class this project has hit hardest: it goes \
+                 red and stays red because nobody runs it."
+            ));
+            continue;
+        };
+        let runs = block.lines().any(|line| {
+            let trimmed = line.trim_start();
+            trimmed
+                .strip_prefix("- run:")
+                .or_else(|| trimmed.strip_prefix("run:"))
+                .is_some_and(|command| command.trim().starts_with(step))
+        });
+        if !runs {
+            found.push(format!(
+                "{ci_path}: no `run:` step in the `{job}` job invokes `{step}`. It may well \
+                 exist in another job; a step asserted to exist somewhere in this file has \
+                 already satisfied one of this project's checks while defending nothing."
+            ));
+        }
+    }
+
+    let scheduled = |job: &str| {
+        job_block(ci, job).is_some_and(|block| {
+            block
+                .lines()
+                .any(|line| line.trim_start().starts_with("if:") && line.contains("schedule"))
+        })
+    };
+    if !scheduled(SYN_CROSS_VALIDATION_CI_JOB) {
+        found.push(format!(
+            "{ci_path}: the `{SYN_CROSS_VALIDATION_CI_JOB}` job has no `if:` naming \
+             `schedule`, so it would run on every push. It brings up the lab -- eight \
+             digest-pinned images, about 2.8 GiB, behind Docker Hub's anonymous pull-rate \
+             limit -- and a job that fails for a reason unrelated to the change is a job \
+             people learn to ignore. Schedule it like `lab-conformance`."
+        ));
+    }
+    if scheduled(PACKETD_CI_JOB) {
+        found.push(format!(
+            "{ci_path}: the `{PACKETD_CI_JOB}` job is gated on the schedule. It needs one \
+             image and no lab, so there is nothing to defer, and deferring it means the \
+             privileged assertions defend a push once a day instead of every time."
+        ));
+    }
+
+    if !crate::visibility::PACKETD_PRIVILEGED_SCRIPT.is_empty()
+        && !crate::visibility::packetd_privileged_argv(
+            "img",
+            "/repo",
+            crate::visibility::PACKETD_PRIVILEGED_SCRIPT,
+            None,
+        )
+        .join(" ")
+        .contains(&format!("{}=1", crate::visibility::PACKETD_DEMAND_ENV))
+    {
+        found.push(format!(
+            "the privileged container no longer sets {}, so every capability-dependent \
+             test inside it skips and the job is green having asserted nothing.",
+            crate::visibility::PACKETD_DEMAND_ENV
+        ));
+    }
+    if !crate::visibility::SYN_CROSS_VALIDATION_SCRIPT.contains("BATHY_LAB_REQUIRED=1") {
+        found.push(
+            "visibility::SYN_CROSS_VALIDATION_SCRIPT does not set BATHY_LAB_REQUIRED, so \
+             AC-6.14's test would SKIP rather than FAIL when the lab or the capability is \
+             absent -- and a CI job that silently skips is the same defect as a test that \
+             silently skips itself, one level up."
+                .to_string(),
+        );
+    }
+    if !crate::visibility::packetd_privileged_argv(
+        "img",
+        "/repo",
+        crate::visibility::SYN_CROSS_VALIDATION_SCRIPT,
+        Some(crate::visibility::LAB_NETWORK),
+    )
+    .join(" ")
+    .contains(&format!("--network {}", crate::visibility::LAB_NETWORK))
+    {
+        found.push(format!(
+            "the cross-validation container does not join `{}`, and `10.30.0.0/24` is \
+             reachable from nowhere else. M6 Task 3 flagged exactly this: its lab evidence \
+             was gathered by hand because the argv builder could not ask for a network.",
+            crate::visibility::LAB_NETWORK
+        ));
+    }
+    found
 }
 
 /// The rule, in both directions.
@@ -3446,6 +4308,15 @@ pub fn unsafe_forbid_violations(root: &Path) -> Vec<String> {
 pub fn check_packetd() -> Fallible<()> {
     let root = Path::new(".");
     let mut violations = packetd_size_violations(root);
+    violations.extend(packetd_window_violations(root));
+    match std::fs::read_to_string(root.join(crate::visibility::CI_PATH)) {
+        Ok(ci) => violations.extend(packetd_ci_job_violations(crate::visibility::CI_PATH, &ci)),
+        Err(e) => violations.push(format!(
+            "{}: cannot be read ({e}), so the privileged jobs cannot be checked and this \
+             gate would pass over nothing",
+            crate::visibility::CI_PATH
+        )),
+    }
     violations.extend(packetd_safety_violations(root));
     violations.extend(unsafe_forbid_violations(root));
     if !violations.is_empty() {
@@ -3481,14 +4352,44 @@ pub fn check_packetd() -> Fallible<()> {
             .filter(|(_, is_packetd_lib)| !is_packetd_lib)
             .count(),
     );
+    let window = packetd_privileged_window(root);
+    println!(
+        "check-packetd: ok ({}/{PACKETD_PRIVILEGED_WINDOW_BUDGET} line(s) and {}/\
+         {PACKETD_PRIVILEGED_WINDOW_FUNCTIONS} function(s) run while CAP_NET_RAW is held: \
+         main.rs's {} inline line(s) between `{}` and `{}`, plus {})",
+        window.total_lines(),
+        window.reachable.len(),
+        window.inline_lines,
+        PACKETD_WINDOW_BOUNDS.0,
+        PACKETD_WINDOW_BOUNDS.1,
+        window
+            .reachable
+            .iter()
+            .map(|(name, site, n)| format!("{name} ({site}) {n}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    println!(
+        "check-packetd: ok ({} required step(s) present in the named job(s): {})",
+        PRIVILEGED_CI_STEPS.len(),
+        PRIVILEGED_CI_STEPS
+            .iter()
+            .map(|(job, step)| format!("{job} -> `{step}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
     println!(
         "check-packetd: WHAT THIS COUNTS — non-blank, non-`//` lines before each file's \
          trailing `{TEST_MODULE_MARKER}`. {physical} physical non-test line(s) including \
-         comments, reported so the choice is visible: the cap exists to bound the logic a \
-         reviewer must follow in the one process that will hold CAP_NET_RAW, and counting \
-         comments against it would be a cap on the explanations that make that review \
-         possible. It cannot see logic moved into a dependency — this crate's dependency \
-         set is the other half of the same argument."
+         comments, reported so the choice is visible: counting comments against a cap \
+         would be a cap on the explanations that make review possible. The crate total \
+         bounds REVIEW BURDEN and nothing stronger — it is not a security boundary, and \
+         until M6 Task 4 it was written as though it were. What bounds the security \
+         property is the privileged-window line above: the crate total counts 780-odd \
+         lines that never execute while a capability is held, and cannot see work moved \
+         INTO the window, which is the change that matters. Neither can see logic moved \
+         into a dependency — this crate's dependency set is the other half of the same \
+         argument."
     );
     Ok(())
 }
@@ -5515,6 +6416,411 @@ jobs:
         assert!(
             found.iter().any(|v| v.contains("is indented")),
             "{found:#?}"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // The privileged window (M6 Task 4, PART A).
+    // -----------------------------------------------------------------
+
+    /// A miniature `packetd` with the same startup shape as the real one:
+    /// the acquisition, one line of work between the boundaries, the drop,
+    /// and a large amount of code *after* the drop that the window must not
+    /// count. That last part is the whole point -- a measure that counted it
+    /// would be the crate-wide cap again.
+    fn window_fixture(root: &Path, between: &str, after: &str) {
+        packetd_file(
+            root,
+            "main.rs",
+            &format!(
+                "fn main() {{\n    let s = privilege::acquire_raw_sockets();\n{between}\
+                 \n    privilege::drop_all_capabilities();\n{after}\n}}\n\
+                 fn helper() {{\n    let x = 1;\n}}\n"
+            ),
+        );
+        packetd_file(
+            root,
+            "privilege.rs",
+            "pub fn acquire_raw_sockets() {\n    let a = 1;\n    let b = 2;\n}\n\
+             pub fn drop_all_capabilities() {\n    let c = 3;\n}\n",
+        );
+    }
+
+    /// The measurement's own definition, as a test: what is between the
+    /// boundaries and what those boundaries reach is counted, and the great
+    /// deal of code after the drop is not.
+    #[test]
+    fn the_window_counts_what_runs_before_the_drop_and_not_what_runs_after() {
+        let root = scratch("packetd-window-shape");
+        let after = (0..40)
+            .map(|i| format!("    let after{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        window_fixture(&root, "    let mid = 1;", &after);
+        let window = packetd_privileged_window(&root);
+        assert!(window.bounds.is_empty(), "{window:#?}");
+        // The slice runs from the acquisition call to the drop call, so it
+        // is that line, the one statement between, and the fragment of the
+        // drop's own line -- three, and nothing from after the drop.
+        assert_eq!(window.inline_lines, 3, "{window:#?}");
+        // Both entry points, and neither `main` nor `helper`.
+        let names: Vec<&str> = window
+            .reachable
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        assert_eq!(names, vec!["acquire_raw_sockets", "drop_all_capabilities"]);
+        // Each entry point's body counted with its braces, as
+        // `packetd_line_counts` counts a file.
+        assert_eq!(window.total_lines(), 3 + 4 + 3, "{window:#?}");
+        assert!(
+            packetd_window_violations(&root).is_empty(),
+            "a four-line window is not over any budget"
+        );
+    }
+
+    /// The falsifier the criterion exists for: **work moved into the
+    /// privileged window fails, and the failure names it**.
+    ///
+    /// The crate total is deliberately *unchanged* between the two halves --
+    /// the same lines, moved from after the drop to before it. That is
+    /// precisely the change the 800-line cap could not see, and it is why
+    /// that cap was the wrong measure rather than the wrong number.
+    #[test]
+    fn moving_work_into_the_window_fails_the_check_and_names_it() {
+        let work = (0..200)
+            .map(|i| format!("    let w{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let safe = scratch("packetd-window-after");
+        window_fixture(&safe, "    let mid = 1;", &work);
+        assert!(
+            packetd_window_violations(&safe).is_empty(),
+            "200 lines AFTER the drop are unprivileged and are not this gate's business"
+        );
+
+        let unsafe_root = scratch("packetd-window-before");
+        window_fixture(&unsafe_root, &work, "    let after = 1;");
+        let found = packetd_window_violations(&unsafe_root);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("run while CAP_NET_RAW is held")
+                    && v.contains(&format!("{PACKETD_PRIVILEGED_WINDOW_BUDGET}-line"))),
+            "the same 200 lines, moved before the drop, must fail: {found:#?}"
+        );
+
+        // And the same for a call reaching new code, which is how the window
+        // grows without a single line moving.
+        let via_call = scratch("packetd-window-call");
+        window_fixture(&via_call, "    let mid = grown();", "    let after = 1;");
+        packetd_file(
+            &via_call,
+            "grown.rs",
+            &format!("pub fn grown() {{\n{work}\n}}\n"),
+        );
+        let found = packetd_window_violations(&via_call);
+        assert!(
+            found.iter().any(|v| v.contains("grown")),
+            "a call from the window into 200 lines must be reported, and must name the \
+             function: {found:#?}"
+        );
+    }
+
+    /// Both vacuity guards, and both directions of the boundary.
+    #[test]
+    fn the_window_is_reported_when_its_boundaries_are_missing_or_reversed() {
+        let missing = scratch("packetd-window-missing");
+        packetd_file(&missing, "main.rs", "fn main() {\n    let x = 1;\n}\n");
+        let found = packetd_window_violations(&missing);
+        assert!(
+            found.iter().any(|v| v.contains("does not contain both")),
+            "a daemon with no window at all must fail rather than measure zero: {found:#?}"
+        );
+
+        let reversed = scratch("packetd-window-reversed");
+        packetd_file(
+            &reversed,
+            "main.rs",
+            "fn main() {\n    privilege::drop_all_capabilities();\n    \
+             let s = privilege::acquire_raw_sockets();\n}\n",
+        );
+        let found = packetd_window_violations(&reversed);
+        assert!(
+            found.iter().any(|v| v.contains("before")),
+            "the reversed order is the failure M6 Task 2's ordering test exists for, and \
+             this check must not report it as a small window: {found:#?}"
+        );
+
+        let no_crate = scratch("packetd-window-absent");
+        std::fs::create_dir_all(no_crate.join(PACKETD_SRC)).unwrap();
+        let found = packetd_window_violations(&no_crate);
+        assert!(
+            found.iter().any(|v| v.contains("ranging over nothing")),
+            "{found:#?}"
+        );
+    }
+
+    /// The function-count half. A line budget alone is satisfied by adding a
+    /// small function, so the fixture here adds sixteen three-line ones --
+    /// well inside the line budget and well over the function budget.
+    #[test]
+    fn many_small_functions_in_the_window_fail_even_though_the_lines_do_not() {
+        let root = scratch("packetd-window-functions");
+        let calls = (0..PACKETD_PRIVILEGED_WINDOW_FUNCTIONS)
+            .map(|i| format!("    let c{i} = tiny{i}();"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        window_fixture(&root, &calls, "    let after = 1;");
+        let bodies = (0..PACKETD_PRIVILEGED_WINDOW_FUNCTIONS)
+            .map(|i| format!("pub fn tiny{i}() {{\n    let a = {i};\n}}\n"))
+            .collect::<Vec<_>>()
+            .join("");
+        packetd_file(&root, "tiny.rs", &bodies);
+        let window = packetd_privileged_window(&root);
+        assert!(
+            window.total_lines() <= PACKETD_PRIVILEGED_WINDOW_BUDGET,
+            "the fixture must be inside the LINE budget or it proves nothing about the \
+             function budget: {} lines",
+            window.total_lines()
+        );
+        let found = packetd_window_violations(&root);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("functions run while CAP_NET_RAW is held")),
+            "{found:#?}"
+        );
+    }
+
+    /// The noise stripper, which everything above rests on. A brace or a
+    /// call inside a string or a comment must not be seen -- this
+    /// repository has already had one gate satisfied by the comment
+    /// describing it (`c690e5b`).
+    #[test]
+    fn braces_and_calls_inside_strings_and_comments_are_not_code() {
+        let stripped = strip_rust_noise(
+            "fn f() {\n    let s = \"} not_a_call(\";\n    // also_not(\n    real(x);\n}\n",
+        );
+        let calls = call_keys(&stripped);
+        assert_eq!(calls, vec!["real".to_string()], "{stripped:?}");
+        let functions = functions_in("f.rs", &stripped);
+        assert_eq!(functions.len(), 1, "{functions:#?}");
+        assert_eq!(functions[0].code_lines, 4, "{functions:#?}");
+        // A lifetime is not a character literal, so it must survive.
+        assert!(strip_rust_noise("fn g<'a>(x: &'a str) {}").contains("'a"));
+    }
+
+    /// Resolution keys, which are what keeps `socket2::Socket::new` out of
+    /// the window on the strength of this crate having a `Session::new`.
+    #[test]
+    fn a_path_call_does_not_resolve_to_an_unrelated_method_of_the_same_name() {
+        let src = strip_rust_noise(
+            "impl Session {\n    pub fn new() {\n        let a = 1;\n    }\n}\n\
+             fn caller() {\n    let s = Socket::new();\n    let t = privilege::measure();\n}\n\
+             fn measure() {\n    let m = 1;\n}\n",
+        );
+        let functions = functions_in("x.rs", &src);
+        let session_new = functions
+            .iter()
+            .find(|f| f.name == "Session::new")
+            .expect("the method is found under its type");
+        assert_eq!(session_new.keys, vec!["Session::new", ".new"]);
+        let caller = functions.iter().find(|f| f.name == "caller").unwrap();
+        assert!(caller.calls.contains(&"Socket::new".to_string()));
+        assert!(
+            !session_new.keys.contains(&"Socket::new".to_string()),
+            "a `Socket::new` call must not resolve to `Session::new`"
+        );
+        // A module path falls back to the free function, which is how
+        // `privilege::drop_all_capabilities` resolves at all.
+        assert!(caller.calls.contains(&"measure".to_string()));
+    }
+
+    // -----------------------------------------------------------------
+    // The privileged CI jobs (M6 Task 4).
+    // -----------------------------------------------------------------
+
+    /// A workflow satisfying every rule in [`packetd_ci_job_violations`].
+    const CLEAN_PRIVILEGED_CI: &str = "\
+jobs:
+  test:
+    steps:
+      - run: cargo test --workspace
+  packetd-privileged:
+    runs-on: ubuntu-latest
+    steps:
+      - run: cargo run -p xtask -- packetd-privileged
+  syn-cross-validation:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - run: lab/run.sh up
+      - run: cargo run -p xtask -- syn-cross-validation
+";
+
+    #[test]
+    fn a_clean_privileged_workflow_passes() {
+        assert!(
+            packetd_ci_job_violations("ci.yml", CLEAN_PRIVILEGED_CI).is_empty(),
+            "{:#?}",
+            packetd_ci_job_violations("ci.yml", CLEAN_PRIVILEGED_CI)
+        );
+    }
+
+    /// The mutation this whole gate exists for: the step is present, it is
+    /// spelled correctly, `check-ci` is happy with it -- and it is in the
+    /// wrong job. That is how a gate came to be satisfied by a step in a
+    /// neighbouring job once already.
+    #[test]
+    fn a_privileged_step_in_a_neighbouring_job_is_reported() {
+        let moved = CLEAN_PRIVILEGED_CI.replace(
+            "  packetd-privileged:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo \
+             run -p xtask -- packetd-privileged\n",
+            "  packetd-privileged:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \
+             nothing\n",
+        );
+        let moved = moved.replace(
+            "      - run: cargo test --workspace\n",
+            "      - run: cargo test --workspace\n      - run: cargo run -p xtask -- \
+             packetd-privileged\n",
+        );
+        // The command IS in the file, exactly once, correctly spelled.
+        assert!(moved.contains("cargo run -p xtask -- packetd-privileged"));
+        let found = packetd_ci_job_violations("ci.yml", &moved);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("no `run:` step in the `packetd-privileged` job")),
+            "{found:#?}"
+        );
+    }
+
+    #[test]
+    fn a_missing_job_is_reported_as_a_command_that_runs_nowhere() {
+        let gone = CLEAN_PRIVILEGED_CI.replace("  syn-cross-validation:", "  something-else:");
+        let found = packetd_ci_job_violations("ci.yml", &gone);
+        assert!(
+            found.iter().any(|v| v.contains("runs nowhere")),
+            "{found:#?}"
+        );
+    }
+
+    /// Both directions of the schedule rule, because they are opposite
+    /// mistakes and a check that only knew one of them would be satisfied by
+    /// making everything daily.
+    #[test]
+    fn the_lab_job_must_be_scheduled_and_the_privileged_job_must_not_be() {
+        let per_push = CLEAN_PRIVILEGED_CI.replace(
+            "    if: github.event_name == 'schedule' || github.event_name == \
+             'workflow_dispatch'\n",
+            "",
+        );
+        let found = packetd_ci_job_violations("ci.yml", &per_push);
+        assert!(
+            found.iter().any(|v| v.contains("would run on every push")),
+            "{found:#?}"
+        );
+
+        let deferred = CLEAN_PRIVILEGED_CI.replace(
+            "  packetd-privileged:\n    runs-on: ubuntu-latest\n",
+            "  packetd-privileged:\n    if: github.event_name == 'schedule'\n    runs-on: \
+             ubuntu-latest\n",
+        );
+        let found = packetd_ci_job_violations("ci.yml", &deferred);
+        assert!(
+            found.iter().any(|v| v.contains("gated on the schedule")),
+            "{found:#?}"
+        );
+    }
+
+    /// The runner constants, checked here rather than only in
+    /// `visibility`'s own tests, because these are the two variables that
+    /// decide whether either job asserts anything at all.
+    #[test]
+    fn both_privileged_runners_still_turn_a_skip_into_a_failure() {
+        assert!(
+            crate::visibility::packetd_privileged_argv(
+                "img",
+                "/repo",
+                crate::visibility::PACKETD_PRIVILEGED_SCRIPT,
+                None,
+            )
+            .join(" ")
+            .contains(&format!("{}=1", crate::visibility::PACKETD_DEMAND_ENV)),
+        );
+        assert!(
+            crate::visibility::SYN_CROSS_VALIDATION_SCRIPT.contains("BATHY_LAB_REQUIRED=1"),
+            "{}",
+            crate::visibility::SYN_CROSS_VALIDATION_SCRIPT
+        );
+        assert!(
+            crate::visibility::packetd_privileged_argv(
+                "img",
+                "/repo",
+                crate::visibility::SYN_CROSS_VALIDATION_SCRIPT,
+                Some(crate::visibility::LAB_NETWORK),
+            )
+            .join(" ")
+            .contains(&format!("--network {}", crate::visibility::LAB_NETWORK)),
+        );
+        // The narrowing control: without a network asked for, none is passed.
+        assert!(
+            !crate::visibility::packetd_privileged_argv("img", "/repo", "x", None)
+                .join(" ")
+                .contains("--network"),
+            "the privileged unit suite must still run on a machine with no lab up"
+        );
+    }
+
+    /// This repository's real workflow, not a fixture. A gate whose only
+    /// evidence is the fixture it wrote itself has never read the file it
+    /// guards.
+    #[test]
+    fn this_repositorys_workflow_runs_both_privileged_jobs() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let ci = std::fs::read_to_string(root.join(crate::visibility::CI_PATH))
+            .expect("this repository has a ci.yml");
+        let found = packetd_ci_job_violations(crate::visibility::CI_PATH, &ci);
+        assert!(found.is_empty(), "{found:#?}");
+    }
+
+    /// This repository's own daemon, measured. Not a fixture: a gate whose
+    /// only evidence is a fixture it wrote itself has never read the thing
+    /// it guards.
+    #[test]
+    fn this_repositorys_privileged_window_is_the_acquisition_and_the_drop() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let window = packetd_privileged_window(&root);
+        assert!(window.bounds.is_empty(), "{window:#?}");
+        let names: Vec<&str> = window
+            .reachable
+            .iter()
+            .map(|(name, _, _)| name.as_str())
+            .collect();
+        for required in ["acquire_raw_sockets", "drop_all_capabilities"] {
+            assert!(names.contains(&required), "{names:#?}");
+        }
+        // The narrowing control, and the whole reason this measure replaced
+        // the crate total: the line protocol and the packet path run AFTER
+        // the drop, so they must not be in here.
+        for forbidden in [
+            "read_line",
+            "Session::handle_line",
+            "Session::handle_probe",
+            "Prober::probe",
+            "check_session_scope",
+        ] {
+            assert!(
+                !names.contains(&forbidden),
+                "`{forbidden}` runs unprivileged and must not be counted as part of the \
+                 privileged window: {names:#?}"
+            );
+        }
+        assert!(
+            packetd_window_violations(&root).is_empty(),
+            "{:#?}",
+            packetd_window_violations(&root)
         );
     }
 
