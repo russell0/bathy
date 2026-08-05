@@ -324,7 +324,7 @@ impl PacketdClient {
         // stderr before exiting 69, and a pipe nobody reads is a pipe that
         // can fill. It is also the text the fallback reason is made of, so
         // discarding it would mean logging "packetd failed" and nothing else.
-        std::thread::spawn(move || {
+        let drainer = std::thread::spawn(move || {
             let mut text = String::new();
             let mut stderr = stderr;
             let _ = stderr.read_to_string(&mut text);
@@ -374,8 +374,28 @@ impl PacketdClient {
             // never had the daemon.
             kill_child(&child);
             drop(stdin);
+            // Joined before the buffer is read, and this is load-bearing:
+            // `read_to_string` returning is what puts the daemon's words in
+            // `collected`, and nothing else makes that happen before this
+            // thread looks. Without the join, whether AC-6.6's `setcap`
+            // guidance reaches the log is a race between two threads that
+            // both became runnable when the child exited -- one that this
+            // machine won until M6 Task 5 put a second daemon in the same
+            // test binary and lost it. The child is already killed and
+            // waited for, so its end of the pipe is closed and this cannot
+            // block.
+            let _ = drainer.join();
             let detail = finish_and_describe(&child, &collected);
-            return Err(PacketdError::Unavailable(format!("{e}{detail}")));
+            // The inner reason, not `{e}`: every arm of the handshake above
+            // already returns an `Unavailable`, so interpolating its `Display`
+            // and wrapping the result in another one printed "packetd is
+            // unavailable: packetd is unavailable: ..." in the log line an
+            // operator reads to find out why their scan changed method.
+            let reason = match e {
+                PacketdError::Unavailable(reason) => reason,
+                other => other.to_string(),
+            };
+            return Err(PacketdError::Unavailable(format!("{reason}{detail}")));
         }
 
         let (jobs, inbox) = std::sync::mpsc::channel::<Job>();
@@ -1164,6 +1184,15 @@ pub(crate) mod tests {
         assert!(
             format!("{e}").contains("before answering init"),
             "the reason must name what was missing: {e}"
+        );
+        // Once, not twice. Every arm of the handshake returns an
+        // `Unavailable`, so a failure path that interpolated the error's own
+        // `Display` and wrapped it again said "packetd is unavailable:
+        // packetd is unavailable: ..." in the line an operator reads.
+        assert_eq!(
+            format!("{e}").matches("packetd is unavailable").count(),
+            1,
+            "{e}"
         );
     }
 }
