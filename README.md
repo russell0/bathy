@@ -69,10 +69,12 @@ detail](#scope-enforcement-in-detail) below.
 > (`service_detection.enabled = false`), in which case no probe bytes are sent
 > at all.
 >
-> What does not exist yet: privileged SYN and ICMP scanning (the rest of
-> Milestone 6). The packet daemon `bathy-packetd` has landed, but so far it is
-> only the protocol it will be spoken to over — it opens no socket, holds no
-> capability, and emits no packet.
+> What does not exist yet: the engine does not use the packet daemon, so
+> nothing you run from the command line or over MCP sends a SYN or an ICMP
+> echo (the rest of Milestone 6). `bathy-packetd` itself now opens raw
+> sockets, drops every capability before reading a byte, and — driven directly
+> over its pipe — sends SYN probes and answers every SYN-ACK with an RST. It
+> does not do ICMP.
 >
 > Plans for all seven milestones — 213 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
@@ -279,13 +281,16 @@ it is:
 - **No IPv6.** It is *refused*, not merely unimplemented — see below.
 - **No Windows.** A licensing constraint, stated in full in
   [`docs/platform-support.md`](docs/platform-support.md).
-- **No privileged scanning.** No SYN scan, no ICMP. That means no host
-  discovery either: unprivileged ICMP is impossible, so `hosts_up` is empty
-  after every scan on this branch and an address with no host on it produces
-  `filtered` endpoints rather than a "host down" verdict. The unprivileged TCP
+- **No privileged scanning from the engine.** `bathy-packetd` can SYN scan —
+  it builds the segment, classifies the reply, and tears an open port's
+  half-open connection down with an RST — but nothing in `bathy-engine` speaks
+  to it, so every scan you can start from the command line or over MCP is a
+  TCP connect scan. There is no ICMP at all. That means no host discovery
+  either: unprivileged ICMP is impossible, so `hosts_up` is empty after every
+  scan on this branch and an address with no host on it produces `filtered`
+  endpoints rather than a "host down" verdict. The unprivileged TCP
   host-discovery building block exists in `bathy-engine` and is not wired into
-  the scheduler. Privileged scanning ships with the packet daemon in Milestone
-  6.
+  the scheduler. The engine's side of this ships in Milestone 6.
 - **No loopback.** `127.0.0.0/8` is refused by `ScopeManifest::allows` on the
   same footing as IPv6, so no manifest can authorize a scan of the machine's
   own loopback interface. This is a deliberate blast-radius decision and it is
@@ -377,7 +382,7 @@ is no second implementation of the fold, the diff, or the policy check.
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by a deadline that covers the whole read rather than each individual `recv`, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. The deadline is per call, not per probe: a probe that writes and then reads can take up to twice it, deliberately, since the hostile case being defended against is on the read path. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
 | `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every interpretation carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. The rule id travels with the observation all the way to the wire — `service.observed`, the fold, and `result.query`'s `rule_id` — so `fingerprint.explain` is reachable *from a finding* and not only from a listing. The byte range is not carried past this crate: it indexes the full response, and stored evidence is capped at the evidence level, so a span that could point past the bytes `evidence.get` returns would be a citation that does not resolve. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
 | `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
-| `bathy-packetd` | The privileged helper. It opens three raw sockets, drops every capability, sets `PR_SET_NO_NEW_PRIVS`, verifies both against `/proc/self/status`, and only then reads a byte — and reads it through a guard that re-measures the capability set on every fill and refuses while one is held. `--self-check` reports what it measured, including that opening a raw socket now fails; without `CAP_NET_RAW` it exits 69 naming the capability, the `setcap` command and the connect-scan fallback. It still emits no packet on this branch: SYN and ICMP probing are the rest of Milestone 6. It is the one crate permitted `unsafe`, and contains one block, in `src/privilege.rs`, for the `prctl` above. What it does today is otherwise refuse: nothing but an `init` may arrive first, an `init` with an empty allowlist is refused rather than read as "allow everything", a second `init` cannot widen the session's scope, and malformed or oversized input ends the session instead of being resynchronized past. Every one of those refusals is final — the session answers `fatal` to everything afterwards, including a valid `init`. SYN and ICMP probing are the rest of Milestone 6. |
+| `bathy-packetd` | The privileged helper. It opens three raw sockets, drops every capability, sets `PR_SET_NO_NEW_PRIVS`, verifies both against `/proc/self/status`, and only then reads a byte — and reads it through a guard that re-measures the capability set on every fill and refuses while one is held. `--self-check` reports what it measured, including that opening a raw socket now fails; without `CAP_NET_RAW` it exits 69 naming the capability, the `setcap` command and the connect-scan fallback. It sends SYN probes when a caller drives its pipe, and it decides for itself whether it may: the session allowlist, denylist and packet ceiling are enforced again inside it, by a matcher that shares no code with `bathy-scope`, and reserved ranges are refused even under an allowlist of `0.0.0.0/0`. Every SYN-ACK is answered with an RST, so no half-open connection is left on a target. Nothing in `bathy-engine` speaks to it yet, and there is no ICMP: both are the rest of Milestone 6. It is the one crate permitted `unsafe`, and contains one block, in `src/privilege.rs`, for the `prctl` above. What it does today is otherwise refuse: nothing but an `init` may arrive first, an `init` with an empty allowlist is refused rather than read as "allow everything", a second `init` cannot widen the session's scope, and malformed or oversized input ends the session instead of being resynchronized past. Every one of those refusals is final — the session answers `fatal` to everything afterwards, including a valid `init`. |
 | `bathy-query` | Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Diffs two of those folds into a classified list of what changed, and refuses to call an endpoint appeared or disappeared unless both scans ran the same plan to completion — a refused, cancelled or budget-exhausted scan is not a scan that found less. Both types are published schemas, and `bathy result query` / `bathy result diff` are this crate, called through the CLI and by the `result.query` / `result.diff` tools with no second fold anywhere. |
 | `bathy-mcp` | The MCP server: eleven typed tools over protocol revision `2026-07-28` on stdio. That revision has no `initialize` handshake and no protocol-level sessions, so the server implements `server/discover` and takes the protocol version from each request's `_meta`. It contains no scanning logic. |
 | `bathy` | The `bathy` command: `scope validate`, `scan preview/start/status/events/cancel/resume`, `result query/diff`, `evidence get`, `explain`, `serve mcp`. A translator over the engine API and nothing else — it contains no scanning logic. Every subcommand that can emit a packet takes `--scope` as a required argument with no default and no skip flag, so omitting it fails inside argument parsing, before a state directory is opened or a request exists. `--json` puts line-delimited JSON on stdout and every diagnostic on stderr, including on the failure paths; exit codes 0-4 have distinct documented meanings and are listed in `--help`. |

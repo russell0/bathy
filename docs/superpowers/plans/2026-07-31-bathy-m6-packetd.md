@@ -242,7 +242,92 @@ git commit -m "feat(packetd): acquire sockets then drop capabilities before read
 ### Task 3: SYN probing with independent scope enforcement
 
 **Files:**
-- Create: `crates/bathy-packetd/src/syn.rs`
+- Create: `crates/bathy-packetd/src/syn.rs`, `crates/bathy-packetd/tests/wire.rs` (plan edit #2)
+- Modify: `crates/bathy-packetd/src/{lib,main,privilege,protocol}.rs`, `crates/bathy-packetd/Cargo.toml`, `README.md`
+
+**Six corrections to this task, made during Task 3. The first is a criterion
+that contradicts another criterion in the same list; the last is a measurement
+that says this milestone's own exit criterion cannot be met as written.**
+
+1. **AC-6.13's test probes an address AC-6.10 forbids.** Step 1's
+   `an_open_port_receives_a_rst_so_no_half_open_connection_is_left_behind`
+   builds `session_allowing("127.0.0.0/8")` and probes `127.0.0.1` — and
+   `reserved_ranges_are_refused_even_if_the_allowlist_permits_them`, four tests
+   above it, requires `127.0.0.1` to be refused. The two cannot both pass. Any
+   implementation that satisfied the RST test would have had a loopback hole,
+   which is the exact defect AC-6.10 exists to prevent, so this is not a typo
+   in a fixture: it is a criterion that would have been closed by breaking
+   another one. The replacement probes a real, non-reserved address — the
+   test container's own primary address, so the packets are locally delivered
+   and therefore *observable* — and the lab run in the task report probes
+   `10.30.0.10`.
+
+2. **`s.rst_sent_count()` counts an intention, not a packet.** A counter the
+   prober increments is satisfied by an implementation that increments it; the
+   criterion says "no half-open connection is left on a target", which is a
+   statement about the wire. `crates/bathy-packetd/tests/wire.rs` opens its own
+   raw socket and counts RSTs in what the kernel actually delivered. That
+   turned out to need a discriminator: when a SYN-ACK arrives for a source port
+   the host kernel has no socket on, **the kernel sends an RST of its own, with
+   the same sequence number ours carries** — so "an RST was observed" is a
+   claim a packet this code did not send would satisfy. Every emitted packet
+   carries `PROBE_MARKER` (0xba71) in its IP identification field, and the
+   capture in the task report shows the two side by side: `id 47729` (ours,
+   win 1024) and `id 0` (the kernel's, win 0).
+
+3. **AC-6.12's test is a table over an enum nothing produces.**
+   `classify_reply(Reply::IcmpUnreachable)` closes nothing unless something
+   constructs `Reply::IcmpUnreachable` from a real packet. The criterion
+   therefore also requires the ICMP receive path — parsing the type, and
+   attributing the unreachable by the datagram it *quotes* (RFC 792) rather
+   than by the address it arrived from, which is a router's. Both halves had
+   mutants that survived the plan's test and die against the added ones.
+
+4. **AC-6.11 does not say what happens when both refusals apply, and the
+   order matters.** Scope and the ceiling can both refuse the same probe. The
+   ceiling asked first is a mutant that survives every test in Step 1, and it
+   makes a privileged process answer "budget spent" about a target it was
+   never authorized to touch. Scope is asked first, and
+   `scope_is_decided_before_the_ceiling_is_consulted` asserts the interleaving
+   rather than the presence of either.
+
+5. **The teardown RST is exempt from the ceiling, and that is a decision the
+   criteria do not make.** `max_packets` admits *probes*. Refusing to send the
+   RST at the ceiling would leave a half-open connection on a third party —
+   more harm, not less, for a tidier number — so the ceiling bounds new
+   probes and the teardown of a connection already paid for is exempt.
+   `packets_emitted()` counts every packet including RSTs, so the exemption is
+   visible rather than hidden, and
+   `at_the_ceiling_an_open_ports_teardown_rst_is_still_sent` pins it.
+
+6. **The 800-line exit criterion cannot be met, and the remedy it names does
+   not apply.** Measured: **919/800** at the end of this task —
+   `syn.rs` 244, `protocol.rs` 250, `privilege.rs` 226, `main.rs` 176,
+   `lib.rs` 23. Task 1 measured 249 and Task 2 measured 646, so **81% of the
+   budget went to the line protocol and the capability drop before the packet
+   path — the milestone's actual subject — existed.** Task 5's ICMP path is
+   still to come.
+
+   The criterion's remedy is "move logic out of the privileged process", and
+   there is nothing here that can go. The packet path is a checksum, a header
+   builder, a reply matcher and a reply classifier; a privileged process that
+   accepted a caller-supplied packet buffer, or delegated the decision of
+   which reply is a reply to this probe, would have given up the property the
+   whole two-process design exists for. Moving it into a new crate would leave
+   it linked into the same address space and is the loophole `check-packetd`'s
+   own passing output already names ("it cannot see logic moved into a
+   dependency"). This task therefore leaves `check-packetd` **red** rather
+   than raising the number quietly, because a cap moved to fit the code is the
+   defect class this repository has recorded six times.
+
+   What the milestone owner has to choose between: (a) re-derive the number
+   from what the component must actually do, and record the derivation where
+   the constant is; (b) cut `--self-check`'s report or `UnprivilegedInput`,
+   both of which are defence-in-depth and diagnostics rather than the mission,
+   and neither of which this task will delete on its own authority; or (c)
+   keep 800 and do not ship Task 5's ICMP path in this process. **Do not
+   resolve it by editing `PACKETD_LINE_BUDGET` without also writing down which
+   of the three this is.**
 
 - [ ] **Step 1: Write the failing test**
 
@@ -493,5 +578,7 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 - [ ] `cargo test --workspace` green; privileged CI job green including the cross-validation test.
 - [ ] AC-6.1 through AC-6.20 each demonstrated by a named passing test.
 - [ ] `bathy-packetd` is under 800 lines of non-test Rust. If it is larger, move logic out of the privileged process. **Enforced by `cargo run -p xtask -- check-packetd`, a `ci.yml` step since Task 1** — see plan edit #6 on Task 1 for what the number counts and why it is not measured for the first time here.
+
+  **This criterion is currently RED and Task 3 left it red deliberately: 919/800.** The remedy it names does not apply — nothing in the packet path can leave a process that must not trust its caller's bytes. See plan edit #6 on Task 3 for the per-file measurement, why each of the five files is the size it is, and the three ways out. It is a decision for the milestone owner, not a number to move.
 - [ ] Every `unsafe` block has a `SAFETY:` comment; no other crate has any.
 - [ ] `docs/design-paper.md` contains a section explaining the two-layer scope enforcement and why the duplication is intentional.
