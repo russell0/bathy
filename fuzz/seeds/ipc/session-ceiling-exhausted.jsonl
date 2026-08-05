@@ -1,0 +1,6 @@
+{"type":"init","allowed_cidrs":["10.30.0.0/24"],"denied_cidrs":[],"packets_per_second":1000,"max_packets":2}
+{"type":"probe","id":1,"target":"10.30.0.10","port":80}
+{"type":"probe","id":2,"target":"10.30.0.11","port":80}
+{"type":"probe","id":3,"target":"10.30.0.12","port":80}
+{"type":"probe","id":4,"target":"10.30.0.13","port":80}
+{"type":"shutdown"}

@@ -385,10 +385,15 @@ pub struct Prober {
     /// cryptographic randomness.
     counter: u32,
     next_send: Option<Instant>,
-    /// How long a probe waits for a reply. `pub(crate)` so a test can shorten
-    /// it; there is no setter, because a caller outside this crate has no
-    /// business changing it.
-    pub(crate) deadline: Duration,
+    /// How long a probe waits for a reply, [`REPLY_DEADLINE`] by default.
+    ///
+    /// Public and directly writable: a test shortens it so silence costs no
+    /// wall-clock time, `fuzz/fuzz_targets/ipc.rs` sets it to zero so a probe
+    /// in a fuzz input does not stall the run, and M6 Task 4's engine will
+    /// want the scan's own connect timeout here. It bounds a wait; it is not
+    /// part of the authorization decision, and nothing below reads it except
+    /// [`Prober::await_reply`].
+    pub deadline: Duration,
 }
 
 impl Prober {
@@ -645,7 +650,7 @@ mod tests {
     fn session_with(allow: &str, deny: &str, max: u64) -> (Session, Shared) {
         let wire = Shared::default();
         let mut session = Session::new(true, Box::new(wire.clone()));
-        session.prober.deadline = Duration::ZERO;
+        session.set_reply_deadline(Duration::ZERO);
         assert!(matches!(
             session.handle_line(&init(allow, deny, max)),
             Some(Response::Ready { .. })
@@ -1271,7 +1276,7 @@ mod tests {
     fn a_probe_before_init_is_still_fatal_and_emits_nothing() {
         let wire = Shared::default();
         let mut session = Session::new(true, Box::new(wire.clone()));
-        session.prober.deadline = Duration::ZERO;
+        session.set_reply_deadline(Duration::ZERO);
         let line = r#"{"type":"probe","id":1,"target":"10.30.0.10","port":80}"#;
         assert!(matches!(
             session.handle_line(line),
@@ -1289,7 +1294,7 @@ mod tests {
     fn handle_probe_called_directly_before_init_is_fatal_and_emits_nothing() {
         let wire = Shared::default();
         let mut session = Session::new(true, Box::new(wire.clone()));
-        session.prober.deadline = Duration::ZERO;
+        session.set_reply_deadline(Duration::ZERO);
         let response = session.handle_probe(1, ip("10.30.0.10"), 80);
         assert!(matches!(response, Response::Fatal { .. }), "{response:?}");
         assert!(session.is_terminated() && session.ended_fatally());

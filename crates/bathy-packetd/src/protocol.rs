@@ -332,6 +332,14 @@ impl Session {
         }
     }
 
+    /// How long each probe waits for a reply. Deliberately the only thing a
+    /// caller may reach through to the prober -- handing out the prober itself
+    /// would let a caller replace the wire under a running session, which is
+    /// the one object here whose identity the scope decision depends on.
+    pub fn set_reply_deadline(&mut self, deadline: std::time::Duration) {
+        self.prober.deadline = deadline;
+    }
+
     /// Every packet this session has put on the wire, teardown RSTs included.
     pub fn packets_emitted(&self) -> u64 {
         self.prober.packets_emitted()
@@ -555,7 +563,7 @@ mod tests {
     /// nothing answers costs no wall-clock time.
     fn test_session_with(dropped: bool) -> Session {
         let mut session = Session::new(dropped, Box::new(NullWire::default()));
-        session.prober.deadline = std::time::Duration::ZERO;
+        session.set_reply_deadline(std::time::Duration::ZERO);
         session
     }
 

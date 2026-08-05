@@ -1,0 +1,10 @@
+{"type":"init","allowed_cidrs":["0.0.0.0/0"],"denied_cidrs":["10.30.0.1/32"],"packets_per_second":1000,"max_packets":1000}
+{"type":"probe","id":1,"target":"127.0.0.1","port":80}
+{"type":"probe","id":2,"target":"224.0.0.1","port":80}
+{"type":"probe","id":3,"target":"255.255.255.255","port":80}
+{"type":"probe","id":4,"target":"169.254.1.1","port":80}
+{"type":"probe","id":5,"target":"240.0.0.1","port":80}
+{"type":"probe","id":6,"target":"0.1.2.3","port":80}
+{"type":"probe","id":7,"target":"10.30.0.1","port":80}
+{"type":"probe","id":8,"target":"198.51.100.7","port":80}
+{"type":"shutdown"}

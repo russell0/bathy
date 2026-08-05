@@ -187,8 +187,13 @@ fn an_open_port_reads_as_open_and_its_teardown_rst_is_seen_on_the_wire() {
         return;
     };
     let host = this_host();
-    let listener = TcpListener::bind((host, 0)).expect("a listener on this host");
-    let port = listener.local_addr().expect("a bound address").port();
+    // Held for the whole test, deliberately: the port is only "the open port"
+    // for as long as something is listening on it, and a listener bound and
+    // then dropped hands the port back to the kernel's ephemeral pool where a
+    // sibling test's `bind(:0)` can take it (`check-fixtures`'s vacated-port
+    // rule, measured at 16 red runs in 30).
+    let _listener = TcpListener::bind((host, 0)).expect("a listener on this host");
+    let port = _listener.local_addr().expect("a bound address").port();
 
     let mut session = session(&format!("\"{host}/32\""), "");
     drain(&watch, Duration::from_millis(60));
@@ -225,7 +230,6 @@ fn an_open_port_reads_as_open_and_its_teardown_rst_is_seen_on_the_wire() {
     let rst_seq = u32::from_be_bytes(rst[24..28].try_into().unwrap());
     assert_eq!(rst_seq, syn_seq.wrapping_add(1));
     assert_eq!(session.packets_emitted(), 2, "one SYN and one RST");
-    drop(listener);
 }
 
 /// AC-6.12 (`Closed`). The narrowing control for the test above: same host,
@@ -269,8 +273,13 @@ fn a_refused_target_puts_nothing_at_all_on_the_wire() {
         return;
     };
     let host = this_host();
-    let listener = TcpListener::bind((host, 0)).expect("a listener on this host");
-    let port = listener.local_addr().expect("a bound address").port();
+    // Held for the whole test, deliberately: the port is only "the open port"
+    // for as long as something is listening on it, and a listener bound and
+    // then dropped hands the port back to the kernel's ephemeral pool where a
+    // sibling test's `bind(:0)` can take it (`check-fixtures`'s vacated-port
+    // rule, measured at 16 red runs in 30).
+    let _listener = TcpListener::bind((host, 0)).expect("a listener on this host");
+    let port = _listener.local_addr().expect("a bound address").port();
 
     // Allow everything, then deny this host: both refusal reasons are about
     // a target whose packets this process could see.
@@ -316,5 +325,4 @@ fn a_refused_target_puts_nothing_at_all_on_the_wire() {
         ours(&captured, port).iter().any(|p| p[33] == FLAG_SYN),
         "the allowed probe's SYN is what should have appeared"
     );
-    drop(listener);
 }

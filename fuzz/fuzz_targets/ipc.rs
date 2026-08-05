@@ -26,10 +26,56 @@
 //! 4. **The reader never allocates past its cap.** Checked after every read,
 //!    including on the error paths, because "rejected without allocating it"
 //!    is a claim about the failure case.
+//! 5. **No packet is ever emitted at an address the session did not
+//!    authorize** (AC-6.9, AC-6.10). The session is handed a `Wire` that
+//!    records instead of sending, and after every line each recorded target
+//!    is re-checked here -- with `IpNet::contains` and `std`'s reserved-range
+//!    predicates, so neither `bathy-packetd`'s hand-rolled mask nor
+//!    `bathy-scope`'s matcher decides whether it passed. That makes this the
+//!    third independent statement of the same policy, and the only one driven
+//!    by bytes an attacker chose.
+
+use std::cell::RefCell;
+use std::net::{IpAddr, Ipv4Addr};
+use std::rc::Rc;
 
 use bathy_fuzz::Stats;
 use bathy_packetd::protocol::{LineError, MAX_LINE_BYTES, Request, Response, Session, read_line};
+use bathy_packetd::syn::Wire;
 use libfuzzer_sys::fuzz_target;
+
+/// A wire that records every target and puts nothing on the network. A fuzz
+/// target that could emit is a fuzz target that scans whoever runs it.
+#[derive(Debug, Default, Clone)]
+struct Recorder(Rc<RefCell<Vec<Ipv4Addr>>>);
+
+impl Wire for Recorder {
+    fn source_for(&self, _target: Ipv4Addr) -> std::io::Result<Ipv4Addr> {
+        Ok(Ipv4Addr::new(10, 30, 0, 99))
+    }
+    fn emit(&mut self, _packet: &[u8], target: Ipv4Addr) -> std::io::Result<()> {
+        self.0.borrow_mut().push(target);
+        Ok(())
+    }
+    fn poll(&mut self, _buf: &mut [u8]) -> Option<usize> {
+        None
+    }
+}
+
+/// Property 5's own opinion of the policy, owed to nothing in the tree:
+/// `std`'s predicates for the reserved ranges, `ipnet`'s `contains` for the
+/// CIDR sets. `bathy-packetd` uses neither.
+fn independently_authorized(addr: Ipv4Addr, allow: &[ipnet::IpNet], deny: &[ipnet::IpNet]) -> bool {
+    let ip = IpAddr::V4(addr);
+    let reserved = addr.is_loopback()
+        || addr.is_multicast()
+        || addr.is_broadcast()
+        || addr.is_link_local()
+        || addr.is_unspecified()
+        || addr.octets()[0] == 0
+        || addr.octets()[0] >= 240;
+    !reserved && !deny.iter().any(|n| n.contains(&ip)) && allow.iter().any(|n| n.contains(&ip))
+}
 
 const LINES: usize = 0;
 const READ_ERRORS: usize = 1;
@@ -37,6 +83,9 @@ const PARSED: usize = 2;
 const ACCEPTED_INIT: usize = 3;
 const RESPONSES_AFTER_INIT: usize = 4;
 const FATALS: usize = 5;
+/// Packets handed to the wire. A run with `emitted=0` has never reached the
+/// packet path at all, and property 5 is ranging over nothing.
+const EMITTED: usize = 6;
 
 const LABELS: &[&str] = &[
     "lines",
@@ -50,6 +99,7 @@ const LABELS: &[&str] = &[
     "accepted_init",
     "responses_after_init",
     "fatals",
+    "emitted",
 ];
 
 const FLAGS: &[&str] = &[
@@ -72,12 +122,20 @@ fuzz_target!(|data: &[u8]| {
     // `Session::new(true)` and not `false`: the capability flag is relayed
     // into `Ready`, and the value that would let a wrong `Ready` pass
     // unnoticed is the one this process would be lying about.
-    let mut session = Session::new(true);
+    let wire = Recorder::default();
+    let mut session = Session::new(true, Box::new(wire.clone()));
+    // A probe in a fuzz input must not wait out a reply deadline for a reply
+    // that a recording wire will never produce.
+    session.set_reply_deadline(std::time::Duration::ZERO);
     let mut reader = std::io::Cursor::new(data.to_vec());
     let mut buf = Vec::new();
     // The scope the session is running on, captured the moment it starts
     // running. Property 2 compares against this and nothing else.
     let mut running_scope: Option<Vec<String>> = None;
+    // The same sets as `ipnet` values, kept so property 5 can still judge an
+    // emission made by the line that ended the session.
+    let mut running_allow: Option<Vec<ipnet::IpNet>> = None;
+    let mut running_deny: Option<Vec<ipnet::IpNet>> = None;
     let mut seen_fatal = false;
 
     loop {
@@ -162,6 +220,8 @@ fuzz_target!(|data: &[u8]| {
                 );
                 STATS.bump(ACCEPTED_INIT);
                 running_scope = Some(cidrs(&session));
+                running_allow = session.scope().map(|s| s.allowed().to_vec());
+                running_deny = session.scope().map(|s| s.denied().to_vec());
             }
         } else {
             STATS.bump(RESPONSES_AFTER_INIT);
@@ -194,6 +254,29 @@ fuzz_target!(|data: &[u8]| {
             seen_fatal = true;
             assert!(session.ended_fatally());
         }
+        // Property 5. Every address that reached the wire, judged by this
+        // file's own rules -- so a `check_session_scope` that agreed with
+        // itself cannot satisfy it.
+        let authorized: Vec<ipnet::IpNet> = session
+            .scope()
+            .map(|s| s.allowed().to_vec())
+            .or_else(|| running_allow.clone())
+            .unwrap_or_default();
+        let refused: Vec<ipnet::IpNet> = session
+            .scope()
+            .map(|s| s.denied().to_vec())
+            .or_else(|| running_deny.clone())
+            .unwrap_or_default();
+        for target in wire.0.borrow().iter() {
+            assert!(
+                independently_authorized(*target, &authorized, &refused),
+                "packetd emitted at {target}, which allow={authorized:?} deny={refused:?} \
+                 does not authorize"
+            );
+            STATS.bump(EMITTED);
+        }
+        wire.0.borrow_mut().clear();
+
         // A response must survive being written and read back: the daemon
         // writes exactly this line to a pipe.
         if let Some(response) = &response {
