@@ -137,7 +137,7 @@ use bathy_probe::{ProbeIo, ProbeRegistry, select_probes};
 use bathy_scope::{BudgetLedger, ScopeManifest};
 use bathy_store::{StoreError, TaskStore};
 use bathy_types::clock::Clock;
-use bathy_types::event::{DenyReason, EventBody, Observation, PortState, Target};
+use bathy_types::event::{DenyReason, EventBody, Observation, PortState, ScanMode, Target};
 use bathy_types::ids::{Digest, ScanId};
 use bathy_types::nonempty::NonEmpty;
 use bathy_types::request::{EvidenceLevel, ServiceDetection};
@@ -145,10 +145,28 @@ use bathy_types::task::TaskStatus;
 
 use crate::connect::{ConnectOutcome, probe_connect_with_local_signal};
 use crate::durable_log::GroupCommitLog;
+use crate::packetd::{PacketdClient, PacketdConfig, PacketdError};
 use crate::rate::RateLimiter;
 
 #[cfg(test)]
 use crate::durable_log::GroupCommitConfig;
+
+/// The connect path's outcome, as a wire state.
+///
+/// M6 Task 4 moved this out of `Scheduler::record`, which now takes a
+/// `PortState` because two methods feed it. `Unreachable` and `Filtered`
+/// both fold to `Filtered` here, and `packetd` folds ICMP-unreachable and
+/// silence the same way: the two methods must agree on every endpoint
+/// (AC-6.14), so a distinction one of them can draw and the other cannot is
+/// a distinction that would fail the cross-validation on every filtered
+/// port. See this task's report for where the lost detail belongs instead.
+fn port_state_of(outcome: ConnectOutcome) -> PortState {
+    match outcome {
+        ConnectOutcome::Open => PortState::Open,
+        ConnectOutcome::Closed => PortState::Closed,
+        ConnectOutcome::Filtered | ConnectOutcome::Unreachable => PortState::Filtered,
+    }
+}
 
 /// Batch size at which accumulated per-unit completions are flushed to the
 /// `TaskStore` resumption cursor (`store.mark_units_done`). Independent of
@@ -287,6 +305,21 @@ pub struct RunSummary {
     /// failing the scan outright when they dominate -- see this task's
     /// report for why.
     pub local_resource_failures: u64,
+    /// M6 AC-6.16: `packetd` answered before and stopped answering, or
+    /// refused a probe its own scope check rejected. The scan's terminal is
+    /// `scan.failed` with `packetd_unavailable` or `packetd_refused`; it is
+    /// never a quiet switch to connect probing, which would produce one
+    /// result set assembled by two methods.
+    pub packetd_unavailable: bool,
+    /// M6 AC-6.15: which method actually produced this run's port states,
+    /// mirroring what `scan.started` records. `None` only when the run
+    /// never reached dispatch (a policy denial, or an already-terminated
+    /// scan), because in that case no method produced anything.
+    pub scan_mode: Option<ScanMode>,
+    /// Why SYN scanning was asked for and connect scanning happened. `None`
+    /// when nothing was degraded -- including when connect scanning is
+    /// simply what was requested.
+    pub packetd_fallback: Option<String>,
 }
 
 /// Tunables that are Task 7's own (as opposed to [`crate::durable_log::GroupCommitConfig`],
@@ -306,6 +339,15 @@ pub struct SchedulerConfig {
     /// progress event, which is not "periodic," it is "every event," a
     /// meaningfully different and much noisier contract).
     pub progress_every: u64,
+    /// M6 Task 4: whether this scan asks for SYN probing, and where the
+    /// daemon that does it lives.
+    ///
+    /// Default is [`PacketdConfig::default`] -- no daemon, connect
+    /// scanning. A scanner that reached for a privileged helper unless told
+    /// otherwise would make the unprivileged path the exception, and this
+    /// project's unprivileged path is the one that is proven correct
+    /// against the lab.
+    pub packetd: PacketdConfig,
 }
 
 impl Default for SchedulerConfig {
@@ -314,6 +356,7 @@ impl Default for SchedulerConfig {
             concurrency: 256,
             connect_timeout: Duration::from_secs(2),
             progress_every: 500,
+            packetd: PacketdConfig::default(),
         }
     }
 }
@@ -699,10 +742,47 @@ impl Scheduler {
             ));
         }
 
+        // M6 AC-6.15/AC-6.16: what actually happened to `packetd`.
+        // `packetd_failure` is deliberately separate from `policy_denial`
+        // and from the two exhaustion flags -- it is the one terminal that
+        // means "the method this scan was run with stopped working", and it
+        // must not be reachable by falling back.
+        let mut syn: Option<PacketdClient> = None;
+        let mut packetd_failure: Option<PacketdError> = None;
+
         'dispatch: {
             if policy_denial.is_some() {
                 break 'dispatch;
             }
+
+            // AC-6.15: the fallback decision, made once, before the scan
+            // announces itself -- so `scan.started` can say which method
+            // produced everything after it.
+            //
+            // The manifest is the only thing `init_request` reads (AC-6.17).
+            let mut scan_mode = ScanMode::TcpConnect;
+            let mut scan_mode_detail = None;
+            if let Some(binary) = self.config.packetd.binary.clone() {
+                match PacketdClient::start(&binary, self.manifest.as_ref()) {
+                    Ok(client) => {
+                        scan_mode = ScanMode::TcpSyn;
+                        syn = Some(client);
+                    }
+                    Err(e) => {
+                        // Recorded rather than raised: a daemon that never
+                        // started has emitted nothing, and connect scanning
+                        // answers the same question without privilege. The
+                        // reason travels in the log because the process
+                        // that knew it has already exited.
+                        scan_mode_detail = Some(format!(
+                            "requested tcp-syn via {}, fell back to tcp-connect: {e}",
+                            binary.display()
+                        ));
+                    }
+                }
+            }
+            summary.scan_mode = Some(scan_mode);
+            summary.packetd_fallback = scan_mode_detail.clone();
 
             // AC-3.28: exactly one `scan.started`, gated on the log's own
             // content rather than on `from_index` -- see the module doc.
@@ -711,6 +791,8 @@ impl Scheduler {
                     plan_hash: plan.hash(),
                     estimated_targets: plan.targets().len() as u64,
                     estimated_probes: plan.len(),
+                    scan_mode: Some(scan_mode),
+                    scan_mode_detail,
                 })?;
             }
 
@@ -725,7 +807,7 @@ impl Scheduler {
                 .collect();
 
             let permits = Arc::new(Semaphore::new(self.config.concurrency.max(1)));
-            let mut in_flight: JoinSet<(ScanUnit, ConnectOutcome, bool)> = JoinSet::new();
+            let mut in_flight: JoinSet<(ScanUnit, PortState, bool)> = JoinSet::new();
             let mut units = plan.units_from(from_index);
             let mut completed_batch: Vec<u64> = Vec::with_capacity(STORE_FLUSH_BATCH);
             let mut last_progress_emitted_at: u64 = 0;
@@ -814,14 +896,46 @@ impl Scheduler {
                     break 'drive;
                 }
 
-                let timeout = self.config.connect_timeout;
-                in_flight.spawn(async move {
-                    let (outcome, local) =
-                        probe_connect_with_local_signal(unit.target, unit.endpoint.port, timeout)
-                            .await;
+                // AC-6.16: a SYN probe is awaited here rather than spawned.
+                // `packetd`'s protocol is one line in and one line out, so
+                // there is no concurrency to schedule -- and the failure
+                // that matters must stop the loop, which a detached task
+                // cannot do. It is deliberately NOT raced against `cancel`:
+                // the packet is already on the wire by the time this awaits,
+                // and invariant 2 is drain-not-drop.
+                if let Some(client) = syn.as_ref() {
+                    let answer = client.probe(unit.target, unit.endpoint.port).await;
                     drop(permit);
-                    (unit, outcome, local)
-                });
+                    match answer {
+                        Ok(state) => {
+                            self.record(
+                                (unit, state, false),
+                                &mut summary,
+                                &mut completed_batch,
+                                &cancel,
+                            )
+                            .await?;
+                        }
+                        Err(e) => {
+                            // The scan does not quietly continue with the
+                            // other method. See `packetd::PacketdError`.
+                            packetd_failure = Some(e);
+                            break 'drive;
+                        }
+                    }
+                } else {
+                    let timeout = self.config.connect_timeout;
+                    in_flight.spawn(async move {
+                        let (outcome, local) = probe_connect_with_local_signal(
+                            unit.target,
+                            unit.endpoint.port,
+                            timeout,
+                        )
+                        .await;
+                        drop(permit);
+                        (unit, port_state_of(outcome), local)
+                    });
+                }
 
                 while let Some(done) = in_flight.try_join_next() {
                     self.record(done?, &mut summary, &mut completed_batch, &cancel)
@@ -880,7 +994,25 @@ impl Scheduler {
         // (M2's mechanism for telling a repeat idempotency key what
         // happened to the original scan) could therefore never report
         // anything but `Pending`, indistinguishable from "never started".
-        let terminal = if summary.budget_exhausted {
+        // AC-6.16, asked FIRST and before every other terminal. A scan
+        // whose probing method stopped working must not be reported as
+        // anything else -- "budget exhausted" or "completed" about a scan
+        // that stopped answering would be the engine describing a result
+        // set it does not have. `packetd_failure` is only ever set from a
+        // probe that was actually attempted, so it cannot pre-empt a
+        // cancellation that arrived first: the loop checks `cancel` at the
+        // top of every iteration and never reaches a probe after it.
+        let terminal = if let Some(failure) = &packetd_failure {
+            summary.packetd_unavailable = true;
+            self.log(EventBody::ScanFailed {
+                reason_code: failure
+                    .terminal_reason()
+                    .unwrap_or("packetd_unavailable")
+                    .to_string(),
+                detail: format!("{failure}"),
+            })?;
+            TaskStatus::Failed
+        } else if summary.budget_exhausted {
             self.log(EventBody::ScanFailed {
                 reason_code: "budget_exhausted".into(),
                 detail: format!(
@@ -1014,26 +1146,29 @@ impl Scheduler {
     /// `cancellation_stops_new_probe_traffic_not_just_new_units` below
     /// reproduces this with a real listener and asserts zero bytes land
     /// post-cancel.
+    /// M6 Task 4: this takes a [`PortState`] rather than a
+    /// [`ConnectOutcome`], and the `ConnectOutcome` mapping moved to the
+    /// connect dispatch site. Two probing methods now feed this function
+    /// (connect and, through `packetd`, SYN), and only one of them produces
+    /// a `ConnectOutcome`; keeping the mapping here would have meant
+    /// inventing a `ConnectOutcome` for a probe that never opened a socket.
+    /// It also makes `PortState::Indeterminate` reachable for the first
+    /// time -- `packetd` can report it, and the connect path cannot.
     async fn record(
         &self,
-        done: (ScanUnit, ConnectOutcome, bool),
+        done: (ScanUnit, PortState, bool),
         summary: &mut RunSummary,
         completed_batch: &mut Vec<u64>,
         cancel: &CancellationToken,
     ) -> Result<(), EngineError> {
-        let (unit, outcome, local_failure) = done;
-        let state = match outcome {
-            ConnectOutcome::Open => PortState::Open,
-            ConnectOutcome::Closed => PortState::Closed,
-            ConnectOutcome::Filtered | ConnectOutcome::Unreachable => PortState::Filtered,
-        };
+        let (unit, state, local_failure) = done;
         self.log(EventBody::PortStateObserved {
             target: Target { ip: unit.target },
             endpoint: unit.endpoint,
             state,
             evidence_refs: None,
         })?;
-        if outcome == ConnectOutcome::Open {
+        if state == PortState::Open {
             summary.open_ports += 1;
             // AC-4.22: `service_detection.enabled = false` must send zero
             // probe bytes -- checked here, before `detect_service` is ever
@@ -1985,6 +2120,7 @@ mod tests {
             concurrency: 32,
             connect_timeout: Duration::from_millis(500),
             progress_every: 500,
+            packetd: PacketdConfig::default(),
         }
     }
 
@@ -2022,6 +2158,7 @@ mod tests {
                 concurrency: 64,
                 connect_timeout: Duration::from_millis(300),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
         )
@@ -2209,6 +2346,8 @@ mod tests {
                 plan_hash: Digest::of_bytes(b"x"),
                 estimated_targets: 1,
                 estimated_probes: 1,
+                scan_mode: Some(ScanMode::TcpConnect),
+                scan_mode_detail: None,
             },
             &clock,
             "0.1.0",
@@ -2340,6 +2479,7 @@ mod tests {
                 concurrency: 1,
                 connect_timeout: Duration::from_millis(800),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
         );
@@ -2486,6 +2626,7 @@ mod tests {
                 concurrency: 16,
                 connect_timeout: Duration::from_secs(5),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
             ServiceDetection {
@@ -2665,6 +2806,7 @@ mod tests {
                 concurrency: 8,
                 connect_timeout: Duration::from_millis(300),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
         );
@@ -3329,7 +3471,7 @@ mod tests {
         // reimplementation of its `+= 1` logic.
         h.scheduler
             .record(
-                (unit, ConnectOutcome::Filtered, true),
+                (unit, port_state_of(ConnectOutcome::Filtered), true),
                 &mut summary,
                 &mut completed_batch,
                 &CancellationToken::new(),
@@ -3453,6 +3595,7 @@ mod tests {
                 concurrency: 10,
                 connect_timeout: Duration::from_secs(5),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
             ServiceDetection {
@@ -3514,6 +3657,7 @@ mod tests {
                     concurrency: 10,
                     connect_timeout: Duration::from_secs(5),
                     progress_every: 500,
+                    packetd: PacketdConfig::default(),
                 },
                 budgets(1_000_000, 3_600, 8),
             )
@@ -3949,6 +4093,7 @@ mod tests {
                 concurrency: 16,
                 connect_timeout: Duration::from_millis(300),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
             GroupCommitConfig {
@@ -4124,6 +4269,7 @@ mod tests {
                 concurrency: 32,
                 connect_timeout: Duration::from_millis(300),
                 progress_every: 500,
+                packetd: PacketdConfig::default(),
             },
             default_manifest(),
         );

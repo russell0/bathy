@@ -70,6 +70,51 @@ pub enum PortState {
     Indeterminate,
 }
 
+/// Which probing method produced a scan's port states.
+///
+/// A consumer comparing two scans of the same targets needs to know whether a
+/// difference is the network or the method. This is recorded on
+/// `scan.started`, so a result is self-describing without a reader having to
+/// know which build or which privilege level produced it.
+///
+/// The two are not interchangeable in what they establish. A `tcp-connect`
+/// `open` is a completed three-way handshake; a `tcp-syn` `open` is a SYN-ACK
+/// that was answered with a reset and never became a connection. They are
+/// required to agree on every endpoint, which is what makes one a valid
+/// substitute for the other.
+//
+// Maintainer notes, deliberately `//` so they stay out of the published
+// contract:
+//
+// The wire strings are kebab-case rather than this file's usual snake_case
+// because `tcp-connect` is the string M6 AC-6.15 names, and `discovery.rs`
+// already publishes `method` strings in the same shape (`tcp-connect:443`).
+// A second spelling of the same method in the same log would be a
+// distinction with no meaning behind it.
+//
+// "Required to agree" is M6 AC-6.14, and it is enforced by
+// `crates/bathy-engine/tests/syn_vs_connect.rs`, which compares both against
+// `lab/ground-truth.json` rather than only against each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScanMode {
+    /// A full TCP connect. Needs no privilege.
+    TcpConnect,
+    /// Half-open SYN probing through a separately privileged helper.
+    TcpSyn,
+}
+
+impl ScanMode {
+    /// The stable identifier. Agents branch on these, so they are part of the
+    /// public contract and must not be reworded.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::TcpConnect => "tcp-connect",
+            Self::TcpSyn => "tcp-syn",
+        }
+    }
+}
+
 /// What a probe concluded about one endpoint. Every field beyond `service` is
 /// optional because partial identification is normal and honest.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -139,6 +184,33 @@ pub enum EventBody {
         plan_hash: Digest,
         estimated_targets: u64,
         estimated_probes: u64,
+        /// Which probing method produced this scan's port states. Absent
+        /// means the record was written by a build that had only one method;
+        /// absence dates a record rather than describing an unknown method.
+        //
+        // Absent means "written before M6 Task 4", which is every build up
+        // to and including `8f62b2e`.
+        //
+        // `Option` + `#[serde(default, skip_serializing_if)]`, on the rule in
+        // `docs/event-log-compatibility.md` and for the same reason
+        // `ServiceObserved::rule_id` above carries it: this field was added
+        // to a record shape that logs already existed in, and `EventBody`
+        // carries `deny_unknown_fields`, so a required field here would make
+        // every log written before M6 Task 4 fail to replay. It is optional
+        // forever.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scan_mode: Option<ScanMode>,
+        /// Why `scan_mode` is what it is, when that needs saying. Present
+        /// only when the mode is not the one that was asked for: a scan that
+        /// requested `tcp-syn` and ran as `tcp-connect` records the reason
+        /// here. Absent means the mode is unremarkable, never that the
+        /// reason is unknown.
+        //
+        // Without it, an agent that sees the method changed has no way to
+        // find out why: the process that knew (`packetd`) has already
+        // exited, and its stderr belongs to a terminal nobody was watching.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        scan_mode_detail: Option<String>,
     },
 
     #[serde(rename = "host.discovered")]
@@ -426,6 +498,8 @@ mod tests {
                     plan_hash: digest_fixture(1),
                     estimated_targets: 10,
                     estimated_probes: 100,
+                    scan_mode: Some(ScanMode::TcpSyn),
+                    scan_mode_detail: None,
                 },
             ),
             (
@@ -532,6 +606,8 @@ mod tests {
                 plan_hash: digest_fixture(10),
                 estimated_targets: 500,
                 estimated_probes: 5000,
+                scan_mode: Some(ScanMode::TcpConnect),
+                scan_mode_detail: Some("packetd exited 69".to_string()),
             },
             EventBody::HostDiscovered {
                 target: Target {

@@ -259,6 +259,8 @@ mod tests {
                     plan_hash: digest("plan"),
                     estimated_targets: 1,
                     estimated_probes: 4,
+                    scan_mode: None,
+                    scan_mode_detail: None,
                 },
             ),
             port_state(2, "10.0.0.1", 443, PortState::Open),

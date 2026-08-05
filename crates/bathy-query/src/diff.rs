@@ -443,6 +443,8 @@ mod tests {
                 plan_hash: digest(plan),
                 estimated_targets: 1,
                 estimated_probes: 4,
+                scan_mode: None,
+                scan_mode_detail: None,
             },
         )
     }
@@ -1471,6 +1473,8 @@ mod proptests {
                     plan_hash: digest(PLANS[*plan]),
                     estimated_targets: 2,
                     estimated_probes: 6,
+                    scan_mode: None,
+                    scan_mode_detail: None,
                 },
             ));
         }

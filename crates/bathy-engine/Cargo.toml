@@ -58,6 +58,21 @@ bathy-plan = { workspace = true }
 # the layer order `check-deps` enforces.
 bathy-probe = { workspace = true }
 bathy-interpret = { workspace = true }
+# M6 Task 4 (`src/packetd.rs`): `packetd`'s `Init` carries the manifest's
+# CIDRs, and the engine must hand them over as the same `IpNet` values
+# `bathy-scope` parsed rather than as strings it re-spells -- a CIDR that
+# survives a round trip through `String` is a CIDR nothing re-validated.
+# Already in this workspace's tree (`bathy-scope`, `bathy-plan`), at the same
+# version, so this is a direct edge onto a crate already in the graph and not
+# new supply-chain surface.
+ipnet = { workspace = true }
+# M6 Task 4: the `packetd` line protocol is line-delimited JSON, and this
+# side states it as `serde` types for the same reason the other side does --
+# an unparseable response is a *parse* failure at the boundary rather than a
+# validation step somebody has to remember. Both are already in this
+# workspace's tree at these versions.
+serde = { workspace = true }
+serde_json = { workspace = true }
 # OPTIONAL, and pulled in by nothing but the `test-util` feature below --
 # `cargo build -p bathy-engine` and every consumer that does not ask for
 # `test-util` resolve exactly the graph they did before, which is checkable

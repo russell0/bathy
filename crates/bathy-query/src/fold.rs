@@ -631,6 +631,8 @@ pub(crate) mod tests {
                 plan_hash: digest("plan"),
                 estimated_targets: 1,
                 estimated_probes: 2,
+                scan_mode: None,
+                scan_mode_detail: None,
             },
         )
     }
@@ -1106,6 +1108,8 @@ pub(crate) mod tests {
                 plan_hash: digest("second-plan"),
                 estimated_targets: 1,
                 estimated_probes: 2,
+                scan_mode: None,
+                scan_mode_detail: None,
             },
         );
         let f = fold_events(&[restarted, started(1)]);
@@ -1295,6 +1299,8 @@ mod proptests {
                 plan_hash: digest("plan"),
                 estimated_targets: 2,
                 estimated_probes: 6,
+                scan_mode: None,
+                scan_mode_detail: None,
             }),
             2 => arb_target().prop_map(|target| EventBody::HostDiscovered {
                 evidence_refs: NonEmpty::new(digest(&target.ip.to_string())),

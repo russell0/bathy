@@ -46,6 +46,11 @@ pub mod cancel;
 pub mod connect;
 pub mod discovery;
 pub mod durable_log;
+// M6 Task 4: the engine's half of the `packetd` seam. It is here rather
+// than in `bathy-packetd` because every line of it is unprivileged work,
+// and `xtask`'s `LAYERS` puts `bathy-packetd` above this crate on purpose
+// -- the engine spawns a process, not a library.
+pub mod packetd;
 pub mod rate;
 pub mod scheduler;
 // Fixtures for tests, and compiled only for them. It exists because "a port
@@ -69,5 +74,6 @@ pub mod test_support;
 pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
 pub use discovery::{DiscoveryConfig, DiscoveryConfigError, DiscoveryResult, discover_host};
 pub use durable_log::{GroupCommitConfig, GroupCommitLog};
+pub use packetd::{PacketdClient, PacketdConfig, PacketdError, init_request};
 pub use rate::RateLimiter;
 pub use scheduler::{EngineError, RunSummary, Scheduler, SchedulerConfig};

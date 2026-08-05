@@ -255,6 +255,32 @@ impl ScopeManifest {
         self.ceiling
     }
 
+    /// The networks this manifest authorizes, as loaded.
+    ///
+    /// Added for M6 AC-6.17: `bathy-packetd`'s `Init` allowlist must be
+    /// derived from *the manifest the engine validated against*, never from
+    /// the caller's request, and the only way to make that structural rather
+    /// than a rule somebody follows is for the builder to have nothing else
+    /// to read. `bathy_engine::packetd::init_request` takes a
+    /// `&ScopeManifest` and no second argument.
+    ///
+    /// Returns a slice, not a `Vec`: a caller that could push onto this
+    /// could widen the authorization, and the whole point of handing it to a
+    /// privileged process is that it is the authorization.
+    pub fn allowed(&self) -> &[IpNet] {
+        &self.allowed
+    }
+
+    /// The networks this manifest excludes. See [`allowed`](Self::allowed).
+    ///
+    /// Deny beats allow, here and in `packetd` -- the two implementations of
+    /// that rule are checked against each other by
+    /// `the_two_scope_implementations_agree_on_every_generated_address` in
+    /// `crates/bathy-packetd/src/syn.rs`.
+    pub fn denied(&self) -> &[IpNet] {
+        &self.denied
+    }
+
     /// Always `false` in v0.1: a manifest's `signature` field, if present,
     /// is stored (see [`had_signature`](Self::had_signature)) but never
     /// cryptographically checked. This method exists so a caller can ask

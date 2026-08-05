@@ -28,7 +28,7 @@ pub use capture::ProbeCapture;
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use confidence::{Confidence, ConfidenceError};
 pub use event::{
-    DenyReason, Endpoint, Event, EventBody, Observation, PortState, Target, Transport,
+    DenyReason, Endpoint, Event, EventBody, Observation, PortState, ScanMode, Target, Transport,
 };
 pub use ids::{Digest, EventId, IdError, ScanId, ScopeId};
 pub use nonempty::{EmptyError, NonEmpty};
