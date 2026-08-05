@@ -37,8 +37,17 @@ trying to hang, exhaust, or exploit the scanner.
   byte per second forever, or floods without end, does neither harm — the
   deadline covers the aggregate, and the cap covers the volume.
 - **No panics in parsing paths.** Every function that consumes network bytes
-  returns `Result`. `unwrap()`, `expect()` and panicking slice indexing are
-  denied by lint in `bathy-probe` and `bathy-interpret`.
+  returns `Result`, and the only `expect()` calls left in either parsing crate
+  are on `LazyLock` regex compilation and on a confidence constant — neither
+  of which touches a network byte. **What is not true, and is stated here
+  because a threat model that overstates its own guards is worse than one that
+  admits a hole:** the project's Global Constraints say `unwrap()`, `expect()`
+  and panicking slice indexing are *denied by lint* in `bathy-probe` and
+  `bathy-interpret`, and no such lint exists anywhere in this tree. The
+  property is currently held by review and by the fuzz targets below, not by
+  the compiler. Found while re-verifying documentation claims against the code
+  in M7 Task 4; adding the lints is an audit of every remaining call site,
+  which is its own piece of work and not a documentation edit.
 - **Every parser of untrusted bytes is fuzzed.** Interpretation, event-log
   parsing, canonical JSON and manifest loading each have a libFuzzer target,
   seeded from real recorded data rather than from random bytes, with counters
