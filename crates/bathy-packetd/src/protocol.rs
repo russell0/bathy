@@ -55,6 +55,8 @@ use std::net::IpAddr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::syn::{Prober, Wire};
+
 /// The largest line `packetd` will accept, in bytes, excluding the newline.
 ///
 /// 8 KiB is far more than any legitimate message needs -- the longest is an
@@ -142,12 +144,6 @@ pub enum RefusalReason {
     OutOfSessionScope,
     /// The session's own packet ceiling is spent (AC-6.11).
     SessionBudgetExhausted,
-    /// This build has no packet path: `bathy-packetd` currently ships the
-    /// protocol and nothing that emits. A probe that reaches a build which
-    /// cannot probe is refused rather than answered, because the alternative
-    /// is a `Result` this process did not observe. Removed by M6 Task 3,
-    /// which replaces the arm that produces it.
-    ProbingUnavailable,
 }
 
 impl Response {
@@ -259,10 +255,15 @@ pub fn read_line<'b, R: BufRead>(
 /// be widened after startup". Read by Task 3's independent scope check.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionScope {
-    allowed: Vec<IpNet>,
-    denied: Vec<IpNet>,
-    packets_per_second: u32,
-    max_packets: u64,
+    // `pub(crate)` and no further: `syn.rs` reads these to make the
+    // independent scope decision, and its tests construct a scope directly
+    // rather than through an `Init` line. Nothing outside this crate can
+    // build or mutate one, which is what "fixed for the process lifetime"
+    // rests on.
+    pub(crate) allowed: Vec<IpNet>,
+    pub(crate) denied: Vec<IpNet>,
+    pub(crate) packets_per_second: u32,
+    pub(crate) max_packets: u64,
 }
 
 impl SessionScope {
@@ -307,6 +308,10 @@ const AFTER_THE_END: &str = "session already terminated; packetd does not resync
 pub struct Session {
     state: State,
     dropped_capabilities: bool,
+    /// The packet path, and the second enforcement point. It is owned by the
+    /// session rather than reached through it, so there is no way to emit
+    /// without having gone through [`Session::handle_probe`].
+    pub(crate) prober: Prober,
 }
 
 impl Session {
@@ -319,10 +324,35 @@ impl Session {
     /// from a constructor that never checked anything -- which is the
     /// "claimed but never enforced" defect class this repository has paid for
     /// repeatedly. See plan edit #1 on M6 Task 1.
-    pub fn new(dropped_capabilities: bool) -> Self {
+    pub fn new(dropped_capabilities: bool, wire: Box<dyn Wire>) -> Self {
         Self {
             state: State::AwaitingInit,
             dropped_capabilities,
+            prober: Prober::new(wire),
+        }
+    }
+
+    /// Every packet this session has put on the wire, teardown RSTs included.
+    pub fn packets_emitted(&self) -> u64 {
+        self.prober.packets_emitted()
+    }
+
+    /// One probe, scope-checked and budget-checked by `packetd` itself.
+    ///
+    /// A probe before `Init`, or after the session has ended, is fatal on the
+    /// same terms as any other out-of-state message (AC-6.1): a privileged
+    /// process asked to emit before it has been told its scope is a process
+    /// that must stop, not one that answers.
+    pub fn handle_probe(&mut self, id: u64, target: IpAddr, port: u16) -> Response {
+        let State::Running(scope) = &self.state else {
+            return self.terminate(format!(
+                "probe {id} arrived outside a running session; packetd refuses all work \
+                 before it has been told its scope"
+            ));
+        };
+        match self.prober.probe(scope, target, port) {
+            Ok(state) => Response::Result { id, state },
+            Err(reason) => Response::Refused { id, reason },
         }
     }
 
@@ -435,10 +465,12 @@ impl Session {
                         .to_string(),
                 ),
             ),
-            (State::Running(_), Request::Probe { id, .. }) => Some(Response::Refused {
-                id,
-                reason: RefusalReason::ProbingUnavailable,
-            }),
+            // AC-6.9 through AC-6.13 all happen inside this call. The arm
+            // carries no policy of its own: one enforcement path, so a second
+            // caller cannot come to have a second one.
+            (State::Running(_), Request::Probe { id, target, port }) => {
+                Some(self.handle_probe(id, target, port))
+            }
             (State::Running(_), Request::Shutdown) => {
                 // A clean end is still an end: the session stops accepting
                 // work. The only thing that distinguishes it from a fatal is
@@ -498,6 +530,39 @@ mod tests {
         )
     }
 
+    /// A wire that accepts every packet, answers nothing, and counts. The
+    /// tests in this module are about the *protocol*; `syn.rs`'s own tests
+    /// are where the emissions are inspected.
+    #[derive(Debug, Default)]
+    struct NullWire {
+        sent: usize,
+    }
+
+    impl Wire for NullWire {
+        fn source_for(&self, _target: std::net::Ipv4Addr) -> std::io::Result<std::net::Ipv4Addr> {
+            Ok(std::net::Ipv4Addr::new(10, 30, 0, 99))
+        }
+        fn emit(&mut self, _packet: &[u8], _target: std::net::Ipv4Addr) -> std::io::Result<()> {
+            self.sent = self.sent.saturating_add(1);
+            Ok(())
+        }
+        fn poll(&mut self, _buf: &mut [u8]) -> Option<usize> {
+            None
+        }
+    }
+
+    /// A session over that wire, with a zero reply deadline so a probe that
+    /// nothing answers costs no wall-clock time.
+    fn test_session_with(dropped: bool) -> Session {
+        let mut session = Session::new(dropped, Box::new(NullWire::default()));
+        session.prober.deadline = std::time::Duration::ZERO;
+        session
+    }
+
+    fn test_session() -> Session {
+        test_session_with(true)
+    }
+
     /// A session that has accepted one `init` over a **narrow** allow set.
     ///
     /// `10.30.0.0/24` and not `0.0.0.0/0`: the second-init test asserts that
@@ -505,7 +570,7 @@ mod tests {
     /// already permitted everything could not tell a refusal from a session
     /// that accepted the widening and looked identical afterwards.
     fn initialized_session() -> Session {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(&init_line(&["10.30.0.0/24"]));
         assert!(
             matches!(response, Some(Response::Ready { .. })),
@@ -580,13 +645,13 @@ mod tests {
 
     #[test]
     fn a_probe_before_init_is_fatal_and_the_session_never_recovers() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         assert_fatal_and_unrecoverable(session.handle_line(PROBE), &mut session);
     }
 
     #[test]
     fn even_shutdown_before_init_is_fatal_because_exactly_one_first_message_is_legal() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(r#"{"type":"shutdown"}"#);
         assert_fatal_and_unrecoverable(response, &mut session);
     }
@@ -596,7 +661,7 @@ mod tests {
     /// `handle_line` that refused everything would pass the criterion.
     #[test]
     fn an_init_that_arrives_first_is_accepted() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(&init_line(&["10.30.0.0/24"]));
         assert!(matches!(response, Some(Response::Ready { .. })));
         assert!(!session.is_terminated());
@@ -641,7 +706,7 @@ mod tests {
 
     #[test]
     fn an_init_with_an_empty_allowlist_is_fatal() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(&init_line(&[]));
         assert_fatal_and_unrecoverable(response, &mut session);
     }
@@ -651,7 +716,7 @@ mod tests {
     /// "empty allowlist" would silently mean "allow everything" downstream.
     #[test]
     fn an_init_with_one_cidr_is_accepted_and_carries_it() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         assert!(matches!(
             session.handle_line(&init_line(&["10.30.0.0/24"])),
             Some(Response::Ready { .. })
@@ -664,7 +729,7 @@ mod tests {
 
     #[test]
     fn a_cidr_that_does_not_parse_is_fatal_rather_than_dropped_from_the_allow_set() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(&init_line(&["10.30.0.0/24", "not-a-cidr"]));
         assert_fatal_and_unrecoverable(response, &mut session);
     }
@@ -687,7 +752,7 @@ mod tests {
 
     #[test]
     fn an_unknown_field_is_fatal_because_the_caller_and_this_process_disagree() {
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(
             r#"{"type":"init","allowed_cidrs":["10.30.0.0/24"],"denied_cidrs":[],"packets_per_second":100,"max_packets":1000,"allow_everything":true}"#,
         );
@@ -723,7 +788,7 @@ mod tests {
 
         let at_cap = format!("{}{}", " ".repeat(pad), base);
         assert_eq!(at_cap.len(), MAX_LINE_BYTES);
-        let mut session = Session::new(true);
+        let mut session = test_session();
         assert!(
             matches!(session.handle_line(&at_cap), Some(Response::Ready { .. })),
             "a line of exactly {MAX_LINE_BYTES} bytes is within the cap"
@@ -731,7 +796,7 @@ mod tests {
 
         let over = format!("{}{}", " ".repeat(pad + 1), base);
         assert_eq!(over.len(), MAX_LINE_BYTES + 1);
-        let mut session = Session::new(true);
+        let mut session = test_session();
         let response = session.handle_line(&over);
         match &response {
             Some(Response::Fatal { detail }) => assert!(
@@ -833,26 +898,48 @@ mod tests {
         assert!(session.ended_fatally());
     }
 
+    /// A probe inside the session's scope is answered with a `Result` and
+    /// leaves the session running. The refusal cases -- and the assertion
+    /// that a refused probe emits nothing -- live in `syn.rs`, which owns the
+    /// enforcement; this pins that the *protocol* arm reaches it and that the
+    /// answer is a result rather than a refusal or a fatal.
     #[test]
-    fn this_build_refuses_every_probe_because_it_has_no_packet_path() {
+    fn an_in_scope_probe_is_answered_and_leaves_the_session_running() {
         let mut session = initialized_session();
-        assert_eq!(
-            session.handle_line(PROBE),
-            Some(Response::Refused {
-                id: 1,
-                reason: RefusalReason::ProbingUnavailable,
-            })
+        let response = session.handle_line(PROBE);
+        assert!(
+            matches!(response, Some(Response::Result { id: 1, .. })),
+            "{response:?}"
         );
+        assert_eq!(session.packets_emitted(), 1);
         assert!(
             !session.is_terminated(),
-            "a refusal is about one probe, not about the session"
+            "a probe is about one endpoint, not about the session"
         );
+    }
+
+    /// The narrowing control for the arm above: a probe outside the session's
+    /// allow set is refused on the same path, with the reason the engine
+    /// branches on, and the session survives.
+    #[test]
+    fn an_out_of_scope_probe_is_refused_on_the_same_arm() {
+        let mut session = initialized_session();
+        let line = r#"{"type":"probe","id":2,"target":"203.0.113.9","port":80}"#;
+        assert_eq!(
+            session.handle_line(line),
+            Some(Response::Refused {
+                id: 2,
+                reason: RefusalReason::OutOfSessionScope,
+            })
+        );
+        assert_eq!(session.packets_emitted(), 0);
+        assert!(!session.is_terminated());
     }
 
     #[test]
     fn ready_reports_the_capability_state_it_was_given_rather_than_a_constant() {
         for dropped in [true, false] {
-            let mut session = Session::new(dropped);
+            let mut session = test_session_with(dropped);
             assert_eq!(
                 session.handle_line(&init_line(&["10.30.0.0/24"])),
                 Some(Response::Ready {
@@ -974,7 +1061,7 @@ mod tests {
         /// non-empty allow set. Everything else is fatal, and terminates.
         #[test]
         fn no_first_line_but_an_init_with_an_allowlist_is_ever_accepted(line in any_line()) {
-            let mut session = Session::new(true);
+            let mut session = test_session();
             let response = session.handle_line(&line);
             if is_an_init_that_may_be_accepted(&line) {
                 let ready = matches!(response, Some(Response::Ready { .. }));
@@ -1014,7 +1101,7 @@ mod tests {
         /// including well-formed traffic.
         #[test]
         fn nothing_revives_a_terminated_session(lines in prop::collection::vec(any_line(), 1..8)) {
-            let mut session = Session::new(true);
+            let mut session = test_session();
             let first = matches!(session.handle_line("{not json"), Some(Response::Fatal { .. }));
             prop_assert!(first);
             for line in lines {

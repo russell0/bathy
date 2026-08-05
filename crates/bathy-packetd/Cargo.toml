@@ -74,3 +74,12 @@ proptest = { workspace = true }
 # privileged binary, so the graph that opens raw sockets stays the four crates
 # listed above.
 bathy-types = { path = "../bathy-types" }
+# TEST ONLY, and the reason `syn.rs`'s scope check is worth writing twice.
+# AC-6.9 requires `packetd` to enforce scope with logic independent of
+# `bathy-scope`; two implementations of one policy are worth nothing unless
+# somebody checks that they agree, so
+# `the_two_scope_implementations_agree_on_every_generated_address` drives
+# generated CIDRs and addresses through both and fails on any disagreement.
+# A dev-dependency edge does not link into the privileged binary: the graph
+# that opens raw sockets is still the five crates listed above.
+bathy-scope = { path = "../bathy-scope" }

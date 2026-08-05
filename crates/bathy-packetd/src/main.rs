@@ -56,6 +56,7 @@ use bathy_packetd::privilege::{
     self, PrivilegeError, PrivilegeState, RawSockets, UnprivilegedInput,
 };
 use bathy_packetd::protocol::{Response, Session, read_line};
+use bathy_packetd::syn::Wire;
 use serde::Serialize;
 
 /// `EX_UNAVAILABLE` from `sysexits.h`: a service this program needs is not
@@ -113,16 +114,15 @@ fn main() -> ExitCode {
     let stdin = std::io::stdin();
     let mut input = UnprivilegedInput::new(stdin.lock());
     let mut stdout = std::io::stdout();
+    // The sockets ARE the wire (`impl Wire for RawSockets`), so the session
+    // takes ownership of them and gives them up when it ends. They were opened
+    // while privileged and cannot be reopened, which is why there is one
+    // owner and no way to acquire a second set.
     let status = if self_check_requested {
         self_check(&sockets, &mut input, &mut stdout)
     } else {
-        run_session(dropped, &mut input, &mut stdout)
+        run_session(dropped, Box::new(sockets), &mut input, &mut stdout)
     };
-    // Explicit, and last: the three descriptors were opened while privileged
-    // and cannot be reopened, so they stay live for the whole session and are
-    // given up only when the process is finished with them. M6 Task 3 sends
-    // and receives through this value.
-    drop(sockets);
     ExitCode::from(status)
 }
 
@@ -256,8 +256,13 @@ fn self_check<R: BufRead, W: Write>(sockets: &RawSockets, input: &mut R, out: &m
 }
 
 /// The line loop. One `Session` per process, and the process ends with it.
-fn run_session<R: BufRead, W: Write>(dropped: bool, input: &mut R, out: &mut W) -> u8 {
-    let mut session = Session::new(dropped);
+fn run_session<R: BufRead, W: Write>(
+    dropped: bool,
+    wire: Box<dyn Wire>,
+    input: &mut R,
+    out: &mut W,
+) -> u8 {
+    let mut session = Session::new(dropped, wire);
     let mut buf = Vec::new();
     loop {
         match read_line(input, &mut buf) {
@@ -298,6 +303,24 @@ mod tests {
     use std::io::ErrorKind;
 
     use super::*;
+
+    /// A wire that accepts every packet and answers nothing. These tests are
+    /// about the daemon's loop and its exit statuses; `syn.rs` owns what goes
+    /// on the wire.
+    #[derive(Debug)]
+    struct NullWire;
+
+    impl Wire for NullWire {
+        fn source_for(&self, _target: std::net::Ipv4Addr) -> std::io::Result<std::net::Ipv4Addr> {
+            Ok(std::net::Ipv4Addr::new(10, 30, 0, 99))
+        }
+        fn emit(&mut self, _packet: &[u8], _target: std::net::Ipv4Addr) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn poll(&mut self, _buf: &mut [u8]) -> Option<usize> {
+            None
+        }
+    }
 
     fn socket_error(kind: ErrorKind) -> PrivilegeError {
         PrivilegeError::Socket {
@@ -462,7 +485,7 @@ mod tests {
             let mut reader = std::io::Cursor::new(lines.into_bytes());
             let mut out = Vec::new();
             assert_eq!(
-                run_session(false, &mut reader, &mut out),
+                run_session(false, Box::new(NullWire), &mut reader, &mut out),
                 expected,
                 "{name}"
             );
@@ -489,7 +512,7 @@ mod tests {
         );
         for dropped in [true, false] {
             let mut out = Vec::new();
-            let mut session = Session::new(dropped);
+            let mut session = Session::new(dropped, Box::new(NullWire));
             let response = session.handle_line(init.trim_end()).unwrap();
             assert!(emit(&mut out, &response));
             let line = String::from_utf8(out).unwrap();

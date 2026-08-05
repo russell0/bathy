@@ -73,11 +73,14 @@
 
 pub mod privilege;
 pub mod protocol;
+pub mod syn;
 
 pub use privilege::{
     PrivilegeError, PrivilegeState, RawSockets, UnprivilegedInput, acquire_raw_sockets,
     capabilities_are_dropped, drop_all_capabilities,
 };
 pub use protocol::{
-    LineError, MAX_LINE_BYTES, PortState, RefusalReason, Request, Response, Session, read_line,
+    LineError, MAX_LINE_BYTES, PortState, RefusalReason, Request, Response, Session, SessionScope,
+    read_line,
 };
+pub use syn::{PROBE_MARKER, Prober, Reply, Wire, check_session_scope, classify_reply};

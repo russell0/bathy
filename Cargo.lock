@@ -207,6 +207,7 @@ dependencies = [
 name = "bathy-packetd"
 version = "0.1.0-alpha.2"
 dependencies = [
+ "bathy-scope",
  "bathy-types",
  "caps",
  "ipnet",

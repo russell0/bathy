@@ -167,6 +167,15 @@ pub fn acquire_raw_sockets() -> Result<RawSockets, PrivilegeError> {
         })?;
     let recv_tcp = raw_socket(IPPROTO_TCP, "tcp-receive")?;
     let recv_icmp = raw_socket(IPPROTO_ICMP, "icmp-receive")?;
+    // Set here, while still privileged, so that nothing after the drop has to
+    // configure a socket: a receive with no timeout is a probe deadline that
+    // cannot be enforced, and a `packetd` blocked forever in `recv` is a scan
+    // that never ends.
+    for (socket, kind) in [(&recv_tcp, "tcp-receive"), (&recv_icmp, "icmp-receive")] {
+        socket
+            .set_read_timeout(Some(crate::syn::RECV_TIMEOUT))
+            .map_err(|source| PrivilegeError::Configure { kind, source })?;
+    }
     Ok(RawSockets {
         send,
         recv_tcp,
