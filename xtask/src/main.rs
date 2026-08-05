@@ -84,6 +84,13 @@ const SUBCOMMANDS: &[&str] = &[
     // every successful run.
     "check-panics",
     "check-msrv",
+    // The M6 exit criterion capping `bathy-packetd` at 800 lines of non-test
+    // Rust, which had no executable form -- the same shape as the five gates
+    // M5 closed and the MSRV membership rule with three recurrences. It is a
+    // design constraint on the only component that will hold CAP_NET_RAW, and
+    // a design constraint measured once at close-out is measured when the
+    // code is already too big to move.
+    "check-packetd",
     "check-deny",
     "check-lab",
     // AC-7.11 to AC-7.15. `check-bench` reads text -- the committed
@@ -147,6 +154,7 @@ fn run(command: Option<&str>, args: &[String]) -> Result<(), Box<dyn std::error:
         Some("check-purity") => gates::check_purity(),
         Some("check-panics") => gates::check_panics(),
         Some("check-msrv") => gates::check_msrv(args.iter().any(|a| a == "--run")),
+        Some("check-packetd") => gates::check_packetd(),
         Some("check-deny") => gates::check_deny(),
         Some("check-lab") => gates::check_lab(),
         Some("check-bench") => bench::check_bench(),
@@ -471,18 +479,16 @@ const DEFERRALS: &[Deferral] = &[
         id: "rmcp-stdio-workaround",
         check: find_rmcp_workaround_staleness,
     },
-    // AC-7.7's fifth untrusted-input surface: `bathy-packetd`'s IPC protocol.
-    // M7 runs before M6 in this project's execution order, so the crate the
-    // criterion names does not exist while the fuzz targets are being written.
-    // The alternative to registering it was a stub target, which would fuzz
-    // nothing while reading as coverage -- the same shape as the property-test
-    // strategy this milestone measured at 6 non-empty results in 4096 cases.
-    // `gates::packetd_ipc_deferral_violations` fires the day the crate lands
-    // and reports itself stale the day the target does.
-    Deferral {
-        id: "packetd-ipc-fuzz-target",
-        check: gates::packetd_ipc_deferral_violations,
-    },
+    // The `packetd-ipc-fuzz-target` entry lived here from M7 Task 2 to M6
+    // Task 1, and is DELETED rather than kept, because it fired and was
+    // discharged: `crates/bathy-packetd` landed with `fuzz/fuzz_targets/ipc.rs`
+    // in the same commit and the `ipc` entry in `gates::FUZZ_SURFACES` is no
+    // longer `deferred`. Its own failure message asked for exactly that
+    // ("clear `deferred` and delete this deferral's entry from `DEFERRALS` --
+    // a check that has quietly stopped applying reads as coverage while
+    // guarding nothing"), which is the same disposal `panic-lint-widening`
+    // got. What it checked is now the ordinary `FUZZ_SURFACES` loop's job.
+    //
     // AC-7.7's MCP stdio surface: the opening JSON-RPC frame from a calling
     // agent, which the threat model treats as possibly adversarial and which
     // `crates/bathy-mcp/src/lifecycle.rs` exists to handle because a
@@ -1207,16 +1213,17 @@ mod tests {
         // honest and this assertion the thing that keeps it non-trivial.
         assert_eq!(
             DEFERRALS.len(),
-            4,
-            "the deferral registry changed size; the four entries are the ops-layer \
-             move (AC-5.39), the rmcp stdio workaround, the `packetd` IPC fuzz target \
-             that AC-7.7 names and M6 has not yet made writable, and the MCP stdio fuzz \
-             target whose blocker is `classify`'s visibility. The fifth, \
-             `panic-lint-widening`, was discharged: `bathy-types`, `bathy-evidence` and \
-             `bathy-query` now carry the lint, the entry reported itself stale on the \
-             spot (`PANIC_LINT_UNCOVERED` is empty, so every untrusted-input crate is \
-             covered and this deferral is checking nothing), and it was deleted rather \
-             than left reading as an open item"
+            3,
+            "the deferral registry changed size; the three entries are the ops-layer \
+             move (AC-5.39), the rmcp stdio workaround, and the MCP stdio fuzz target \
+             whose blocker is `classify`'s visibility. TWO have now been discharged and \
+             deleted rather than left reading as open items. `panic-lint-widening` went \
+             first: `bathy-types`, `bathy-evidence` and `bathy-query` took the lint and \
+             the entry reported itself stale on the spot. `packetd-ipc-fuzz-target` went \
+             in M6 Task 1, which is the milestone it was waiting for -- \
+             `crates/bathy-packetd` and `fuzz/fuzz_targets/ipc.rs` landed in the same \
+             commit, the `ipc` entry in `gates::FUZZ_SURFACES` is no longer `deferred`, \
+             and the ordinary surface loop now checks what the special case did"
         );
         let ids: Vec<&str> = DEFERRALS.iter().map(|d| d.id).collect();
         assert_eq!(
@@ -1224,7 +1231,6 @@ mod tests {
             vec![
                 "ops-layer-move",
                 "rmcp-stdio-workaround",
-                "packetd-ipc-fuzz-target",
                 "mcp-stdio-fuzz-target"
             ]
         );

@@ -17,10 +17,25 @@
 ### Task 1: The IPC protocol
 
 **Files:**
-- Create: `crates/bathy-packetd/Cargo.toml`, `crates/bathy-packetd/src/protocol.rs`
+- Create: `crates/bathy-packetd/Cargo.toml`, `crates/bathy-packetd/src/lib.rs` (plan edit #4), `crates/bathy-packetd/src/protocol.rs`, `fuzz/fuzz_targets/ipc.rs` + `fuzz/seeds/ipc/` (plan edit #5)
+- Modify: `xtask/src/gates.rs`, `xtask/src/main.rs`, `xtask/src/readme.rs`, `.github/workflows/ci.yml`, `README.md`, the overview's "No panics in parsing paths" constraint (plan edits #5, #6)
 
 **Interfaces:**
 - Produces: `Request::{ Init { allowed_cidrs, denied_cidrs, packets_per_second, max_packets }, Probe { id, target, port }, Shutdown }`, `Response::{ Ready { dropped_capabilities: bool }, Result { id, state }, Refused { id, reason }, Fatal { detail } }`, all line-delimited JSON.
+
+  **Six corrections to this task, made during Task 1 and flagged as plan edits. The first three are defects in the interface as written: one would have made this module fabricate a security claim, one would have made it tell the engine something untrue, and one describes a test that cannot prove what its own name says.**
+
+  1. **`Session::new()` takes `dropped_capabilities: bool`.** `Response::Ready { dropped_capabilities }` is a claim about whether this process still holds `CAP_NET_RAW`. A `Session::new()` with no argument can only answer it with a constant, so the protocol layer would be *fabricating* a security-relevant value that nothing measured — the "claimed but never enforced" defect class this repository has paid for repeatedly, in the one component where it matters most. `main` (Task 2) measures it after `drop_all_capabilities()` and the session relays it. AC-6.5's `--self-check` is what verifies the measurement; this type's job is not to invent one. Pinned by `ready_reports_the_capability_state_it_was_given_rather_than_a_constant`, which drives both values.
+
+  2. **`handle_line` returns `Option<Response>`.** The `Response` set in this task's own interface has no goodbye message, and `Shutdown` is a legal request after `Init`. A signature that must return a `Response` therefore forces `Shutdown` to be answered with `Ready` or with `Fatal`, both of which are this process telling the engine something untrue in order to satisfy a return type. `None` means "no response line", and it happens for exactly that one message. Every acceptance test reads `matches!(r, Some(Response::Fatal { .. }))`.
+
+  3. **The oversized-line criterion needs a reader, and the plan's test cannot prove it.** `a_line_longer_than_the_cap_is_rejected_without_allocating_it` builds a 1 MiB `String` and hands it to `handle_line(&str)` — by which point the caller has already allocated the megabyte the test is named after. The cap that actually bounds memory has to live where the bytes are *read*, so this task also produces `protocol::read_line`, which refuses to grow its buffer past `MAX_LINE_BYTES` and copies nothing past it, and the test asserts `buf.len() <= MAX_LINE_BYTES` over a megabyte of input. `handle_line` keeps a length check as a second line of defence. Both halves have a narrowing control — a line of *exactly* the cap must be accepted — because a cap of zero passes every test that only checks the refusal.
+
+  4. **A `lib.rs` is part of this task.** The crate needs a root to carry `#![forbid(unsafe_code)]` and the `#![cfg_attr(not(test), deny(...))]` panic lints; `main.rs` is Task 2's.
+
+  5. **The `packetd-ipc-fuzz-target` deferral fires on this task and is discharged in the same commit.** `xtask`'s `DEFERRALS` registered, since M7 Task 2, that AC-7.7's fifth untrusted-input surface had no fuzz target because this crate did not exist. Creating `crates/bathy-packetd/Cargo.toml` makes it due, so `fuzz/fuzz_targets/ipc.rs` and ten seeds land here, the `ipc` entry in `gates::FUZZ_SURFACES` loses its `deferred`, and the deferral is deleted rather than left on the books. `bathy-packetd` also joins `PANIC_LINT_CRATES` and the overview's constraint sentence — the same checked, two-directional relationship every other untrusted-input crate is in — and the `msrv` job at 1.88, measured against real 1.88 and 1.95 toolchains before the line was written.
+
+  6. **The 800-line exit criterion had no executable form, and now runs from this task rather than from close-out.** It is a design constraint on the only component that will hold `CAP_NET_RAW`, and a size constraint first measured at milestone close-out is measured when the code is already too big to move — the shape of the five gates M5 closed and of the MSRV membership rule with three recurrences. `cargo run -p xtask -- check-packetd` is a `ci.yml` step from Task 1. It also fixes what the criterion leaves undefined: the number counts non-blank, non-`//` lines before each file's trailing `#[cfg(test)]`, and reports the physical total beside it. Comments are outside the number on purpose — the cap exists to bound the logic a reviewer must follow, and counting comments against it would be a cap on the explanations that make the review possible. Task 1 measures **249/800**.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -463,6 +478,6 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 
 - [ ] `cargo test --workspace` green; privileged CI job green including the cross-validation test.
 - [ ] AC-6.1 through AC-6.20 each demonstrated by a named passing test.
-- [ ] `bathy-packetd` is under 800 lines of non-test Rust. If it is larger, move logic out of the privileged process.
+- [ ] `bathy-packetd` is under 800 lines of non-test Rust. If it is larger, move logic out of the privileged process. **Enforced by `cargo run -p xtask -- check-packetd`, a `ci.yml` step since Task 1** — see plan edit #6 on Task 1 for what the number counts and why it is not measured for the first time here.
 - [ ] Every `unsafe` block has a `SAFETY:` comment; no other crate has any.
 - [ ] `docs/design-paper.md` contains a section explaining the two-layer scope enforcement and why the duplication is intentional.

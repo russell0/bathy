@@ -1829,26 +1829,20 @@ pub const FUZZ_SURFACES: &[FuzzSurface] = &[
     },
     FuzzSurface {
         name: "ipc",
-        parser: "bathy-packetd's line protocol between the unprivileged engine and the \
-                 privileged helper",
-        // M7 was resequenced ahead of M6 (see the overview's "Recommended
-        // execution order": M1-M5, M7, M6), so AC-7.7 names a crate that does
-        // not exist while this task runs. A stub target would be worse than
-        // the honest gap: it would fuzz nothing, register as coverage, and be
-        // the exact "reaches nothing" shape this milestone measured and
-        // rejected in a property-test strategy. So the surface stays
-        // registered here and the obligation is mechanical rather than
-        // remembered.
-        deferred: Some(
-            "crates/bathy-packetd does not exist yet — M6 ships after M7 in this \
-             project's execution order. `xtask check-deps` fails the moment the crate \
-             lands without `fuzz/fuzz_targets/ipc.rs`, via the `packetd-ipc-fuzz-target` \
-             deferral.",
-        ),
-        // Deferred: the code these bytes would reach is not in the tree
-        // (`bathy-packetd`) or is not reachable from outside its crate
-        // (`classify`). Nothing to lint yet, so nothing to require.
-        lint_crates: &[],
+        parser: "bathy_packetd::protocol::{Session::handle_line, read_line} — the line \
+                 protocol between the unprivileged engine and the privileged helper",
+        // Deferred from M7 Task 2 until M6 Task 1, because M7 was resequenced
+        // ahead of M6 (see the overview's "Recommended execution order":
+        // M1-M5, M7, M6) and AC-7.7 therefore named a crate that did not
+        // exist. The deferral fired the day `crates/bathy-packetd` landed and
+        // the target was written in the same commit, which is what it was
+        // registered to force; its entry in `DEFERRALS` is gone with it.
+        deferred: None,
+        // The one surface in this repository where a parsing bug is a
+        // privilege-escalation bug rather than only a denial of service: these
+        // bytes are read by the process that holds CAP_NET_RAW. The lint was
+        // enabled in `bathy-packetd`'s first commit rather than retrofitted.
+        lint_crates: &["bathy-packetd"],
     },
     FuzzSurface {
         name: "mcp_stdio",
@@ -1926,53 +1920,15 @@ pub fn mcp_stdio_deferral_violations(root: &Path) -> Vec<String> {
     found
 }
 
-/// The crate whose arrival makes the `ipc` target due.
-pub const PACKETD_CRATE: &str = "crates/bathy-packetd";
-/// The target that discharges it.
-pub const IPC_FUZZ_TARGET: &str = "fuzz/fuzz_targets/ipc.rs";
-
-/// The `packetd-ipc-fuzz-target` deferral's condition, in both directions.
-///
-/// Registered in `xtask`'s `DEFERRALS` rather than only in `check-fuzz`
-/// because a deferral that only the thing being deferred knows about is a
-/// note. The second direction is the one that matters most here: when the
-/// target does land, this check reports *itself* as stale, so the registry
-/// does not keep a discharged obligation on the books forever.
-pub fn packetd_ipc_deferral_violations(root: &Path) -> Vec<String> {
-    let crate_exists = root.join(PACKETD_CRATE).join("Cargo.toml").is_file();
-    let target_exists = root.join(IPC_FUZZ_TARGET).is_file();
-    let registered_deferred = FUZZ_SURFACES
-        .iter()
-        .any(|s| s.name == "ipc" && s.deferred.is_some());
-
-    let mut found = Vec::new();
-    if crate_exists && !target_exists {
-        found.push(format!(
-            "{PACKETD_CRATE} now exists, so AC-7.7's `packetd` IPC fuzz target is due: \
-             write {IPC_FUZZ_TARGET}, seed `fuzz/seeds/ipc/`, and clear `deferred` on the \
-             `ipc` entry in `FUZZ_SURFACES`. The IPC protocol is the boundary a \
-             *privileged* process parses across, which is the one surface in this \
-             repository where a parsing bug is a privilege-escalation bug rather than \
-             only a denial of service."
-        ));
-    }
-    if target_exists && registered_deferred {
-        found.push(format!(
-            "{IPC_FUZZ_TARGET} exists but the `ipc` entry in `FUZZ_SURFACES` is still \
-             marked `deferred`, so `run_fuzz` skips the target it has. Clear `deferred` \
-             and delete this deferral's entry from `DEFERRALS` — a check that has \
-             quietly stopped applying reads as coverage while guarding nothing."
-        ));
-    }
-    if !crate_exists && !registered_deferred && !target_exists {
-        found.push(format!(
-            "the `ipc` entry in `FUZZ_SURFACES` is no longer marked `deferred` and no \
-             {IPC_FUZZ_TARGET} exists, so AC-7.7's fifth surface is neither covered nor \
-             recorded as outstanding"
-        ));
-    }
-    found
-}
+// The `packetd-ipc-fuzz-target` deferral used to live here, with a
+// `PACKETD_CRATE` constant and a two-direction check. It is DELETED, not
+// kept, because M6 Task 1 discharged it: `crates/bathy-packetd` landed,
+// `fuzz/fuzz_targets/ipc.rs` landed in the same commit, and the `ipc` entry
+// in `FUZZ_SURFACES` is no longer `deferred`. What it checked -- "the crate
+// exists and the target does not" -- is what the ordinary loop in
+// `fuzz_violations` checks for every non-deferred surface, so keeping the
+// special case would have been a check that had quietly stopped applying
+// while still reading as coverage. Same disposal as `panic-lint-widening`.
 
 /// Every `[[bin]]` name declared by the fuzz manifest.
 ///
@@ -2294,7 +2250,6 @@ pub fn fuzz_violations(root: &Path, manifest: &str, ci_path: &str, ci: &str) -> 
 
     found.extend(fuzz_ci_job_violations(ci_path, ci));
     found.extend(fuzz_crate_gate_violations(ci_path, ci));
-    found.extend(packetd_ipc_deferral_violations(root));
     found.extend(mcp_stdio_deferral_violations(root));
     found
 }
@@ -2608,6 +2563,13 @@ pub const PANIC_LINT_CRATES: &[&str] = &[
     "bathy-types",
     "bathy-evidence",
     "bathy-query",
+    // The first crate in this list that carried the lint from its own first
+    // commit instead of being retrofitted, and the one where the stakes are
+    // highest: `bathy-packetd` parses lines sent by a caller it does not trust
+    // inside the only process in this repository that will hold CAP_NET_RAW.
+    // Measured at **0 hits** on the day it was written, which is what enabling
+    // the lint before the code rather than after buys.
+    "bathy-packetd",
 ];
 
 /// Where the attribute has to be, per crate.
@@ -2970,6 +2932,222 @@ pub fn check_panics() -> Fallible<()> {
         )
         .into())
     }
+}
+
+// ---------------------------------------------------------------------------
+// `check-packetd` — the size of the only privileged component.
+// ---------------------------------------------------------------------------
+
+/// The M6 exit criterion: `bathy-packetd` is under 800 lines of non-test Rust.
+///
+/// It is a design constraint, not a budget. `packetd` is the only component
+/// that will hold `CAP_NET_RAW` and the only one permitted `unsafe`, and the
+/// argument for trusting it is that a person can read all of it in one
+/// sitting. "If it is larger, move logic out of the privileged process" is
+/// the remedy the milestone states, and a number that only gets measured at
+/// close-out is a number that gets measured once the code is too big to move.
+pub const PACKETD_LINE_BUDGET: usize = 800;
+
+/// The crate the budget is about.
+pub const PACKETD_SRC: &str = "crates/bathy-packetd/src";
+
+/// The marker that starts test code, and the only shape of it this counter
+/// accepts. Anything else is reported rather than guessed at — see
+/// [`packetd_size_violations`].
+const TEST_MODULE_MARKER: &str = "#[cfg(test)]";
+
+/// What "a line of non-test Rust" is counted as, written out because the
+/// criterion does not say and a number whose definition drifts is not a gate.
+///
+/// **Code lines**: non-blank, not a `//` comment, and before the file's
+/// `#[cfg(test)]` marker. Comments and blank lines are excluded deliberately
+/// and in the direction that makes the gate mean what it is for: the risk
+/// this criterion exists to bound is *logic a reviewer has to follow*, and
+/// prose explaining that logic reduces review cost rather than adding to it.
+/// A cap counted over physical lines would be a cap on documentation, which
+/// in this repository would be the wrong incentive by a wide margin.
+///
+/// The physical total is reported alongside, so the choice is visible rather
+/// than hidden inside the pass.
+pub fn packetd_line_counts(root: &Path) -> Vec<(String, usize, usize)> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.join(PACKETD_SRC)];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e == "rs") {
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let production: Vec<&str> = text
+                    .lines()
+                    .take_while(|line| line.trim() != TEST_MODULE_MARKER)
+                    .collect();
+                let code = production
+                    .iter()
+                    .filter(|line| {
+                        let t = line.trim();
+                        !t.is_empty() && !t.starts_with("//")
+                    })
+                    .count();
+                let name = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string()
+                    .replace('\\', "/");
+                out.push((name, code, production.len()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The rule, in both directions.
+///
+/// 1. The crate must exist. A gate whose subject is absent passes over
+///    anything, and this file has already recorded one entry that could not
+///    fire (`lab/Cargo.toml`).
+/// 2. Every file's test code must be one trailing `#[cfg(test)]` module at
+///    column zero. Anything else — an indented marker, a second one, or
+///    production code after the first — makes the counter wrong in the
+///    permissive direction, silently. Reported rather than guessed at.
+/// 3. The total must be under [`PACKETD_LINE_BUDGET`].
+pub fn packetd_size_violations(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let src = root.join(PACKETD_SRC);
+    if !src.is_dir() {
+        found.push(format!(
+            "{PACKETD_SRC} does not exist, so the M6 exit criterion capping the only \
+             privileged component at {PACKETD_LINE_BUDGET} lines is ranging over nothing. \
+             Either the crate moved, or this gate is checking an empty set and reading as \
+             coverage."
+        ));
+        return found;
+    }
+
+    let counts = packetd_line_counts(root);
+    if counts.is_empty() {
+        found.push(format!(
+            "{PACKETD_SRC} contains no `.rs` files, so the {PACKETD_LINE_BUDGET}-line cap \
+             is vacuous"
+        ));
+        return found;
+    }
+
+    // The counter's own premise, checked rather than assumed.
+    let mut stack = vec![src];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().is_some_and(|e| e != "rs") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let shown = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let markers: Vec<(usize, &str)> = text
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains(TEST_MODULE_MARKER))
+                .map(|(i, l)| (i.saturating_add(1), l))
+                .collect();
+            if markers.len() > 1 {
+                found.push(format!(
+                    "{shown} has {} `{TEST_MODULE_MARKER}` markers (lines {}). This counter \
+                     stops at the first one, so every line after it is treated as test code \
+                     and the cap silently stops applying to production Rust.",
+                    markers.len(),
+                    markers
+                        .iter()
+                        .map(|(n, _)| n.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ));
+            }
+            if let Some((number, line)) = markers.first()
+                && line.trim() != *line
+            {
+                found.push(format!(
+                    "{shown}:{number}: the `{TEST_MODULE_MARKER}` marker is indented, so it \
+                     is not the trailing test module this counter recognises and every line \
+                     of that module counts against the cap. Put test code in one trailing \
+                     module at column zero."
+                ));
+            }
+        }
+    }
+
+    let total: usize = counts.iter().map(|(_, code, _)| code).sum();
+    if total > PACKETD_LINE_BUDGET {
+        found.push(format!(
+            "crates/bathy-packetd is {total} lines of non-test Rust, over the M6 exit \
+             criterion's {PACKETD_LINE_BUDGET}. The remedy the milestone states is not a \
+             bigger number: \"if it is larger, move logic out of the privileged process\". \
+             Per file: {}",
+            counts
+                .iter()
+                .map(|(name, code, _)| format!("{name} {code}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    found
+}
+
+pub fn check_packetd() -> Fallible<()> {
+    let root = Path::new(".");
+    let violations = packetd_size_violations(root);
+    if !violations.is_empty() {
+        for v in &violations {
+            eprintln!("check-packetd: {v}");
+        }
+        return Err(format!("{} packetd size violation(s)", violations.len()).into());
+    }
+    let counts = packetd_line_counts(root);
+    let code: usize = counts.iter().map(|(_, code, _)| code).sum();
+    let physical: usize = counts.iter().map(|(_, _, physical)| physical).sum();
+    println!(
+        "check-packetd: ok ({code}/{PACKETD_LINE_BUDGET} line(s) of non-test Rust across {} \
+         file(s): {})",
+        counts.len(),
+        counts
+            .iter()
+            .map(|(name, c, _)| format!("{name} {c}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    );
+    println!(
+        "check-packetd: WHAT THIS COUNTS — non-blank, non-`//` lines before each file's \
+         trailing `{TEST_MODULE_MARKER}`. {physical} physical non-test line(s) including \
+         comments, reported so the choice is visible: the cap exists to bound the logic a \
+         reviewer must follow in the one process that will hold CAP_NET_RAW, and counting \
+         comments against it would be a cap on the explanations that make that review \
+         possible. It cannot see logic moved into a dependency — this crate's dependency \
+         set is the other half of the same argument."
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4883,28 +5061,118 @@ jobs:
         );
     }
 
+    // The `packetd-ipc-fuzz-target` deferral's own test used to sit here. It
+    // went with the deferral in M6 Task 1 (see the comment where
+    // `PACKETD_CRATE` used to be). The obligation it enforced is not
+    // unguarded: `ipc` is now an ordinary non-deferred entry in
+    // `FUZZ_SURFACES`, so deleting `fuzz/fuzz_targets/ipc.rs` fails
+    // `check-fuzz` through the same loop that covers the other four, and
+    // `a_surface_over_an_unlinted_crate_is_reported` covers the panic-lint
+    // half.
+
+    // --- `check-packetd`: the size of the only privileged component. ---
+
+    /// Writes one `bathy-packetd` source file into a scratch root.
+    fn packetd_file(root: &Path, name: &str, body: &str) {
+        let dir = root.join(PACKETD_SRC);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    /// The counter's definition, stated as a test rather than only in a doc
+    /// comment: comments, blank lines and the trailing test module are all
+    /// outside the number, and ordinary code is inside it. A fixture that was
+    /// all code would pass a counter that ignored every exclusion.
     #[test]
-    fn the_packetd_deferral_fires_when_the_crate_lands_and_reports_itself_stale_when_the_target_does()
-     {
-        let root = scratch("packetd");
-        // Neither present: the deferral is registered and silent.
-        assert!(packetd_ipc_deferral_violations(&root).is_empty());
+    fn the_count_excludes_comments_blank_lines_and_the_test_module() {
+        let root = scratch("packetd-count");
+        packetd_file(
+            &root,
+            "lib.rs",
+            "// a comment\n\nfn a() {}\nfn b() {}\n\n#[cfg(test)]\nmod tests {\n\
+             fn c() {}\nfn d() {}\nfn e() {}\n}\n",
+        );
+        let counts = packetd_line_counts(&root);
+        assert_eq!(counts.len(), 1);
+        // Two code lines; the comment, the blanks and the five lines of test
+        // module are all out.
+        assert_eq!(counts[0].1, 2, "{counts:#?}");
+        // ...and the physical figure still reports what was skipped, so the
+        // choice is visible rather than buried.
+        assert_eq!(counts[0].2, 5, "{counts:#?}");
+        assert!(packetd_size_violations(&root).is_empty());
+    }
 
-        // The crate lands. The obligation is now due, and it says so without
-        // anyone having to remember AC-7.7.
-        std::fs::create_dir_all(root.join(PACKETD_CRATE)).unwrap();
-        std::fs::write(root.join(PACKETD_CRATE).join("Cargo.toml"), "[package]\n").unwrap();
-        let due = packetd_ipc_deferral_violations(&root);
-        assert_eq!(due.len(), 1, "{due:#?}");
-        assert!(due[0].contains(IPC_FUZZ_TARGET), "{}", due[0]);
+    #[test]
+    fn a_crate_over_the_budget_is_reported_with_the_remedy_the_milestone_states() {
+        let root = scratch("packetd-over");
+        let body: String = std::iter::repeat_n("fn f() {}\n", PACKETD_LINE_BUDGET + 1).collect();
+        packetd_file(&root, "lib.rs", &body);
+        let found = packetd_size_violations(&root);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(
+            found[0].contains(&format!("{} lines", PACKETD_LINE_BUDGET + 1)),
+            "{}",
+            found[0]
+        );
+        assert!(
+            found[0].contains("move logic out of the privileged process"),
+            "a size failure must name the remedy, not invite a bigger number: {}",
+            found[0]
+        );
+    }
 
-        // The target lands too. Now the deferral is the thing that is stale,
-        // and it reports itself rather than sitting on the books as coverage.
-        std::fs::create_dir_all(root.join("fuzz/fuzz_targets")).unwrap();
-        std::fs::write(root.join(IPC_FUZZ_TARGET), "#![no_main]\n").unwrap();
-        let stale = packetd_ipc_deferral_violations(&root);
-        assert_eq!(stale.len(), 1, "{stale:#?}");
-        assert!(stale[0].contains("still marked `deferred`"), "{}", stale[0]);
+    /// One line under is not a violation. Without this the gate could be an
+    /// off-by-one that refuses everything, which is the shape a cap nobody
+    /// can satisfy takes right before it gets deleted.
+    #[test]
+    fn a_crate_exactly_at_the_budget_is_not_a_violation() {
+        let root = scratch("packetd-at");
+        let body: String = std::iter::repeat_n("fn f() {}\n", PACKETD_LINE_BUDGET).collect();
+        packetd_file(&root, "lib.rs", &body);
+        assert!(packetd_size_violations(&root).is_empty());
+    }
+
+    /// A gate whose subject is absent passes over anything. This file has
+    /// already recorded one entry that could not fire (`lab/Cargo.toml`),
+    /// which is why the absent case is a failure rather than a skip.
+    #[test]
+    fn a_missing_crate_is_a_violation_rather_than_a_vacuous_pass() {
+        let root = scratch("packetd-absent");
+        let found = packetd_size_violations(&root);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("ranging over nothing"), "{}", found[0]);
+    }
+
+    /// The counter stops at the first `#[cfg(test)]`, so a file with two of
+    /// them, or one that is indented, has production code the cap silently
+    /// stops applying to. Both are reported rather than guessed at -- a
+    /// counter that quietly under-counts is worse than no counter.
+    #[test]
+    fn a_test_marker_the_counter_cannot_honour_is_reported() {
+        let root = scratch("packetd-markers");
+        packetd_file(
+            &root,
+            "two.rs",
+            "fn a() {}\n#[cfg(test)]\nmod t {}\nfn hidden() {}\n#[cfg(test)]\nmod u {}\n",
+        );
+        let found = packetd_size_violations(&root);
+        assert!(
+            found.iter().any(|v| v.contains("2 `#[cfg(test)]` markers")),
+            "{found:#?}"
+        );
+
+        let root = scratch("packetd-indented");
+        packetd_file(
+            &root,
+            "one.rs",
+            "mod inner {\n    #[cfg(test)]\n    mod t {}\n}\n",
+        );
+        let found = packetd_size_violations(&root);
+        assert!(
+            found.iter().any(|v| v.contains("is indented")),
+            "{found:#?}"
+        );
     }
 
     #[test]

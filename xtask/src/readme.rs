@@ -174,9 +174,17 @@ const ABSENCE_CLAIMS: &[AbsenceClaim] = &[
         phrase: "the MCP tool names arrive with the server",
         falsified_by: "crates/bathy-mcp/src/descriptors.rs",
     },
+    // Was "a packet daemon (Milestone 6)" / `crates/bathy-packetd/Cargo.toml`
+    // until M6 Task 1, which is when that falsifier appeared and this entry
+    // did its job: the crate landed and `check-readme` refused the commit
+    // until the sentence changed. What the README claims now is narrower and
+    // still checkable -- the daemon exists, the *scanning* does not -- so the
+    // falsifier moves to the file M6 Task 3 creates. `every_falsifier_names_a_
+    // path_the_tree_can_actually_produce` is why it is a source file the plan
+    // names rather than a directory that may never exist.
     AbsenceClaim {
-        phrase: "a packet daemon (Milestone 6)",
-        falsified_by: "crates/bathy-packetd/Cargo.toml",
+        phrase: "privileged SYN and ICMP scanning (the rest of Milestone 6)",
+        falsified_by: "crates/bathy-packetd/src/syn.rs",
     },
     // `lab/Cargo.toml` until M7 Task 4, which is a path that was never going
     // to exist: the lab is a digest-pinned compose file, a ground-truth
@@ -1117,6 +1125,35 @@ identification, structured event output.
                  is not a planned crate under crates/. A falsifier that cannot appear makes the \
                  entry dead: the claim can never be reported false. Name a path the tree really \
                  produces.",
+                claim.phrase,
+                claim.falsified_by,
+            );
+        }
+    }
+
+    /// The other way an entry can be dead, and the one the M6 Task 1 edit to
+    /// this list could have introduced: a phrase that `README.md` does not
+    /// actually write. `violations` only fires when the prose *contains* the
+    /// phrase, so a typo in an entry whose falsifier has not appeared yet is
+    /// an entry that will never fire and nothing else would say so. Entries
+    /// whose falsifier already exists are exempt on purpose: their sentence
+    /// has necessarily been deleted from the README (that is what being
+    /// falsified means), and they stay registered so that re-introducing it
+    /// is caught.
+    #[test]
+    fn an_absence_claim_that_has_not_been_falsified_yet_is_a_sentence_the_readme_writes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let prose = flatten(&std::fs::read_to_string(root.join(README)).unwrap());
+        for claim in ABSENCE_CLAIMS {
+            if root.join(claim.falsified_by).exists() {
+                continue;
+            }
+            assert!(
+                prose.contains(claim.phrase),
+                "ABSENCE_CLAIMS registers {:?}, whose falsifier `{}` does not exist yet, but \
+                 README.md does not contain that sentence. The entry can therefore never \
+                 fire: `violations` only reports a claim the README actually makes. Either \
+                 the phrase is mistyped, or the sentence was reworded and the entry was not.",
                 claim.phrase,
                 claim.falsified_by,
             );

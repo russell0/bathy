@@ -1,0 +1,2 @@
+{"type":"init","allowed_cidrs":["10.30.0.0/24","192.168.0.0/16","2001:db8::/32"],"denied_cidrs":["10.30.0.1/32"],"packets_per_second":50,"max_packets":250}
+{"type":"probe","id":1,"target":"2001:db8::1","port":22}

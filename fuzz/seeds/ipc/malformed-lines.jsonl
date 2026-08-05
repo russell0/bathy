@@ -1,0 +1,4 @@
+{not json
+
+{"type":"probe","id":1,"target":"example.com","port":80}
+{"type":"probe","id":1,"target":"10.30.0.7","port":70000}

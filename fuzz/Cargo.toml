@@ -55,6 +55,9 @@ bathy-scope = { path = "../crates/bathy-scope" }
 # parsed, because `fold_events` is the first thing every consumer of a log
 # does with it and it is reached only through bytes an older build wrote.
 bathy-query = { path = "../crates/bathy-query" }
+# The `ipc` target drives the line protocol the way the daemon will: the
+# reader and the session together, over one buffer, for the whole input.
+bathy-packetd = { path = "../crates/bathy-packetd" }
 
 serde_json = "1"
 # The manifest target re-derives the allow/deny sets from the raw document so
@@ -99,6 +102,13 @@ bench = false
 [[bin]]
 name = "manifest"
 path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc"
+path = "fuzz_targets/ipc.rs"
 test = false
 doc = false
 bench = false

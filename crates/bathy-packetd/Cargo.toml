@@ -1,0 +1,53 @@
+[package]
+name = "bathy-packetd"
+version.workspace = true
+edition.workspace = true
+# The 1.88 tier, and measured in both directions before this line was written
+# (this project has given a crate an unchecked floor three times -- see the
+# comments on the two `msrv` jobs in `.github/workflows/ci.yml`):
+# `cargo +1.88 check -p bathy-packetd --all-targets` passes and
+# `cargo +1.95 check -p bathy-packetd --all-targets` passes, so the floor this
+# crate promises is real and `1.88` is the job that has to check it. Nothing
+# here reaches `bathy-store` or `libsqlite3-sys`, and nothing here is allowed
+# to: a privileged process with a C build script in its dependency graph is a
+# privileged process nobody can review. Named in the `msrv` job and in no
+# other.
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# The dependency graph of the ONLY privileged component in this workspace, and
+# the shortest one in it. Every crate here is either a parser this protocol
+# cannot avoid or a type it would otherwise hand-roll:
+#
+# - `serde`/`serde_json`: the line protocol is line-delimited JSON, and the
+#   deserializer is what makes an unparseable target address or an out-of-range
+#   port a *parse failure* (AC-6.4, fatal) rather than a validation step
+#   somebody has to remember to write. Keeping the refusal in the type is the
+#   whole reason this crate has almost no validation logic of its own.
+# - `ipnet`: the same CIDR parser `bathy-scope` uses, for the same reason --
+#   a malformed CIDR in `Init` must be fatal at the boundary, not later.
+#   Sharing the *parser* is not sharing the *policy*: AC-6.9's independent
+#   scope check (Task 3) shares no code with `bathy-scope`.
+# - `thiserror`: the error types this crate's public API returns.
+#
+# Deliberately NOT `bathy-types`, though `LAYERS` in `xtask` would permit it.
+# `PortState` here is three lines of local enum with the same wire strings
+# (asserted by a test); depending on `bathy-types` for it would drag
+# `schemars`, `blake3`, `ulid` and `time` into the address space that opens
+# raw sockets. The duplication is four variants; the alternative is four
+# crates.
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+ipnet = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# TEST ONLY, and the reason the local `PortState` above is a copy of a contract
+# rather than a second contract: `the_wire_strings_match_bathy_types` compares
+# the two enums' serialized forms. A dev-dependency edge does not link into the
+# privileged binary, so the graph that opens raw sockets stays the four crates
+# listed above.
+bathy-types = { path = "../bathy-types" }

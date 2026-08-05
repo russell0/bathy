@@ -204,6 +204,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bathy-packetd"
+version = "0.1.0"
+dependencies = [
+ "bathy-types",
+ "ipnet",
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "bathy-plan"
 version = "0.1.0"
 dependencies = [

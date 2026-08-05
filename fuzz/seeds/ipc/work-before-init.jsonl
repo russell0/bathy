@@ -1,0 +1,2 @@
+{"type":"probe","id":1,"target":"10.30.0.7","port":80}
+{"type":"init","allowed_cidrs":["10.30.0.0/24"],"denied_cidrs":[],"packets_per_second":100,"max_packets":1000}

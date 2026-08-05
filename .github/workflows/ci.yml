@@ -146,6 +146,17 @@ jobs:
       # `stable` twice) and prints the exact `cargo +<toolchain> check` lines,
       # so the local invocation is derived rather than remembered.
       - run: cargo run -p xtask -- check-msrv
+      # M6's exit criterion: `bathy-packetd` is under 800 lines of non-test
+      # Rust. It is the only component that will hold CAP_NET_RAW and the only
+      # one permitted `unsafe`, and the whole argument for trusting it is that
+      # a person can read all of it. That criterion had no executable form --
+      # the same shape as the five gates M5 closed and the MSRV membership
+      # rule with three recurrences -- and a size constraint first measured at
+      # milestone close-out is measured when the code is already too big to
+      # move. It runs from M6 Task 1 rather than from M6 Task 5 for exactly
+      # that reason. What the number counts, and what it cannot see, is
+      # printed on every pass.
+      - run: cargo run -p xtask -- check-packetd
       # AC-7.1, and the rule the M7 plan states in prose and nothing enforced.
       #
       # The integration lab is the oracle every downstream claim rests on --
@@ -372,7 +383,26 @@ jobs:
       # The standing rule this is the second instance of: a crate declaring
       # a floor must appear in exactly one of these two jobs, and changing a
       # crate's dependencies means re-deciding which one in the same commit.
-      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p xtask --all-targets
+      #
+      # `bathy-packetd` joined this job in M6 Task 1, and the tier is a
+      # deliberate constraint rather than an observation. Its whole dependency
+      # set is `serde`, `serde_json`, `thiserror` and `ipnet` -- every one of
+      # them already inside `bathy-types`' 1.88-clean graph -- plus a
+      # `bathy-types` DEV-dependency for the one test that pins `PortState`'s
+      # wire strings, which is also 1.88. Nothing in the only privileged
+      # component in this workspace is allowed to reach `bathy-store` and
+      # `libsqlite3-sys`'s build script: a privileged process with a C build
+      # script in its graph is a privileged process nobody can review. So
+      # `--all-targets` is right here, and if this line ever has to move to
+      # `msrv-bathy-store` that is a signal about the dependency graph, not
+      # about the toolchain. Measured against real toolchains in both
+      # directions before this line was written, the way this project has
+      # required since the third recurrence: `cargo +1.88 check -p
+      # bathy-packetd --all-targets` passes (so the declared floor is real and
+      # this is the job that checks it) and `cargo +1.95 check -p
+      # bathy-packetd --all-targets` also passes (so it is not silently a
+      # 1.95 crate named in the wrong job).
+      - run: cargo check -p bathy-types -p bathy-scope -p bathy-evidence -p bathy-plan -p bathy-probe -p bathy-interpret -p bathy-packetd -p xtask --all-targets
       # `bathy-query` joined this job in M5 Task 1 -- and it is the first
       # crate whose floor these two jobs, as previously written, could not
       # express. Its `[dependencies]` are `bathy-types`, `schemars`, `serde`,

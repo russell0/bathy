@@ -1,0 +1,1 @@
+{"type":"init","allowed_cidrs":[],"denied_cidrs":[],"packets_per_second":100,"max_packets":1000}

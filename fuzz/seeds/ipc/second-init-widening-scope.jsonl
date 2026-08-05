@@ -1,0 +1,2 @@
+{"type":"init","allowed_cidrs":["10.30.0.0/24"],"denied_cidrs":[],"packets_per_second":100,"max_packets":1000}
+{"type":"init","allowed_cidrs":["0.0.0.0/0"],"denied_cidrs":[],"packets_per_second":100,"max_packets":1000}
