@@ -341,11 +341,10 @@ or obsolete, and nothing here is a comparison to a person.
 
 ## The eleven MCP tools
 
-`bathy serve mcp` speaks MCP over stdio and advertises eleven tools:
-
-`scope.validate` · `scan.preview` · `scan.start` · `scan.status` ·
-`scan.events` · `scan.cancel` · `scan.resume` · `result.query` ·
-`result.diff` · `evidence.get` · `fingerprint.explain`
+`bathy serve mcp` speaks MCP over stdio and advertises eleven typed tools:
+`scope.validate`, `scan.preview`, `scan.start`, `scan.status`, `scan.events`,
+`scan.cancel`, `scan.resume`, `result.query`, `result.diff`, `evidence.get`,
+`fingerprint.explain`.
 
 Every one of them declares an output schema and returns a conforming structured
 result with a JSON text mirror. What the tool surface deliberately does not

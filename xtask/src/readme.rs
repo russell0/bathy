@@ -116,6 +116,19 @@ pub struct Truth {
     pub protocols: BTreeSet<String>,
     /// The subset of [`Truth::protocols`] whose probe writes no bytes.
     pub silent_protocols: BTreeSet<String>,
+    /// Entries in `bathy-interpret`'s `ALL_RULES`.
+    ///
+    /// M7 Task 4 put this number in the README's limitations section, which
+    /// makes it exactly the kind of claim the Global Constraint says must be
+    /// pinned: a number with a source of truth in the tree, sitting in the
+    /// paragraph a sceptical reader weighs hardest.
+    pub interpretation_rules: usize,
+    /// `bathy_mcp::descriptors::TOOL_NAMES`.
+    ///
+    /// "Eleven tools" was stated in the README from M5 onward and read by
+    /// nothing. The set is pinned too, not only the count: an eleven-element
+    /// list with one wrong name is the failure a count cannot see.
+    pub mcp_tools: BTreeSet<String>,
     /// Files under `schemas/`.
     pub committed_schemas: usize,
     /// Files under `schemas/` whose name begins `mcp-`: the tool surface.
@@ -165,9 +178,20 @@ const ABSENCE_CLAIMS: &[AbsenceClaim] = &[
         phrase: "a packet daemon (Milestone 6)",
         falsified_by: "crates/bathy-packetd/Cargo.toml",
     },
+    // `lab/Cargo.toml` until M7 Task 4, which is a path that was never going
+    // to exist: the lab is a digest-pinned compose file, a ground-truth
+    // document and a shell script, and it is not a crate. So this entry was
+    // structurally dead -- the README asserted through the whole of M7 Tasks 1
+    // to 3 that the verification suite does not exist yet, while the lab, four
+    // fuzz targets and a published benchmark were all committed, and
+    // `check-readme` stayed green because the falsifier could not appear.
+    // A register catches a claim that GOES stale; it cannot catch one whose
+    // falsifier is unreachable, which makes the *choice of path* part of the
+    // entry rather than a detail. `every_falsifier_names_a_path_the_tree_can_
+    // actually_produce` is the guard.
     AbsenceClaim {
         phrase: "the verification suite (Milestone 7)",
-        falsified_by: "lab/Cargo.toml",
+        falsified_by: "lab/docker-compose.yml",
     },
 ];
 
@@ -240,6 +264,18 @@ fn number_claims(truth: &Truth) -> Vec<NumberClaim> {
                 r"(\w+) clean-room protocol probes",
                 r"begins with (\w+) protocols",
             ],
+        },
+        NumberClaim {
+            claim: "number of interpretation rules",
+            source: "ALL_RULES (crates/bathy-interpret/src/rules.rs)",
+            expected: truth.interpretation_rules,
+            patterns: &[r"(\w+) interpretation rules"],
+        },
+        NumberClaim {
+            claim: "number of MCP tools",
+            source: "TOOL_NAMES (crates/bathy-mcp/src/descriptors.rs)",
+            expected: truth.mcp_tools.len(),
+            patterns: &[r"(\w+) typed tools"],
         },
         NumberClaim {
             claim: "number of probes that put no bytes on the wire",
@@ -316,6 +352,16 @@ fn name_set_claims(truth: &Truth) -> Vec<NameSetClaim> {
                      io.write_all",
             expected: truth.silent_protocols.clone(),
             patterns: &[r"send nothing at all\*\*: the ([A-Za-z0-9 ]+?) probes are"],
+        },
+        NameSetClaim {
+            claim: "the set of MCP tools",
+            source: "TOOL_NAMES (crates/bathy-mcp/src/descriptors.rs)",
+            expected: truth.mcp_tools.clone(),
+            // The whole backticked, comma-separated run after "typed tools:".
+            // A tool name contains a `.`, so the `([^.]+)` shape the protocol
+            // patterns use cannot be reused here -- it would stop at
+            // `scope.validate`'s own dot and compare a one-element set.
+            patterns: &[r"typed tools: ((?:`[a-z.]+`(?:, )?)+)"],
         },
     ]
 }
@@ -502,9 +548,34 @@ fn parse_quantity(text: &str) -> Option<usize> {
     if let Ok(n) = text.parse::<usize>() {
         return Some(n);
     }
+    // Index is the value, so the list must stay contiguous. It stopped at
+    // twelve until M7 Task 4 wrote "thirteen interpretation rules" into the
+    // limitations section, at which point the parser reported a correct
+    // sentence as "not a number" -- a failure in the safe direction, but a
+    // failure. Extended to twenty rather than to exactly thirteen so the next
+    // rule does not have to touch this.
     const WORDS: &[&str] = &[
-        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
-        "eleven", "twelve",
+        "zero",
+        "one",
+        "two",
+        "three",
+        "four",
+        "five",
+        "six",
+        "seven",
+        "eight",
+        "nine",
+        "ten",
+        "eleven",
+        "twelve",
+        "thirteen",
+        "fourteen",
+        "fifteen",
+        "sixteen",
+        "seventeen",
+        "eighteen",
+        "nineteen",
+        "twenty",
     ];
     let lowered = text.to_ascii_lowercase();
     WORDS.iter().position(|w| *w == lowered)
@@ -517,6 +588,11 @@ fn parse_name_list(text: &str) -> BTreeSet<String> {
     text.split(['/', ',', ';'])
         .flat_map(|part| part.split(" and "))
         .map(str::trim)
+        // The MCP tool list is written in code spans, as every identifier in
+        // this README is; the protocol lists are not. Trimming backticks is
+        // what lets one parser read both, and it cannot change a protocol
+        // name, which has none.
+        .map(|part| part.trim_matches('`'))
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect()
@@ -544,6 +620,8 @@ pub fn gather_truth(root: &Path) -> Fallible<Truth> {
         crates: workspace_members(root)?,
         protocols,
         silent_protocols,
+        interpretation_rules: count_interpretation_rules(root)?,
+        mcp_tools: mcp_tool_names(root)?,
         committed_schemas: count_files(&root.join("schemas"))?,
         mcp_schemas: count_matching(&root.join("schemas"), |n| n.starts_with("mcp-"))?,
         mcp_input_schemas: count_matching(&root.join("schemas"), |n| {
@@ -697,6 +775,55 @@ fn count_matching(dir: &Path, keep: impl Fn(&str) -> bool) -> Fallible<usize> {
     Ok(n)
 }
 
+/// Every rule `bathy-interpret` can fire, counted by asking the crate.
+///
+/// Called rather than parsed, on the same reasoning as [`probe_truth`]: a
+/// fourteenth rule then fails `check-readme` instead of quietly leaving the
+/// README's limitations section understating what this project identifies.
+fn count_interpretation_rules(_root: &Path) -> Fallible<usize> {
+    Ok(bathy_interpret::all_rules().count())
+}
+
+/// The MCP tool names, read out of `descriptors.rs`.
+///
+/// `bathy-mcp` is a 1.95-MSRV crate (it depends on `bathy-engine`, which
+/// depends on `bathy-store`), and `xtask` is pinned to the 1.88 tier, so this
+/// list cannot be obtained by calling the code that owns it without dragging
+/// `xtask` out of the `msrv` CI job. Anchored on the `TOOL_NAMES` literal, so
+/// a reformat that keeps the array intact still matches and a changed name
+/// does not.
+///
+/// The array is asserted non-empty: a parse that silently found nothing would
+/// compare the README's eleven names against an empty set and report eleven
+/// spurious extras, which reads as a README defect rather than as the parser
+/// defect it is.
+fn mcp_tool_names(root: &Path) -> Fallible<BTreeSet<String>> {
+    const DESCRIPTORS: &str = "crates/bathy-mcp/src/descriptors.rs";
+    let path = root.join(DESCRIPTORS);
+    let source = std::fs::read_to_string(&path).map_err(|e| format!("{DESCRIPTORS}: {e}"))?;
+    let re = Regex::new(r#"(?s)TOOL_NAMES:\s*&\[&str\]\s*=\s*&\[(.*?)\]"#)
+        .expect("checker pattern must compile");
+    let body = re
+        .captures(&source)
+        .ok_or_else(|| {
+            format!(
+                "{DESCRIPTORS}: no `TOOL_NAMES: &[&str] = &[...]` literal found. The README \
+                 states the tool count and the tool set and this is where both are read from; \
+                 either the constant moved (update this pattern) or it is no longer a literal \
+                 array (then the README's list has no source of truth and must be re-derived)."
+            )
+        })?
+        .get(1)
+        .expect("the pattern has one group")
+        .as_str();
+    let name = Regex::new(r#""([a-z][a-z.]*)""#).expect("checker pattern must compile");
+    let names: BTreeSet<String> = name.captures_iter(body).map(|c| c[1].to_string()).collect();
+    if names.is_empty() {
+        return Err(format!("{DESCRIPTORS}: `TOOL_NAMES` parsed to no names at all").into());
+    }
+    Ok(names)
+}
+
 /// The `EvidenceLevel` cap the scheduler actually applies, in KiB, read from
 /// its source. `xtask` sits in the 1.88 MSRV tier and `bathy-engine` is 1.95
 /// (`libsqlite3-sys`'s build script), so this one number cannot be obtained by
@@ -766,7 +893,19 @@ pub fn check_readme() -> Fallible<()> {
 //     register, not a scan: it catches a claim that has gone stale, never a
 //     new claim written without an entry. Writing "X does not exist yet" and
 //     not registering it is exactly as invisible to this checker as the three
-//     MCP sentences were before the register existed.
+//     MCP sentences were before the register existed. A *registered* entry
+//     can also be dead rather than merely quiet, and one was: the
+//     verification suite's falsifier named `lab/Cargo.toml`, a path the tree
+//     was never going to produce, so the README carried the claim through all
+//     of M7 Tasks 1 to 3 with the lab, the fuzz targets and the benchmarks
+//     committed. `every_falsifier_names_a_path_the_tree_can_actually_produce`
+//     now guards the paths; nothing guards the completeness of the register.
+//   - **Everything outside `README.md`.** This module reads one file. The
+//     structural claims of the design paper, the platform-support document
+//     and the threat model -- that each required section exists and states
+//     the thing its acceptance criterion names -- are `check-docs`
+//     (`xtask/src/docs.rs`), which has its own list of what it cannot see.
+//     Neither checker reads the *truth* of a sentence in any of them.
 //   - Every guarantee sentence in the status note and "Authorized use":
 //     what the scheduler checks and when, that a scan is refused in full and
 //     never silently trimmed, that a mid-scan expiry does not halt a run in
@@ -854,7 +993,10 @@ server speak first.
 
 Service-identification coverage will start far below mature scanners: this
 project begins with eight protocols against decades of accumulated community
-fingerprint data elsewhere.
+fingerprint data elsewhere. bathy v0.1 has eight protocols and three
+interpretation rules.
+
+`bathy serve mcp` advertises two typed tools: `scope.validate`, `scan.start`.
 
 ## Planned scope for v0.1
 
@@ -885,6 +1027,8 @@ identification, structured event output.
                 "Redis",
             ]),
             silent_protocols: names(&["SSH", "MySQL"]),
+            interpretation_rules: 3,
+            mcp_tools: names(&["scope.validate", "scan.start"]),
             committed_schemas: 6,
             mcp_schemas: 5,
             mcp_input_schemas: 3,
@@ -944,6 +1088,39 @@ identification, structured event output.
             named.contains("crates/bathy-mcp/src/server.rs"),
             "the failure must name what falsifies the claim: {named}"
         );
+    }
+
+    /// The register catches a claim that *goes* stale. It cannot catch one
+    /// whose falsifier can never appear, and it had one: the verification
+    /// suite's entry named `lab/Cargo.toml`, and the lab is a compose file, a
+    /// ground-truth document and a shell script -- never a crate. So the
+    /// README asserted through the whole of M7 Tasks 1 to 3 that the
+    /// verification suite does not exist yet, with a committed lab, four fuzz
+    /// targets and a published benchmark in the tree, and this check stayed
+    /// green. The *choice of path* is therefore part of the entry, and this
+    /// is its guard: every falsifier must be a path this repository could
+    /// actually produce, which for a path outside `crates/` means one that
+    /// exists right now.
+    #[test]
+    fn every_falsifier_names_a_path_the_tree_can_actually_produce() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for claim in ABSENCE_CLAIMS {
+            let exists = root.join(claim.falsified_by).exists();
+            // A falsifier under `crates/` names a crate this project has
+            // planned and not yet written -- that is the whole point of the
+            // entry, and it must NOT exist yet. Anywhere else, the file has
+            // to be real, or nothing will ever make the claim false.
+            let is_a_planned_crate = claim.falsified_by.starts_with("crates/");
+            assert!(
+                exists || is_a_planned_crate,
+                "ABSENCE_CLAIMS entry for {:?} is falsified by `{}`, which does not exist and \
+                 is not a planned crate under crates/. A falsifier that cannot appear makes the \
+                 entry dead: the claim can never be reported false. Name a path the tree really \
+                 produces.",
+                claim.phrase,
+                claim.falsified_by,
+            );
+        }
     }
 
     /// And it is the *tree* that decides, not the phrase: the same sentence
@@ -1032,6 +1209,52 @@ identification, structured event output.
             "connections a scanned third party receives per open port",
             "README says 2",
             "the tree says 4",
+        );
+    }
+
+    /// The number lives in the limitations section, which is the paragraph a
+    /// reader deciding whether to trust this weighs hardest, and it is the
+    /// one place where *understating* is as much a defect as overstating.
+    #[test]
+    fn a_wrong_interpretation_rule_count_is_caught_and_named() {
+        let readme = readme().replace("three\ninterpretation rules", "nine\ninterpretation rules");
+        fails_naming(
+            &readme,
+            "number of interpretation rules",
+            "README says 9",
+            "the tree says 3",
+        );
+    }
+
+    #[test]
+    fn a_wrong_tool_count_is_caught_and_named() {
+        let readme = readme().replace("two typed tools", "five typed tools");
+        fails_naming(
+            &readme,
+            "number of MCP tools",
+            "README says 5",
+            "the tree says 2",
+        );
+    }
+
+    /// A count cannot see this: eleven names with one of them wrong is still
+    /// eleven. `scan.start` renamed to `scan.begin` is a README that sends an
+    /// agent author to a tool that does not exist.
+    #[test]
+    fn a_tool_list_with_the_right_length_and_a_wrong_name_is_caught() {
+        let readme = readme().replace("`scan.start`", "`scan.begin`");
+        let joined = violations(&readme, &truth()).join("\n");
+        assert!(
+            joined.contains("the set of MCP tools"),
+            "a renamed tool must fail the set claim; got:\n{joined}"
+        );
+        assert!(
+            joined.contains("scan.start"),
+            "the failure must name what is missing; got:\n{joined}"
+        );
+        assert!(
+            !joined.contains("number of MCP tools"),
+            "the count is still right, so the count claim must not also fail:\n{joined}"
         );
     }
 

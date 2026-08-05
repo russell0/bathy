@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod docs;
 mod fixtures;
 mod gates;
 mod phrases;
@@ -53,6 +54,14 @@ const SUBCOMMANDS: &[&str] = &[
     "check-deps",
     "check-schemas",
     "check-readme",
+    // AC-7.16 and AC-7.18 through AC-7.21: the structural claims of the four
+    // documents a stranger reads before deciding whether to trust this. Every
+    // one of those criteria would otherwise have been closed by a person
+    // reading the file and saying so, and the Global Constraint is explicit
+    // that manual verification closes nothing. `check-readme` asks whether a
+    // number is true; this asks whether the section that has to exist still
+    // does, and still says the thing its criterion names.
+    "check-docs",
     "check-phrases",
     // The class the M7 flaky sweep found four times, in the four shapes a
     // checker can see: two tests sharing a scratch path, a port bound and
@@ -105,6 +114,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("check-schemas") => emit_schemas(false),
         Some("gen-ports") => gen_ports(),
         Some("check-readme") => readme::check_readme(),
+        Some("check-docs") => docs::check_docs(),
         Some("check-phrases") => phrases::check_phrases(),
         Some("check-fixtures") => fixtures::check_fixtures(),
         Some("check-purity") => gates::check_purity(),

@@ -55,6 +55,20 @@ jobs:
       # Constraint requiring a README audit at every milestone exit still
       # stands in full.
       - run: cargo run -p xtask -- check-readme
+      # `check-readme` asks whether a number in the README is true.
+      # `check-docs` asks a different question, over four files: does the
+      # section that has to exist still exist, is it where its criterion says
+      # it has to be, and does it still say the thing it was required to say.
+      # AC-7.16 and AC-7.18 through AC-7.21 are all of that shape, and every
+      # one of them would otherwise have been closed by a person reading the
+      # file and reporting that it looked right -- which the Global
+      # Constraints say closes nothing. It covers position as well as
+      # presence: the authorized-use statement moving below another section is
+      # a one-line edit that leaves every presence check green, and it is
+      # exactly what AC-7.18 forbids. Like `check-readme`, it ends with a
+      # written-out list of what it cannot see -- starting with whether any of
+      # what those documents say is true.
+      - run: cargo run -p xtask -- check-docs
       # The three forbidden-pattern rules -- no time/id generation outside
       # `Clock` (AC-2.1), no `unsafe` outside `bathy-packetd`, and the
       # unscoped determinism claim -- used to live here, as inline `grep`

@@ -338,7 +338,20 @@ git commit -m "bench: reproducible cross-scanner comparison with accuracy report
 ### Task 4: Documentation
 
 **Files:**
-- Create: `README.md`, `docs/design-paper.md`, `docs/platform-support.md`, `docs/threat-model.md`
+- Modify: `README.md` (it exists; it does not get created) — Create: `docs/design-paper.md`, `docs/platform-support.md`, `docs/threat-model.md`
+- Create: `xtask/src/docs.rs` — the structural claims of all four documents, where they can be unit-tested (see plan edit #3)
+- Modify: `xtask/src/phrases.rs`, `xtask/src/readme.rs`, `xtask/src/main.rs`, `.github/workflows/ci.yml` — AC-7.17 is a gate, and this project's standing rule is that a gate with no `cargo run -p xtask -- check-<something>` form is a gate that goes red and stays red
+- Modify: this file and the overview — see plan edit #1
+
+  **Four corrections to this task, made during Task 4 and flagged as plan edits. The first is a defect in the acceptance surface itself: the plan document that states AC-7.17 violated it.**
+
+  1. **AC-7.17's own target contained the thing AC-7.17 forbids.** These plans live under `docs/`, which is precisely the tree the criterion says must not name an individual, and Task 6's Step 1 sketch spelled a name out three times — in the research-artifact filename filter, in the positioning grep, and in a test fixture — with a fourth in the overview's Pre-Publication Gates. The sketch also contradicted the plan's *own* AC-7.25, which says personal identifiers live only in the git-ignored `.publish-deny` and never in the checker's source. All four sites now read the register instead, and Task 6 inherits `denied_names()` rather than a literal list. The name no longer appears anywhere in this repository, which is the property AC-7.17 exists to keep and which a `grep -ri` can now confirm in one second.
+
+  2. **`README.md` carried a claim of absence that the register could not fire on.** `readme.rs`'s `ABSENCE_CLAIMS` registered "the verification suite (Milestone 7)" as falsified by `lab/Cargo.toml` — a path that was never going to exist, because the lab is a Docker compose file and a shell script and not a crate. So the entry was structurally dead: the README asserted through all of M7 Tasks 1-3 that the verification suite does not exist yet, while the lab, four fuzz targets and a published benchmark were all committed, and `check-readme` stayed green. The register catches a claim that *goes* stale; it cannot catch one whose falsifier can never appear. The falsifier is now `lab/docker-compose.yml`, and a test pins that every registered falsifier path is one the tree could actually produce.
+
+  3. **Six of this task's criteria had no executable form.** AC-7.16 and AC-7.18 through AC-7.21 are all statements about document structure, and the Global Constraint is that a criterion is closed by a named test that dies and by nothing else. They are now `cargo run -p xtask -- check-docs` (`xtask/src/docs.rs`): every claim is a named pattern with a stated reason, over pure text, mutation-tested. What it can and cannot see is written out at the bottom of that module in the same form `readme.rs` uses — it can prove a section exists and says the required thing, and it cannot prove the section is *true*.
+
+  4. **The quickstart in the drafted structure could not have been executed.** A quickstart against `127.0.0.1` is the obvious one to write and it cannot work: `ScopeManifest::allows` refuses loopback outright, so no manifest can authorize it. The shipped quickstart uses a non-loopback interface address, was executed end to end from a clean state, and its output is a transcript rather than an illustration — including the two things the transcript reveals that a written-from-imagination one would not have (`http` with no product name, and an empty `hosts_up` on a host that is plainly up).
 
 - [ ] **Step 1: Write the README**
 
@@ -372,12 +385,12 @@ git commit -m "docs: README, design paper, platform support, and threat model"
 ```
 
 **Acceptance criteria:**
-- **AC-7.16** The README's limitations section explicitly states that service-identification coverage is far below Nmap's and explains why.
-- **AC-7.17** No document in the repository names an individual person in a comparative or critical context. Asserted by a CI grep over `docs/` and `README.md`.
-- **AC-7.18** The README carries an authorized-use statement above the fold.
-- **AC-7.19** The quickstart cannot be followed without creating a scope manifest, reflecting that the tool genuinely requires one.
-- **AC-7.20** `docs/design-paper.md` contains a limitations section and a clean-room attestation.
-- **AC-7.21** `docs/platform-support.md` states the Windows position factually as a licensing constraint.
+- **AC-7.16** The README's limitations section explicitly states that service-identification coverage is far below Nmap's and explains why — the 28-years-of-fingerprints asymmetry, the protocol count, and the one measured per-endpoint loss (a TLS-fronted service is identified only as `tls`, because `detect_service` stops at the first probe that interprets and `tls-v1` is protocol-only by construction under RFC 8446). `cargo run -p xtask -- check-docs` fails if any of those claims leaves the section.
+- **AC-7.17** No document in the repository names an individual person in a comparative or critical context. Asserted by `check-phrases`' `compare-tools-not-people` rule over `docs/` and `README.md`, in CI. *Restated — see plan edit #1.* Honest about its own reach: it is a denylist over the names this project's positioning could reach for, not a detector of personhood, which no pattern decides. Its pattern and its test fixtures assemble the names rather than spelling them, so the repository itself contains none. The rule is also the reason `Rule::roots` now accepts a plain file: a root list that walked only directories would have skipped `README.md` and reported success.
+- **AC-7.18** The README carries an authorized-use statement above the fold — `check-docs` fails if the section is not the first one in the file, if it moves below the quickstart, or if it starts beyond the top of the document.
+- **AC-7.19** The quickstart cannot be followed without creating a scope manifest, reflecting that the tool genuinely requires one. `check-docs` fails if the quickstart stops creating a manifest, or if any packet-emitting command in it stops passing `--scope`. Demonstrated by execution as well: the quickstart was run end to end from a clean state and the two skip-step-2 paths (no `--scope`, and an address the manifest does not cover) both refuse, at exit 1 and exit 2 respectively.
+- **AC-7.20** `docs/design-paper.md` contains a limitations section and a clean-room attestation. The attestation must be *precise* rather than vague, because the true statement is more complicated than "we never touched it": Nmap is installed on the development machine and was run there, as a benchmark subject and in no other capacity, and its data files were not read. `check-docs` requires the section, the run-as-benchmark-subject admission, and the data-files-not-read boundary.
+- **AC-7.21** `docs/platform-support.md` states the Windows position factually as a licensing constraint — Npcap's terms against this project's redistribution model — and says in as many words that it is not a criticism. `check-docs` requires all three parts.
 
 ---
 
@@ -430,7 +443,8 @@ fn publish_check() -> Result<(), Box<dyn std::error::Error>> {
     let tracked = git_ls_files()?;
     for f in &tracked {
         let l = f.to_lowercase();
-        if l.contains("google search") || l.contains("fyodor") || l.ends_with(".html.orig") {
+        if l.contains("google search") || denied_names().any(|n| l.contains(n))
+            || l.ends_with(".html.orig") {
             failures.push(format!("research artifact tracked: {f}"));
         }
     }
@@ -474,8 +488,13 @@ fn publish_check() -> Result<(), Box<dyn std::error::Error>> {
         failures.push(format!("unscoped determinism claim in {hit}"));
     }
 
-    // 4. No named individual in a comparative context.
-    for name in ["Fyodor", "Gordon Lyon"] {
+    // 4. No named individual in a comparative context. The names come from
+    //    the git-ignored `.publish-deny` for the reason AC-7.25 gives, and
+    //    because this plan lives under `docs/`, which is exactly what AC-7.17
+    //    forbids naming an individual in. `check-phrases`'
+    //    `compare-tools-not-people` rule already covers the tracked tree in
+    //    CI; this is the local, deny-list-driven backstop.
+    for name in denied_names() {
         if let Some(hit) = grep_tracked_docs(&tracked, name)? {
             failures.push(format!("`{name}` appears in documentation at {hit}; \
                                    positioning must compare tools, not people"));
@@ -509,7 +528,7 @@ fn publish_check() -> Result<(), Box<dyn std::error::Error>> {
 ```rust
 #[test]
 fn the_publish_gate_rejects_a_tracked_research_artifact() {
-    let repo = fixture_repo_with_file("nmap fyodor - Google Search.html");
+    let repo = fixture_repo_with_file(&format!("nmap {} - Google Search.html", a_denied_name()));
     assert!(publish_check_in(&repo).is_err());
 }
 

@@ -30,6 +30,17 @@ bathy-types = { path = "../crates/bathy-types" }
 # why the evidence caps, owned by the 1.95-tier `bathy-engine`, are read from
 # source text instead.
 bathy-probe = { path = "../crates/bathy-probe" }
+# `check-readme` pins the README's "thirteen interpretation rules" by CALLING
+# `all_rules()`, for the same reason it calls `ProbeRegistry::standard()`
+# rather than parsing `rules.rs`: the count is then compile-checked, and a
+# fourteenth rule fails the check instead of quietly leaving the limitations
+# section -- the paragraph a sceptical reader weighs hardest -- understating
+# what this project can identify. `bathy-interpret` is a 1.88-tier crate (its
+# only dependencies are `bathy-types` and `regex`), so this edge keeps `xtask`
+# in the `msrv` CI job. `bathy-mcp`, which owns the eleven tool names, is
+# 1.95-tier and cannot be added on those terms, so `TOOL_NAMES` is read from
+# source text instead -- the same trade the evidence caps make.
+bathy-interpret = { path = "../crates/bathy-interpret" }
 # `check-schemas`/`emit-schemas` merges this crate's two published schemas
 # (`ScanFold`, `ScanDiff`, M5 Task 2 AC-5.35) with `bathy-types`'s four.
 # `schemars::schema_for!` needs the concrete type, and these two are defined

@@ -60,7 +60,13 @@ pub struct Rule {
     pub headline: &'static str,
     /// The pattern, as a `regex` crate expression.
     pub pattern: &'static str,
-    /// Directories to walk, relative to the repository root.
+    /// What to scan, relative to the repository root. A directory is walked;
+    /// a plain file is scanned on its own.
+    ///
+    /// Files matter: AC-7.17's rule covers `docs/` **and `README.md`**, and a
+    /// root list that silently ignored the second would have made the rule
+    /// cover the one document positioning errors are most likely to reach.
+    /// [`a_file_named_as_a_root_is_scanned`] pins it.
     pub roots: &'static [&'static str],
     /// File extensions to consider. `None` means every text file.
     pub extensions: Option<&'static [&'static str]>,
@@ -201,6 +207,54 @@ pub const RULES: &[Rule] = &[
                               (a CLI that reports skipped work to a user, not a test that skips \
                               itself), mark the line -- an exempted line then says so in its own \
                               text.",
+    },
+    Rule {
+        id: "compare-tools-not-people",
+        headline: "a named individual in README.md or docs/ (AC-7.17)",
+        // M7 Task 4's binding positioning rule: this project compares itself
+        // to *tools*, publishes measurements, and never argues against a
+        // person. The argument "here is an interface designed for a different
+        // consumer, here are the numbers" is strictly stronger than any
+        // adjective, and an adjective aimed at a human being is what a reader
+        // uses to dismiss a whole document.
+        //
+        // The pattern is written with bracket expressions so that this line
+        // does not itself contain either name -- the same device the
+        // determinism rule uses one rule up, and for the same reason: a rule
+        // whose own definition trips it needs an exemption, and an exemption
+        // is a hole. `grep -ri` for either name over this repository returns
+        // nothing, which is the property the rule exists to keep.
+        //
+        // What this is and is not, stated honestly, because the difference
+        // matters when someone later reads a green check as proof:
+        //
+        //   IS: a denylist of the specific names that this project's own
+        //       positioning could plausibly reach for, checked over the two
+        //       places positioning prose lives.
+        //   IS NOT: a detector of personhood. "No document names an
+        //       individual in a comparative context" is not decidable by
+        //       pattern, and nothing here decides it. A new name written into
+        //       a document tomorrow is invisible to this rule until someone
+        //       adds it -- exactly the hand-maintained-register limitation
+        //       AC-7.7 records about `FUZZ_SURFACES`.
+        //
+        // Deliberately NOT read out of `.publish-deny`: that file is
+        // git-ignored, so a rule sourced from it would scan for nothing in
+        // CI, which is the "check that silently covers nothing" defect. The
+        // reason those two files hold personal identifiers is that publishing
+        // a secret detector publishes the secret; a public figure's public
+        // name is not a secret, and the concern here is positioning rather
+        // than disclosure.
+        pattern: r"(?i)\bf[y]odor\b|\bgordon[ ]lyon\b",
+        roots: &["docs", "README.md"],
+        extensions: None,
+        exempt_path_prefixes: &[],
+        exemption_rationale: "None. Compare tools, never people, and never claim another project \
+                              is bad, badly run or obsolete -- publish the measurement instead. A \
+                              line that must name a forbidden name to define, test or enforce this \
+                              rule carries the [phrase-rule] marker; there are none in `docs/` or \
+                              `README.md` today, and a document that needs one is almost certainly \
+                              a document making the argument this rule forbids.",
     },
 ];
 
@@ -373,9 +427,15 @@ pub fn scan(root: &Path) -> Fallible<(Vec<Violation>, usize)> {
             compile(rule).map_err(|e| format!("rule {} has an invalid pattern: {e}", rule.id))?;
         let mut files = Vec::new();
         for r in rule.roots {
-            let dir = root.join(r);
-            if dir.is_dir() {
-                walk(&dir, &mut files)?;
+            let at = root.join(r);
+            if at.is_dir() {
+                walk(&at, &mut files)?;
+            } else if at.is_file() {
+                // A root may name a single file. Without this arm a rule
+                // declaring `README.md` scans nothing at all and reports
+                // success -- the "covers less than it says" shape this
+                // repository has now found five times.
+                files.push(at);
             }
         }
         for file in files {
@@ -489,6 +549,19 @@ mod tests {
     fn run(id: &str, path: &str, text: &str) -> Vec<Violation> {
         let r = rule(id);
         violations_in_text(r, &compile(r).unwrap(), path, text)
+    }
+
+    /// A name `compare-tools-not-people` forbids, assembled at run time.
+    ///
+    /// Spelled out as a literal here, this file would be the one place in the
+    /// repository where `grep -ri` finds the name -- and a test fixture is a
+    /// silly place to lose a property the rule exists to keep. The rule's own
+    /// pattern uses the same device for the same reason.
+    fn forbidden_name(which: usize) -> String {
+        match which {
+            0 => format!("F{}odor", "y"),
+            _ => format!("Gordon {}yon", "L"),
+        }
     }
 
     /// The exact line that was in the tree, red, for the whole back half of
@@ -699,11 +772,13 @@ mod tests {
     /// `RULES` itself, so a rule added later inherits it or fails here.
     #[test]
     fn every_rule_without_exception_honours_the_sentinel() {
+        let a_name = forbidden_name(0);
         let offending = [
             ("clock-only-time-and-ids", "    SystemTime::now()"), // [phrase-rule]
             ("unsafe-only-in-packetd", "unsafe fn raw() {}"),     // [phrase-rule]
             ("no-unscoped-determinism-claim", "DETERMINISTIC RESULTS"), // [phrase-rule]
             ("captured-skip-message", r#"eprintln!("skipping: no lab");"#), // [phrase-rule]
+            ("compare-tools-not-people", a_name.as_str()),
         ];
         assert_eq!(
             offending.len(),
@@ -772,6 +847,83 @@ mod tests {
             run("captured-skip-message", "crates/bathy/tests/x.rs", unmarked).len(),
             1,
             "fixture sanity: without the marker this is a violation"
+        );
+    }
+
+    /// AC-7.17, in the direction that matters: the rule fires on a name in
+    /// either of the two places positioning prose lives, in any case, and it
+    /// names the file and the line.
+    #[test]
+    fn the_positioning_rule_catches_a_named_individual_in_a_document() {
+        for which in 0..2 {
+            let name = forbidden_name(which);
+            for path in ["README.md", "docs/design-paper.md"] {
+                for text in [
+                    format!("bathy is faster to integrate than {name}'s scanner."),
+                    format!("{} wrote it that way.", name.to_uppercase()),
+                ] {
+                    let found = run("compare-tools-not-people", path, &text);
+                    assert_eq!(found.len(), 1, "{path}: {text:?} must be caught");
+                    assert_eq!(found[0].path, path);
+                    assert_eq!(found[0].line, 1);
+                }
+            }
+        }
+    }
+
+    /// The argument this project is allowed to make. A rule that also fired on
+    /// the sentences the documents actually contain would be a rule someone
+    /// deletes, and the whole positioning position with it.
+    #[test]
+    fn comparing_tools_and_publishing_measurements_is_not_a_violation() {
+        for source in [
+            "Nmap has 28 years of community fingerprint contributions; bathy v0.1 has eight.",
+            "bathy-connect took 26285 ms; nmap-version took 17819 ms -- 1.5x.",
+            "Npcap's license terms are incompatible with this project's redistribution model.",
+            "Nmap identified the product at 10.30.0.17:443 and bathy did not.",
+        ] {
+            assert!(
+                run("compare-tools-not-people", "README.md", source).is_empty(),
+                "{source:?} must not be caught"
+            );
+        }
+    }
+
+    /// A rule may name a plain file as a root, and it must actually be read.
+    ///
+    /// This is the arm's own guard: with the `is_file()` branch in [`scan`]
+    /// removed, `docs/` is still walked and the README is silently skipped,
+    /// so the check reports success over a document carrying the exact thing
+    /// it forbids. That is the "covers less than it claims" shape, and it
+    /// would land on the single most likely file for a positioning error.
+    #[test]
+    fn a_file_named_as_a_root_is_scanned() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path();
+        std::fs::create_dir_all(root.join("docs")).expect("docs/");
+        let name = forbidden_name(1);
+        std::fs::write(
+            root.join("README.md"),
+            format!("bathy compared with {name}'s tool.\n"),
+        )
+        .expect("README.md");
+        std::fs::write(
+            root.join("docs/positioning.md"),
+            format!("as {name} put it\n"),
+        )
+        .expect("docs/positioning.md");
+
+        let (violations, _) = scan(root).expect("scanning the scratch tree");
+        let mut paths: Vec<&str> = violations
+            .iter()
+            .filter(|v| v.rule_id == "compare-tools-not-people")
+            .map(|v| v.path.as_str())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(
+            paths,
+            ["README.md", "docs/positioning.md"],
+            "both roots must be read: the directory and the plain file"
         );
     }
 
