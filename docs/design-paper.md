@@ -198,12 +198,50 @@ before each probe — that the target is inside the allow set and outside the de
 set. Service identification re-checks the manifest before opening any
 connection.
 
+**Layer 3 — inside the privileged process, in `bathy-packetd`.** The two layers
+above are in the *unprivileged* half. `packetd` is the only component that can
+put an arbitrary packet on a wire, so it does not delegate the question of
+whether it may: its `Init` fixes an allowlist, a denylist and a packet ceiling
+for the process lifetime, a second `Init` is fatal rather than widening, and
+every probe — SYN and ICMP echo alike — is checked against them by
+`check_session_scope`, which **shares no code with `bathy-scope`**. It does not
+import it, does not use `IpNet::contains`, and does not use `std`'s
+`is_loopback`/`is_multicast`/`is_broadcast`/`is_link_local`: containment is a
+mask comparison written there and the reserved ranges are decided from the
+octets. Reserved addresses are refused even when the allowlist is `0.0.0.0/0`,
+because an operator writing that is saying "I am authorized for the internet",
+not "send this at 255.255.255.255".
+
+This duplication is the point, and it is the one place in this design where
+duplication is deliberate. The argument for the two-process split is that a bug
+or a compromise in the unprivileged half must be *unable* to become a packet at
+an address nobody authorized; a `packetd` that asked `bathy-scope` would make
+both checks one implementation and one bug away from failing together. Two
+statements of one policy are worth nothing unless something checks they agree,
+so a proptest generates a CIDR pair and an address and asserts that
+`check_session_scope` and a real `bathy_scope::ScopeManifest` reach the same
+verdict, and the fuzz target that drives the line protocol with attacker-shaped
+bytes judges every emitted packet by a *third* implementation of the same rules
+— `ipnet`'s matcher and `std`'s predicates, which `packetd` uses neither of.
+
+Both probe kinds reach that check through one function. `Prober::admit` is the
+only place in the crate that asks "may I touch this address" and "have I any
+budget left", in that order — scope first, so a privileged process never answers
+"budget spent" about a target it was never authorized to touch. A second probe
+type carrying its own copy would be a second place for the authorization to be
+wrong, and a test that exhausts the ceiling with a *mix* of SYN and ICMP probes
+is what makes one shared counter a fact rather than a claim: two counters that
+agree still pass a budget test spent with one kind.
+
 Layer 1 exists because refusing early is kinder and leaves nothing behind.
 Layer 2 exists because Layer 1 is in an adapter, and an adapter can be bypassed
-by a library caller. **The property that must hold is "no packet leaves this
-process for an unauthorized address", and only Layer 2 is on the path where
-packets actually leave.** Deleting Layer 1 costs tidiness; deleting Layer 2
-costs the guarantee.
+by a library caller. Layer 3 exists because Layers 1 and 2 are in a process that
+cannot emit a packet at all, and the process that can is the one whose refusal
+has to be true. **The property that must hold is "no packet leaves this system
+for an unauthorized address", and each layer is the only one that still holds it
+when the layer above is wrong.** Deleting Layer 1 costs tidiness; deleting Layer
+2 costs the guarantee for library callers; deleting Layer 3 costs the argument
+for splitting the process in the first place.
 
 Three decisions inside the policy are worth stating because they cost something:
 
@@ -300,11 +338,16 @@ another tool's output.**
   `lab/ground-truth.json`, and the conformance suite holds that endpoint to
   being unidentified — the day bathy names it, that test fails and demands the
   entry be deleted.
-- **No OS detection, no UDP, no traceroute, no IPv6, no Windows, no privileged
-  scanning** in v0.1. Because unprivileged ICMP is impossible, there is no host
-  discovery either: `hosts_up` is empty after every scan on this branch, and an
-  address with no host produces `filtered` endpoints rather than a "host down"
-  verdict.
+- **No OS detection, no UDP, no traceroute, no IPv6, no Windows, and no
+  privileged scanning from the CLI or over MCP** in v0.1. `bathy-packetd` sends
+  SYN probes and ICMP echo requests, and `bathy-engine` can drive both, but no
+  surface asks it to. There is also **no host discovery in the output**:
+  `discover_host_combined` exists and reports which method decided, and nothing
+  in production constructs a `host.discovered` event, so `hosts_up` is empty
+  after every scan on this branch and an address with no host produces
+  `filtered` endpoints rather than a "host down" verdict. The blocker is not the
+  ICMP path: `ScanPlan` carries no objective, so the scheduler has nothing to
+  branch on to decide when discovery should run.
 - **Port presets are IANA-derived heuristics, not prevalence measurements.**
   `top-100` and `common-1000` come from the IANA service-name registry with a
   documented ranking heuristic. Nothing here claims they are the hundred ports

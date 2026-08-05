@@ -599,6 +599,103 @@ git commit -m "feat(engine): packetd integration with connect fallback and cross
 
 The source design document specifies "ICMP/TCP host discovery". M3 delivered the TCP half, which is all that is possible unprivileged. The ICMP half lands here because it requires the same raw-socket capability as SYN scanning.
 
+**Eight corrections to this task, made during Task 5. The first is a test
+that cannot pass without breaking AC-6.10 — the same defect Task 3 found in
+its own Step 1 — and the last says one third of AC-6.20 cannot be closed from
+the files this task owns.**
+
+1. **AC-6.18's first test probes an address AC-6.10 forbids.**
+   `an_echo_reply_marks_the_host_up_with_the_icmp_method` builds
+   `session_allowing("127.0.0.0/8")` and probes `127.0.0.1` — and AC-6.19
+   requires that probe to go through the *same* `check_session_scope` that
+   AC-6.10 makes refuse loopback under any allowlist. The two cannot both
+   pass, and an implementation that satisfied the test would have had a
+   loopback hole in the ICMP path: exactly the shape of Task 3's plan edit
+   #1, repeated. The replacement asserts `Up` against fixtures that answer
+   a *real*, non-reserved address, and `crates/bathy-packetd/tests/wire.rs`
+   proves it on the wire against the test container's own primary address,
+   which the host answers for real.
+
+2. **`s.last_method()` is a second statement of a fact the response already
+   carries.** `classify_icmp` is a bijection — echo reply, unreachable and
+   silence map one-to-one onto `Up`, `Down` and `Unknown` — so a mutable
+   `last_method` on the session is derivable state that can disagree with
+   the answer it describes, in the process that holds `CAP_NET_RAW`. It is
+   not built. The method string belongs where AC-6.20 puts it: on the
+   engine's `DiscoveryResult`, derived from the `HostState` that came off
+   the wire.
+
+3. **`Response::Result` cannot carry a `HostState`.** Step 1's first test
+   reads `matches!(r, Response::Result { state, .. } if *state ==
+   HostState::Up)`, and `Response::Result`'s `state` is a `PortState` (Task
+   1). Host discovery needs its own request/response pair, so the protocol
+   gains `Request::IcmpProbe { id, target }` and `Response::HostResult { id,
+   state }`. A `port: Option<u16>` on the existing `Probe` was rejected: a
+   request whose *response type* depends on whether a field was null is a
+   protocol two builds can disagree about silently.
+
+4. **AC-6.20's `discover_host_combined` cannot return a bare
+   `DiscoveryResult`.** Two of the three things `packetd` can answer with are
+   terminal by Task 4's own plan edit #3 and by AC-6.16: a **refusal** means
+   the daemon's independent scope check rejected a target the engine
+   authorized, and a **death** means the method stopped working. A signature
+   with no error channel forces both into a discovery result, and the only
+   discovery result available is "ICMP said nothing, try TCP" — which is this
+   engine sending connect probes at an address a privileged process just
+   declined to touch. It returns `Result<DiscoveryResult, PacketdError>`, and
+   `a_refused_icmp_probe_is_terminal_and_sends_no_tcp_probe` observes the
+   absence of the TCP probe by asking the listener, rather than asserting it.
+
+5. **AC-6.20's test passes whichever answer it gets.** `assert!(r.method ==
+   "icmp-echo-reply" || r.method.starts_with("tcp-connect"))` is a
+   disjunction over both possible outcomes and therefore closes nothing —
+   the "satisfied by the wrong thing" shape this milestone has now found
+   eight times. It is replaced by three tests, each of which arranges for the
+   *other* method to give a different answer: the `Down` case's configured
+   TCP port is one that WOULD answer, so an implementation that fell back on
+   anything but `Unknown` reports the opposite finding.
+
+6. **AC-6.19's mixed-budget test is necessary and not sufficient.** Scope and
+   the ceiling are two questions, and a plausible wrong ICMP implementation
+   passes the allowlist half by calling a CIDR test and reaches multicast and
+   broadcast anyway. `reserved_ranges_are_refused_for_icmp_too` is the other
+   half, with an in-scope control so `0.0.0.0/0` still means something, and
+   `an_out_of_scope_icmp_probe_is_refused_for_scope_even_with_no_budget`
+   pins the interleaving for ICMP that AC-6.11 pins for SYN.
+
+7. **A second probe kind on one receive path creates cross-talk no criterion
+   mentions.** Both kinds share `RawSockets::poll`, and an ICMP unreachable
+   quoting an *echo request* carries 0x0800 (type 8, code 0) exactly where a
+   quoted TCP segment carries its source port. Each matcher now checks the
+   quoted datagram's protocol, and the test hands `match_reply` precisely the
+   port numbers it would otherwise have read out of the echo header — so the
+   guard's removal fails it rather than passing by arithmetic luck.
+
+8. **AC-6.20 names the `host.discovered` event, and this task's own file list
+   contains no file that can emit one.** The files are `icmp.rs` (create) and
+   `discovery.rs` (modify); an emitter needs the event log, the evidence
+   store — `EventBody::HostDiscovered::evidence_refs` is a
+   `NonEmpty<Digest>`, so there is no event without a stored blob — and a
+   decision about *when* discovery runs. That last one is the blocker and it
+   is not new: `bathy_plan::ScanPlan` carries no
+   `bathy_types::request::Objective`, so `scheduler` cannot tell a
+   `HostInventory` scan from an `InventoryExposedServices` one, and running
+   discovery unconditionally changes the packet cost and the event stream of
+   every scan this engine has ever run. **This task therefore closes the
+   deciding-method half of AC-6.20 and leaves the event half open, recorded,
+   rather than emitting the event from a default-off configuration flag that
+   would be a production caller in name only.** See Task 5's report for the
+   shape of the follow-up: plumb `Objective` onto `ScanPlan`, gate a
+   discovery phase on `HostInventory`, and write the evidence record before
+   the event as `emit_service_observed` already does.
+
+**Task 5 measures 1074/1100** (Task 3 measured 922, Task 4 added nothing), so
+the ICMP path cost **152 of the 178 lines Task 4 reserved for it**. The
+privileged window is **unchanged at 130/140 lines across 15/16 functions**:
+`acquire_raw_sockets` already opened the ICMP receive socket, the sending
+socket is `IPPROTO_RAW` with `IP_HDRINCL`, and every function in `icmp.rs`
+runs after the drop.
+
 - [ ] **Step 1: Write the failing test**
 
 ```rust
@@ -667,7 +764,7 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 **Acceptance criteria:**
 - **AC-6.18** ICMP echo discovery classifies echo reply as up, destination unreachable as down, and silence as unknown.
 - **AC-6.19** ICMP probes pass through the identical scope check and session budget as SYN probes — one code path, verified by a test that exhausts the budget using a mix of both probe types.
-- **AC-6.20** Combined discovery tries ICMP first when privileged and falls back to TCP on an inconclusive result, recording the deciding method on the `host.discovered` event.
+- **AC-6.20** Combined discovery tries ICMP first when privileged and falls back to TCP on an inconclusive result, recording the deciding method on the `host.discovered` event. **Partially closed** — the deciding method is produced and tested; nothing in production constructs the event. See correction 8 above.
 
 ---
 
@@ -679,6 +776,6 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 
   **This replaces "under 800 lines of non-test Rust", which was a defect in the criterion and not merely a number that had been outgrown.** It was written before the design existed, and its own stated purpose — in the checker's output — was to bound "the logic a reviewer must follow in the one process that will hold `CAP_NET_RAW`". Task 2 then established, by execution from a second process watching `/proc/<pid>/status`, that the capability is held only across those two calls: `read_line`, `handle_line`, all of `protocol.rs` and all of `syn.rs` run unprivileged, holding sockets that were already open. So the total counted 780-odd lines that never execute with a capability held, and — the failure that matters — **could not see work moved into the window**, because moving a line from after the drop to before it leaves the total unchanged. Task 3 left the gate red at 922/800 rather than raising it, which was right; the resolution is a criterion that tracks the property, not a bigger number. Verified the way everything else here is: `moving_work_into_the_window_fails_the_check_and_names_it` moves 200 lines across the drop in both directions and asserts the check fails only one way.
 
-- [ ] `bathy-packetd` is under **1100** lines of non-test Rust — a bound on *review burden*, which is what a whole-crate count can honestly claim, and not a security boundary. Derived and recorded at the constant: 922 measured at the end of Task 3, plus 178 for Task 5's ICMP path (three quarters of `syn.rs`'s 244 — the same shape with an 8-byte header, no pseudo-header checksum, no sequence matching and no teardown, reusing `check_session_scope` and the session budget unchanged as AC-6.19 requires). Task 4 adds nothing to it: the engine-side integration is in `bathy-engine`. If it goes red, the remedy is still not a bigger number — it is either evidence the estimate was wrong, in which case replace the derivation, or work that does not belong in this crate.
+- [ ] `bathy-packetd` is under **1100** lines of non-test Rust — a bound on *review burden*, which is what a whole-crate count can honestly claim, and not a security boundary. Derived and recorded at the constant: 922 measured at the end of Task 3, plus 178 for Task 5's ICMP path (three quarters of `syn.rs`'s 244 — the same shape with an 8-byte header, no pseudo-header checksum, no sequence matching and no teardown, reusing `check_session_scope` and the session budget unchanged as AC-6.19 requires). Task 4 adds nothing to it: the engine-side integration is in `bathy-engine`. If it goes red, the remedy is still not a bigger number — it is either evidence the estimate was wrong, in which case replace the derivation, or work that does not belong in this crate. **Measured at the end of Task 5: 1074/1100.** The ICMP path cost 152 of the reserved 178, and 20 of those 152 are a `Prober::admit` and a `Session::handle_work` that *removed* a duplicate from the SYN path rather than adding one — the derivation held.
 - [ ] Every `unsafe` block has a `SAFETY:` comment; no other crate has any.
 - [ ] `docs/design-paper.md` contains a section explaining the two-layer scope enforcement and why the duplication is intentional.
