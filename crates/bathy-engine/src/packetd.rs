@@ -372,6 +372,13 @@ impl PacketdClient {
         }
         match answer.await {
             Ok(result) => result,
+            // Fail-closed, and the one arm here with no reachable trigger:
+            // the worker answers every job it takes and drops the sender
+            // only after doing so, so this fires solely if that thread
+            // panicked. It is kept because the alternative to a redundant
+            // fail-closed arm is an `unwrap`, and it produces the same
+            // verdict the reachable path does. Mutating it survives the
+            // suite; that is a property of the arm, not a gap in a test.
             Err(_) => Err(PacketdError::Gone(self.postmortem())),
         }
     }
@@ -842,6 +849,70 @@ mod tests {
         assert!(
             format!("{e}").contains("empty allowlist"),
             "the daemon's own words must survive: {e}"
+        );
+    }
+
+    /// A daemon that answers one probe and then exits is **gone**, not a
+    /// filtered port.
+    ///
+    /// This is the *clean* disappearance -- stdout at end of file rather
+    /// than a broken pipe -- and it is a different code path from the one
+    /// `packetd_dying_mid_scan_fails_the_scan_rather_than_silently_degrading`
+    /// exercises, which kills the process while the engine is between
+    /// probes and therefore fails on the write. Mutation found this path
+    /// uncovered: reading end-of-stream as `Filtered` survived the whole
+    /// suite, and a scan that recorded `filtered` for every endpoint after
+    /// its daemon quietly exited is exactly the silent degradation AC-6.16
+    /// forbids.
+    ///
+    /// The real daemon cannot be asked to exit at a chosen moment, so the
+    /// responder is scripted. What is under test is the engine.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_exits_mid_scan_is_gone_rather_than_a_filtered_port() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one-then-exit.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            "#!/bin/sh\nread init\necho '{{\"type\":\"ready\",\"dropped_capabilities\":true}}'\n\
+             read probe\necho '{{\"type\":\"result\",\"id\":1,\"state\":\"closed\"}}'\nexit 0\n"
+        )
+        .unwrap();
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let client = PacketdClient::start(&path, &manifest(LAB_MANIFEST)).expect("it says ready");
+        let target: IpAddr = "10.30.0.10".parse().unwrap();
+        // The control: while it is answering, an answer is an answer.
+        assert_eq!(client.probe(target, 80).await.unwrap(), PortState::Closed);
+        // And the moment it stops, the scan is over rather than filtered.
+        let e = client
+            .probe(target, 81)
+            .await
+            .expect_err("a daemon that has exited cannot report a port state");
+        assert_eq!(e.terminal_reason(), Some("packetd_unavailable"), "{e}");
+        assert!(
+            format!("{e}").contains("closed its output"),
+            "the reason must name what happened: {e}"
+        );
+        // Every probe after that too -- there is no recovery, and no
+        // quiet switch to the other method.
+        let e = client
+            .probe(target, 82)
+            .await
+            .expect_err("and it does not come back");
+        assert_eq!(e.terminal_reason(), Some("packetd_unavailable"), "{e}");
+        // And the worker stood down at the first fatal rather than writing
+        // another probe into a dead pipe: this error came from the closed
+        // channel, not from a failed `write_all`. Without the check, the
+        // worker looping on after a fatal produces the same verdict by a
+        // different route and nothing notices it is still there.
+        assert!(
+            !format!("{e}").contains("writing a probe"),
+            "the worker must have exited at the first fatal: {e}"
         );
     }
 
