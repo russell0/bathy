@@ -41,7 +41,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::time::{Duration, Instant};
 
-use bathy_packetd::protocol::{PortState, RefusalReason, Response, Session};
+use bathy_packetd::protocol::{HostState, PortState, RefusalReason, Response, Session};
 use bathy_packetd::{PROBE_MARKER, acquire_raw_sockets};
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -66,7 +66,15 @@ fn announce(reason: &str) {
 /// A raw socket this process can watch the wire with, or `None` when it has
 /// no `CAP_NET_RAW` -- in which case nothing in this file can run at all.
 fn sniffer(test: &str) -> Option<Socket> {
-    let opened = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(6)));
+    sniffer_for(test, 6)
+}
+
+/// The same, listening on one IP protocol number: 6 for the SYN tests, 1 for
+/// the ICMP one. An `AF_INET` raw socket is bound to a protocol, so a TCP
+/// sniffer sees no ICMP at all and "no ICMP was emitted" over one would be
+/// vacuous.
+fn sniffer_for(test: &str, protocol: i32) -> Option<Socket> {
+    let opened = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(protocol)));
     let demanded = std::env::var(DEMAND).as_deref() == Ok("1");
     match opened {
         Ok(socket) => {
@@ -176,6 +184,103 @@ fn a_refused_port(host: Ipv4Addr) -> u16 {
         }
     }
     panic!("no refused port found in 39000..39100 on {host}");
+}
+
+/// The echo requests in `captured` that this process emitted: the marker, the
+/// ICMP protocol, type 8, and this host as the destination.
+///
+/// The marker excludes the host's own `ping` and everything else on the wire;
+/// nothing else in this file emits ICMP, so unlike [`ours`] there is no port
+/// to disambiguate concurrent tests with.
+fn our_echo_requests(captured: &[Vec<u8>], to: Ipv4Addr) -> Vec<&Vec<u8>> {
+    captured
+        .iter()
+        .filter(|packet| {
+            packet.len() >= 28
+                && be16(packet, 4) == PROBE_MARKER
+                && packet[9] == 1
+                && packet[20] == 8
+                && packet[16..20] == to.octets()
+        })
+        .collect()
+}
+
+/// AC-6.18 and AC-6.19 **on the wire**, in one test because a raw ICMP socket
+/// sees every ICMP packet delivered to this host and two concurrent ICMP tests
+/// would read each other's.
+///
+/// The refusals come first, then the allowed probe as their control: without
+/// it, a watcher that could see nothing would satisfy "zero packets emitted".
+#[test]
+fn an_icmp_probe_reaches_the_wire_only_for_a_target_the_session_allows() {
+    let Some(watch) = sniffer_for(
+        "an_icmp_probe_reaches_the_wire_only_for_a_target_the_session_allows",
+        1,
+    ) else {
+        return;
+    };
+    let host = this_host();
+
+    // AC-6.19: the same two refusals SYN probes get, asked by the same
+    // function. Both targets are ones whose packets this watcher could see.
+    let mut denied = session("\"0.0.0.0/0\"", &format!("\"{host}/32\""));
+    drain(&watch, Duration::from_millis(60));
+    let by_denylist = denied.handle_icmp_probe(1, IpAddr::V4(host));
+    let by_reserved = denied.handle_icmp_probe(2, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let captured = drain(&watch, Duration::from_millis(200));
+    for (name, response) in [("denylist", by_denylist), ("reserved", by_reserved)] {
+        assert!(
+            matches!(&response, Response::Refused { reason, .. }
+                     if *reason == RefusalReason::OutOfSessionScope),
+            "{name}: {response:?}"
+        );
+    }
+    assert_eq!(denied.packets_emitted(), 0);
+    assert!(
+        our_echo_requests(&captured, host).is_empty(),
+        "a refused ICMP target must emit zero packets, and {} carrying our marker reached \
+         the wire",
+        our_echo_requests(&captured, host).len()
+    );
+
+    // AC-6.18: the host answers its own echo request, so this is `Up` --
+    // observed, not reported, because the request itself is on the wire.
+    let mut allowed = session(&format!("\"{host}/32\""), "");
+    drain(&watch, Duration::from_millis(60));
+    let response = allowed.handle_icmp_probe(3, IpAddr::V4(host));
+    let captured = drain(&watch, Duration::from_millis(300));
+    let ours = our_echo_requests(&captured, host);
+    assert_eq!(
+        ours.len(),
+        1,
+        "exactly one echo request carrying our marker should have reached the wire; \
+         captured {} ICMP packet(s) in total",
+        captured.len()
+    );
+    assert_eq!(allowed.packets_emitted(), 1, "one packet, and no teardown");
+    assert_eq!(
+        response,
+        Response::HostResult {
+            id: 3,
+            state: HostState::Up
+        },
+        "{host} did not answer its own echo request. If this container sets \
+         net.ipv4.icmp_echo_ignore_all, the daemon is right and the environment is not the \
+         one this test assumes."
+    );
+    // The reply has to have been attributed to *this* probe, so the request's
+    // identifier and sequence number are what the matcher had to read.
+    let request = ours[0];
+    assert_eq!(
+        be16(request, 2),
+        28,
+        "20-byte IP header plus an 8-byte ICMP"
+    );
+    assert_ne!(
+        be16(request, 24),
+        0,
+        "the identifier must be set, or every session's replies match every probe"
+    );
 }
 
 /// AC-6.12 (`Open`) and AC-6.13, both observed rather than reported.

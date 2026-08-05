@@ -71,16 +71,18 @@
 //! Test code is exempt by compilation unit (`cfg_attr(not(test), ...)`), not
 //! by a path list -- see `bathy-probe`'s crate doc for the full reasoning.
 
+pub mod icmp;
 pub mod privilege;
 pub mod protocol;
 pub mod syn;
 
+pub use icmp::{IcmpReply, classify_icmp};
 pub use privilege::{
     PrivilegeError, PrivilegeState, RawSockets, UnprivilegedInput, acquire_raw_sockets,
     capabilities_are_dropped, drop_all_capabilities,
 };
 pub use protocol::{
-    LineError, MAX_LINE_BYTES, PortState, RefusalReason, Request, Response, Session, SessionScope,
-    read_line,
+    HostState, LineError, MAX_LINE_BYTES, PortState, RefusalReason, Request, Response, Session,
+    SessionScope, read_line,
 };
 pub use syn::{PROBE_MARKER, Prober, Reply, Wire, check_session_scope, classify_reply};

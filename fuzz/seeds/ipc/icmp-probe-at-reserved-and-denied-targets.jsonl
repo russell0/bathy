@@ -1,0 +1,9 @@
+{"type":"init","allowed_cidrs":["0.0.0.0/0"],"denied_cidrs":["10.30.0.1/32"],"packets_per_second":1000,"max_packets":1000}
+{"type":"icmp_probe","id":1,"target":"127.0.0.1"}
+{"type":"icmp_probe","id":2,"target":"224.0.0.1"}
+{"type":"icmp_probe","id":3,"target":"255.255.255.255"}
+{"type":"icmp_probe","id":4,"target":"169.254.1.1"}
+{"type":"icmp_probe","id":5,"target":"10.30.0.1"}
+{"type":"icmp_probe","id":6,"target":"::1"}
+{"type":"icmp_probe","id":7,"target":"198.51.100.7"}
+{"type":"shutdown"}

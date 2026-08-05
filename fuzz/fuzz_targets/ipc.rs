@@ -33,7 +33,11 @@
 //!    predicates, so neither `bathy-packetd`'s hand-rolled mask nor
 //!    `bathy-scope`'s matcher decides whether it passed. That makes this the
 //!    third independent statement of the same policy, and the only one driven
-//!    by bytes an attacker chose.
+//!    by bytes an attacker chose. Since M6 Task 5 it covers `icmp_probe`
+//!    lines as well, which is the point of AC-6.19: the two probe kinds share
+//!    one scope check and one ceiling, so one property over every emission
+//!    covers both, and a corpus mixing them is what exercises the shared
+//!    counter with attacker-chosen bytes.
 
 use std::cell::RefCell;
 use std::net::{IpAddr, Ipv4Addr};
@@ -114,6 +118,8 @@ const FLAGS: &[&str] = &[
     "rsp:fatal",
     "rsp:none",
     "second_init_refused",
+    "req:icmp_probe",
+    "rsp:host_result",
 ];
 
 static STATS: Stats = Stats::new("ipc", LABELS, FLAGS);
@@ -173,6 +179,7 @@ fuzz_target!(|data: &[u8]| {
                 Request::Init { .. } => 3,
                 Request::Probe { .. } => 4,
                 Request::Shutdown => 5,
+                Request::IcmpProbe { .. } => 11,
             });
         }
         let is_valid_init = matches!(
@@ -187,6 +194,11 @@ fuzz_target!(|data: &[u8]| {
             Some(Response::Refused { .. }) => STATS.flag(7),
             Some(Response::Fatal { .. }) => STATS.flag(8),
             Some(Response::Result { .. }) => {}
+            // M6 Task 5. Counted so a run that never produced a host result
+            // is visible: property 5 ranges over ICMP emissions too, and a
+            // corpus that only ever sent `probe` lines would leave the second
+            // half of the packet path unfuzzed.
+            Some(Response::HostResult { .. }) => STATS.flag(12),
             None => STATS.flag(9),
         }
         let fatal = matches!(response, Some(Response::Fatal { .. }));

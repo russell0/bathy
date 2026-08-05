@@ -97,6 +97,17 @@ pub enum Request {
     /// One probe request. `target` is an `IpAddr` and `port` a `u16`, so
     /// `"10.0.0.256"` and `70000` never reach any logic in this crate.
     Probe { id: u64, target: IpAddr, port: u16 },
+    /// One ICMP echo host-discovery probe (M6 Task 5, AC-6.18). No port:
+    /// discovery asks whether the *host* answers, and a port field this
+    /// process would ignore is a field a caller could believe in.
+    ///
+    /// It is a separate variant rather than a `port: Option<u16>` on
+    /// [`Self::Probe`] because the two produce different answers --
+    /// [`PortState`] and [`HostState`] -- and a request whose response type
+    /// depends on whether a field was null is a protocol two builds can
+    /// disagree about silently. Scope and budget are *not* separate: see
+    /// [`Session::handle_icmp_probe`].
+    IcmpProbe { id: u64, target: IpAddr },
     /// End the session cleanly. Legal only after `Init`.
     Shutdown,
 }
@@ -110,6 +121,8 @@ pub enum Response {
     Ready { dropped_capabilities: bool },
     /// A probe completed.
     Result { id: u64, state: PortState },
+    /// An ICMP host-discovery probe completed (AC-6.18).
+    HostResult { id: u64, state: HostState },
     /// A probe was rejected by this process. The session continues: a
     /// refusal is about one probe, and only the four fatals above are about
     /// the session.
@@ -132,6 +145,23 @@ pub enum PortState {
     Closed,
     Filtered,
     Indeterminate,
+}
+
+/// What one ICMP echo probe established about a host (AC-6.18).
+///
+/// **Three values, and `Unknown` is an answer.** An echo reply proves the
+/// host is there; a destination unreachable is somebody on the path saying it
+/// is not; silence is neither, because the overwhelmingly common reason a
+/// host does not answer an echo request is a firewall that drops it. Folding
+/// `Unknown` into `Down` would report every ICMP-filtering host as absent,
+/// and it is also what makes AC-6.20's fallback decidable: the engine falls
+/// back to TCP on `Unknown` and on nothing else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostState {
+    Up,
+    Down,
+    Unknown,
 }
 
 /// Why one probe was refused. A closed set, because the engine branches on
@@ -345,23 +375,52 @@ impl Session {
         self.prober.packets_emitted()
     }
 
-    /// One probe, scope-checked and budget-checked by `packetd` itself.
-    ///
-    /// A probe before `Init`, or after the session has ended, is fatal on the
-    /// same terms as any other out-of-state message (AC-6.1): a privileged
-    /// process asked to emit before it has been told its scope is a process
-    /// that must stop, not one that answers.
+    /// One SYN probe, scope-checked and budget-checked by `packetd` itself.
     pub fn handle_probe(&mut self, id: u64, target: IpAddr, port: u16) -> Response {
+        self.handle_work(id, target, Work::Syn(port))
+    }
+
+    /// One ICMP echo host-discovery probe (AC-6.18), through the **same**
+    /// path (AC-6.19).
+    ///
+    /// This is a two-line wrapper on purpose. The scope check and the session
+    /// ceiling are not restated here, are not restated in
+    /// [`crate::icmp`], and could not be: both probe kinds reach the wire
+    /// through [`Work`] below and then through [`Prober::admit`], which is
+    /// the one function in this crate that asks either question. A second
+    /// probe type that re-implemented either would be a second place for the
+    /// authorization to be wrong, and a mixed-probe budget test
+    /// (`the_ceiling_counts_icmp_and_syn_probes_against_one_budget`) is what
+    /// proves the counter is shared rather than merely spelled the same way.
+    pub fn handle_icmp_probe(&mut self, id: u64, target: IpAddr) -> Response {
+        self.handle_work(id, target, Work::Icmp)
+    }
+
+    /// The one path from a request to a packet.
+    ///
+    /// A probe of either kind before `Init`, or after the session has ended,
+    /// is fatal on the same terms as any other out-of-state message
+    /// (AC-6.1): a privileged process asked to emit before it has been told
+    /// its scope is a process that must stop, not one that answers.
+    fn handle_work(&mut self, id: u64, target: IpAddr, work: Work) -> Response {
         let State::Running(scope) = &self.state else {
             return self.terminate(format!(
-                "probe {id} arrived outside a running session; packetd refuses all work \
-                 before it has been told its scope"
+                "{} {id} arrived outside a running session; packetd refuses all work \
+                 before it has been told its scope",
+                work.name()
             ));
         };
-        match self.prober.probe(scope, target, port) {
-            Ok(state) => Response::Result { id, state },
-            Err(reason) => Response::Refused { id, reason },
-        }
+        let answered = match work {
+            Work::Syn(port) => self
+                .prober
+                .probe(scope, target, port)
+                .map(|state| Response::Result { id, state }),
+            Work::Icmp => self
+                .prober
+                .icmp_probe(scope, target)
+                .map(|state| Response::HostResult { id, state }),
+        };
+        answered.unwrap_or_else(|reason| Response::Refused { id, reason })
     }
 
     /// True once the session has ended, whether fatally or by `Shutdown`.
@@ -479,6 +538,9 @@ impl Session {
             (State::Running(_), Request::Probe { id, target, port }) => {
                 Some(self.handle_probe(id, target, port))
             }
+            (State::Running(_), Request::IcmpProbe { id, target }) => {
+                Some(self.handle_icmp_probe(id, target))
+            }
             (State::Running(_), Request::Shutdown) => {
                 // A clean end is still an end: the session stops accepting
                 // work. The only thing that distinguishes it from a fatal is
@@ -508,7 +570,28 @@ impl Request {
         match self {
             Request::Init { .. } => "init",
             Request::Probe { .. } => "probe",
+            Request::IcmpProbe { .. } => "icmp_probe",
             Request::Shutdown => "shutdown",
+        }
+    }
+}
+
+/// Which packet [`Session::handle_work`] is being asked for.
+///
+/// It exists so that there is exactly one out-of-state guard and exactly one
+/// refusal-to-response mapping for both probe kinds, rather than two copies
+/// that a later edit could let drift apart.
+#[derive(Debug, Clone, Copy)]
+enum Work {
+    Syn(u16),
+    Icmp,
+}
+
+impl Work {
+    fn name(self) -> &'static str {
+        match self {
+            Work::Syn(_) => "probe",
+            Work::Icmp => "icmp_probe",
         }
     }
 }
@@ -588,6 +671,7 @@ mod tests {
     }
 
     const PROBE: &str = r#"{"type":"probe","id":1,"target":"10.30.0.7","port":80}"#;
+    const ICMP_PROBE: &str = r#"{"type":"icmp_probe","id":1,"target":"10.30.0.7"}"#;
 
     /// Every one of the four fatals is asserted with this, not with
     /// `matches!(r, Response::Fatal { .. })` alone. A refusal that leaves the
@@ -978,6 +1062,63 @@ mod tests {
         }
     }
 
+    /// The three `HostState` strings, spelled out rather than derived, so a
+    /// rename is a failing test and not a silently different wire contract.
+    /// The engine's own copy of this enum (`bathy_engine::packetd`) parses
+    /// exactly these, and the check that the two agree is by execution --
+    /// `crates/bathy-engine/tests/packetd_integration.rs` drives the real
+    /// binary.
+    #[test]
+    fn the_host_state_wire_strings_are_what_the_engine_parses() {
+        for (state, expected) in [
+            (HostState::Up, "\"up\""),
+            (HostState::Down, "\"down\""),
+            (HostState::Unknown, "\"unknown\""),
+        ] {
+            assert_eq!(serde_json::to_string(&state).unwrap(), expected);
+        }
+    }
+
+    /// AC-6.1 for the second probe kind: a privileged process asked to ping
+    /// before it has been told its scope must stop, not answer. The narrowing
+    /// control is that the *same* line after an accepted `init` is answered.
+    #[test]
+    fn an_icmp_probe_before_init_is_fatal_and_unrecoverable() {
+        let mut session = test_session();
+        let response = session.handle_line(ICMP_PROBE);
+        assert_fatal_and_unrecoverable(response, &mut session);
+
+        let mut running = initialized_session();
+        assert!(
+            matches!(
+                running.handle_line(ICMP_PROBE),
+                Some(Response::HostResult { id: 1, .. })
+            ),
+            "the control: the same line inside a running session is answered"
+        );
+    }
+
+    /// The `icmp_probe` line as the engine writes it, through the real
+    /// deserializer: the tag, the two field names, and no `port`.
+    #[test]
+    fn the_icmp_probe_line_parses_into_the_request_the_engine_means() {
+        assert_eq!(
+            serde_json::from_str::<Request>(ICMP_PROBE).unwrap(),
+            Request::IcmpProbe {
+                id: 1,
+                target: "10.30.0.7".parse().unwrap(),
+            }
+        );
+        // `deny_unknown_fields`: a caller that sent a port would be a caller
+        // this process and that caller disagree with about the protocol.
+        assert!(
+            serde_json::from_str::<Request>(
+                r#"{"type":"icmp_probe","id":1,"target":"10.30.0.7","port":80}"#
+            )
+            .is_err()
+        );
+    }
+
     #[test]
     fn every_response_renders_to_one_line_that_parses_back() {
         for response in [
@@ -987,6 +1128,10 @@ mod tests {
             Response::Result {
                 id: 7,
                 state: PortState::Open,
+            },
+            Response::HostResult {
+                id: 7,
+                state: HostState::Up,
             },
             Response::Refused {
                 id: 7,
@@ -1023,6 +1168,11 @@ mod tests {
             2 => Just(init_line(&["0.0.0.0/0"])),
             2 => Just(init_line(&[])),
             3 => Just(PROBE.to_string()),
+            // Added with the second probe kind (M6 Task 5). Without it the
+            // properties below never once reach an `icmp_probe` arriving in
+            // the wrong state, which is the same strategy failure the comment
+            // above records for `probe`.
+            3 => Just(ICMP_PROBE.to_string()),
             2 => Just(r#"{"type":"shutdown"}"#.to_string()),
             3 => ".{0,120}",
         ]

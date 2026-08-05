@@ -69,6 +69,7 @@ use std::time::{Duration, Instant};
 use ipnet::IpNet;
 use socket2::SockAddr;
 
+use crate::icmp::ICMP_UNREACHABLE;
 use crate::privilege::RawSockets;
 use crate::protocol::{PortState, RefusalReason, SessionScope};
 
@@ -97,15 +98,12 @@ pub const RECV_TIMEOUT: Duration = Duration::from_millis(10);
 const SOURCE_PORT_BASE: u16 = 20_000;
 const SOURCE_PORT_SPAN: u32 = 10_000;
 
-const PROTO_ICMP: u8 = 1;
+pub(crate) const PROTO_ICMP: u8 = 1;
 const PROTO_TCP: u8 = 6;
-/// ICMP type 3, Destination Unreachable (RFC 792). The only ICMP type this
-/// module reads; Task 5's echo handling is separate.
-const ICMP_UNREACHABLE: u8 = 3;
 const FLAG_SYN: u8 = 0x02;
 const FLAG_RST: u8 = 0x04;
 const FLAG_ACK: u8 = 0x10;
-const TTL: u8 = 64;
+pub(crate) const TTL: u8 = 64;
 
 // ---------------------------------------------------------------------------
 // AC-6.12 — what a reply means.
@@ -200,20 +198,20 @@ pub fn check_session_scope(
 /// Every read of an inbound packet in this file goes through this or through
 /// [`slice::get`]. `clippy::indexing_slicing` is denied in this crate, and the
 /// bytes below arrive from whatever is on the network.
-fn be16(bytes: &[u8], at: usize) -> Option<u16> {
+pub(crate) fn be16(bytes: &[u8], at: usize) -> Option<u16> {
     let field: [u8; 2] = bytes.get(at..at.checked_add(2)?)?.try_into().ok()?;
     Some(u16::from_be_bytes(field))
 }
 
 /// Everything after an IPv4 header, using that header's own IHL.
-fn payload(packet: &[u8]) -> Option<&[u8]> {
+pub(crate) fn payload(packet: &[u8]) -> Option<&[u8]> {
     packet.get(usize::from(packet.first()? & 0x0f).checked_mul(4)?..)
 }
 
 /// The internet checksum (RFC 1071): one's-complement sum of 16-bit words,
 /// complemented. An odd trailing byte is padded with zero, which is what the
 /// RFC specifies and what makes the pseudo-header case below correct.
-fn checksum(bytes: &[u8]) -> u16 {
+pub(crate) fn checksum(bytes: &[u8]) -> u16 {
     let word = |w: &[u8]| {
         u16::from_be_bytes([
             w.first().copied().unwrap_or(0),
@@ -251,18 +249,32 @@ fn segment(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, seq: u32, flags
     if let Some(field) = tcp.get_mut(16..18) {
         field.copy_from_slice(&tcp_sum.to_be_bytes());
     }
-    // version 4, IHL 5, DSCP 0, total length 40.
-    let mut ip: Vec<u8> = vec![0x45, 0, 0, 40];
+    let mut ip = ip_header(src, dst, PROTO_TCP, 20);
+    ip.extend_from_slice(&tcp);
+    ip
+}
+
+/// The 20-byte IPv4 header every packet this process emits carries, checksum
+/// included.
+///
+/// Shared with [`crate::icmp`] so that [`PROBE_MARKER`], the TTL and the
+/// Don't-Fragment bit are one decision rather than two: a marker that only
+/// SYNs carried would leave `tests/wire.rs` unable to attribute an echo
+/// request to this process, which is the discriminator AC-6.13's capture
+/// already depends on.
+pub(crate) fn ip_header(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload_len: u16) -> Vec<u8> {
+    // version 4, IHL 5, DSCP 0, then the total length including this header.
+    let mut ip: Vec<u8> = vec![0x45, 0];
+    ip.extend_from_slice(&payload_len.saturating_add(20).to_be_bytes());
     ip.extend_from_slice(&PROBE_MARKER.to_be_bytes());
     // Don't Fragment, no offset, TTL, protocol, checksum placeholder.
-    ip.extend_from_slice(&[0x40, 0, TTL, PROTO_TCP, 0, 0]);
+    ip.extend_from_slice(&[0x40, 0, TTL, protocol, 0, 0]);
     ip.extend_from_slice(&src.octets());
     ip.extend_from_slice(&dst.octets());
     let ip_sum = checksum(&ip);
     if let Some(field) = ip.get_mut(10..12) {
         field.copy_from_slice(&ip_sum.to_be_bytes());
     }
-    ip.extend_from_slice(&tcp);
     ip
 }
 
@@ -272,7 +284,7 @@ fn segment(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, seq: u32, flags
 /// The source port is unique per probe, so it is what attributes a reply; a
 /// packet that fails any test here belongs to somebody else's traffic and is
 /// dropped rather than guessed at.
-fn match_reply(packet: &[u8], dst: Ipv4Addr, port: u16, sport: u16) -> Option<Reply> {
+pub(crate) fn match_reply(packet: &[u8], dst: Ipv4Addr, port: u16, sport: u16) -> Option<Reply> {
     let source: [u8; 4] = packet.get(12..16)?.try_into().ok()?;
     match packet.get(9).copied()? {
         PROTO_TCP => {
@@ -302,6 +314,16 @@ fn match_reply(packet: &[u8], dst: Ipv4Addr, port: u16, sport: u16) -> Option<Re
             let quoted = icmp.get(8..)?;
             let quoted_dst: [u8; 4] = quoted.get(16..20)?.try_into().ok()?;
             let seg = payload(quoted)?;
+            // The quoted datagram's own protocol, checked since M6 Task 5:
+            // this session emits ICMP echo requests too, and an unreachable
+            // quoting one of *those* has 0x0800 (type 8, code 0) where a
+            // quoted TCP segment has its source port. Reading it here would
+            // put a `Filtered` on a port nothing refused, and the numbers
+            // happen not to collide today only because the source-port range
+            // starts at 20000.
+            if quoted.get(9).copied()? != PROTO_TCP {
+                return None;
+            }
             if Ipv4Addr::from(quoted_dst) != dst || be16(seg, 0)? != sport || be16(seg, 2)? != port
             {
                 return None;
@@ -412,6 +434,55 @@ impl Prober {
         self.emitted
     }
 
+    /// The address this host would send to `target` from. The one accessor
+    /// through which both probe kinds reach the wire's route lookup, so that
+    /// [`Prober::wire`] itself stays private to this module.
+    pub(crate) fn source_for(&self, target: Ipv4Addr) -> std::io::Result<Ipv4Addr> {
+        self.wire.source_for(target)
+    }
+
+    /// **The one authorization path in this crate** — scope, then the
+    /// ceiling, then the per-probe identity (AC-6.19).
+    ///
+    /// Both probe kinds go through this and neither restates any part of it.
+    /// That is the whole of AC-6.19: `packetd` is the only process here that
+    /// can emit an arbitrary packet, and a second probe type carrying a
+    /// second copy of "may I" and "have I any budget left" would be a second
+    /// place for the answer to be wrong. `crate::icmp`'s probe calls this
+    /// function; it does not call [`check_session_scope`], and it does not
+    /// touch [`Prober::probes`].
+    ///
+    /// The order is AC-6.11's: **scope is decided before the ceiling**, so a
+    /// target this process was never authorized to touch is never answered
+    /// with "budget spent". `scope_is_decided_before_the_ceiling_is_consulted`
+    /// pins it for SYN and
+    /// `an_out_of_scope_icmp_probe_is_refused_for_scope_even_with_no_budget`
+    /// pins the same interleaving for ICMP.
+    ///
+    /// Returns the target as an `Ipv4Addr` -- the only way to obtain one --
+    /// and the identity counter this probe advanced it to.
+    pub(crate) fn admit(
+        &mut self,
+        scope: &SessionScope,
+        target: IpAddr,
+    ) -> Result<(Ipv4Addr, u32), RefusalReason> {
+        let addr = check_session_scope(scope, target)?;
+        if self.probes >= scope.max_packets() {
+            return Err(RefusalReason::SessionBudgetExhausted);
+        }
+        self.probes = self.probes.saturating_add(1);
+        self.counter = self.counter.wrapping_add(1);
+        Ok((addr, self.counter))
+    }
+
+    /// The 16-bit per-probe discriminator: a TCP source port for a SYN, an
+    /// ICMP identifier for an echo request. Shared so that two probes of
+    /// either kind in one session never carry the same one.
+    pub(crate) fn discriminator(counter: u32) -> u16 {
+        let offset = counter.checked_rem(SOURCE_PORT_SPAN).unwrap_or(0);
+        SOURCE_PORT_BASE.saturating_add(u16::try_from(offset).unwrap_or(0))
+    }
+
     /// One probe: scope, then ceiling, then a SYN, then a reply, then -- if it
     /// was a SYN-ACK -- an RST (AC-6.13).
     ///
@@ -424,16 +495,10 @@ impl Prober {
         target: IpAddr,
         port: u16,
     ) -> Result<PortState, RefusalReason> {
-        let addr = check_session_scope(scope, target)?;
-        if self.probes >= scope.max_packets() {
-            return Err(RefusalReason::SessionBudgetExhausted);
-        }
-        self.probes = self.probes.saturating_add(1);
-        self.counter = self.counter.wrapping_add(1);
-        let offset = self.counter.checked_rem(SOURCE_PORT_SPAN).unwrap_or(0);
-        let sport = SOURCE_PORT_BASE.saturating_add(u16::try_from(offset).unwrap_or(0));
-        let seq = self.counter.wrapping_mul(2_654_435_761);
-        let Ok(src) = self.wire.source_for(addr) else {
+        let (addr, counter) = self.admit(scope, target)?;
+        let sport = Self::discriminator(counter);
+        let seq = counter.wrapping_mul(2_654_435_761);
+        let Ok(src) = self.source_for(addr) else {
             return Ok(PortState::Indeterminate);
         };
         let pps = scope.packets_per_second();
@@ -456,7 +521,7 @@ impl Prober {
     /// The rate is `packets_per_second` from `Init`, enforced here and not by
     /// asking the engine -- the same reason as the ceiling. A `pps` of zero
     /// divides to `None` and paces at no delay rather than panicking.
-    fn send(&mut self, packet: &[u8], target: Ipv4Addr, pps: u32) -> bool {
+    pub(crate) fn send(&mut self, packet: &[u8], target: Ipv4Addr, pps: u32) -> bool {
         if let Some(at) = self.next_send {
             std::thread::sleep(at.saturating_duration_since(Instant::now()));
         }
@@ -471,31 +536,40 @@ impl Prober {
         sent
     }
 
-    /// Reads until something answers this probe or the deadline passes.
-    fn await_reply(&mut self, addr: Ipv4Addr, port: u16, sport: u16) -> Reply {
+    /// Reads inbound packets until `matcher` recognises one as this probe's
+    /// answer, or the deadline passes.
+    ///
+    /// Generic over the answer so that the ICMP path reuses the deadline, the
+    /// buffer bound and the "a packet that is not ours is dropped rather than
+    /// guessed at" rule rather than restating them.
+    pub(crate) fn await_matching<T>(&mut self, matcher: impl Fn(&[u8]) -> Option<T>) -> Option<T> {
         let mut buf = [0u8; 256];
         let until = Instant::now().checked_add(self.deadline);
         while until.is_some_and(|at| Instant::now() < at) {
             if let Some(read) = self.wire.poll(&mut buf)
-                && let Some(reply) = buf
-                    .get(..read)
-                    .and_then(|packet| match_reply(packet, addr, port, sport))
+                && let Some(answer) = buf.get(..read).and_then(&matcher)
             {
-                return reply;
+                return Some(answer);
             }
         }
-        Reply::None
+        None
+    }
+
+    /// Reads until something answers this SYN probe or the deadline passes.
+    fn await_reply(&mut self, addr: Ipv4Addr, port: u16, sport: u16) -> Reply {
+        self.await_matching(|packet| match_reply(packet, addr, port, sport))
+            .unwrap_or(Reply::None)
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::protocol::{Request, Response, Session};
 
     /// The address `source_for` reports, so the fixtures know which address a
     /// reply has to be sent back to.
-    const HOST: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 99);
+    pub(crate) const HOST: Ipv4Addr = Ipv4Addr::new(10, 30, 0, 99);
 
     /// A wire that emits nothing and records everything, so "zero packets" is
     /// asserted where the packet would have left rather than inferred.
@@ -508,23 +582,23 @@ mod tests {
     /// silently stops matching the moment the derivation changes.
     /// How a fixture answers a probe: given the emitted SYN, the replies the
     /// network should produce.
-    type Answer = fn(&[u8]) -> Vec<Vec<u8>>;
+    pub(crate) type Answer = fn(&[u8]) -> Vec<Vec<u8>>;
 
     #[derive(Debug, Default)]
-    struct Recorder {
-        sent: Vec<(Ipv4Addr, Vec<u8>)>,
-        inbound: Vec<Vec<u8>>,
-        answer: Option<Answer>,
+    pub(crate) struct Recorder {
+        pub(crate) sent: Vec<(Ipv4Addr, Vec<u8>)>,
+        pub(crate) inbound: Vec<Vec<u8>>,
+        pub(crate) answer: Option<Answer>,
     }
 
     impl Recorder {
-        fn flags(&self) -> Vec<u8> {
+        pub(crate) fn flags(&self) -> Vec<u8> {
             self.sent
                 .iter()
                 .filter_map(|(_, packet)| packet.get(33).copied())
                 .collect()
         }
-        fn rsts(&self) -> usize {
+        pub(crate) fn rsts(&self) -> usize {
             self.flags().iter().filter(|f| **f & FLAG_RST != 0).count()
         }
     }
@@ -535,8 +609,16 @@ mod tests {
         }
         fn emit(&mut self, packet: &[u8], target: Ipv4Addr) -> std::io::Result<()> {
             self.sent.push((target, packet.to_vec()));
+            // Only a probe is answered, never a teardown RST -- and since M6
+            // Task 5, "a probe" means a bare SYN *or* an ICMP echo request,
+            // because both kinds now travel this wire.
+            let is_probe = match packet.get(9).copied() {
+                Some(PROTO_TCP) => packet.get(33).copied() == Some(FLAG_SYN),
+                Some(PROTO_ICMP) => true,
+                _ => false,
+            };
             if let Some(answer) = self.answer
-                && packet.get(33).copied() == Some(FLAG_SYN)
+                && is_probe
             {
                 self.inbound.extend(answer(packet));
             }
@@ -551,7 +633,7 @@ mod tests {
     }
 
     /// The addresses and ports of a probe we emitted, read back off the wire.
-    fn probe_fields(syn: &[u8]) -> (Ipv4Addr, Ipv4Addr, u16, u16) {
+    pub(crate) fn probe_fields(syn: &[u8]) -> (Ipv4Addr, Ipv4Addr, u16, u16) {
         let src: [u8; 4] = syn.get(12..16).unwrap().try_into().unwrap();
         let dst: [u8; 4] = syn.get(16..20).unwrap().try_into().unwrap();
         (
@@ -592,7 +674,7 @@ mod tests {
     /// A shared recorder, so a test can read what the session emitted after
     /// the session has borrowed it.
     #[derive(Debug, Default, Clone)]
-    struct Shared(std::rc::Rc<std::cell::RefCell<Recorder>>);
+    pub(crate) struct Shared(pub(crate) std::rc::Rc<std::cell::RefCell<Recorder>>);
 
     impl Wire for Shared {
         fn source_for(&self, target: Ipv4Addr) -> std::io::Result<Ipv4Addr> {
@@ -608,23 +690,23 @@ mod tests {
 
     /// A prober with a shortened reply deadline, so a test does not spend a
     /// second per probe waiting for a recorder that will never answer.
-    fn prober_with(wire: Box<dyn Wire>, deadline: Duration) -> Prober {
+    pub(crate) fn prober_with(wire: Box<dyn Wire>, deadline: Duration) -> Prober {
         let mut prober = Prober::new(wire);
         prober.deadline = deadline;
         prober
     }
 
-    fn ip(s: &str) -> IpAddr {
+    pub(crate) fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
     }
 
-    fn v4(s: &str) -> Ipv4Addr {
+    pub(crate) fn v4(s: &str) -> Ipv4Addr {
         s.parse().unwrap()
     }
 
     /// A session scope built directly, without an `Init` line. The fields
     /// are `pub(crate)`, so this is the same value the protocol would build.
-    fn scope_of(
+    pub(crate) fn scope_of(
         allowed: Vec<IpNet>,
         denied: Vec<IpNet>,
         packets_per_second: u32,
@@ -638,7 +720,7 @@ mod tests {
         }
     }
 
-    fn init(allow: &str, deny: &str, max: u64) -> String {
+    pub(crate) fn init(allow: &str, deny: &str, max: u64) -> String {
         format!(
             r#"{{"type":"init","allowed_cidrs":[{allow}],"denied_cidrs":[{deny}],
                "packets_per_second":100000,"max_packets":{max}}}"#
@@ -647,7 +729,7 @@ mod tests {
 
     /// A session wired to a recorder that answers nothing, with a zero reply
     /// deadline so silence is instant.
-    fn session_with(allow: &str, deny: &str, max: u64) -> (Session, Shared) {
+    pub(crate) fn session_with(allow: &str, deny: &str, max: u64) -> (Session, Shared) {
         let wire = Shared::default();
         let mut session = Session::new(true, Box::new(wire.clone()));
         session.set_reply_deadline(Duration::ZERO);
@@ -658,7 +740,7 @@ mod tests {
         (session, wire)
     }
 
-    fn session_allowing(allow: &str) -> (Session, Shared) {
+    pub(crate) fn session_allowing(allow: &str) -> (Session, Shared) {
         session_with(&format!("\"{allow}\""), "", 1000)
     }
 
