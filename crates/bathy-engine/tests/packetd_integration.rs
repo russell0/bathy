@@ -435,7 +435,7 @@ fn pid_announcing_shim(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let mut file = std::fs::File::create(&shim).expect("the shim is writable");
     write!(
         file,
-        "#!/bin/sh\necho $$ > {pid}\nexec {bin} \"$@\"\n",
+        "#!/bin/sh\n[ \"$1\" = \"--warmup\" ] && exit 0\necho $$ > {pid}\nexec {bin} \"$@\"\n",
         pid = pidfile.display(),
         bin = packetd_bin().display(),
     )
@@ -443,6 +443,24 @@ fn pid_announcing_shim(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     drop(file);
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755))
         .expect("the shim is executable");
+    // A file this process has just written is not immediately executable
+    // while other threads are spawning: `fork` duplicates the writing
+    // descriptor into the child, and until that child `exec`s, the inode is
+    // open for writing and `execve` answers ETXTBSY. `linux-gate` found this
+    // for real. The `--warmup` arm above makes the shim safe to exec as a
+    // probe; without this the engine would see a spawn failure, fall back,
+    // and the test would fail claiming the mode was wrong.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(&shim).arg("--warmup").status() {
+            Ok(status) if status.success() => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the shim never became executable: {other:?}"
+            ),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
     (shim, pidfile)
 }
 
