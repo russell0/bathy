@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod fixtures;
 mod gates;
 mod phrases;
 mod prose;
@@ -53,6 +54,13 @@ const SUBCOMMANDS: &[&str] = &[
     "check-schemas",
     "check-readme",
     "check-phrases",
+    // The class the M7 flaky sweep found four times, in the four shapes a
+    // checker can see: two tests sharing a scratch path, a port bound and
+    // released and then relied on, a fixed scan range inside the kernel's
+    // ephemeral window, and `/proc/self/*` read in a binary with more than
+    // one test. What it deliberately cannot see is listed in
+    // `fixtures::UNCHECKABLE` and printed by every successful run.
+    "check-fixtures",
     "check-purity",
     "check-msrv",
     "check-deny",
@@ -98,6 +106,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("gen-ports") => gen_ports(),
         Some("check-readme") => readme::check_readme(),
         Some("check-phrases") => phrases::check_phrases(),
+        Some("check-fixtures") => fixtures::check_fixtures(),
         Some("check-purity") => gates::check_purity(),
         Some("check-msrv") => gates::check_msrv(args.iter().any(|a| a == "--run")),
         Some("check-deny") => gates::check_deny(),

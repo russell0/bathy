@@ -71,6 +71,19 @@ jobs:
       # so the checker itself is checked, which a shell pipeline in a workflow
       # never was. This step is the single call site.
       - run: cargo run -p xtask -- check-phrases
+      # The class the M7 flaky-test sweep found four times, in the four shapes
+      # a checker can see: two tests computing the same scratch path, a port
+      # bound and released and then relied on, a fixed scan range inside the
+      # kernel's ephemeral window, and `/proc/self/*` read in a binary with
+      # more than one test. Every one of them was found by a person reading
+      # code, and three different people found the four -- which is this
+      # project's standing signal to mechanize.
+      #
+      # It is NOT a claim that the class is now caught: wall-clock bounds and
+      # ambient-environment preconditions cannot be reduced to a pattern, and
+      # `fixtures::UNCHECKABLE` says so in the gate's own passing output so a
+      # green run is not read as a stronger statement than it is.
+      - run: cargo run -p xtask -- check-fixtures
       # `bathy-interpret` (M4 Task 3) may depend on `bathy-types` and `regex`
       # only -- no async runtime, no filesystem access, no clock, no randomness
       # of its own. That constraint is what lets M4 Task 4's replay corpus run

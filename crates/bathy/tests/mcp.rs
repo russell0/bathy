@@ -2077,6 +2077,10 @@ fn parity_cases(name: &str, f: &Fixture) -> Vec<Case> {
                     "--min-confidence",
                     "0.8",
                     "--port-range",
+                    // A FILTER over a fold that already exists, not a scan
+                    // range: no packet is sent for any of these ports, and
+                    // the point of the case is that the widest possible
+                    // filter is a no-op.  [fixture-rule]
                     "1-65535",
                 ]),
                 parity: Parity::Identical,

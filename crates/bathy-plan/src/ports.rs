@@ -186,6 +186,9 @@ mod tests {
         // dispatch: "A range that spans the whole space (1-65535) must work
         // and must not be quadratic or allocate absurdly."
         let started = std::time::Instant::now();
+        // Nothing is scanned here: `resolve_ports` is a pure expansion and
+        // this asserts its cost. The whole port space is the input under
+        // test, not a range aimed at a machine.  [fixture-rule]
         let v = resolve_ports(&explicit(&["1-65535"])).unwrap();
         let elapsed = started.elapsed();
         assert_eq!(v.len(), 65535);
