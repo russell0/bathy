@@ -53,6 +53,12 @@ use bathy_types::request::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// The `scan_mode_detail` the log carries, for asserting the summary and the
+/// log say the same thing.
+fn detail_of(h: &Harness) -> Option<String> {
+    h.detail()
+}
+
 /// Set to `1` by `cargo run -p xtask -- packetd-privileged`.
 const DEMAND: &str = "BATHY_PACKETD_PRIVILEGED_TESTS";
 
@@ -161,6 +167,10 @@ impl Harness {
             EventBody::ScanFailed { reason_code, .. } => Some(reason_code),
             _ => None,
         })
+    }
+
+    fn detail(&self) -> Option<String> {
+        self.scan_mode_recorded().and_then(|(_, detail)| detail)
     }
 
     fn port_state_count(&self) -> usize {
@@ -305,6 +315,7 @@ async fn the_engine_records_which_method_actually_ran() {
              (AC-6.10), and a refusal is an authorization disagreement, not a missing row"
         );
         assert!(summary.packetd_unavailable);
+        assert_eq!(summary.scan_mode, Some(ScanMode::TcpSyn));
     } else {
         assert_eq!(
             mode,
@@ -336,6 +347,10 @@ async fn the_engine_records_which_method_actually_ran() {
             "and it must produce real results, not an empty completed scan"
         );
         assert_eq!(summary.open_ports, 1, "the listener above is open");
+        // The summary must agree with the log. Two records of one fact that
+        // can disagree is a fact nobody can rely on.
+        assert_eq!(summary.scan_mode, Some(ScanMode::TcpConnect));
+        assert_eq!(summary.packetd_fallback, detail_of(&h));
     }
     assert!(
         open_listener.local_addr().is_ok(),
@@ -361,7 +376,8 @@ async fn a_scan_that_never_asked_for_syn_records_connect_with_nothing_to_explain
         PacketdConfig::default(),
         1000,
     );
-    h.scheduler
+    let summary = h
+        .scheduler
         .run(&h.plan, 0, CancellationToken::new())
         .await
         .expect("the run returns");
@@ -370,6 +386,8 @@ async fn a_scan_that_never_asked_for_syn_records_connect_with_nothing_to_explain
         Some((Some(ScanMode::TcpConnect), None)),
         "connect scanning that was asked for is not a degradation and has nothing to explain"
     );
+    assert_eq!(summary.scan_mode, Some(ScanMode::TcpConnect));
+    assert_eq!(summary.packetd_fallback, None);
     assert!(open_listener.local_addr().is_ok(), "still bound");
 }
 
@@ -606,6 +624,8 @@ async fn an_unmolested_syn_scan_completes_every_endpoint() {
         Some((Some(ScanMode::TcpSyn), None)),
         "a SYN scan that worked has nothing to explain"
     );
+    assert_eq!(summary.scan_mode, Some(ScanMode::TcpSyn));
+    assert_eq!(summary.packetd_fallback, None);
     assert_eq!(h.terminal_reason(), None, "nothing failed");
     assert_eq!(
         h.port_state_count(),

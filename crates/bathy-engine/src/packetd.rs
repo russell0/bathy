@@ -239,7 +239,11 @@ struct Job {
 /// crates -- to a workspace that has deliberately avoided both.
 #[derive(Debug)]
 pub struct PacketdClient {
-    jobs: std::sync::mpsc::Sender<Job>,
+    /// `Option` only so that [`Drop`] can release it *before* joining the
+    /// worker. The worker's loop ends when this sender is gone; joining
+    /// first deadlocks, because a field is not dropped until `drop` has
+    /// already returned.
+    jobs: Option<std::sync::mpsc::Sender<Job>>,
     /// Held so the child can be killed from the async side while the worker
     /// thread is blocked reading from it. This is what AC-6.16's test uses
     /// to kill a real process for real.
@@ -327,8 +331,15 @@ impl PacketdClient {
         })();
 
         if let Err(e) = handshake {
-            let detail = finish_and_describe(&child, &collected);
+            // Killed BEFORE waiting, and this order is load-bearing: a
+            // daemon that answered and did not exit -- one that is hung, or
+            // one whose handshake this build rejected while it went on
+            // reading -- would otherwise make `wait()` block forever, and a
+            // scan that hangs on a fallback path is worse than one that
+            // never had the daemon.
             kill_child(&child);
+            drop(stdin);
+            let detail = finish_and_describe(&child, &collected);
             return Err(PacketdError::Unavailable(format!("{e}{detail}")));
         }
 
@@ -337,7 +348,7 @@ impl PacketdClient {
         let worker = std::thread::spawn(move || serve(inbox, stdin, reader, worker_stderr));
 
         Ok(Self {
-            jobs,
+            jobs: Some(jobs),
             child,
             stderr: collected,
             next_id: AtomicU64::new(1),
@@ -355,8 +366,9 @@ impl PacketdClient {
             endpoint: format!("{target}:{port}"),
             reply,
         };
-        if self.jobs.send(job).is_err() {
-            return Err(PacketdError::Gone(self.postmortem()));
+        match self.jobs.as_ref() {
+            Some(jobs) if jobs.send(job).is_ok() => {}
+            _ => return Err(PacketdError::Gone(self.postmortem())),
         }
         match answer.await {
             Ok(result) => result,
@@ -399,8 +411,12 @@ impl Drop for PacketdClient {
     /// would be a privileged process holding raw sockets for nobody.
     fn drop(&mut self) {
         kill_child(&self.child);
-        // Dropping the sender is what ends the worker's `recv` loop; the
-        // kill is what unblocks it if it is mid-read.
+        // Dropping the sender is what ends the worker's `recv` loop, and it
+        // has to happen before the join: a struct field is not dropped until
+        // `drop` has returned, so joining first waits for a loop whose exit
+        // condition this function is still holding. The kill above is what
+        // unblocks the worker if it is mid-read.
+        drop(self.jobs.take());
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -751,6 +767,82 @@ mod tests {
         .expect_err("there is no daemon at that path");
         assert!(e.terminal_reason().is_none(), "{e}");
         assert!(format!("{e}").contains("/nonexistent/bathy-packetd"), "{e}");
+    }
+
+    /// A scripted responder that answers the `Init` line with `answer` and
+    /// then reads its input to end.
+    ///
+    /// The real daemon cannot produce the line the test below needs -- it
+    /// *measures* `dropped_capabilities` after its own drop, so a `false`
+    /// means a build that is lying or broken. The subject here is the
+    /// engine's refusal, not the daemon, so the daemon is scripted and the
+    /// two answers are each other's control.
+    #[cfg(unix)]
+    fn responder(dir: &std::path::Path, answer: &str) -> PathBuf {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = dir.join("responder.sh");
+        let mut file = std::fs::File::create(&path).unwrap();
+        write!(
+            file,
+            "#!/bin/sh\nread line\necho '{answer}'\ncat >/dev/null\n"
+        )
+        .unwrap();
+        drop(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A daemon that says it still holds capabilities is refused.
+    ///
+    /// `Response::Ready { dropped_capabilities }` is the one security claim
+    /// the daemon makes about itself, and M6 Task 1 made it a measured value
+    /// rather than a constant precisely so that it could be false. The
+    /// engine must not stream targets to a process in that state merely
+    /// because it is willing to answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_reports_it_is_still_privileged_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let still = responder(
+            dir.path(),
+            r#"{"type":"ready","dropped_capabilities":false}"#,
+        );
+        let e = PacketdClient::start(&still, &manifest(LAB_MANIFEST))
+            .expect_err("a daemon that still holds capabilities must not get targets");
+        assert!(e.terminal_reason().is_none(), "{e}");
+        assert!(
+            format!("{e}").contains("still holds capabilities"),
+            "the reason must say which claim was refused: {e}"
+        );
+
+        // The narrowing control, differing in exactly that one field: the
+        // same script, the same handshake, accepted.
+        let dropped = responder(
+            dir.path(),
+            r#"{"type":"ready","dropped_capabilities":true}"#,
+        );
+        PacketdClient::start(&dropped, &manifest(LAB_MANIFEST))
+            .expect("the same daemon reporting a completed drop is usable");
+    }
+
+    /// A daemon that refuses the session says so, and the engine repeats it
+    /// rather than reporting a generic failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_daemon_that_refuses_the_init_is_unavailable_with_its_own_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let fatal = responder(
+            dir.path(),
+            r#"{"type":"fatal","detail":"init carries an empty allowlist"}"#,
+        );
+        let e = PacketdClient::start(&fatal, &manifest(LAB_MANIFEST))
+            .expect_err("a fatal is not a session");
+        assert!(e.terminal_reason().is_none(), "{e}");
+        assert!(
+            format!("{e}").contains("empty allowlist"),
+            "the daemon's own words must survive: {e}"
+        );
     }
 
     /// A process that answers something other than `ready` does not become a
