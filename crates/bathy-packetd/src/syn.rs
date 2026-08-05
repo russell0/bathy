@@ -794,6 +794,37 @@ mod tests {
         );
     }
 
+    /// The *order* of the two refusals, not merely their presence. Swapping
+    /// them leaves every other assertion in this file passing and changes the
+    /// reason the engine is given for an out-of-scope target once the budget
+    /// is spent -- and scope is the first question a process holding
+    /// `CAP_NET_RAW` has to ask, not the second.
+    #[test]
+    fn scope_is_decided_before_the_ceiling_is_consulted() {
+        let (mut s, wire) = session_with("\"10.30.0.0/24\"", "", 1);
+        assert!(matches!(
+            s.handle_probe(1, ip("10.30.0.2"), 80),
+            Response::Result { .. }
+        ));
+        // The budget is now spent, so both refusals apply to the next probe.
+        // The one that must be reported is the scope refusal.
+        let r = s.handle_probe(2, ip("8.8.8.8"), 80);
+        assert!(
+            matches!(&r, Response::Refused { reason, .. }
+                     if *reason == RefusalReason::OutOfSessionScope),
+            "an out-of-scope target must be refused for being out of scope, \
+             whatever the budget says: {r:?}"
+        );
+        // The control: in scope, budget spent, so the budget is what answers.
+        let r = s.handle_probe(3, ip("10.30.0.2"), 80);
+        assert!(
+            matches!(&r, Response::Refused { reason, .. }
+                     if *reason == RefusalReason::SessionBudgetExhausted),
+            "{r:?}"
+        );
+        assert_eq!(wire.0.borrow().sent.len(), 1);
+    }
+
     // -- AC-6.12 ------------------------------------------------------------
 
     #[test]
@@ -855,6 +886,184 @@ mod tests {
             "the unreachable was not recognised; this is the silence path \
              wearing its answer, and it took {:?}",
             started.elapsed()
+        );
+    }
+
+    /// Only ICMP type 3 is an unreachable. A packet of another type quoting
+    /// the same probe says something else entirely -- a time exceeded is a
+    /// routing loop, an echo reply is Task 5's business -- and reading any of
+    /// them as "unreachable" would put a `Filtered` on a port nothing refused.
+    #[test]
+    fn only_a_destination_unreachable_is_read_as_one() {
+        let syn = one_emitted_syn();
+        let sport = be16(&syn, 20).unwrap();
+        let mut unreachable = answer_icmp_unreachable(&syn).pop().unwrap();
+        assert_eq!(
+            match_reply(&unreachable, v4("10.30.0.10"), 80, sport),
+            Some(Reply::IcmpUnreachable),
+            "the control: type 3 quoting this probe"
+        );
+        for other_type in [0u8, 8, 11, 12] {
+            if let Some(field) = unreachable.get_mut(20) {
+                *field = other_type;
+            }
+            assert_eq!(
+                match_reply(&unreachable, v4("10.30.0.10"), 80, sport),
+                None,
+                "ICMP type {other_type} is not a destination unreachable"
+            );
+        }
+    }
+
+    /// The checksum, against an oracle this code did not produce: the worked
+    /// example in RFC 1071 section 3. Checking `checksum` by feeding it a
+    /// header `checksum` already stamped is self-consistent and stays green
+    /// when the algorithm is wrong in both directions at once -- the carry
+    /// fold deleted survived exactly that, until this test existed.
+    #[test]
+    fn the_checksum_matches_rfc_1071s_worked_example() {
+        assert_eq!(
+            checksum(&[0x00, 0x01, 0xf2, 0x03, 0xf4, 0xf5, 0xf6, 0xf7]),
+            0x220d
+        );
+        // An odd trailing byte is padded with zero, not dropped.
+        assert_ne!(checksum(&[0x00, 0x01, 0xf2]), checksum(&[0x00, 0x01]));
+        assert_eq!(
+            checksum(&[0x00, 0x01, 0xf2]),
+            checksum(&[0x00, 0x01, 0xf2, 0x00])
+        );
+    }
+
+    /// A reply carrying IP options. Every other fixture here has a 20-byte
+    /// header, so a `payload` that ignored the IHL and assumed 20 would pass
+    /// all of them and mis-read every packet from a stack that uses options.
+    #[test]
+    fn a_reply_with_ip_options_is_parsed_at_the_offset_its_header_declares() {
+        let syn = one_emitted_syn();
+        let sport = be16(&syn, 20).unwrap();
+        let plain = answer_syn_ack(&syn).pop().unwrap();
+        let mut with_options = plain.clone();
+        // IHL 6 words, and four bytes of no-op options spliced in after the
+        // fixed header.
+        if let Some(byte) = with_options.get_mut(0) {
+            *byte = 0x46;
+        }
+        for (at, value) in [(20usize, 1u8), (20, 1), (20, 1), (20, 1)] {
+            with_options.insert(at, value);
+        }
+        assert_eq!(
+            match_reply(&plain, v4("10.30.0.10"), 80, sport),
+            Some(Reply::SynAck),
+            "the control: the same reply without options"
+        );
+        assert_eq!(
+            match_reply(&with_options, v4("10.30.0.10"), 80, sport),
+            Some(Reply::SynAck),
+            "a header of 24 bytes puts the TCP header at 24, not at 20"
+        );
+    }
+
+    /// A bare SYN is not a SYN-ACK. Reading one as `Open` would report a port
+    /// open on the strength of a packet that acknowledged nothing -- a stray
+    /// SYN, or a simultaneous open, answering a question nobody asked.
+    #[test]
+    fn a_reply_must_acknowledge_before_it_can_mean_open() {
+        let syn = one_emitted_syn();
+        let sport = be16(&syn, 20).unwrap();
+        let mut reply = answer_syn_ack(&syn).pop().unwrap();
+        assert_eq!(
+            match_reply(&reply, v4("10.30.0.10"), 80, sport),
+            Some(Reply::SynAck),
+            "the control"
+        );
+        if let Some(flags) = reply.get_mut(33) {
+            *flags = FLAG_SYN;
+        }
+        assert_eq!(
+            match_reply(&reply, v4("10.30.0.10"), 80, sport),
+            None,
+            "a SYN with no ACK says nothing about this probe"
+        );
+    }
+
+    /// An unreachable is attributed by the datagram it *quotes*, not by the
+    /// address it came from -- a router sends it, so the source address is
+    /// nobody's business. A stray unreachable for somebody else's traffic
+    /// must not mark this probe's port `Filtered`.
+    #[test]
+    fn an_unreachable_quoting_a_different_datagram_is_not_ours() {
+        let syn = one_emitted_syn();
+        let sport = be16(&syn, 20).unwrap();
+        let ours = answer_icmp_unreachable(&syn).pop().unwrap();
+        assert_eq!(
+            match_reply(&ours, v4("10.30.0.10"), 80, sport),
+            Some(Reply::IcmpUnreachable),
+            "the control: an unreachable quoting this probe"
+        );
+        // The quoted datagram, with each attributing field wrong in turn. The
+        // quote starts 28 bytes in (20 IP + 8 ICMP), so the quoted source
+        // port is at 48 and the quoted destination port at 50.
+        for (at, field) in [(48usize, "source port"), (50, "destination port")] {
+            let mut stray = ours.clone();
+            if let Some(bytes) = stray.get_mut(at..at.saturating_add(2)) {
+                bytes.copy_from_slice(&9999u16.to_be_bytes());
+            }
+            assert_eq!(
+                match_reply(&stray, v4("10.30.0.10"), 80, sport),
+                None,
+                "an unreachable quoting a different {field} is not this probe's"
+            );
+        }
+        // And one quoting a datagram sent to a different host.
+        let mut elsewhere = ours;
+        if let Some(bytes) = elsewhere.get_mut(44..48) {
+            bytes.copy_from_slice(&v4("10.30.0.11").octets());
+        }
+        assert_eq!(match_reply(&elsewhere, v4("10.30.0.10"), 80, sport), None);
+    }
+
+    /// A local failure is `Indeterminate`, never `Filtered`. `Filtered` is a
+    /// claim about the network, and a `sendto` that failed means this process
+    /// never reached the network to have an opinion about it.
+    #[test]
+    fn a_send_that_fails_is_indeterminate_rather_than_filtered() {
+        #[derive(Debug)]
+        struct Broken {
+            route: bool,
+        }
+        impl Wire for Broken {
+            fn source_for(&self, _target: Ipv4Addr) -> std::io::Result<Ipv4Addr> {
+                if self.route {
+                    Ok(HOST)
+                } else {
+                    Err(std::io::Error::other("no route"))
+                }
+            }
+            fn emit(&mut self, _packet: &[u8], _target: Ipv4Addr) -> std::io::Result<()> {
+                Err(std::io::Error::other("the send failed"))
+            }
+            fn poll(&mut self, _buf: &mut [u8]) -> Option<usize> {
+                None
+            }
+        }
+        let scope = scope_of(vec!["10.30.0.0/24".parse().unwrap()], vec![], 100_000, 10);
+        for route in [true, false] {
+            let mut prober = prober_with(Box::new(Broken { route }), Duration::ZERO);
+            assert_eq!(
+                prober.probe(&scope, ip("10.30.0.10"), 80),
+                Ok(PortState::Indeterminate),
+                "route={route}"
+            );
+            assert_eq!(prober.packets_emitted(), 0, "nothing reached the wire");
+        }
+        // The control: the same probe over a wire that works is not
+        // `Indeterminate`, so the assertion above is about the failure and
+        // not about the code path always saying so.
+        let wire = Shared::default();
+        let mut prober = prober_with(Box::new(wire), Duration::ZERO);
+        assert_eq!(
+            prober.probe(&scope, ip("10.30.0.10"), 80),
+            Ok(PortState::Filtered)
         );
     }
 
@@ -985,9 +1194,27 @@ mod tests {
         assert_eq!(packet.first().copied(), Some(0x45));
         assert_eq!(be16(packet, 2), Some(40));
         assert_eq!(be16(packet, 4), Some(PROBE_MARKER));
+        // Non-zero, and this is not a taste question. Linux fills in the IP
+        // identification field on an `IP_HDRINCL` socket **when it is zero**,
+        // so a marker of 0 is a marker the kernel overwrites -- and the whole
+        // reason it exists is to tell our teardown RST from the one the
+        // kernel sends on its own account, which carries id 0. A zero marker
+        // makes `tests/wire.rs` attribute the kernel's packets to us.
+        assert_ne!(PROBE_MARKER, 0, "a zero IP id is filled in by the kernel");
         assert_eq!(packet.get(9).copied(), Some(PROTO_TCP));
         assert_eq!(be16(packet, 22), Some(80));
         assert_eq!(packet.get(33).copied(), Some(FLAG_SYN));
+        // Data offset 5 words. This segment carries no options, and a header
+        // length that disagrees with the bytes present is a segment the
+        // target's stack discards -- silently, as a `Filtered` we would then
+        // report about a port we never actually reached.
+        assert_eq!(packet.get(32).copied(), Some(0x50), "data offset");
+        assert_eq!(be16(packet, 34), Some(1024), "window");
+        assert_eq!(
+            packet.get(28..32),
+            Some([0u8, 0, 0, 0].as_slice()),
+            "a SYN acknowledges nothing"
+        );
         // The checksums a target will verify. `checksum` over a header that
         // already carries its own checksum is zero when it is correct.
         assert_eq!(checksum(packet.get(..20).unwrap()), 0, "IP checksum");
@@ -1050,6 +1277,29 @@ mod tests {
             session.handle_line(line),
             Some(Response::Fatal { .. })
         ));
+        assert_eq!(wire.0.borrow().sent.len(), 0);
+    }
+
+    /// The guard inside `handle_probe` itself. `dispatch` refuses a probe
+    /// before `init` on its own arm, so this one is only reachable by a
+    /// caller inside this crate -- and it survived a mutation that replaced
+    /// it with an ordinary refusal until this test existed. A privileged
+    /// process asked to emit before it knows its scope must stop, not answer.
+    #[test]
+    fn handle_probe_called_directly_before_init_is_fatal_and_emits_nothing() {
+        let wire = Shared::default();
+        let mut session = Session::new(true, Box::new(wire.clone()));
+        session.prober.deadline = Duration::ZERO;
+        let response = session.handle_probe(1, ip("10.30.0.10"), 80);
+        assert!(matches!(response, Response::Fatal { .. }), "{response:?}");
+        assert!(session.is_terminated() && session.ended_fatally());
+        assert_eq!(wire.0.borrow().sent.len(), 0);
+        // And after a clean shutdown, which is a terminated session that was
+        // never fatal -- the other way into that guard.
+        let (mut after, wire) = session_allowing("10.30.0.0/24");
+        assert_eq!(after.handle_line(r#"{"type":"shutdown"}"#), None);
+        let response = after.handle_probe(2, ip("10.30.0.10"), 80);
+        assert!(matches!(response, Response::Fatal { .. }), "{response:?}");
         assert_eq!(wire.0.borrow().sent.len(), 0);
     }
 
@@ -1167,7 +1417,40 @@ mod tests {
         assert!(allowed >= 2, "the table must contain allowed cases too");
     }
 
+    /// Addresses biased towards the boundaries where two implementations of
+    /// one policy are most likely to disagree.
+    ///
+    /// A uniform `[u8; 4]` reaches `100.64.0.0/10` -- to pick the range that
+    /// actually caught this -- about once in a thousand cases, so a
+    /// divergence confined to it survived the cross-check on luck. Two
+    /// implementations agreeing on random addresses is a much weaker
+    /// statement than two implementations agreeing on the edges of every
+    /// range either of them special-cases.
+    fn interesting_address() -> impl proptest::strategy::Strategy<Value = Ipv4Addr> {
+        use proptest::prelude::*;
+        let octet = |edges: Vec<u8>| {
+            prop_oneof![
+                3 => proptest::sample::select(edges),
+                1 => any::<u8>(),
+            ]
+        };
+        (
+            octet(vec![
+                0, 1, 9, 10, 100, 126, 127, 128, 169, 172, 192, 198, 223, 224, 239, 240, 255,
+            ]),
+            octet(vec![0, 63, 64, 127, 128, 253, 254, 255]),
+            any::<u8>(),
+            any::<u8>(),
+        )
+            .prop_map(|(a, b, c, d)| Ipv4Addr::new(a, b, c, d))
+    }
+
     proptest::proptest! {
+        // 1024 rather than the default 256: the cross-check is the only test
+        // here whose value is in how much of the address space it covers, and
+        // a divergence confined to one /10 survived it at 256.
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(1024))]
+
         /// Two implementations of one policy are worth nothing unless somebody
         /// checks that they agree. This drives generated CIDRs and generated
         /// addresses through *both* `check_session_scope` and a real
@@ -1181,7 +1464,7 @@ mod tests {
         /// above is the fixed table that says so without depending on luck.
         #[test]
         fn the_two_scope_implementations_agree_on_every_generated_address(
-            target in proptest::array::uniform4(0u8..=255),
+            target in interesting_address(),
             allow_octets in proptest::array::uniform4(0u8..=255),
             allow_prefix in 0u8..=32,
             allow_from_target in proptest::bool::ANY,
@@ -1189,7 +1472,7 @@ mod tests {
             deny_prefix in 0u8..=32,
             deny_from_target in proptest::bool::ANY,
         ) {
-            let addr = Ipv4Addr::from(target);
+            let addr = target;
             let base = |from_target: bool, octets: [u8; 4]| {
                 if from_target { addr } else { Ipv4Addr::from(octets) }
             };

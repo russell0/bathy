@@ -5,3 +5,13 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 96a995de4e5991bcb1a89fee6a36008f480d302a0cca41a462e3a023027bb57f # shrinks to segments = [0, 0, 0, 0, 0, 0, 0, 0]
+cc dbca6dfc8f80def021245b227a74157245f641529a27134e70460d29287da6b6 # shrinks to target = [1, 0, 0, 0], allow_octets = [32, 0, 0, 0], allow_prefix = 3, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 8, deny_from_target = false
+cc 7c71a7e001bf5cfcc3dfaf445ca6ae0b4dc6c4e97b604a4b07dd1e6129c946ca # shrinks to target = [224, 0, 0, 0], allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 1, deny_from_target = false
+cc b9ed3f18ac81f55dde831405686873ef98d305b437cc1771de3bb84de5735fe7 # shrinks to target = [127, 0, 0, 0], allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 2, deny_from_target = false
+cc e8fde566e17bca0f9e9692f10fca0274459e99543a77786d1a5e6d36746520ed # shrinks to target = [0, 0, 0, 0], allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 32, 0], deny_prefix = 19, deny_from_target = false
+cc a42342f3c9e57255cdaa63919d05ebe0de9e526d91227b13dcedcf48cd1b2296 # shrinks to target = [1, 0, 0, 0], allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 8, deny_from_target = false
+cc 6470461ac1eada32a1b335563d839c751447e056c32160934d7f193da87ec59b # shrinks to target = [128, 0, 0, 0], allow_octets = [0, 0, 0, 0], allow_prefix = 1, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 2, deny_from_target = false
+cc 04ffd2301a2889f86bea199d8a41354f0c0518d3a976d671ca40a4923fc16711 # shrinks to target = [240, 0, 0, 0], allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 1, deny_from_target = false
+cc 5dfc4fe10ab653d43389561a45499be055bf7e9d5574582ea00f0db738ce3cb9 # shrinks to target = 100.64.0.0, allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 2, deny_from_target = false
+cc cdd3bcff7e0d266f3f3ea6fe73ec6ffb4d457cee3d6e5808575d980bf1cf0954 # shrinks to target = 240.0.0.0, allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 1, deny_from_target = false
+cc a800e63674e9f2b91718ece902fd455e6d0e9a3a4bb33ee5ec7781a064267420 # shrinks to target = 1.0.0.0, allow_octets = [0, 0, 0, 0], allow_prefix = 0, allow_from_target = false, deny_octets = [0, 0, 0, 0], deny_prefix = 8, deny_from_target = false
