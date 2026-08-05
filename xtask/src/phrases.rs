@@ -792,7 +792,13 @@ mod tests {
             .find(|r| r.id == "unsafe-only-in-packetd")
             .expect("the rule exists");
         let mut uncovered = Vec::new();
-        let mut stack = vec![PathBuf::from(".")];
+        // `cargo test` runs with the *package* directory as its working
+        // directory, not the workspace root -- so a walk from "." here reads
+        // `xtask/` and nothing else, and this test passed over a tree with no
+        // `fuzz/` in it at all. Measured, not reasoned about: with `.` the
+        // mutation that removes `fuzz` from the roots survived.
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut stack = vec![repository.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else {
                 continue;
@@ -805,7 +811,7 @@ mod tests {
                         stack.push(path);
                     }
                 } else if name == "Cargo.toml" {
-                    let shown = relative(Path::new("."), &dir);
+                    let shown = relative(&repository, &dir);
                     // The workspace manifest itself is not a crate root.
                     if shown.is_empty()
                         || dir.join("src").is_dir()

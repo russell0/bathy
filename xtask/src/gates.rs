@@ -3290,7 +3290,7 @@ pub fn packetd_safety_violations(root: &Path) -> Vec<String> {
     if blocks == 0 {
         let lib = root.join(PACKETD_SRC).join("lib.rs");
         let forbids = std::fs::read_to_string(&lib)
-            .is_ok_and(|text| text.contains("#![forbid(unsafe_code)]"));
+            .is_ok_and(|text| carries_attribute(&text, &attribute("forbid")));
         if !forbids {
             found.push(format!(
                 "crates/bathy-packetd has no `unsafe` block, so AC-6.7 is ranging over \
@@ -3373,7 +3373,30 @@ fn crate_target_roots(root: &Path) -> Vec<(String, bool)> {
 /// re-reading a sentence rather than by a gate — `main.rs` carried it, and an
 /// inner attribute in a binary root does not reach the library target beside
 /// it. Every other invariant in this project is enforced by a test that dies.
+/// The two spellings of the attribute, assembled so this file does not carry
+/// the literal it searches for. See [`carries_attribute`] for why that
+/// matters more than tidiness here.
+fn attribute(level: &str) -> String {
+    format!("#![{level}({UNSAFE_KEYWORD}_code)]")
+}
+
+/// Whether `text` carries `attribute` **as a line of source**, not as a
+/// substring.
+///
+/// `text.contains(..)` is the version this was written as, and it survived
+/// its own mutation test: removing the attribute from
+/// `crates/bathy-packetd/src/main.rs` left the gate green, because that
+/// file's module documentation *mentions* the attribute in a sentence
+/// explaining which target carries which level. A gate satisfied by the
+/// comment describing it is a gate this repository lost a day to one commit
+/// before this one was written (`c690e5b`).
+fn carries_attribute(text: &str, attribute: &str) -> bool {
+    text.lines().any(|line| line.trim() == attribute)
+}
+
 pub fn unsafe_forbid_violations(root: &Path) -> Vec<String> {
+    let forbid = attribute("forbid");
+    let deny = attribute("deny");
     let mut found = Vec::new();
     let roots = crate_target_roots(root);
     if roots.is_empty() {
@@ -3391,8 +3414,7 @@ pub fn unsafe_forbid_violations(root: &Path) -> Vec<String> {
         };
         if *is_packetd_lib {
             packetd_libs = packetd_libs.saturating_add(1);
-            if !text.contains("#![deny(unsafe_code)]") && !text.contains("#![forbid(unsafe_code)]")
-            {
+            if !carries_attribute(&text, &deny) && !carries_attribute(&text, &forbid) {
                 found.push(format!(
                     "{path}: the one crate permitted `unsafe` must still carry \
                      `#![deny(unsafe_code)]`, so that every block is a site-level `expect` \
@@ -3400,7 +3422,7 @@ pub fn unsafe_forbid_violations(root: &Path) -> Vec<String> {
                      `#![forbid(unsafe_code)]`."
                 ));
             }
-        } else if !text.contains("#![forbid(unsafe_code)]") {
+        } else if !carries_attribute(&text, &forbid) {
             found.push(format!(
                 "{path}: every crate target outside bathy-packetd must carry \
                  `#![forbid(unsafe_code)]` (Global Constraint). An inner attribute in one \
@@ -5658,6 +5680,51 @@ jobs:
         let found = unsafe_forbid_violations(&root);
         assert_eq!(found.len(), 1, "{found:#?}");
         assert!(found[0].contains("bathy-query/src/lib.rs"), "{found:#?}");
+    }
+
+    /// A gate satisfied by the comment describing it. This is not a
+    /// hypothetical failure mode in this repository: `c690e5b`, one commit
+    /// before this one was written, is titled after exactly it — and the
+    /// first version of this rule used `text.contains(..)` and was caught by
+    /// its own mutation run, because `crates/bathy-packetd/src/main.rs`
+    /// explains in its module documentation which target carries which level
+    /// of the attribute and thereby *contains* the string it was missing.
+    #[test]
+    fn a_comment_mentioning_the_attribute_does_not_satisfy_the_rule() {
+        let root = scratch("forbid-prose");
+        let src = root.join("crates/bathy-engine/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("crates/bathy-engine/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(
+            src.join("lib.rs"),
+            format!(
+                "//! This crate carries `#![forbid({}_code)]` like every other.\npub fn f() {{}}\n",
+                kw()
+            ),
+        )
+        .unwrap();
+        let packetd = root.join(PACKETD_SRC);
+        std::fs::create_dir_all(&packetd).unwrap();
+        std::fs::write(root.join("crates/bathy-packetd/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(packetd.join("lib.rs"), format!("#![deny({}_code)]\n", kw())).unwrap();
+
+        let found = unsafe_forbid_violations(&root);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("bathy-engine/src/lib.rs"), "{found:#?}");
+
+        // The same file with the attribute actually present passes, so this
+        // is a test of where the attribute is and not of whether the word
+        // appears at all.
+        std::fs::write(
+            src.join("lib.rs"),
+            format!(
+                "#![forbid({}_code)]\n//! This crate carries `#![forbid({}_code)]`.\n",
+                kw(),
+                kw()
+            ),
+        )
+        .unwrap();
+        assert!(unsafe_forbid_violations(&root).is_empty());
     }
 
     /// The binary target beside a library is a separate compilation unit, and

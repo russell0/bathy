@@ -113,8 +113,13 @@ trying to hang, exhaust, or exploit the scanner.
   happens in a pure crate with no I/O, no clock and no randomness. A hostile
   response cannot reach a socket, a file, or a clock through the interpreter,
   because the interpreter has none.
-- **`#![forbid(unsafe_code)]`** in every crate, so a parsing bug is a wrong
-  answer or a panic, not memory corruption.
+- **`#![forbid(unsafe_code)]`** on every crate target but one, so a parsing
+  bug is a wrong answer or a panic, not memory corruption. The exception is
+  the `bathy-packetd` library root, `#![deny(unsafe_code)]`, with exactly one
+  block: `prctl(PR_SET_NO_NEW_PRIVS, ...)` in `src/privilege.rs`. It passes no
+  pointer and is on the startup path, not the parsing path — by the time that
+  process reads a byte from anyone, it has dropped every capability and
+  cannot open another socket.
 
 ### 2.2 A confused or adversarial calling agent
 

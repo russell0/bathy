@@ -87,10 +87,17 @@ Three of those prohibitions are enforced mechanically rather than by review:
 - **`bathy-interpret` is pure.** Two dependencies, no I/O, no clock, no
   randomness, no async runtime, checked by `check-purity`. That purity is what
   makes §4's replay property real rather than aspirational.
-- **No `unsafe`, anywhere, except one crate that does not exist yet.**
-  `#![forbid(unsafe_code)]` is in every crate; `bathy-packetd` (Milestone 6)
-  will be permitted it for raw socket syscalls and must document every block.
-  `check-phrases` enforces the boundary.
+- **One `unsafe` block in the whole workspace, and it is not a socket call.**
+  `#![forbid(unsafe_code)]` is on every crate target except the
+  `bathy-packetd` library root, which is `#![deny(unsafe_code)]` so the single
+  permitted site can be a site-level `expect` with a reason. That site is
+  `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)`, which makes the privileged
+  helper's capability drop survive an `execve`. The raw sockets and the
+  capability clearing needed none: `socket2::Socket::new` is `socket(2)` and
+  `caps::clear` is `capset(2)`, both safe APIs over crates already in that
+  process's graph. `check-phrases` enforces that the keyword appears nowhere
+  else; `check-packetd` enforces the `SAFETY:` comment and that no crate
+  target has lost its attribute.
 
 ## 3. Evidence and provenance
 

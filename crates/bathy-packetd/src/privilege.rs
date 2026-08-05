@@ -312,7 +312,22 @@ pub fn capabilities_are_dropped() -> bool {
 pub fn drop_all_capabilities() -> Result<(), PrivilegeError> {
     clear_capability_sets()?;
     set_no_new_privs()?;
-    let state = measure()?;
+    refuse_unless_unprivileged(measure()?)
+}
+
+/// The verification, separated from the syscalls so that it can be tested
+/// with a state nothing had to produce.
+///
+/// It exists because a `caps::clear` that silently did nothing would
+/// otherwise be indistinguishable from one that worked, and everything after
+/// this point treats "dropped" as permission to read hostile input. But on a
+/// tree where the drop *does* work it is dead weight, and a mutation that
+/// replaces its condition with `true` changes nothing observable -- it
+/// survived exactly that, in the privileged container, before this function
+/// existed. What it costs when it is wrong is the entire security property
+/// of this process, so the answer is a test that can put it in the state it
+/// guards against rather than deleting it.
+fn refuse_unless_unprivileged(state: PrivilegeState) -> Result<(), PrivilegeError> {
     if state.is_unprivileged() {
         return Ok(());
     }
@@ -550,27 +565,104 @@ mod tests {
     /// Every way of failing to read a mask must read as *held*. A parser
     /// whose default was zero would turn an empty file, a truncated read or a
     /// kernel that renamed a field into a clean bill of health.
+    ///
+    /// Each case leaves **exactly one** thing wrong and every other field
+    /// readable and clean, which is what makes it a test of that field. The
+    /// first version of the unparseable-mask case omitted `CapAmb` as well,
+    /// so the state was privileged for a second reason and the case survived
+    /// a mutation that made an unparseable mask read as zero.
     #[test]
     fn anything_unreadable_reads_as_still_privileged() {
-        for text in [
-            "",
-            "Name:\tbathy-packetd\n",
-            "CapEff:\tnot-a-mask\nCapPrm:\t0000000000000000\nCapInh:\t0000000000000000\nNoNewPrivs:\t1\n",
-            // Every mask present and zero, but no `NoNewPrivs` line at all.
-            "CapEff:\t0000000000000000\nCapPrm:\t0000000000000000\nCapInh:\t0000000000000000\n",
+        let clean = "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
+                     CapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n\
+                     CapBnd:\t0000000000000000\nNoNewPrivs:\t1\n";
+        assert!(
+            parse_status(clean).is_unprivileged(),
+            "the control: this document is the one shape that may read as dropped"
+        );
+        for (why, text) in [
+            ("an empty document", String::new()),
+            (
+                "no capability fields at all",
+                "Name:\tbathy-packetd\n".to_string(),
+            ),
+            (
+                "one mask the kernel wrote in a form this code does not parse",
+                clean.replace("CapEff:\t0000000000000000", "CapEff:\tnot-a-mask"),
+            ),
+            ("no NoNewPrivs line", clean.replace("NoNewPrivs:\t1\n", "")),
+            ("a renamed field", clean.replace("CapPrm:", "CapPermitted:")),
         ] {
-            let state = parse_status(text);
+            let state = parse_status(&text);
             assert!(
                 !state.is_unprivileged(),
-                "{text:?} must not read as a successful drop"
+                "{why}: {text:?} must not read as a successful drop"
             );
         }
+    }
+
+    /// Each capability set on its own has to be able to make the answer
+    /// `false`. A conjunction that dropped one of its terms would let a
+    /// process with that set populated read as unprivileged, and `CapAmb` is
+    /// the one a reader is most likely to think is implied by the others.
+    #[test]
+    fn every_capability_set_can_make_this_process_privileged_by_itself() {
+        let clean = "CapInh:\t0000000000000000\nCapPrm:\t0000000000000000\n\
+                     CapEff:\t0000000000000000\nCapAmb:\t0000000000000000\n\
+                     CapBnd:\t0000000000000000\nNoNewPrivs:\t1\n";
+        for field in ["CapInh", "CapPrm", "CapEff", "CapAmb"] {
+            let held = clean.replace(
+                &format!("{field}:\t0000000000000000"),
+                &format!("{field}:\t0000000000002000"),
+            );
+            assert_ne!(held, clean, "{field} is not in the fixture");
+            assert!(
+                !parse_status(&held).capabilities_are_dropped(),
+                "CAP_NET_RAW held in {field} alone must not read as dropped"
+            );
+        }
+        // `CapBnd` is the exception, and it is an exception on purpose: it
+        // permits nothing by itself and cannot be cleared without
+        // CAP_SETPCAP. `no_new_privs` is what closes it.
+        let bounded = clean.replace("CapBnd:\t0000000000000000", "CapBnd:\t00000000a80425fb");
+        assert!(parse_status(&bounded).is_unprivileged());
     }
 
     #[test]
     fn the_unknown_state_is_fully_privileged_in_every_set() {
         assert!(!PrivilegeState::UNKNOWN.capabilities_are_dropped());
         assert!(!PrivilegeState::UNKNOWN.is_unprivileged());
+    }
+
+    /// The drop refuses to report success on a state that is not the state
+    /// it was supposed to produce, and names the masks that are wrong -- so
+    /// an operator reading the failure can see *which* set did not clear.
+    #[test]
+    fn a_drop_that_did_not_take_is_refused_rather_than_reported_as_done() {
+        let clean = parse_status(DROPPED);
+        assert!(
+            refuse_unless_unprivileged(clean).is_ok(),
+            "the control: a genuinely dropped process must be allowed to proceed"
+        );
+
+        for (why, state) in [
+            ("CAP_NET_RAW still effective", parse_status(HELD)),
+            (
+                "no_new_privs did not take",
+                parse_status(&DROPPED.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0")),
+            ),
+            ("nothing could be measured", PrivilegeState::UNKNOWN),
+        ] {
+            let error = refuse_unless_unprivileged(state)
+                .expect_err(&format!("{why} must not be reported as a completed drop"));
+            let text = error.to_string();
+            assert!(text.contains("did not take"), "{why}: {text}");
+            assert!(
+                text.contains("CapEff="),
+                "{why} must name the masks: {text}"
+            );
+            assert!(text.contains("NoNewPrivs="), "{why}: {text}");
+        }
     }
 
     // -- the ordering guard --------------------------------------------------
