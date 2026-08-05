@@ -330,6 +330,7 @@ async fn scan_real_ports_under(
         "0.1.0",
         request.service_detection,
         request.evidence_level,
+        request.objective,
         Arc::new(EvidenceStore::open(dir.path()).unwrap()),
         Arc::new(ProbeRegistry::standard()),
     );

@@ -303,6 +303,7 @@ async fn scan_lab(truth: &GroundTruth, packetd: PacketdConfig) -> ScanResult {
         "0.1.0",
         request.service_detection,
         request.evidence_level,
+        request.objective,
         Arc::new(EvidenceStore::open(dir.path()).expect("an evidence store")),
         Arc::new(ProbeRegistry::standard()),
     );

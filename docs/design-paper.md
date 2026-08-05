@@ -341,13 +341,14 @@ another tool's output.**
 - **No OS detection, no UDP, no traceroute, no IPv6, no Windows, and no
   privileged scanning from the CLI or over MCP** in v0.1. `bathy-packetd` sends
   SYN probes and ICMP echo requests, and `bathy-engine` can drive both, but no
-  surface asks it to. There is also **no host discovery in the output**:
-  `discover_host_combined` exists and reports which method decided, and nothing
-  in production constructs a `host.discovered` event, so `hosts_up` is empty
-  after every scan on this branch and an address with no host produces
-  `filtered` endpoints rather than a "host down" verdict. The blocker is not the
-  ICMP path: `ScanPlan` carries no objective, so the scheduler has nothing to
-  branch on to decide when discovery should run.
+  surface asks it to. Host discovery **is** in the output, for one objective:
+  a scan requesting `host-inventory` runs a discovery phase and emits
+  `host.discovered` events recording the method that decided, and every other
+  objective emits none, so `hosts_up` is empty for them and an address with no
+  host produces `filtered` endpoints rather than a "host down" verdict. Since
+  no surface can reach `bathy-packetd`, the ICMP half of that pair never runs
+  outside the tests, and the method a real scan records is always one of the
+  `tcp-connect-*` ones.
 - **Port presets are IANA-derived heuristics, not prevalence measurements.**
   `top-100` and `common-1000` come from the IANA service-name registry with a
   documented ranking heuristic. Nothing here claims they are the hundred ports

@@ -297,13 +297,15 @@ it is:
   and a daemon that dies mid-scan fails the scan with `packetd_unavailable`
   rather than quietly finishing by the other method. `bathy-packetd` also
   sends ICMP echo requests now, and `bathy-engine`'s `discover_host_combined`
-  tries ICMP first and falls back to the TCP method when ICMP is inconclusive
-  — but **nothing in production constructs a `host.discovered` event**, so
-  `hosts_up` is still empty after every scan on this branch and an address
-  with no host on it produces `filtered` endpoints rather than a "host down"
-  verdict. Both discovery functions are library building blocks that the
-  scheduler does not call: it has no objective to branch on, because
-  `ScanPlan` does not carry one.
+  tries ICMP first and falls back to the TCP method when ICMP is inconclusive.
+  A scan requesting `--objective host-inventory` runs a discovery phase and
+  emits `host.discovered` events naming the method that decided, so `hosts_up`
+  is populated for those scans. Every other objective runs no discovery phase,
+  so `hosts_up` is empty and an address with no host on it produces `filtered`
+  endpoints rather than a "host down" verdict. The **ICMP** half of discovery
+  additionally needs a `bathy-packetd` the CLI cannot reach (see the bullet
+  below), so from the CLI the deciding method is always one of the
+  `tcp-connect-*` ones.
 - **No loopback.** `127.0.0.0/8` is refused by `ScopeManifest::allows` on the
   same footing as IPv6, so no manifest can authorize a scan of the machine's
   own loopback interface. This is a deliberate blast-radius decision and it is

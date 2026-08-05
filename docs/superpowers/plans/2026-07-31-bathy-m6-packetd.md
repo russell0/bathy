@@ -679,18 +679,29 @@ the files this task owns.**
    `discovery.rs` (modify); an emitter needs the event log, the evidence
    store — `EventBody::HostDiscovered::evidence_refs` is a
    `NonEmpty<Digest>`, so there is no event without a stored blob — and a
-   decision about *when* discovery runs. That last one is the blocker and it
-   is not new: `bathy_plan::ScanPlan` carries no
-   `bathy_types::request::Objective`, so `scheduler` cannot tell a
-   `HostInventory` scan from an `InventoryExposedServices` one, and running
-   discovery unconditionally changes the packet cost and the event stream of
-   every scan this engine has ever run. **This task therefore closes the
-   deciding-method half of AC-6.20 and leaves the event half open, recorded,
+   decision about *when* discovery runs. **This task therefore closed the
+   deciding-method half of AC-6.20 and left the event half open, recorded,
    rather than emitting the event from a default-off configuration flag that
-   would be a production caller in name only.** See Task 5's report for the
-   shape of the follow-up: plumb `Objective` onto `ScanPlan`, gate a
-   discovery phase on `HostInventory`, and write the evidence record before
-   the event as `emit_service_observed` already does.
+   would be a production caller in name only.** That much was right.
+
+   **The blocker this task named was not one, and the fix wave closed the
+   criterion.** Task 5 gave the deciding reason as "`bathy_plan::ScanPlan`
+   carries no `bathy_types::request::Objective`, so `scheduler` cannot tell a
+   `HostInventory` scan from an `InventoryExposedServices` one". The first
+   clause is true; the conclusion does not follow, because the scheduler does
+   not take its request-derived configuration from `ScanPlan` and never has.
+   `Scheduler::new` already accepted `service_detection` and `evidence_level`
+   as direct parameters, both production call sites already read them off
+   `authorized.request()` in the same argument list, and `Objective` is a
+   `Copy` field on that same `ScanRequest`. It was a thirteenth parameter and
+   two call-site lines, on a seam M4 built and had used twice since. Naming
+   `ScanPlan` as the obstruction also pointed the next reader at the one
+   structure that must not change -- its field set is what the plan hash is
+   over. The wrong reason had been copied into `crates/bathy-engine/src/discovery.rs`,
+   `README.md` and `docs/design-paper.md` before anyone checked it; all four
+   copies are now corrected. What was genuinely left was the phase itself --
+   evidence record, event emission, budget and pacing -- which is work rather
+   than a missing primitive.
 
 **Task 5 measures 1074/1100** (Task 3 measured 922, Task 4 added nothing), so
 the ICMP path cost **152 of the 178 lines Task 4 reserved for it**. The
@@ -767,7 +778,9 @@ git commit -m "feat(packetd): ICMP echo discovery sharing the SYN scope and budg
 **Acceptance criteria:**
 - **AC-6.18** ICMP echo discovery classifies echo reply as up, destination unreachable as down, and silence as unknown.
 - **AC-6.19** ICMP probes pass through the identical scope check and session budget as SYN probes — one code path, verified by a test that exhausts the budget using a mix of both probe types.
-- **AC-6.20** Combined discovery tries ICMP first when privileged and falls back to TCP on an inconclusive result, recording the deciding method on the `host.discovered` event. **Partially closed** — the deciding method is produced and tested; nothing in production constructs the event. See correction 8 above.
+- **AC-6.20** Combined discovery tries ICMP first when privileged and falls back to TCP on an inconclusive result, recording the deciding method on the `host.discovered` event. **Closed** by the fix wave. `Scheduler::run` gates a discovery phase on `Objective::HostInventory`, stores each `DiscoveryResult` and appends the `host.discovered` event citing that digest — the only production construction of `EventBody::HostDiscovered`. `a_host_inventory_scan_records_the_deciding_method_and_an_inventory_scan_records_nothing` is the named test, and its second half is the narrowing control that keeps the three `InventoryExposedServices` tests meaning what they meant.
+
+  **This criterion was edited to read "Partially closed" while it was unmet, and that edit is the move this project has refused seven times.** M6's whole-branch review ruled it UNMET rather than two-thirds closed, on the ground that a criterion deferred out of the last implementation milestone is not deferred. See correction 8 above for the blocker that was not one.
 
 ---
 

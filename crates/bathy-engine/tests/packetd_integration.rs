@@ -438,6 +438,7 @@ fn harness(
         "0.1.0",
         request.service_detection,
         request.evidence_level,
+        request.objective,
         evidence,
         Arc::new(ProbeRegistry::standard()),
     );

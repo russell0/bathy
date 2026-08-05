@@ -210,6 +210,11 @@ async fn run_to_completion(
         bathy_evidence::ENGINE_VERSION,
         authorized.request().service_detection,
         authorized.request().evidence_level,
+        // AC-6.20. `--objective host-inventory` and the MCP schemas' own
+        // `host_inventory` have been offering this since M1 with nothing
+        // branching on it; this is the parameter that makes the option a
+        // user can already type do what it says.
+        authorized.request().objective,
         Arc::clone(&runtime.evidence),
         Arc::clone(&runtime.probes),
     );

@@ -308,6 +308,7 @@ async fn scan_the_lab(truth: &GroundTruth, idempotency_key: &str) -> ScanFold {
         "lab-conformance",
         request.service_detection,
         request.evidence_level,
+        request.objective,
         Arc::new(EvidenceStore::open(dir.path()).expect("evidence")),
         Arc::new(ProbeRegistry::standard()),
     );
@@ -423,23 +424,31 @@ async fn addresses_with_no_host_are_never_reported_open_or_closed() {
     let fold = scan_the_lab(&truth, "lab-conformance-absent-addresses").await;
 
     // AC-7.4 as the plan drafted it asserted `!fold.hosts_up.contains(&ip)`.
-    // That assertion cannot fail: `Scheduler` has no call to `discover_host`
-    // in v0.1 (host discovery needs the raw-socket capability and ships with
-    // `packetd` in M6), so `hosts_up` is empty for every scan and the test
-    // would pass against a scanner that reported the whole subnet live. It is
-    // a decoration test, and the plan has been corrected -- see the Plan
-    // Defects note in lab/README.md.
+    // That assertion could not fail when it was written: `Scheduler` had no
+    // call to `discover_host` at all, so `hosts_up` was empty for every scan
+    // and the test would pass against a scanner that reported the whole
+    // subnet live. It was a decoration test, and the plan has been corrected
+    // -- see the Plan Defects note in lab/README.md.
     //
-    // The property that is real in v0.1, and that a broken scanner would
+    // M6's fix wave wired the discovery phase (AC-6.20), so `hosts_up` is no
+    // longer empty by construction -- but it is still empty *here*, and for a
+    // reason that is now a real property rather than a missing feature: this
+    // scan requests `Objective::InventoryExposedServices` (line 267), and
+    // discovery runs only for `Objective::HostInventory`. So this assertion
+    // has become the objective gate's lab-side control. If it goes red,
+    // either the gate has stopped gating or something is emitting
+    // `host.discovered` outside it.
+    //
+    // The property that is real either way, and that a broken scanner would
     // fail: nothing answers at an address with no host, so every endpoint on
     // one must be `Filtered`. `Open` means we invented a service; `Closed`
     // means we claim an RST arrived, which is itself evidence that a host is
     // there.
     assert!(
         fold.hosts_up.is_empty(),
-        "v0.1 emits no host.discovered events, so this must be empty; if it is not, \
-         host discovery has been wired in and this test needs the stronger assertion \
-         it was written to stand in for"
+        "this scan asked for exposed services, not a host inventory, so no discovery \
+         phase ran and this must be empty; if it is not, the objective gate on the \
+         discovery phase has stopped gating"
     );
 
     let mut checked = 0usize;

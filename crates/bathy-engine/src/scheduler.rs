@@ -121,7 +121,7 @@
 //! calls.
 
 use std::collections::HashSet;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::net::TcpStream;
@@ -140,10 +140,11 @@ use bathy_types::clock::Clock;
 use bathy_types::event::{DenyReason, EventBody, Observation, PortState, ScanMode, Target};
 use bathy_types::ids::{Digest, ScanId};
 use bathy_types::nonempty::NonEmpty;
-use bathy_types::request::{EvidenceLevel, ServiceDetection};
+use bathy_types::request::{EvidenceLevel, Objective, ServiceDetection};
 use bathy_types::task::TaskStatus;
 
 use crate::connect::{ConnectOutcome, probe_connect_with_local_signal};
+use crate::discovery::{DiscoveryConfig, DiscoveryResult, discover_host_combined};
 use crate::durable_log::GroupCommitLog;
 use crate::packetd::{PacketdClient, PacketdConfig, PacketdError};
 use crate::rate::RateLimiter;
@@ -239,6 +240,13 @@ pub enum EngineError {
     Evidence(#[from] EvidenceError),
     #[error("a scan worker task panicked or was cancelled by the runtime: {0}")]
     Join(#[from] tokio::task::JoinError),
+    /// M6 fix wave, AC-6.20: the host-discovery record could not be
+    /// canonicalized into the bytes its digest would name. Hard, like
+    /// `Evidence` above and for the same reason -- the packets are already
+    /// spent, and a `host.discovered` whose `evidence_refs` cites nothing
+    /// storable is a provenance claim that does not resolve.
+    #[error("host discovery could not record what it measured: {0}")]
+    Discovery(String),
     /// M3 whole-branch review, IMPORTANT-3: `run` refused to execute `plan`
     /// against `scan_id` because `plan.hash()` does not match the
     /// `plan_hash` the store recorded when this scan was started.
@@ -420,6 +428,23 @@ pub struct Scheduler {
     /// `EventBody::ServiceObserved::evidence_refs` being `NonEmpty<Digest>`,
     /// emits no event at all (AC-4.23). See that method's own doc comment.
     evidence_level: EvidenceLevel,
+    /// M6 fix wave, AC-6.20: what this scan is *for*, and the only thing
+    /// that decides whether `run` performs a host-discovery phase at all.
+    ///
+    /// Carried as plain request-derived config, exactly like
+    /// `service_detection` and `evidence_level` beside it and for exactly
+    /// the same reason: nothing in `ScanPlan` retains it -- `ScanPlan` is
+    /// `{ targets, ports, hash }` and its field set is what the plan hash is
+    /// over -- so a caller hands it to this constructor directly rather than
+    /// rederiving it from the plan.
+    ///
+    /// M6 Task 5 named that absence from `ScanPlan` as the blocker on
+    /// AC-6.20, and it was never one. The seam this parameter travels on is
+    /// the seam M4 built and had already used twice; the whole-branch review
+    /// disproved the reason and this field is the disproof. The genuine work
+    /// was the phase itself -- evidence record, event emission, budget and
+    /// pacing -- and that is in `run`.
+    objective: Objective,
     /// M4 Task 5: where `emit_service_observed` stores a matched probe's raw
     /// response before appending the `service.observed` event that cites
     /// it -- never the other way around; see this module's own ordering
@@ -509,6 +534,7 @@ impl Scheduler {
         engine_version: impl Into<String>,
         service_detection: ServiceDetection,
         evidence_level: EvidenceLevel,
+        objective: Objective,
         evidence: Arc<EvidenceStore>,
         probes: Arc<ProbeRegistry>,
     ) -> Self {
@@ -525,6 +551,7 @@ impl Scheduler {
             engine_version: engine_version.into(),
             service_detection,
             evidence_level,
+            objective,
             evidence,
             probes,
         }
@@ -786,7 +813,8 @@ impl Scheduler {
 
             // AC-3.28: exactly one `scan.started`, gated on the log's own
             // content rather than on `from_index` -- see the module doc.
-            if self.log_guard().last_sequence() == 0 {
+            let first_run = self.log_guard().last_sequence() == 0;
+            if first_run {
                 self.log(EventBody::ScanStarted {
                     plan_hash: plan.hash(),
                     estimated_targets: plan.targets().len() as u64,
@@ -794,6 +822,107 @@ impl Scheduler {
                     scan_mode: Some(scan_mode),
                     scan_mode_detail,
                 })?;
+            }
+
+            // AC-6.20's third clause: the discovery phase, and the only
+            // production construction site of `EventBody::HostDiscovered`.
+            //
+            // # Why this is gated on the objective and not on a flag
+            //
+            // `Objective::HostInventory` is "which hosts are up" and has been
+            // on the CLI (`--objective host-inventory`) and in two published
+            // MCP input schemas since M1 with nothing in the tree branching
+            // on it -- an advertised option that performed an identical scan
+            // and differed only in its plan hash. A default-off flag would
+            // have been a production caller in name only; this is the option
+            // a user could already type finally doing what it says.
+            //
+            // The three tests that pin the current shape all request
+            // `Objective::InventoryExposedServices` and are untouched by
+            // this: `end_to_end_scan.rs`, `lab_conformance.rs` and
+            // `real_log_fold.rs`.
+            //
+            // # `first_run`, and what a resume does not repeat
+            //
+            // Gated on the same signal `scan.started` is, and for a stronger
+            // reason: a resumed scan that re-ran discovery would spend the
+            // packets again and append a second `host.discovered` for every
+            // address. The cost is that a scan interrupted *during* discovery
+            // resumes with only the hosts it had already found -- port
+            // results carry their own per-unit cursor, discovery does not.
+            // Duplicated packet spend on every resume is the worse of the
+            // two, and the one a budget cannot bound.
+            if first_run && self.objective == Objective::HostInventory {
+                let cfg = DiscoveryConfig::default();
+                // The worst case, reserved before a single packet leaves.
+                // `discover_host_combined` sends at most one echo request
+                // (only when there is a daemon to send it) plus one connect
+                // per configured port, and `BudgetLedger` has no refund --
+                // deliberately, since a refund path is how a ceiling gets
+                // talked around. So this over-charges a host that answers on
+                // the first try, in the direction that ends the scan early
+                // rather than the direction that emits past
+                // `maximum_packets`. See AC-3.24, and `Budgets`' own doc
+                // comment on what this ledger counts.
+                let worst_case =
+                    (cfg.probe_ports().len() as u64).saturating_add(u64::from(syn.is_some()));
+                // No dedup pass here, deliberately. `ScanPlan::targets()` is
+                // "the expanded, sorted, deduplicated target list"
+                // (`bathy_plan::plan`, and `expand_targets` is what makes it
+                // so), so one address appears once however the request
+                // spelled it. A `HashSet` here was written first and removed:
+                // it could never skip anything, which makes the test for it a
+                // decoration test — it passes against a scheduler with no
+                // dedup at all, because there is nothing to dedup.
+                for target in plan.targets() {
+                    if cancel.is_cancelled() {
+                        summary.cancelled = true;
+                        break 'dispatch;
+                    }
+                    if self
+                        .ledger()
+                        .elapsed_exceeded(ceil_elapsed_seconds(started.elapsed()))
+                    {
+                        summary.time_exhausted = true;
+                        break 'dispatch;
+                    }
+                    // The same unconditional per-target gate the unit loop
+                    // applies, on the same terms and for the same reason
+                    // (M3 whole-branch review, CRITICAL-1): this is an
+                    // emission path, so it asks the manifest itself rather
+                    // than trusting an upstream `evaluate` to have run.
+                    if !self.manifest.allows(*target) {
+                        policy_denial = Some((
+                            DenyReason::TargetOutOfScope,
+                            format!(
+                                "{} is not authorized by manifest {} (host discovery)",
+                                target,
+                                self.manifest.id()
+                            ),
+                        ));
+                        break 'dispatch;
+                    }
+                    if self.ledger().try_spend_packets(worst_case).is_err() {
+                        summary.budget_exhausted = true;
+                        break 'dispatch;
+                    }
+                    // No `self.limiter.acquire` here: `discover_host_combined`
+                    // takes the limiter and acquires from it per probe, so a
+                    // wait at this level would pace the same packets twice
+                    // and report a rate below the one the manifest allows.
+                    match discover_host_combined(*target, &cfg, &self.limiter, syn.as_ref()).await {
+                        Ok(result) => self.emit_host_discovered(*target, &result)?,
+                        Err(e) => {
+                            // Terminal, exactly as in the unit loop: a
+                            // refusal means the privileged process's own
+                            // scope check disagrees with this one about an
+                            // authorization boundary, and a death means the
+                            // method stopped working. Neither falls back.
+                            packetd_failure = Some(e);
+                            break 'dispatch;
+                        }
+                    }
+                }
             }
 
             // Invariant 3: the full set of units a PREVIOUS run already
@@ -1383,6 +1512,66 @@ impl Scheduler {
         Ok(())
     }
 
+    /// AC-6.20's third clause: store the measurement, then append the
+    /// `host.discovered` event that cites it. Never the other way around --
+    /// the same ordering `emit_service_observed` holds, and the reason
+    /// `EventBody::HostDiscovered::evidence_refs` is a `NonEmpty<Digest>`
+    /// rather than an `Option`.
+    ///
+    /// # An event only for a host that is up
+    ///
+    /// `host.discovered` has no `up` field, and `bathy_query`'s fold inserts
+    /// its `target` straight into `hosts_up`. The event therefore *is* the
+    /// assertion that the host answered; emitting one for a host reported
+    /// down would put every scanned address into `hosts_up` and make the
+    /// answer to "which hosts are up" the question that was asked. A down
+    /// host costs its packets, is charged to the ledger, and records nothing
+    /// -- which is what `addresses_with_no_host_are_never_reported_open_or_closed`
+    /// checks on the lab.
+    ///
+    /// # Why this ignores `evidence_level`
+    ///
+    /// `EvidenceLevel` bounds how much of a *captured response* is kept, and
+    /// `EvidenceLevel::None` therefore suppresses `service.observed`
+    /// entirely (AC-4.23). Discovery captures no response: this blob is the
+    /// derived observation itself, it is under a hundred bytes, and there is
+    /// no larger thing it is a truncation of. Making the event conditional on
+    /// that knob would make a criterion about ICMP-versus-TCP method
+    /// recording depend on an unrelated storage setting.
+    fn emit_host_discovered(
+        &self,
+        target: IpAddr,
+        result: &DiscoveryResult,
+    ) -> Result<(), EngineError> {
+        if !result.up {
+            return Ok(());
+        }
+        // What was measured, in the form an agent replaying the log can read
+        // back: the method that decided is on the event, and this is the
+        // record it was derived from. Canonicalized (RFC 8785) before it is
+        // stored, because the digest that names it is a digest of these
+        // bytes -- two builds that serialized the same measurement with keys
+        // in a different order would otherwise cite two different blobs for
+        // one observation.
+        let record = serde_json::json!({
+            "target": target.to_string(),
+            "up": result.up,
+            "method": result.method,
+            "packets_spent": result.packets_spent,
+        });
+        let bytes = bathy_types::canonical::canonical_json(&record)
+            .map_err(|e| EngineError::Discovery(format!("{e}")))?
+            .into_bytes();
+        // Store runs to completion and its `?` is checked BEFORE the append.
+        let digest = self.evidence.put(&bytes)?;
+        self.log(EventBody::HostDiscovered {
+            target: Target { ip: target },
+            method: result.method.clone(),
+            evidence_refs: NonEmpty::new(digest),
+        })?;
+        Ok(())
+    }
+
     /// Forces the log durable, then flushes `completed` to the `TaskStore`
     /// resumption cursor (`mark_units_done`), then -- only once at least
     /// `progress_every` units have completed since the last emission --
@@ -1702,6 +1891,9 @@ mod tests {
         /// silently reverting to different detection settings.
         service_detection: ServiceDetection,
         evidence_level: EvidenceLevel,
+        /// AC-6.20: likewise the exact `Objective`, so `resume` builds a
+        /// second `Scheduler` that would run the same phases as the first.
+        objective: Objective,
         /// M4 Task 5: the SAME probe registry `scheduler` was built with.
         probes: Arc<ProbeRegistry>,
     }
@@ -1817,6 +2009,7 @@ mod tests {
                 "0.1.0",
                 self.service_detection,
                 self.evidence_level,
+                self.objective,
                 Arc::clone(&self.evidence),
                 Arc::clone(&self.probes),
             )
@@ -1847,6 +2040,12 @@ mod tests {
             group_commit,
             ServiceDetection::default(),
             EvidenceLevel::Headers,
+            // The objective every harness in this module has always
+            // implied. AC-6.20's discovery phase runs only for
+            // `HostInventory`, so this keeps every pre-existing test's
+            // event stream byte-identical, and
+            // `make_harness_with_objective` is what the new ones use.
+            Objective::InventoryExposedServices,
         )
     }
 
@@ -1873,6 +2072,31 @@ mod tests {
             GroupCommitConfig::default(),
             service_detection,
             evidence_level,
+            Objective::InventoryExposedServices,
+        )
+    }
+
+    /// Like [`make_harness`], but with a caller-chosen [`Objective`] --
+    /// AC-6.20's discovery phase is gated on it, and it is the only thing in
+    /// this engine that branches on one.
+    fn make_harness_with_objective(
+        targets: &[&str],
+        port_specs: &[&str],
+        budgets: Budgets,
+        config: SchedulerConfig,
+        manifest: Arc<ScopeManifest>,
+        objective: Objective,
+    ) -> Harness {
+        make_harness_core(
+            targets,
+            port_specs,
+            budgets,
+            config,
+            manifest,
+            GroupCommitConfig::default(),
+            ServiceDetection::default(),
+            EvidenceLevel::Headers,
+            objective,
         )
     }
 
@@ -1892,6 +2116,7 @@ mod tests {
         group_commit: GroupCommitConfig,
         service_detection: ServiceDetection,
         evidence_level: EvidenceLevel,
+        objective: Objective,
     ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         // One shared `Arc<dyn Clock>` for both `TaskStore` and every
@@ -1907,7 +2132,7 @@ mod tests {
             targets: NonEmpty::try_from(targets.iter().map(|s| s.to_string()).collect::<Vec<_>>())
                 .unwrap(),
             authorization_scope_id: scope_id(),
-            objective: Objective::InventoryExposedServices,
+            objective,
             ports: PortSelection::Explicit {
                 explicit: NonEmpty::try_from(
                     port_specs.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
@@ -1955,6 +2180,7 @@ mod tests {
             "0.1.0",
             service_detection,
             evidence_level,
+            objective,
             Arc::clone(&evidence),
             Arc::clone(&probes),
         );
@@ -1971,6 +2197,7 @@ mod tests {
             evidence,
             service_detection,
             evidence_level,
+            objective,
             probes,
         }
     }
@@ -2302,6 +2529,7 @@ mod tests {
             "0.1.0",
             h.service_detection,
             h.evidence_level,
+            h.objective,
             Arc::clone(&h.evidence),
             Arc::clone(&h.probes),
         );
@@ -5482,6 +5710,322 @@ mod tests {
             unit1.accept_count(),
             2,
             "unit 1 must be fully connected AND identified during run2, exactly once"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // AC-6.20's third clause: `host.discovered`, and the objective that
+    // decides whether there is one.
+    // -----------------------------------------------------------------
+
+    /// Every `host.discovered` this scan wrote, as `(ip, method, digest)`.
+    fn host_discovered(h: &Harness) -> Vec<(IpAddr, String, Digest)> {
+        h.events()
+            .into_iter()
+            .filter_map(|e| match e.body {
+                EventBody::HostDiscovered {
+                    target,
+                    method,
+                    evidence_refs,
+                } => Some((target.ip, method, *evidence_refs.first())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// AC-6.20(c), and the criterion this repository deferred out of three
+    /// milestones: **a `HostInventory` scan records the deciding method on a
+    /// `host.discovered` event, and an `InventoryExposedServices` scan of the
+    /// same targets records nothing.**
+    ///
+    /// The second half is the narrowing control, and it is not decoration:
+    /// without it, a scheduler that ran discovery unconditionally — the
+    /// product change M6 Task 5 correctly refused to make — passes the first
+    /// half exactly as well as this one does. It is also the assertion that
+    /// keeps `end_to_end_scan.rs`, `lab_conformance.rs` and
+    /// `real_log_fold.rs` meaning what they meant, all three of which request
+    /// `InventoryExposedServices`.
+    #[tokio::test]
+    async fn a_host_inventory_scan_records_the_deciding_method_and_an_inventory_scan_records_nothing()
+     {
+        let port = open_port().await;
+        let specs = [port.to_string()];
+        let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+
+        let discovering = make_harness_with_objective(
+            &["127.0.0.1"],
+            &spec_refs,
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            Objective::HostInventory,
+        );
+        discovering.run_to_completion().await.unwrap();
+        let found = host_discovered(&discovering);
+        assert_eq!(found.len(), 1, "one address, one discovery: {found:#?}");
+        let (ip, method, digest) = found.into_iter().next().unwrap();
+        assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        // Loopback answers every configured discovery port one way or the
+        // other, so the method is one of the TCP verdicts. Which one depends
+        // on whether this host happens to run something on 443/80/22, and
+        // both are `up` — the criterion is that the method that *decided* is
+        // recorded, not that it is a particular one.
+        assert!(
+            method == crate::discovery::METHOD_TCP_OPEN
+                || method == crate::discovery::METHOD_TCP_REFUSED,
+            "the method that decided must be recorded and must be a real one: {method}"
+        );
+        // Evidence before event: the digest the event cites resolves, and
+        // resolves to the measurement it was derived from.
+        let blob = discovering.evidence.get(&digest).unwrap();
+        let record: serde_json::Value = serde_json::from_slice(&blob).unwrap();
+        assert_eq!(record["target"], "127.0.0.1");
+        assert_eq!(record["up"], serde_json::json!(true));
+        assert_eq!(record["method"], serde_json::Value::String(method));
+
+        // The narrowing control: identical targets, identical ports,
+        // identical manifest, different objective.
+        let inventorying = make_harness_with_objective(
+            &["127.0.0.1"],
+            &spec_refs,
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            default_manifest(),
+            Objective::InventoryExposedServices,
+        );
+        inventorying.run_to_completion().await.unwrap();
+        assert!(
+            host_discovered(&inventorying).is_empty(),
+            "an InventoryExposedServices scan must be byte-identical to what it always was: \
+             {:#?}",
+            host_discovered(&inventorying)
+        );
+        // And it must still have done the scan it was asked for, or the
+        // assertion above is satisfied by a scheduler that did nothing.
+        assert!(
+            inventorying.events().iter().any(
+                |e| matches!(&e.body, EventBody::PortStateObserved { state, .. } if *state == PortState::Open)
+            ),
+            "the control must still be a real scan"
+        );
+    }
+
+    /// `host.discovered` has no `up` field and `bathy_query`'s fold puts its
+    /// target straight into `hosts_up`, so an event for a host reported down
+    /// would make the answer to "which hosts are up" the whole target list.
+    ///
+    /// Driven through `emit_host_discovered` directly rather than through a
+    /// scan, because a *deterministically* silent address is not something a
+    /// unit test can bind: this pins the branch, and
+    /// `addresses_with_no_host_are_never_reported_open_or_closed` is the same
+    /// property on the lab, where genuinely absent addresses exist.
+    #[tokio::test]
+    async fn a_host_reported_down_produces_no_event_and_stores_no_blob() {
+        let h = harness(&["127.0.0.1"], &[9]);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let before = h.evidence_blob_count();
+
+        h.scheduler
+            .emit_host_discovered(
+                ip,
+                &DiscoveryResult {
+                    up: false,
+                    method: crate::discovery::METHOD_NO_RESPONSE.into(),
+                    packets_spent: 3,
+                },
+            )
+            .unwrap();
+        assert!(host_discovered(&h).is_empty());
+        assert_eq!(
+            h.evidence_blob_count(),
+            before,
+            "a host that is not up leaves nothing behind at all"
+        );
+
+        // The narrowing control, without which the assertions above are
+        // satisfied by an `emit_host_discovered` that never emits anything.
+        h.scheduler
+            .emit_host_discovered(
+                ip,
+                &DiscoveryResult {
+                    up: true,
+                    method: crate::discovery::METHOD_ICMP_UP.into(),
+                    packets_spent: 1,
+                },
+            )
+            .unwrap();
+        let found = host_discovered(&h);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert_eq!(found[0].1, crate::discovery::METHOD_ICMP_UP);
+        assert_eq!(h.evidence_blob_count(), before + 1);
+    }
+
+    /// The discovery phase is on the emission path, so it asks the manifest
+    /// itself rather than trusting whatever ran upstream — the M3
+    /// whole-branch CRITICAL-1 rule, applied to the phase that now runs
+    /// *before* the unit loop.
+    ///
+    /// The detail string is asserted because the unit loop would refuse this
+    /// same target too: without naming which check answered, this test passes
+    /// against a scheduler whose discovery phase has no gate at all and whose
+    /// first plan unit catches it one moment later — after the discovery
+    /// packets are already on the wire.
+    #[tokio::test]
+    async fn host_discovery_asks_the_manifest_itself_before_a_single_probe_leaves() {
+        let h = make_harness_with_objective(
+            &["127.0.0.1"],
+            &["9"],
+            budgets(1_000_000, 3_600, 1_000_000),
+            small_config(),
+            manifest_denying_loopback(),
+            Objective::HostInventory,
+        );
+        let summary = h.run_to_completion().await.unwrap();
+        assert!(summary.policy_denied, "{summary:#?}");
+        let denial = h
+            .events()
+            .into_iter()
+            .find_map(|e| match e.body {
+                EventBody::PolicyDenied { detail, .. } => Some(detail),
+                _ => None,
+            })
+            .expect("a denied scan appends policy.denied");
+        assert!(
+            denial.contains("host discovery"),
+            "the discovery phase's own gate must be the one that answered, not the unit \
+             loop's one probe later: {denial}"
+        );
+        assert!(host_discovered(&h).is_empty());
+    }
+
+    /// Discovery costs packets and they come out of the same ledger as
+    /// everything else — the ceiling is over the scan, not over the port
+    /// probes. Asserted against a control at the identical plan, because a
+    /// `packets_spent` that simply counted plan units would satisfy any
+    /// absolute number chosen here.
+    #[tokio::test]
+    async fn host_discovery_is_charged_to_the_same_packet_budget_as_the_scan() {
+        let port = open_port().await;
+        let specs = [port.to_string()];
+        let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let mut spent = Vec::new();
+        for objective in [
+            Objective::InventoryExposedServices,
+            Objective::HostInventory,
+        ] {
+            let h = make_harness_with_objective(
+                &["127.0.0.1"],
+                &spec_refs,
+                budgets(1_000_000, 3_600, 1_000_000),
+                small_config(),
+                default_manifest(),
+                objective,
+            );
+            spent.push(h.run_to_completion().await.unwrap().packets_spent);
+        }
+        assert!(
+            spent[1] > spent[0],
+            "a scan that pinged every host cannot cost the same as one that did not: {spent:?}"
+        );
+    }
+
+    /// A resumed scan does not discover the same hosts again. Discovery is
+    /// gated on the same "this log is empty" signal `scan.started` is, so a
+    /// resume neither re-spends the packets nor appends a second
+    /// `host.discovered` for an address it already answered for.
+    ///
+    /// **The first run is cancelled, not completed, and that is the whole
+    /// test.** A completed run appends `scan.completed`, `already_terminated`
+    /// sees it and `run` returns before the dispatch block — so a resume
+    /// after a *completed* scan cannot reach the discovery phase for reasons
+    /// that have nothing to do with this gate, and a test written that way
+    /// passes with the gate deleted. It was written that way first, and the
+    /// mutant that removes `first_run` survived it.
+    #[tokio::test]
+    async fn a_resumed_host_inventory_scan_does_not_rediscover_what_it_already_found() {
+        // Enough units, throttled hard enough, that the run can genuinely be
+        // caught mid-flight -- the same construction (and the same reason)
+        // as `cancelled_run_resumes_to_a_full_gap_free_union_with_no_unit_probed_twice`.
+        const N: u64 = 30;
+        let mut ports: Vec<u16> = Vec::with_capacity(N as usize);
+        for _ in 0..N {
+            ports.push(open_port().await);
+        }
+        let specs: Vec<String> = ports.iter().map(|p| p.to_string()).collect();
+        let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+        let mut h = make_harness_with_objective(
+            &["127.0.0.1"],
+            &spec_refs,
+            budgets(1_000_000, 3_600, 8),
+            SchedulerConfig {
+                concurrency: 10,
+                connect_timeout: Duration::from_secs(5),
+                progress_every: 500,
+                packetd: PacketdConfig::default(),
+            },
+            default_manifest(),
+            Objective::HostInventory,
+        );
+        assert_eq!(h.plan.len(), N);
+
+        // Cancel as soon as discovery has answered -- polled rather than
+        // slept, and polled on the event this test is about, so the first
+        // run always stops after the phase and before the plan runs out.
+        let cancel = CancellationToken::new();
+        let c = cancel.clone();
+        let log_for_poll = Arc::clone(&h.log);
+        let poller = tokio::spawn(async move {
+            loop {
+                let seen = log_for_poll
+                    .lock()
+                    .unwrap()
+                    .read_from(0)
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(&e.body, EventBody::HostDiscovered { .. }));
+                if seen {
+                    c.cancel();
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let first = h.scheduler.run(&h.plan, 0, cancel).await.unwrap();
+        poller.await.unwrap();
+        assert!(first.cancelled, "{first:#?}");
+        assert!(
+            first.units_completed < N,
+            "the first run must not have finished, or the resume below never reaches the \
+             dispatch block at all: {}",
+            first.units_completed
+        );
+        assert_eq!(host_discovered(&h).len(), 1, "{:#?}", host_discovered(&h));
+
+        let resume_from = h.store.next_pending_unit(h.scan_id, N).unwrap().unwrap();
+        let second = h
+            .resume(
+                SchedulerConfig {
+                    concurrency: 10,
+                    connect_timeout: Duration::from_secs(5),
+                    progress_every: 500,
+                    packetd: PacketdConfig::default(),
+                },
+                budgets(1_000_000, 3_600, 1_000_000),
+            )
+            .run(&h.plan, resume_from, CancellationToken::new())
+            .await
+            .unwrap();
+        // The narrowing control: the resumed run must genuinely have gone
+        // through the dispatch block, or the assertion below is about a run
+        // that returned early.
+        assert!(!second.cancelled, "{second:#?}");
+        assert!(second.units_completed > 0, "{second:#?}");
+        assert_eq!(
+            host_discovered(&h).len(),
+            1,
+            "the second run must not append a second discovery for an address the first \
+             one already answered for: {:#?}",
+            host_discovered(&h)
         );
     }
 }

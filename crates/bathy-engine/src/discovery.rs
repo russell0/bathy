@@ -26,47 +26,56 @@
 //! task report for a recommendation on giving `DiscoveryResult` a distinct
 //! signal for that case in M3 Task 7.
 //!
-//! # A library-only deliverable in v0.1 (M3 whole-branch review, IMPORTANT-4)
+//! # Who calls this, and when (AC-6.20)
 //!
-//! [`discover_host`] has no caller in this crate outside its own tests, and
+//! [`discover_host_combined`] is called by `crate::scheduler`'s discovery
+//! phase, once per address in the plan, for a scan whose request carries
+//! [`Objective::HostInventory`](bathy_types::request::Objective::HostInventory)
+//! and for no other objective. That phase stores the
+//! [`DiscoveryResult`] as evidence and then appends the
 //! [`EventBody::HostDiscovered`](bathy_types::event::EventBody::HostDiscovered)
-//! is constructed nowhere in production. This is a deliberate scope
-//! decision, not an oversight left over from M3, and not the same shape as
-//! CRITICAL-1 (nothing on the emission path consulting scope): scope
-//! authorization is a boundary every scan must cross regardless of what it
-//! is scanning *for*; host discovery is one specific technique among
-//! several this crate offers for *finding* hosts, and `crate::scheduler`'s
-//! v0.1 scan loop always probes every configured port on every plan unit
-//! directly, for every [`bathy_types::request::Objective`] -- it does not
-//! yet branch on objective at all (that routing decision, including what
-//! `Objective::HostInventory` should actually DO differently, does not
-//! exist yet and is out of this fix wave's scope).
+//! event that cites it -- evidence before event, never the other way around.
+//! See `Scheduler::emit_host_discovered`.
 //!
-//! M6 Task 5 delivered the other half: [`discover_host_combined`] tries
-//! privileged ICMP first (via `bathy-packetd`) and falls back to exactly this
-//! module's TCP method on an inconclusive result, returning whichever method
-//! actually produced the answer in [`DiscoveryResult::method`].
+//! [`discover_host`] itself is reached only through
+//! [`discover_host_combined`]'s fallback arm; it stays public because it is
+//! the unprivileged half of the pair and is independently tested as such.
 //!
-//! **`EventBody::HostDiscovered` is still constructed nowhere in production,
-//! and that is now the only part of AC-6.20 left open.** The remaining step
-//! is not in this module and could not be: an emitter needs the event log,
-//! the evidence store (`HostDiscovered::evidence_refs` is a
-//! `NonEmpty<Digest>`, so there is no event without a stored blob) and a
-//! decision about *when* discovery runs -- and that last one still does not
-//! exist. `bathy_plan::ScanPlan` carries no
-//! [`bathy_types::request::Objective`], so `crate::scheduler` cannot tell a
-//! `HostInventory` scan from an `InventoryExposedServices` one, and running
-//! discovery unconditionally would change the packet cost and the event
-//! stream of every scan this engine has ever run -- three tests pin the
-//! current shape (`crates/bathy-engine/tests/end_to_end_scan.rs`,
+//! ## The reason this was deferred for three milestones, and why it was wrong
+//!
+//! From M3 until M6's whole-branch review, this module recorded that the
+//! blocker on wiring the event was that `bathy_plan::ScanPlan` carries no
+//! `bathy_types::request::Objective`, so `crate::scheduler` could not tell a
+//! `HostInventory` scan from an `InventoryExposedServices` one. **The first
+//! clause is true and the conclusion does not follow**, and the reason had
+//! been copied into the milestone plan, the README and the design paper
+//! before anyone checked it.
+//!
+//! `ScanPlan` is `{ targets, ports, hash }` because that field set is what
+//! the plan hash is over -- a deliberate M3 design. M4 then deliberately
+//! routed request-derived behaviour config *around* it: `Scheduler::new`
+//! already took `service_detection` and `evidence_level` as direct
+//! parameters, and both production call sites already read them off
+//! `authorized.request()` in the same argument list. `Objective` is a `Copy`
+//! field on that same `ScanRequest`. Plumbing it was a thirteenth parameter
+//! and two call-site lines, on a seam that had been in use since M4.
+//!
+//! What was genuinely left was the phase -- evidence record, event emission,
+//! budget and pacing -- and that is work, not a missing primitive. The
+//! difference matters, because the wrong version of the reason invited the
+//! next reader to go and change `ScanPlan`, which is the one thing here that
+//! must not change.
+//!
+//! The other two reasons given at the time do hold, and both are honoured
+//! above: an emitter needs the evidence store, because
+//! `HostDiscovered::evidence_refs` is a `NonEmpty<Digest>` and there is no
+//! event without a stored blob; and running discovery unconditionally would
+//! have been a product change, which is why the phase is gated on the
+//! objective and the three tests that pin the current shape
+//! (`crates/bathy-engine/tests/end_to_end_scan.rs`,
 //! `crates/bathy/tests/lab_conformance.rs`,
-//! `crates/bathy-query/tests/real_log_fold.rs`). See M6 Task 5's report for
-//! the recommendation.
-//!
-//! `discover_host`/[`discover_host_combined`]/[`DiscoveryConfig`]/
-//! [`DiscoveryResult`] therefore ship as correct, independently tested
-//! library building blocks, publicly exported from this crate (see
-//! `crate::lib`'s own doc comment), with no production caller yet.
+//! `crates/bathy-query/tests/real_log_fold.rs`) all request
+//! `InventoryExposedServices` and are untouched.
 
 use std::net::IpAddr;
 
