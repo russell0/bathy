@@ -1,12 +1,40 @@
 # bathy
 
-An agent-native network discovery engine: turns authorized network questions into
-bounded scan plans, executes them, and returns structured, evidence-backed findings
-over MCP.
+An agent-native network discovery engine: it turns authorized network questions
+into bounded scan plans, executes them, and returns structured, evidence-backed
+findings. One engine is exposed three ways — a Rust library, the `bathy`
+command, and an MCP server — and none of the three contains any scanning logic
+of its own.
 
-> **Status: Milestones 1-4 of 7 landed (contracts; evidence and state; planner
-> and engine; probes and interpretation); Milestone 5 in progress — the `bathy`
-> CLI runs and `bathy serve mcp` serves the eleven tools.**
+## Authorized use
+
+**bathy is for scanning networks you are authorized to scan.** Read this before
+the quickstart; the quickstart cannot be completed without it.
+
+- **Every scan requires a scope manifest.** `--scope <path>` is a required
+  argument on every subcommand that can emit a packet. There is no default, no
+  environment variable and no flag to skip it, so omitting it fails inside
+  argument parsing — before a state directory is opened or a request exists.
+- **Deny by default.** A manifest names the address ranges it authorizes and
+  the instant it stops being valid. Anything it does not name is refused.
+- **Refused in full, never trimmed.** If the manifest belongs to a different
+  scope, has expired, or fails to cover a single one of the targets, the whole
+  scan is refused. bathy does not scan the part it is allowed to scan and stay
+  quiet about the rest.
+- **Deliberately identifiable.** The probes name the tool and link to this
+  repository. There is no anonymous mode, no evasive mode, and no flag to
+  remove the identification.
+- **Scanning networks without authorization may be unlawful in your
+  jurisdiction and may violate your provider's terms of service. That is your
+  responsibility, not the tool's.**
+
+Exactly what a scanned third party receives on their wire, and where the
+enforcement happens in the code, is in [Scope enforcement, in
+detail](#scope-enforcement-in-detail) below.
+
+> **Status: Milestones 1-5 of 7 landed (contracts; evidence and state; planner
+> and engine; probes and interpretation; query, diff, CLI and MCP server);
+> Milestone 7 — the verification suite — in progress.**
 >
 > bathy scans, and identifies what it finds. `bathy-engine`'s scheduler drives
 > real, unprivileged TCP connect scanning against IPv4 targets: budget- and
@@ -42,10 +70,300 @@ over MCP.
 > at all.
 >
 > What does not exist yet: privileged SYN/ICMP scanning and a packet daemon
-> (Milestone 6), and the verification suite (Milestone 7).
+> (Milestone 6), which by the plan's own execution order comes after the
+> verification work.
 >
 > Plans for all seven milestones — 213 numbered acceptance criteria — are in
 > [`docs/superpowers/plans/`](docs/superpowers/plans/).
+
+## 60-second quickstart
+
+Every command below is real, and every line of output is a transcript of one
+run on macOS on 2026-08-05 against `10.211.55.2` — an address of the machine it
+ran on. Nothing in it is illustrative.
+
+**Step 2 is not optional and cannot be worked around.** There is no way to
+reach a socket in this tool without a manifest on disk that authorizes the
+address you are about to touch.
+
+### 1. Build
+
+```
+git clone https://github.com/russell0/bathy && cd bathy
+cargo build --release -p bathy
+```
+
+`rust-toolchain.toml` pins stable; the `bathy` binary's own floor is Rust 1.95.
+
+### 2. Write a scope manifest
+
+Pick the address first, and pick one you are authorized to scan. A non-loopback
+address of the machine you are sitting at is the easy answer — **`127.0.0.1`
+will not work**: loopback is not an ordinary unicast address and no manifest
+can authorize it (see [Limitations](#limitations)).
+
+```
+TARGET=          # ← put your address here. There is no default, deliberately.
+
+cat > quickstart-scope.json <<EOF
+{
+  "id": "scope_01K2HZ8V5N3QR7BXMC4TDWF9GJ",
+  "description": "Quickstart: this machine only, for one hour.",
+  "not_after": "$(date -u -v+1H +%Y-%m-%dT%H:%M:%S.000Z 2>/dev/null || date -u -d '+1 hour' +%Y-%m-%dT%H:%M:%S.000Z)",
+  "allowed_cidrs": ["$TARGET/32"],
+  "denied_cidrs": [],
+  "budget_ceiling": {
+    "maximum_packets": 5000,
+    "maximum_runtime_seconds": 60,
+    "maximum_packets_per_second": 50
+  }
+}
+EOF
+```
+
+The expiry is one hour out on purpose. A manifest is a grant of permission with
+an end, not a setting.
+
+### 3. Ask the manifest what it authorizes
+
+```
+$ ./target/release/bathy scope validate --scope quickstart-scope.json --targets $TARGET
+scope_01K2HZ8V5N3QR7BXMC4TDWF9GJ "Quickstart: this machine only, for one hour."
+  valid at 2026-08-05T00:17:29.502Z
+  ceiling 5000pkt / 60s / 50pps
+  1 target(s) in scope
+  signature: none
+```
+
+### 4. Give it something to find (optional)
+
+```
+mkdir -p /tmp/quickstart-served
+python3 -m http.server 8080 --bind $TARGET --directory /tmp/quickstart-served &
+```
+
+`--directory` is not decoration: `python3 -m http.server` serves the working
+directory to everything that can reach that interface, and the working
+directory here is a source tree.
+
+### 5. Scan
+
+```
+$ ./target/release/bathy --state-dir ./quickstart-state scan start \
+    --scope quickstart-scope.json --idempotency-key quickstart-1 \
+    --targets $TARGET --ports 22,80,443,8080
+scan_01KZ7MGMW7ZM647KA4AV7TCR4K  running  plan blake3:bc5b48d762941fa3f89dc775c37871e21dd3fc88ca18095fc1adbdf9e6f25735
+4 unit(s) probed, 1 open, 5 packet(s) spent
+```
+
+### 6. Read the result, then read the bytes behind it
+
+```
+$ ./target/release/bathy --state-dir ./quickstart-state result query --scan scan_01KZ7MGMW7ZM647KA4AV7TCR4K
+10.211.55.2:22 closed
+10.211.55.2:80 closed
+10.211.55.2:443 closed
+10.211.55.2:8080 open http
+4 of 4 endpoint(s)
+```
+
+Add `--json` for the same document as line-delimited JSON, which is what the
+`result.query` tool returns. Each open endpoint carries the digest of the bytes
+that justified it and the id of the rule that fired:
+
+```
+$ ./target/release/bathy --json --state-dir ./quickstart-state result query --scan scan_01KZ7MGMW7ZM647KA4AV7TCR4K
+{"endpoints":[{"endpoint":{"port":22,"transport":"tcp"},"evidence_refs":[],"observation":null,"probe_id":null,"rule_id":null,"state":"closed","target":"10.211.55.2"},{"endpoint":{"port":80,"transport":"tcp"},"evidence_refs":[],"observation":null,"probe_id":null,"rule_id":null,"state":"closed","target":"10.211.55.2"},{"endpoint":{"port":443,"transport":"tcp"},"evidence_refs":[],"observation":null,"probe_id":null,"rule_id":null,"state":"closed","target":"10.211.55.2"},{"endpoint":{"port":8080,"transport":"tcp"},"evidence_refs":["blake3:7c79458c5f4c327b70c1746439bacdfd21c17694382155781659ee4f078713e7"],"observation":{"confidence":0.7,"service":"http"},"probe_id":"http-get-v1","rule_id":"http.protocol.bare.v1","state":"open","target":"10.211.55.2"}],"hosts_up":[],"plan_hash":"blake3:bc5b48d762941fa3f89dc775c37871e21dd3fc88ca18095fc1adbdf9e6f25735","terminal":{"findings":1,"outcome":"completed","packets_spent":5,"probes_sent":4},"total":4,"total_before_filter":4}
+
+$ ./target/release/bathy --state-dir ./quickstart-state evidence get \
+    --digest blake3:7c79458c5f4c327b70c1746439bacdfd21c17694382155781659ee4f078713e7 | head -5
+HTTP/1.0 200 OK
+Server: SimpleHTTP/0.6 Python/3.9.12
+Date: Wed, 05 Aug 2026 00:17:31 GMT
+Content-type: text/html; charset=utf-8
+Content-Length: 297
+
+$ ./target/release/bathy explain http.protocol.bare.v1
+http.protocol.bare.v1
+  service: http
+  rationale: The response's first line is a well-formed HTTP status line, but no `Server` header matched any known product.
+  source: RFC 9112 §4 ("Status Line": `status-line = HTTP-version SP status-code SP [ reason-phrase ]`)
+```
+
+Note two things that transcript does *not* say. It reports `http`, not
+`SimpleHTTP/0.6 Python/3.9.12` — bathy has no rule for that server, so it names
+the protocol it can prove and stops, at confidence 0.7. And `"hosts_up":[]` is
+empty even though the host is plainly up: there is no host discovery in v0.1.
+Both are in [Limitations](#limitations).
+
+### What happens if you skip step 2
+
+```
+$ ./target/release/bathy scan start --idempotency-key x --targets 10.211.55.2 --ports 80
+error: the following required arguments were not provided:
+  --scope <PATH>
+
+$ ./target/release/bathy scan start --scope quickstart-scope.json --idempotency-key y \
+    --targets 10.211.55.3 --ports 80
+bathy: denied (target_out_of_scope): 10.211.55.3 is not authorized by manifest scope_01K2HZ8V5N3QR7BXMC4TDWF9GJ
+```
+
+Exit code 1 for the first (argument parsing, before any bathy code runs) and 2
+for the second (policy denial, before any packet). Codes 0-4 have distinct
+documented meanings and are listed in `bathy --help`.
+
+## Limitations
+
+This section is the one a reader should weigh hardest, and it is written to
+survive someone who runs [the benchmark](docs/benchmarks.md) themselves.
+
+**Service identification is a fraction of Nmap's, and will stay that way for a
+long time.** Nmap has 28 years of accumulated community fingerprint
+contributions. bathy v0.1 has eight protocols and thirteen interpretation
+rules, each authored from an RFC, vendor documentation or a lab capture. On
+this project's own nine-service integration lab — a lab built to exercise
+exactly those thirteen rules, which flatters bathy enormously — both tools
+named five of the six products the lab establishes, and *they were not the same
+five*. On an arbitrary network the ratio would be far worse. The one number
+that generalises is the count of protocols, and it is eight.
+
+**A TLS-fronted service is identified only as `tls`.** This is the most
+concrete identification loss the project has, it is structural rather than a
+missing rule, and it was measured: on the lab's `10.30.0.17:443`, `nmap -sV`
+names the product and bathy does not. `Scheduler::detect_service` stops at the
+first probe whose capture interprets to anything; on 443 that is `tls-v1`,
+which is protocol-only *by construction* because RFC 8446 encrypts the
+certificate, so the HTTP probe never runs — even though the rule that would
+name the product matches those exact bytes. Changing that policy changes
+per-endpoint packet accounting, pacing, and the reported service for every TLS
+port, so it is a scanner change and not a documentation fix. The gap is
+recorded as `identification_gap` in
+[`lab/ground-truth.json`](lab/ground-truth.json), and the conformance suite
+holds that endpoint to being unidentified — so the day bathy names it, the test
+fails and demands the entry be deleted.
+
+**bathy is slower than Nmap, by between 1.4x and 17.8x depending on which
+comparison you make.** Like for like — port discovery with no identification —
+it is about 1.4x slower than `nmap -sT`. With identification on, it is about
+1.5x slower than `nmap -sT -sV`. The 17.8x figure compares bathy's default,
+which identifies services, against a bare Nmap port sweep that does not; it is
+real and it is not like for like. All of it, including the command lines and
+the observed ranges, is in [`docs/benchmarks.md`](docs/benchmarks.md).
+
+**Observations are not reproducible. Planning and interpretation are.** This is
+a distinction, not a hedge, and it is the reason the codebase is shaped the way
+it is:
+
+- *Planning is deterministic.* The same request against the same scope manifest
+  produces the same `plan_hash`, every time, on any machine. That is what makes
+  idempotency and resumption safe.
+- *Interpretation is reproducible.* The same evidence bytes through the same
+  engine version produce the same findings, with no I/O, no clock and no
+  randomness involved. A committed corpus of recorded captures is replayed
+  against the rules offline on every change.
+- *Observation is neither, and cannot be.* Networks drop packets, rate-limit,
+  reorder, and change under you between one connection and the next. Two scans
+  of the same host minutes apart may legitimately disagree, and no amount of
+  engineering here changes that. What the project does instead is make the
+  disagreement visible: every finding cites the bytes it came from, and
+  `result.diff` separates confidence noise from substantive change.
+
+**Not in v0.1, at all:**
+
+- **No OS detection.** Nothing in this tree fingerprints an operating system.
+- **No UDP.** `Transport::Udp` exists in the type system so that logs written
+  today stay readable later; no planner emits it and no probe speaks it. Every
+  scan is TCP.
+- **No traceroute**, and no path or topology discovery of any kind.
+- **No IPv6.** It is *refused*, not merely unimplemented — see below.
+- **No Windows.** A licensing constraint, stated in full in
+  [`docs/platform-support.md`](docs/platform-support.md).
+- **No privileged scanning.** No SYN scan, no ICMP. That means no host
+  discovery either: unprivileged ICMP is impossible, so `hosts_up` is empty
+  after every scan on this branch and an address with no host on it produces
+  `filtered` endpoints rather than a "host down" verdict. The unprivileged TCP
+  host-discovery building block exists in `bathy-engine` and is not wired into
+  the scheduler. Privileged scanning ships with the packet daemon in Milestone
+  6.
+- **No loopback.** `127.0.0.0/8` is refused by `ScopeManifest::allows` on the
+  same footing as IPv6, so no manifest can authorize a scan of the machine's
+  own loopback interface. This is a deliberate blast-radius decision and it is
+  why the quickstart needs a real interface address.
+- **No evasion and no anonymization.** Permanent non-goals, not omissions.
+
+**Port presets are IANA-derived heuristics, not prevalence measurements.**
+`top-100` and `common-1000` are built from the IANA service-name registry with
+a documented ranking heuristic. They are not derived from a measurement of what
+is actually listening on the internet, and nothing here claims they are the
+same hundred ports another tool would choose.
+
+**IPv6 is refused outright**, not merely unimplemented. `ScopeManifest::allows()`
+returns false for every IPv6 address in v0.1. That decision came out of review:
+three rounds of prefix-by-prefix hardening each closed an enumerated set of
+IPv4-in-IPv6 embedding schemes and each was followed by a review finding one
+more — eight in total, the last (ISATAP) signalling through the interface
+identifier rather than a prefix, which no prefix list can catch. A blanket
+refusal is immune to every scheme, enumerated or not. The eight guards remain in
+the source, parked and tested, as the starting point for v0.2.
+
+**macOS is best-effort and Linux is the target.** Both are described, with the
+specific things that differ, in
+[`docs/platform-support.md`](docs/platform-support.md).
+
+## What it is meant to be
+
+The design premise is that existing scanners were built for humans at a terminal, and
+expose their results to software as XML plus command-line string construction. That is
+a poor fit for typed tool calling. bathy targets the gap:
+
+- **Typed operations.** Every action has JSON Schema inputs and outputs. No agent
+  constructs a command line.
+- **Task handles.** Scans start, poll, stream, cancel, pause, and resume. Nothing
+  blocks. *`bathy scan start` prints a `TaskHandle` before the scan runs and
+  keeps running until it finishes; `scan status`, `scan events --follow`, `scan
+  cancel` and `scan resume` all work from a separate process against a live
+  scan. `pause` is not implemented.*
+- **Evidence.** Every finding cites content-addressed response bytes. `evidence.get`
+  returns exactly what justified a claim; `fingerprint.explain` takes the `rule_id` a finding
+  carries and says why that rule fired. *Callable both ways: as `bathy evidence get` and `bathy explain`, and as
+  the `evidence.get` and `fingerprint.explain` tools, which return the same
+  documents.*
+- **Scope enforcement.** Deny-by-default manifests with expiry, checked against
+  scope identity, expiry, and per-target authorization on the actual emission
+  path, and again as an upfront, pre-plan check in the CLI before anything is
+  written.
+- **Differential scanning.** "What changed since Monday" is a first-class query, with
+  confidence noise separated from substantive change.
+
+That argument is about interfaces and about measurements, and it is the whole
+argument. Nothing in this repository claims another project is bad, badly run,
+or obsolete, and nothing here is a comparison to a person.
+
+## The eleven MCP tools
+
+`bathy serve mcp` speaks MCP over stdio and advertises eleven tools:
+
+`scope.validate` · `scan.preview` · `scan.start` · `scan.status` ·
+`scan.events` · `scan.cancel` · `scan.resume` · `result.query` ·
+`result.diff` · `evidence.get` · `fingerprint.explain`
+
+Every one of them declares an output schema and returns a conforming structured
+result with a JSON text mirror. What the tool surface deliberately does not
+have is as important as what it has:
+
+- No tool's input schema has a `command`, `args`, `flags`, `argv` or `raw`
+  field. An agent cannot build a command line through this interface.
+- No tool accepts a scope manifest inline or by id. A scope is named by a path,
+  exactly as `--scope` takes one, so a caller cannot author its own
+  authorization.
+- A scan wider than the server's configured approval threshold starts nothing.
+  It returns an `input_required` result carrying an `elicitation/create`, and
+  will only proceed when a retry brings back an approval token that is
+  HMAC-sealed, bound to the caller and to the arguments it was issued for,
+  time-limited and single-use. See [`docs/threat-model.md`](docs/threat-model.md).
+
+Every tool has a CLI equivalent, and the two go through the same code — there
+is no second implementation of the fold, the diff, or the policy check.
 
 ## What works today
 
@@ -59,10 +377,10 @@ over MCP.
 | `bathy-probe` | Eight clean-room protocol probes (HTTP, TLS, SSH, SMTP, DNS, PostgreSQL, MySQL, Redis) and the bounded I/O layer they run on: every read is capped in bytes and bounded by a deadline that covers the whole read rather than each individual `recv`, so a peer that floods or dribbles forever cannot exhaust memory or hang a scan. The deadline is per call, not per probe: a probe that writes and then reads can take up to twice it, deliberately, since the hostile case being defended against is on the read path. Probes return raw, uninterpreted bytes — they never decide what a response *means*. |
 | `bathy-interpret` | The rule engine that decides what those bytes mean. Pure: no I/O, no clock, no randomness, no async runtime — exactly two dependencies, enforced in CI. Every interpretation carries the rule that fired, the byte range that justified it, and a confidence from a fixed specificity ladder. The rule id travels with the observation all the way to the wire — `service.observed`, the fold, and `result.query`'s `rule_id` — so `fingerprint.explain` is reachable *from a finding* and not only from a listing. The byte range is not carried past this crate: it indexes the full response, and stored evidence is capped at the evidence level, so a span that could point past the bytes `evidence.get` returns would be a citation that does not resolve. Every rule cites its source (an RFC section, vendor documentation, or a capture with an image digest), and a committed corpus of recorded captures is replayed against it offline on every change. |
 | `bathy-engine` | The scheduler: budget-governed, rate-limited, cancellable, resumable execution of a `ScanPlan` over real unprivileged TCP connect probes, with scope identity, manifest expiry, and per-target authorization all checked directly on the actual emission path. Drives service identification on top of that — up to `intensity` further paced, budgeted, scope-checked connections per open port, stopping at the first response a rule recognizes — and stores the evidence bytes *before* emitting the event that cites them. Also ships unprivileged TCP host discovery as a library building block (not yet wired into the scheduler — see the `discovery` module doc for why, and Milestone 6's plan for where it lands). |
-| `bathy-query` | Milestone 5, in progress. Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Diffs two of those folds into a classified list of what changed, and refuses to call an endpoint appeared or disappeared unless both scans ran the same plan to completion — a refused, cancelled or budget-exhausted scan is not a scan that found less. Both types are published schemas, and `bathy result query` / `bathy result diff` are this crate, called through the CLI and by the `result.query` / `result.diff` tools with no second fold anywhere. |
-| `bathy-mcp` | Milestone 5. The MCP server: eleven typed tools — `scope.validate`, `scan.preview/start/status/events/cancel/resume`, `result.query/diff`, `evidence.get`, `fingerprint.explain` — over protocol revision `2026-07-28` on stdio. That revision has no `initialize` handshake and no protocol-level sessions, so the server implements `server/discover` and takes the protocol version from each request's `_meta`. Every tool declares an output schema and returns a conforming structured result with a JSON text mirror. No tool's input schema has a `command`, `args`, `flags`, `argv` or `raw` field, and no tool accepts a scope manifest inline or by id — a scope is named by a path, exactly as `--scope` takes one, so a caller cannot author its own authorization. A scan wider than the server's configured approval threshold returns a Multi Round-Trip `input_required` result carrying an `elicitation/create`, and starts nothing until a retry brings back an approval token that is HMAC-sealed, bound to the caller and to the arguments it was issued for, time-limited and single-use. It contains no scanning logic. |
+| `bathy-query` | Folds a scan's event log into the state it describes: one record per endpoint carrying its last observed reachability, its last service observation, every evidence digest cited for it, and the scan's terminal outcome — completed, failed, or refused by policy. Pure, and ordered by `sequence` rather than by arrival, so the answer does not depend on how the log was read. Diffs two of those folds into a classified list of what changed, and refuses to call an endpoint appeared or disappeared unless both scans ran the same plan to completion — a refused, cancelled or budget-exhausted scan is not a scan that found less. Both types are published schemas, and `bathy result query` / `bathy result diff` are this crate, called through the CLI and by the `result.query` / `result.diff` tools with no second fold anywhere. |
+| `bathy-mcp` | The MCP server: eleven typed tools over protocol revision `2026-07-28` on stdio. That revision has no `initialize` handshake and no protocol-level sessions, so the server implements `server/discover` and takes the protocol version from each request's `_meta`. It contains no scanning logic. |
 | `bathy` | The `bathy` command: `scope validate`, `scan preview/start/status/events/cancel/resume`, `result query/diff`, `evidence get`, `explain`, `serve mcp`. A translator over the engine API and nothing else — it contains no scanning logic. Every subcommand that can emit a packet takes `--scope` as a required argument with no default and no skip flag, so omitting it fails inside argument parsing, before a state directory is opened or a request exists. `--json` puts line-delimited JSON on stdout and every diagnostic on stderr, including on the failure paths; exit codes 0-4 have distinct documented meanings and are listed in `--help`. |
-| `xtask` | Every gate this project has, as commands: the dependency layering, the "no inference client on the packet path" rule, schema drift against the committed `schemas/`, the README's checkable numbers, the forbidden-pattern rules, `bathy-interpret`'s dependency purity, the MSRV floors and their job membership, `cargo deny`'s check set, and — so a future gate cannot go back to being unrunnable — that every CI step is one of these. |
+| `xtask` | Every gate this project has, as commands: the dependency layering, the "no inference client on the packet path" rule, schema drift against the committed `schemas/`, the README's checkable numbers, the documentation's structural claims, the forbidden-pattern rules, `bathy-interpret`'s dependency purity, the MSRV floors and their job membership, `cargo deny`'s check set, and — so a future gate cannot go back to being unrunnable — that every CI step is one of these. |
 
 27 schemas are committed under [`schemas/`](schemas/) and CI fails if a type
 changes without regenerating them — they are the published contract, not a
@@ -74,7 +392,62 @@ handed and the diff the CLI prints cannot be two shapes. Either way the schema
 an agent is shown is the one the Rust type generates rather than a second copy
 someone wrote out.
 
-### Verified properties, not just tested ones
+## Scope enforcement, in detail
+
+Every scan requires an unexpired scope manifest naming the permitted address
+ranges, bound to the exact scope the scan was started under; there is no flag to
+bypass it, and a scan is refused in full — never silently trimmed — the moment
+any of that fails: the manifest belongs to a different scope, the manifest has
+expired, or a single target falls outside its allow set. `bathy-engine`'s
+scheduler enforces all three directly, on the actual emission path. Scope
+identity and expiry are checked once per `Scheduler::run`, before any probe is
+dispatched; the allow/deny set is checked per unit, immediately before each
+probe. A manifest that expires mid-scan does not halt the run in progress. The
+CLI adds an earlier refusal in front of that: `bathy scan preview`, `scan start`
+and `scan resume` each call `bathy_scope::evaluate` over the fully expanded
+target list before a scan record is written and before a scheduler exists, and
+each takes `--scope` as a required argument, so a scan with no manifest fails
+during argument parsing rather than reaching any code that could open a socket.
+(`preview` and `start` refuse before the state directory is opened at all.
+`resume` has to open it first — the plan it is re-authorizing is the one already
+in the store — so a refused resume leaves behind a created state directory and
+its empty stores, and no scan record, no plan and no packet.) `scan resume` is
+re-evaluated against the manifest handed to it, not against the decision the
+original `scan start` got. Scans carry hard packet, rate, and runtime budgets.
+
+**What a scanned third party sees on their wire.** Every port is first touched by
+a plain, unprivileged TCP connect that sends no payload. A port that answers then
+receives **up to `intensity` further connections — four by default, and never
+fewer than one** — each a separate TCP connection carrying one protocol probe,
+tried in order of port affinity and stopping at the first response a rule
+recognizes. So a port whose first probe is recognized receives one additional
+connection; a port that answers but is never identified receives four.
+`--intensity 0` is accepted and means one, not none: the floor is one probe,
+because "identify this service" with no probe at all is a request the flag
+cannot express and `bathy scan preview` is what sends nothing. Most carry a
+real request — a
+`GET /`, a TLS `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind`
+query, a PostgreSQL `SSLRequest`. **Two send nothing at all**: the SSH and MySQL
+probes are listen-first, because those protocols have the server speak first and
+sending anything would corrupt the banner being read. Those bytes are fixed and
+public: they are listed, byte for byte, in each probe's own module in
+`crates/bathy-probe/src/probes/`.
+
+bathy is **deliberately identifiable**, and that is a design commitment, not an
+oversight. The HTTP probe sends
+`User-Agent: bathy/<version> (+https://github.com/russell0/bathy)`, and the SMTP
+probe identifies itself as `bathy.invalid`. An operator who receives this traffic
+can tell what it is and who to contact. There is no anonymous mode, no evasive
+mode, and no flag to remove the identification. Detection evasion and
+anonymization are permanent non-goals — see
+[`docs/threat-model.md`](docs/threat-model.md) before opening a feature request
+for either.
+
+Service identification can be disabled entirely
+(`service_detection.enabled = false`), in which case only the bare connect probe
+is ever sent. It cannot be made anonymous.
+
+## Verified properties, not just tested ones
 
 Reviews on this branch mutation-test their findings: a check is deleted, and the
 suite must fail. Several defects were caught that way and would not have been
@@ -111,100 +484,6 @@ days while every local command was green:
   fixtures depended on the kernel handing out ephemeral ports in ascending
   order, which macOS does and Linux does not.
 
-## Authorized use
-
-bathy is built for scanning networks you are authorized to scan. Every scan requires
-an unexpired scope manifest naming the permitted address ranges, bound to the exact
-scope the scan was started under; there is no flag to bypass it, and a scan is
-refused in full — never silently trimmed — the moment any of that fails: the
-manifest belongs to a different scope, the manifest has expired, or a single target
-falls outside its allow set. `bathy-engine`'s scheduler enforces all three directly,
-on the actual emission path. Scope identity and expiry are checked once per
-`Scheduler::run`, before any probe is dispatched; the allow/deny set is checked
-per unit, immediately before each probe. A manifest that expires mid-scan does
-not halt the run in progress. The CLI adds an earlier refusal in front of that:
-`bathy scan preview`, `scan start` and `scan resume` each call
-`bathy_scope::evaluate` over the fully expanded target list before a scan record
-is written and before a scheduler exists, and each takes `--scope` as a required
-argument, so a scan with no manifest fails during argument parsing rather than
-reaching any code that could open a socket. (`preview` and `start` refuse before
-the state directory is opened at all. `resume` has to open it first — the plan
-it is re-authorizing is the one already in the store — so a refused resume
-leaves behind a created state directory and its empty stores, and no scan
-record, no plan and no packet.) `scan resume` is re-evaluated
-against the manifest handed to it, not against the decision the original `scan
-start` got. Scans carry hard packet, rate, and runtime budgets.
-
-**What a scanned third party sees on their wire.** Every port is first touched by
-a plain, unprivileged TCP connect that sends no payload. A port that answers then
-receives **up to `intensity` further connections — four by default, and never
-fewer than one** — each a separate TCP connection carrying one protocol probe,
-tried in order of port affinity and stopping at the first response a rule
-recognizes. So a port whose first probe is recognized receives one additional
-connection; a port that answers but is never identified receives four.
-`--intensity 0` is accepted and means one, not none: the floor is one probe,
-because "identify this service" with no probe at all is a request the flag
-cannot express and `bathy scan preview` is what sends nothing. Most carry a
-real request — a
-`GET /`, a TLS `ClientHello`, an `EHLO`, a Redis `PING`, a DNS `version.bind`
-query, a PostgreSQL `SSLRequest`. **Two send nothing at all**: the SSH and MySQL
-probes are listen-first, because those protocols have the server speak first and
-sending anything would corrupt the banner being read. Those bytes are fixed and
-public: they are listed, byte for byte, in each probe's own module in
-`crates/bathy-probe/src/probes/`.
-
-bathy is **deliberately identifiable**, and that is a design commitment, not an
-oversight. The HTTP probe sends
-`User-Agent: bathy/<version> (+https://github.com/russell0/bathy)`, and the SMTP
-probe identifies itself as `bathy.invalid`. An operator who receives this traffic
-can tell what it is and who to contact. There is no anonymous mode, no evasive
-mode, and no flag to remove the identification. Detection evasion and
-anonymization are permanent non-goals — see the design notes before opening a
-feature request for either.
-
-Service identification can be disabled entirely
-(`service_detection.enabled = false`), in which case only the bare connect probe
-is ever sent. It cannot be made anonymous.
-
-Scanning networks without authorization may be unlawful in your jurisdiction and may
-violate your provider's terms of service. That is your responsibility, not the tool's.
-
-## What it is meant to be
-
-The design premise is that existing scanners were built for humans at a terminal, and
-expose their results to software as XML plus command-line string construction. That is
-a poor fit for typed tool calling. bathy targets the gap:
-
-- **Typed operations.** Every action has JSON Schema inputs and outputs. No agent
-  constructs a command line.
-- **Task handles.** Scans start, poll, stream, cancel, pause, and resume. Nothing
-  blocks. *`bathy scan start` prints a `TaskHandle` before the scan runs and
-  keeps running until it finishes; `scan status`, `scan events --follow`, `scan
-  cancel` and `scan resume` all work from a separate process against a live
-  scan. `pause` is not implemented.*
-- **Evidence.** Every finding cites content-addressed response bytes. `evidence.get`
-  returns exactly what justified a claim; `fingerprint.explain` takes the `rule_id` a finding
-  carries and says why that rule fired. *Callable both ways: as `bathy evidence get` and `bathy explain`, and as
-  the `evidence.get` and `fingerprint.explain` tools, which return the same
-  documents.*
-- **Scope enforcement.** Deny-by-default manifests with expiry, checked against
-  scope identity, expiry, and per-target authorization on the actual emission
-  path, and again as an upfront, pre-plan check in the CLI before anything is
-  written — see "Authorized use" above for exactly what each of the two does.
-- **Differential scanning.** "What changed since Monday" is a first-class query, with
-  confidence noise separated from substantive change.
-
-### What is deliberately *not* claimed
-
-Planning is deterministic and interpretation is reproducible. **Observations are not** —
-networks drop packets, rate-limit, and change under you. The distinction is enforced in
-the codebase.
-
-Service-identification coverage will start far below mature scanners: this project
-begins with eight protocols against decades of accumulated community fingerprint data
-elsewhere. Port presets are IANA-derived heuristics, not prevalence measurements.
-See each plan's limitations sections.
-
 ## Planned scope for v0.1
 
 IPv4 TCP connect scanning, optional privileged SYN and ICMP, host discovery, top-port
@@ -215,21 +494,42 @@ and rate budgets, a CLI, a Rust library, and an MCP server.
 Out of scope for v0.1: OS fingerprinting, UDP breadth, traceroute, evasion modes,
 IPv6 scanning, and Windows support.
 
-**IPv6 is refused outright**, not merely unimplemented. `ScopeManifest::allows()`
-returns false for every IPv6 address in v0.1. That decision came out of review:
-three rounds of prefix-by-prefix hardening each closed an enumerated set of
-IPv4-in-IPv6 embedding schemes and each was followed by a review finding one
-more — eight in total, the last (ISATAP) signalling through the interface
-identifier rather than a prefix, which no prefix list can catch. A blanket
-refusal is immune to every scheme, enumerated or not. The eight guards remain in
-the source, parked and tested, as the starting point for v0.2.
+### What is deliberately *not* claimed
+
+Planning is deterministic and interpretation is reproducible. **Observations are not** —
+networks drop packets, rate-limit, and change under you. The distinction is enforced in
+the codebase and is explained under [Limitations](#limitations).
+
+Service-identification coverage will start far below mature scanners: this project
+begins with eight protocols against decades of accumulated community fingerprint data
+elsewhere. Port presets are IANA-derived heuristics, not prevalence measurements.
+
+## Documents
+
+- [`docs/design-paper.md`](docs/design-paper.md) — why this exists, how it is
+  built, what it measured, and where it falls short.
+- [`docs/threat-model.md`](docs/threat-model.md) — what bathy defends against,
+  what it does not, and who it trusts.
+- [`docs/platform-support.md`](docs/platform-support.md) — Linux, macOS, and
+  the Windows licensing position.
+- [`docs/benchmarks.md`](docs/benchmarks.md) — the cross-scanner comparison,
+  including every category bathy loses.
+- [`docs/protocol-notes.md`](docs/protocol-notes.md) — the MCP revision this
+  server implements and the reasoning behind each choice.
+- [`docs/event-log-compatibility.md`](docs/event-log-compatibility.md) — what
+  may and may not change about a stored record.
+- [`lab/README.md`](lab/README.md) — the digest-pinned integration lab and its
+  ground truth.
+- [`fuzz/README.md`](fuzz/README.md) — the fuzz targets and their corpora.
 
 ## Clean room
 
 No Nmap source, probe file, or fingerprint database is consulted, copied, or derived
 from in this project. Interpretation rules are authored from protocol RFCs, vendor
 documentation, or captures from software run in this project's own test lab, and each
-rule records its source. Contributions must follow the same rule.
+rule records its source. Contributions must follow the same rule. The full
+attestation, including the one place Nmap is legitimately run, is in
+[`docs/design-paper.md`](docs/design-paper.md).
 
 ## License
 
