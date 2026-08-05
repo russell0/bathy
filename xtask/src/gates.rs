@@ -3116,14 +3116,321 @@ pub fn packetd_size_violations(root: &Path) -> Vec<String> {
     found
 }
 
+// ---------------------------------------------------------------------------
+// AC-6.7 — every `unsafe` block carries a `SAFETY:` comment.
+// AC-6.8 — no crate outside `bathy-packetd` contains `unsafe` at all.
+// ---------------------------------------------------------------------------
+
+/// Where the `SAFETY:` marker must be: somewhere in the unbroken run of
+/// comment lines immediately above the block, or on the block's own line.
+///
+/// The criterion's own test uses a fixed four-line window. That is the wrong
+/// shape twice over. It is too *small* -- the safety argument for the one
+/// block in this tree is a dozen lines, because "why is this sound" is a
+/// paragraph and not a sentence, and a gate that caps the explanation at four
+/// lines is a gate that rewards shorter arguments. And it is too *loose*: any
+/// `SAFETY:` within four lines counts, including one belonging to a different
+/// block or trailing off some unrelated code.
+///
+/// A contiguous comment run has neither problem. It cannot be satisfied by a
+/// marker that is not attached to this block, and it does not bound how much
+/// is written under the marker.
+const SAFETY_MARKER_PLACEMENT: &str = "the unbroken run of comment lines directly above the block";
+
+/// The marker. Upper case and with the colon, because that is the convention
+/// every Rust reviewer greps for and a `// safety` that reads as prose is not
+/// findable.
+const SAFETY_MARKER: &str = "SAFETY:";
+
+/// Every `unsafe` block in `text` that has no `SAFETY:` comment within
+/// [`SAFETY_WINDOW`] lines above it, as (1-based line, line text).
+///
+/// Pure over text so the checker is checked: the tests below feed it a
+/// documented block, an undocumented one, a comment just outside the window
+/// and an `unsafe` inside a string, and assert what comes back. A gate for a
+/// convention nobody exercises is the shape this repository has lost gates to
+/// before.
+///
+/// The keyword, assembled rather than written, so this file does not trip the
+/// `unsafe-only-in-packetd` pattern rule it is a sibling of. The alternative
+/// is a `[phrase-rule]` marker on every line that mentions it, and a marker
+/// is an opt-out where a constant is a fact.
+const UNSAFE_KEYWORD: &str = concat!("un", "safe");
+
+/// How many blocks the code on `line` opens.
+///
+/// **Anywhere on the line, not only at its start.** The criterion's own test,
+/// as the plan writes it, is `line.trim_start().starts_with("unsafe ")` -- and  [phrase-rule]
+/// that misses the single most common spelling there is:
+///
+/// ```text
+/// let rc = unsafe { libc::prctl(...) };   // [phrase-rule]
+/// ```
+///
+/// which is exactly the shape of the one block this crate contains. A gate
+/// that cannot see the block it was written for is worse than no gate: it
+/// reports zero violations over a file full of them. Found by running it, not
+/// by reading it -- the first version of this checker reported "no unsafe   [phrase-rule]
+/// block" about a crate that had one.
+///
+/// Boundaries on both sides: a preceding word character means an identifier
+/// (`is_unsafe`), and a following one means a different token entirely
+/// (`unsafe_code` in the lint attribute, `unsafe_op_in_unsafe_fn`). The `//`
+/// tail is dropped first, so prose about the keyword is not code that uses
+/// it -- which is what makes every doc comment in `privilege.rs`, and this
+/// one, not a block.
+fn unsafe_blocks_on_line(line: &str) -> usize {
+    let code = match line.find("//") {
+        Some(at) => line.get(..at).unwrap_or_default(),
+        None => line,
+    };
+    let bytes = code.as_bytes();
+    let mut count = 0usize;
+    let mut from = 0usize;
+    while let Some(relative) = code.get(from..).and_then(|rest| rest.find(UNSAFE_KEYWORD)) {
+        let at = from.saturating_add(relative);
+        let after_keyword = at.saturating_add(UNSAFE_KEYWORD.len());
+        let preceded_by_word = at
+            .checked_sub(1)
+            .and_then(|before| bytes.get(before))
+            .is_some_and(|b| b.is_ascii_alphanumeric() || *b == b'_');
+        let after = code.get(after_keyword..).unwrap_or_default();
+        let followed_by_boundary = after.is_empty() || after.starts_with([' ', '{', '(']);
+        if !preceded_by_word && followed_by_boundary {
+            count = count.saturating_add(1);
+        }
+        from = after_keyword;
+    }
+    count
+}
+
+fn is_unsafe_block_line(line: &str) -> bool {
+    unsafe_blocks_on_line(line) > 0
+}
+
+pub fn undocumented_unsafe_blocks(text: &str) -> Vec<(usize, String)> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut found = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !is_unsafe_block_line(line) {
+            continue;
+        }
+        let documented = line.contains(SAFETY_MARKER)
+            || lines
+                .get(..index)
+                .unwrap_or_default()
+                .iter()
+                .rev()
+                .take_while(|above| above.trim_start().starts_with("//"))
+                .any(|above| above.contains(SAFETY_MARKER));
+        if !documented {
+            found.push((index.saturating_add(1), (*line).trim().to_string()));
+        }
+    }
+    found
+}
+
+/// AC-6.7 over the whole crate, plus the guard that keeps it from ranging
+/// over nothing.
+///
+/// The criterion as written is satisfied by a crate with no `unsafe` in it at
+/// all, which is a gate that passes over an empty set — the failure mode
+/// `packetd_size_violations` already refuses for the line budget, and the one
+/// this repository has recorded most often. So: if there are zero blocks, the
+/// crate root must carry `#![forbid(unsafe_code)]`, which is the *stronger*
+/// statement and one the compiler enforces. A crate that has neither blocks
+/// nor a forbid has quietly stopped being covered by either.
+pub fn packetd_safety_violations(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut blocks = 0usize;
+    let mut sources: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![root.join(PACKETD_SRC)];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+    sources.sort();
+    if sources.is_empty() {
+        found.push(format!(
+            "{PACKETD_SRC} has no `.rs` files, so AC-6.7's `SAFETY:` requirement is ranging \
+             over nothing"
+        ));
+        return found;
+    }
+    for path in &sources {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let shown = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+            .replace('\\', "/");
+        blocks = blocks.saturating_add(text.lines().filter(|l| is_unsafe_block_line(l)).count());
+        for (number, line) in undocumented_unsafe_blocks(&text) {
+            found.push(format!(
+                "{shown}:{number}: `{line}` has no `{SAFETY_MARKER}` comment in \
+                 {SAFETY_MARKER_PLACEMENT} (AC-6.7). This is the only crate in the workspace \
+                 permitted the keyword, and the argument for each block is the only thing \
+                 standing between it and a memory-safety bug in the one process that holds \
+                 CAP_NET_RAW."
+            ));
+        }
+    }
+    if blocks == 0 {
+        let lib = root.join(PACKETD_SRC).join("lib.rs");
+        let forbids = std::fs::read_to_string(&lib)
+            .is_ok_and(|text| text.contains("#![forbid(unsafe_code)]"));
+        if !forbids {
+            found.push(format!(
+                "crates/bathy-packetd has no `unsafe` block, so AC-6.7 is ranging over \
+                 nothing, and its `lib.rs` does not carry `#![forbid(unsafe_code)]` either. \
+                 One of the two has to be true: either there are blocks and each carries a \
+                 `{SAFETY_MARKER}` comment, or there are none and the compiler is what says \
+                 so. Neither is a gate that reads as coverage while guarding nothing."
+            ));
+        }
+    }
+    found
+}
+
+/// Every crate *target root* in the repository, as (repository-relative path,
+/// is-the-packetd-library).
+///
+/// Discovered from the `Cargo.toml` files rather than listed, because a hand
+/// list is what let `crates/bathy/src/lib.rs` sit outside the constraint for
+/// six milestones: `main.rs` carried the attribute, an inner attribute in a
+/// binary root does not reach the library beside it, and nothing checked.
+fn crate_target_roots(root: &Path) -> Vec<(String, bool)> {
+    let mut manifests = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if path.is_dir() {
+                if !matches!(
+                    name.as_str(),
+                    "target" | ".git" | ".superpowers" | "node_modules"
+                ) {
+                    stack.push(path);
+                }
+            } else if name == "Cargo.toml" {
+                manifests.push(dir.clone());
+            }
+        }
+    }
+    let mut roots = Vec::new();
+    for package in manifests {
+        let mut candidates = vec![package.join("src/lib.rs"), package.join("src/main.rs")];
+        for directory in [package.join("src/bin"), package.join("fuzz_targets")] {
+            if let Ok(entries) = std::fs::read_dir(&directory) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|e| e == "rs") {
+                        candidates.push(path);
+                    }
+                }
+            }
+        }
+        for candidate in candidates {
+            if !candidate.is_file() {
+                continue;
+            }
+            let shown = candidate
+                .strip_prefix(root)
+                .unwrap_or(&candidate)
+                .display()
+                .to_string()
+                .replace('\\', "/");
+            let is_packetd_lib = shown == format!("{PACKETD_SRC}/lib.rs");
+            roots.push((shown, is_packetd_lib));
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+}
+
+/// AC-6.8's other half: the `unsafe-only-in-packetd` pattern rule catches the
+/// keyword *appearing*; nothing caught the attribute *going missing*.
+///
+/// That is not hypothetical. `crates/bathy/src/lib.rs` had no
+/// `#![forbid(unsafe_code)]` until M7 (commit `6142271`), found by a person
+/// re-reading a sentence rather than by a gate — `main.rs` carried it, and an
+/// inner attribute in a binary root does not reach the library target beside
+/// it. Every other invariant in this project is enforced by a test that dies.
+pub fn unsafe_forbid_violations(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let roots = crate_target_roots(root);
+    if roots.is_empty() {
+        found.push(
+            "no crate target roots were found, so the `forbid(unsafe_code)` rule is ranging \
+             over nothing"
+                .to_string(),
+        );
+        return found;
+    }
+    let mut packetd_libs = 0usize;
+    for (path, is_packetd_lib) in &roots {
+        let Ok(text) = std::fs::read_to_string(root.join(path)) else {
+            continue;
+        };
+        if *is_packetd_lib {
+            packetd_libs = packetd_libs.saturating_add(1);
+            if !text.contains("#![deny(unsafe_code)]") && !text.contains("#![forbid(unsafe_code)]")
+            {
+                found.push(format!(
+                    "{path}: the one crate permitted `unsafe` must still carry \
+                     `#![deny(unsafe_code)]`, so that every block is a site-level `expect` \
+                     with a reason rather than an unmarked one. It carries neither that nor \
+                     `#![forbid(unsafe_code)]`."
+                ));
+            }
+        } else if !text.contains("#![forbid(unsafe_code)]") {
+            found.push(format!(
+                "{path}: every crate target outside bathy-packetd must carry \
+                 `#![forbid(unsafe_code)]` (Global Constraint). An inner attribute in one \
+                 target root does not reach another target in the same package, which is \
+                 exactly how `crates/bathy/src/lib.rs` sat outside this constraint for six \
+                 milestones with every check green."
+            ));
+        }
+    }
+    if packetd_libs != 1 {
+        found.push(format!(
+            "expected exactly one bathy-packetd library root among {} crate target root(s), \
+             found {packetd_libs}. Either the crate moved or this rule is exempting \
+             something it should not.",
+            roots.len()
+        ));
+    }
+    found
+}
+
 pub fn check_packetd() -> Fallible<()> {
     let root = Path::new(".");
-    let violations = packetd_size_violations(root);
+    let mut violations = packetd_size_violations(root);
+    violations.extend(packetd_safety_violations(root));
+    violations.extend(unsafe_forbid_violations(root));
     if !violations.is_empty() {
         for v in &violations {
             eprintln!("check-packetd: {v}");
         }
-        return Err(format!("{} packetd size violation(s)", violations.len()).into());
+        return Err(format!("{} packetd violation(s)", violations.len()).into());
     }
     let counts = packetd_line_counts(root);
     let code: usize = counts.iter().map(|(_, code, _)| code).sum();
@@ -3137,6 +3444,20 @@ pub fn check_packetd() -> Fallible<()> {
             .map(|(name, c, _)| format!("{name} {c}"))
             .collect::<Vec<_>>()
             .join(", "),
+    );
+    let blocks: usize = packetd_line_counts(root)
+        .iter()
+        .filter_map(|(name, _, _)| std::fs::read_to_string(root.join(name)).ok())
+        .map(|text| text.lines().filter(|l| is_unsafe_block_line(l)).count())
+        .sum();
+    println!(
+        "check-packetd: ok ({blocks} block(s) of the permitted keyword, each with a \
+         `{SAFETY_MARKER}` comment in {SAFETY_MARKER_PLACEMENT}; {} crate target root(s) \
+         outside bathy-packetd carry the forbid attribute)",
+        crate_target_roots(root)
+            .iter()
+            .filter(|(_, is_packetd_lib)| !is_packetd_lib)
+            .count(),
     );
     println!(
         "check-packetd: WHAT THIS COUNTS — non-blank, non-`//` lines before each file's \
@@ -5173,6 +5494,231 @@ jobs:
             found.iter().any(|v| v.contains("is indented")),
             "{found:#?}"
         );
+    }
+
+    // --- AC-6.7 / AC-6.8: the SAFETY comments and the forbid attributes. ---
+
+    /// The keyword, built the same way the checker builds it, so these
+    /// fixtures do not trip the `unsafe-only-in-packetd` pattern rule that
+    /// scans this very file.
+    fn kw() -> &'static str {
+        UNSAFE_KEYWORD
+    }
+
+    /// The defect the plan's own AC-6.7 test has: it looks for a line that
+    /// *starts with* the keyword, and the single most common spelling does
+    /// not. This is not hypothetical -- the one block this milestone writes
+    /// is `let rc = <kw> { libc::prctl(..) };`, and the first version of this
+    /// checker reported "no block found" about the file containing it.
+    #[test]
+    fn a_block_in_the_middle_of_a_line_is_found_not_only_one_at_its_start() {
+        let assigned = format!("    let rc = {} {{ libc::prctl(x) }};", kw());
+        assert_eq!(unsafe_blocks_on_line(&assigned), 1, "{assigned}");
+        assert_eq!(unsafe_blocks_on_line(&format!("{} fn raw() {{}}", kw())), 1);
+        assert_eq!(unsafe_blocks_on_line(&format!("    {}{{ *p }}", kw())), 1);
+        assert_eq!(unsafe_blocks_on_line(&format!("        {}", kw())), 1);
+    }
+
+    /// The three shapes that are the word and not the keyword. A checker that
+    /// cried wolf on the lint attribute would be disabled within a day, and
+    /// the attribute appears in every crate root in this repository.
+    #[test]
+    fn an_identifier_a_lint_name_and_a_comment_are_not_blocks() {
+        for line in [
+            format!("let is_{} = true;", kw()),
+            format!("#![forbid({}_code)]", kw()),
+            format!("#![deny({}_op_in_{}_fn)]", kw(), kw()),
+            format!("// this function needs {} because ...", kw()),
+            format!("/// {} is permitted in this crate", kw()),
+        ] {
+            assert_eq!(unsafe_blocks_on_line(&line), 0, "{line}");
+        }
+    }
+
+    /// The marker has to belong to *this* block. A contiguous comment run is
+    /// what makes that true; a fixed window is satisfied by any marker that
+    /// happens to be nearby.
+    #[test]
+    fn a_safety_comment_directly_above_documents_the_block_and_a_detached_one_does_not() {
+        let documented = format!(
+            "fn f() {{\n    // SAFETY: the argument shape is fixed here,\n    \
+             // and no pointer is passed.\n    let rc = {} {{ g() }};\n}}\n",
+            kw()
+        );
+        assert!(undocumented_unsafe_blocks(&documented).is_empty());
+
+        // Same text, with one blank line between the argument and the block.
+        // The comment is now attached to nothing.
+        let detached = format!(
+            "fn f() {{\n    // SAFETY: the argument shape is fixed here.\n\n    \
+             let rc = {} {{ g() }};\n}}\n",
+            kw()
+        );
+        let found = undocumented_unsafe_blocks(&detached);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert_eq!(found.first().map(|(n, _)| *n), Some(4));
+    }
+
+    /// A safety argument longer than four lines is the normal case, and the
+    /// criterion's own four-line window would reject it. This fixture is the
+    /// shape of the block actually in the tree.
+    #[test]
+    fn a_safety_argument_longer_than_four_lines_is_still_a_safety_argument() {
+        let mut text = String::from("fn f() {\n    // SAFETY: line one.\n");
+        for n in 2..12 {
+            text.push_str(&format!("    // continued, line {n}.\n"));
+        }
+        text.push_str(&format!("    let rc = {} {{ g() }};\n}}\n", kw()));
+        assert!(undocumented_unsafe_blocks(&text).is_empty(), "{text}");
+    }
+
+    #[test]
+    fn an_undocumented_block_is_reported_with_its_line_and_its_text() {
+        let text = format!("fn f() {{\n    let rc = {} {{ g() }};\n}}\n", kw());
+        let found = undocumented_unsafe_blocks(&text);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let (line, shown) = found.first().cloned().unwrap();
+        assert_eq!(line, 2);
+        assert!(shown.contains("libc") || shown.contains("g()"), "{shown}");
+    }
+
+    /// AC-6.7 is satisfied by a crate with no blocks at all, which is a gate
+    /// ranging over nothing -- the failure this file already refuses for the
+    /// line budget. The rule is: blocks with markers, or no blocks and a
+    /// crate-level forbid. Neither, and the criterion is guarding air.
+    #[test]
+    fn a_crate_with_no_blocks_and_no_forbid_attribute_is_reported_as_vacuous() {
+        let root = scratch("packetd-vacuous");
+        packetd_file(&root, "lib.rs", "#![deny(clippy::panic)]\npub fn f() {}\n");
+        let found = packetd_safety_violations(&root);
+        assert!(
+            found.iter().any(|v| v.contains("ranging over")),
+            "{found:#?}"
+        );
+
+        // The same crate, with the compiler making the statement instead.
+        let root = scratch("packetd-forbid");
+        packetd_file(
+            &root,
+            "lib.rs",
+            &format!("#![forbid({}_code)]\npub fn f() {{}}\n", kw()),
+        );
+        assert!(packetd_safety_violations(&root).is_empty());
+    }
+
+    #[test]
+    fn a_documented_block_passes_and_an_undocumented_one_names_its_file() {
+        let root = scratch("packetd-safety");
+        packetd_file(
+            &root,
+            "privilege.rs",
+            &format!(
+                "fn f() {{\n    // SAFETY: no pointer argument.\n    let rc = {} {{ g() }};\n}}\n",
+                kw()
+            ),
+        );
+        assert!(packetd_safety_violations(&root).is_empty());
+
+        packetd_file(
+            &root,
+            "other.rs",
+            &format!("fn f() {{\n    let rc = {} {{ g() }};\n}}\n", kw()),
+        );
+        let found = packetd_safety_violations(&root);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("other.rs:2"), "{found:#?}");
+    }
+
+    /// AC-6.8's other half. The pattern rule catches the keyword appearing;
+    /// this catches the attribute going missing, which is what actually
+    /// happened to `crates/bathy/src/lib.rs` and stayed true for six
+    /// milestones with every check green.
+    #[test]
+    fn a_crate_target_root_without_the_forbid_attribute_is_reported() {
+        let root = scratch("forbid-missing");
+        let forbid = format!("#![forbid({}_code)]\n", kw());
+        for (dir, body) in [
+            ("crates/bathy-packetd", None),
+            ("crates/bathy-engine", Some(forbid.as_str())),
+            ("crates/bathy-query", Some("// nothing\n")),
+        ] {
+            let src = root.join(dir).join("src");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(root.join(dir).join("Cargo.toml"), "[package]\n").unwrap();
+            let text = body.unwrap_or(forbid.as_str());
+            std::fs::write(src.join("lib.rs"), text).unwrap();
+        }
+        // packetd's own root gets the deny form.
+        std::fs::write(
+            root.join(PACKETD_SRC).join("lib.rs"),
+            format!("#![deny({}_code)]\n", kw()),
+        )
+        .unwrap();
+
+        let found = unsafe_forbid_violations(&root);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("bathy-query/src/lib.rs"), "{found:#?}");
+    }
+
+    /// The binary target beside a library is a separate compilation unit, and
+    /// an inner attribute in one does not reach the other. That is the exact
+    /// mechanism of the defect above, so it gets its own fixture.
+    #[test]
+    fn a_binary_target_is_checked_separately_from_the_library_beside_it() {
+        let root = scratch("forbid-bin");
+        let forbid = format!("#![forbid({}_code)]\n", kw());
+        let src = root.join("crates/bathy/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("crates/bathy/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(src.join("main.rs"), &forbid).unwrap();
+        std::fs::write(src.join("lib.rs"), "// no attribute here\n").unwrap();
+        let packetd = root.join(PACKETD_SRC);
+        std::fs::create_dir_all(&packetd).unwrap();
+        std::fs::write(root.join("crates/bathy-packetd/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(packetd.join("lib.rs"), format!("#![deny({}_code)]\n", kw())).unwrap();
+
+        let found = unsafe_forbid_violations(&root);
+        assert_eq!(found.len(), 1, "{found:#?}");
+        assert!(found[0].contains("crates/bathy/src/lib.rs"), "{found:#?}");
+    }
+
+    /// A fuzz target is a crate root too, and `fuzz/` is a separate cargo
+    /// workspace that this project has already discovered sitting outside
+    /// `cargo fmt --all` and `cargo clippy --workspace`.
+    #[test]
+    fn a_fuzz_target_is_a_crate_root_this_rule_reads() {
+        let root = scratch("forbid-fuzz");
+        let forbid = format!("#![forbid({}_code)]\n", kw());
+        let targets = root.join("fuzz/fuzz_targets");
+        std::fs::create_dir_all(&targets).unwrap();
+        std::fs::write(root.join("fuzz/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(targets.join("ipc.rs"), "#![no_main]\n").unwrap();
+        let packetd = root.join(PACKETD_SRC);
+        std::fs::create_dir_all(&packetd).unwrap();
+        std::fs::write(root.join("crates/bathy-packetd/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(packetd.join("lib.rs"), format!("#![deny({}_code)]\n", kw())).unwrap();
+        std::fs::write(root.join("fuzz/src"), "").ok();
+
+        let found = unsafe_forbid_violations(&root);
+        assert!(
+            found.iter().any(|v| v.contains("fuzz/fuzz_targets/ipc.rs")),
+            "{found:#?}"
+        );
+        let _ = forbid;
+    }
+
+    /// The vacuity guard, in the direction that matters: if the packetd
+    /// library root cannot be found, this rule has stopped applying to the
+    /// one crate it exists for and must say so rather than pass.
+    #[test]
+    fn a_tree_without_the_packetd_library_root_is_reported_rather_than_passed() {
+        let root = scratch("forbid-no-packetd");
+        let src = root.join("crates/bathy-engine/src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(root.join("crates/bathy-engine/Cargo.toml"), "[package]\n").unwrap();
+        std::fs::write(src.join("lib.rs"), format!("#![forbid({}_code)]\n", kw())).unwrap();
+        let found = unsafe_forbid_violations(&root);
+        assert!(found.iter().any(|v| v.contains("found 0")), "{found:#?}");
     }
 
     #[test]

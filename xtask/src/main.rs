@@ -114,6 +114,11 @@ const SUBCOMMANDS: &[&str] = &[
     // and because `usage:` should name every command that exists.
     "check-ci-status",
     "linux-gate",
+    // M6 Task 2. AC-6.5's ordering test and AC-6.6's privileged control need
+    // a process holding CAP_NET_RAW: macOS has no capabilities and
+    // `linux-gate` is deliberately non-root, so without this command those
+    // tests exist and never run. See `visibility::packetd_privileged`.
+    "packetd-privileged",
     "publish-check",
     // Whether this workspace COULD be released, decided offline: the publish
     // order derived from the real dependency graph, the manifest fields
@@ -199,6 +204,9 @@ fn run(command: Option<&str>, args: &[String]) -> Result<(), Box<dyn std::error:
         ),
         Some("check-ci-status") => visibility::check_ci_status(),
         Some("linux-gate") => visibility::linux_gate(args.iter().any(|a| a == "--fresh")),
+        Some("packetd-privileged") => {
+            visibility::packetd_privileged(args.iter().any(|a| a == "--fresh"))
+        }
         // The gate that runs immediately before the repository is made
         // public. `--no-tests` skips only `cargo test --workspace` and makes
         // the run exit non-zero regardless, so a partial run can never be

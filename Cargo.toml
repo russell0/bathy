@@ -189,3 +189,29 @@ clap = { version = "4.6", features = ["derive"] }
 criterion = { version = "0.5", default-features = false, features = [
     "cargo_bench_support",
 ] }
+# M6 Task 2 (`crates/bathy-packetd`, the only privileged component): the raw
+# sockets and the capability drop. All three are in exactly one crate's
+# dependency table and must stay there -- see the long comment in
+# `crates/bathy-packetd/Cargo.toml` for why that graph is deliberately the
+# shortest in the workspace.
+#
+# `socket2` 0.6: `Socket::new(Domain::IPV4, Type::RAW, ..)`, `IP_HDRINCL`, and
+# `getsockopt(SO_TYPE)`. MIT OR Apache-2.0, `rust-version = "1.70"`, no build
+# script, `libc` its only dependency on unix.
+#
+# `features = ["all"]` is required, not decorative: `Type::RAW` and
+# `set_header_included_v4` are both behind it, and without it this crate does
+# not compile. The feature does not pull in another dependency -- socket2 has
+# none beyond `libc` on unix -- it only un-gates the API surface.
+socket2 = { version = "0.6", features = ["all"] }
+# `caps` 0.5: `capset(2)` over all five capability sets, behind a safe API, so
+# the drop needs no `unsafe` of its own. MIT OR Apache-2.0,
+# `rust-version = "1.63"`, `libc` its only non-optional dependency, no build
+# script. Linux-only by construction; `bathy-packetd` takes it through a
+# `cfg(target_os = "linux")` target table.
+caps = { version = "0.5.6", default-features = false }
+# `libc` for one syscall: `prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)`, which
+# neither `socket2` nor `caps` exposes and which is what makes the capability
+# drop irrevocable. It is already a transitive dependency of both, so this
+# adds no crate to the privileged binary's graph.
+libc = "0.2"

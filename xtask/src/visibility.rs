@@ -401,9 +401,165 @@ pub fn linux_gate(fresh: bool) -> Fallible<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// `packetd-privileged` — the half of M6 Task 2 that needs a capability.
+// ---------------------------------------------------------------------------
+
+/// The directories `packetd-privileged` builds into.
+///
+/// Separate from [`LINUX_GATE_DIRS`] on purpose: this container runs as
+/// **root**, because the whole point is a process that holds `CAP_NET_RAW`,
+/// and mixing root-written build artifacts into the directory `linux-gate`
+/// uses as an unprivileged user is how one gate starts failing for reasons
+/// that belong to the other.
+pub const PACKETD_PRIVILEGED_DIRS: &[&str] =
+    &["packetd-priv", "packetd-priv-cargo", "packetd-priv-home"];
+
+/// The environment variable `crates/bathy-packetd/tests/privilege.rs` reads
+/// to turn a skipped precondition into a failure.
+pub const PACKETD_DEMAND_ENV: &str = "BATHY_PACKETD_PRIVILEGED_TESTS";
+
+/// What runs inside the container. One command, so the failure a contributor
+/// sees is the failure CI would see.
+pub const PACKETD_PRIVILEGED_SCRIPT: &str = "cargo test -p bathy-packetd";
+
+/// The `docker run` argument vector, as pure data so a test can read it.
+///
+/// Three things here are load-bearing and each is asserted below:
+///
+/// - `--cap-add=NET_RAW` is the entire reason this command exists. Without
+///   it the container has the same capability set `linux-gate` does and every
+///   privileged assertion skips, which is a green run over nothing.
+/// - `--user 0:0`, the opposite of [`docker_argv`]'s deliberate non-root.
+///   A non-root process in a `--cap-add=NET_RAW` container has the capability
+///   in its *bounding* set and not in its permitted set, so `socket(2)` still
+///   fails: the capability has to be one the process actually holds.
+/// - `--security-opt=no-new-privileges` is **not** passed, because the
+///   daemon sets `PR_SET_NO_NEW_PRIVS` itself and a container that had
+///   already set it would make that call unobservable — the `NoNewPrivs: 1`
+///   in `/proc/self/status` would be true before `packetd` ran.
+pub fn packetd_privileged_argv(image: &str, repo_root: &str, script: &str) -> Vec<String> {
+    vec![
+        "run".into(),
+        "--rm".into(),
+        "--cap-add".into(),
+        "NET_RAW".into(),
+        "--user".into(),
+        "0:0".into(),
+        "--volume".into(),
+        format!("{repo_root}:/w"),
+        "--workdir".into(),
+        "/w".into(),
+        "--env".into(),
+        format!("{PACKETD_DEMAND_ENV}=1"),
+        "--env".into(),
+        "CARGO_TARGET_DIR=/w/target/packetd-priv".into(),
+        "--env".into(),
+        "CARGO_HOME=/w/target/packetd-priv-cargo".into(),
+        "--env".into(),
+        "HOME=/w/target/packetd-priv-home".into(),
+        image.into(),
+        "bash".into(),
+        "-euxo".into(),
+        "pipefail".into(),
+        "-c".into(),
+        script.into(),
+    ]
+}
+
+/// Runs `bathy-packetd`'s suite in a container that holds `CAP_NET_RAW`.
+///
+/// AC-6.5's ordering test and AC-6.6's privileged control cannot run on the
+/// machine this project is developed on (macOS has no capabilities) and
+/// cannot run in `linux-gate` (which is deliberately non-root). Without a
+/// command they would be tests that exist and never execute, announcing a
+/// skipped precondition into a log nobody reads — and this is the one
+/// property in the repository where that would matter most.
+///
+/// `{PACKETD_DEMAND_ENV}=1` is what makes the run mean something: inside the
+/// container those tests fail rather than skip if the capability is absent,
+/// so a `--cap-add` that stopped working shows up as red instead of green.
+pub fn packetd_privileged(fresh: bool) -> Fallible<()> {
+    let repo_root = capture("git", &["rev-parse", "--show-toplevel"])?;
+    let mut reused = Vec::new();
+    for dir in PACKETD_PRIVILEGED_DIRS {
+        let path = Path::new(&repo_root).join("target").join(dir);
+        if fresh && path.exists() {
+            std::fs::remove_dir_all(&path).map_err(|e| format!("clearing target/{dir}: {e}"))?;
+        } else if path.exists() {
+            reused.push(*dir);
+        }
+        std::fs::create_dir_all(&path).map_err(|e| format!("creating target/{dir}: {e}"))?;
+    }
+    if !reused.is_empty() {
+        eprintln!(
+            "packetd-privileged: NOT HERMETIC — reusing {}. `--fresh` clears it.",
+            reused
+                .iter()
+                .map(|d| format!("target/{d}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    let argv = packetd_privileged_argv(LINUX_IMAGE, &repo_root, PACKETD_PRIVILEGED_SCRIPT);
+    eprintln!(
+        "packetd-privileged: `{PACKETD_PRIVILEGED_SCRIPT}` in {LINUX_IMAGE} as root with \
+         CAP_NET_RAW and {PACKETD_DEMAND_ENV}=1"
+    );
+    let status = Command::new("docker").args(&argv).status().map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            "docker is not installed or not on PATH. It is the only way to give this \
+             repository's one privileged component a capability on a macOS host, and \
+             without it AC-6.5's ordering test and AC-6.6's privileged control do not run \
+             at all."
+                .to_string()
+        } else {
+            format!("running docker: {e}")
+        }
+    })?;
+    if !status.success() {
+        return Err("packetd-privileged failed".to_string().into());
+    }
+    println!("packetd-privileged: ok ({LINUX_IMAGE}, CAP_NET_RAW, root)");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Each of the three things that make this container different from
+    /// `linux-gate`'s, asserted separately, because losing any one of them
+    /// turns every privileged assertion into a skip and the run stays green.
+    #[test]
+    fn the_privileged_container_adds_the_capability_runs_as_root_and_demands_the_tests() {
+        let argv = packetd_privileged_argv("img", "/repo", "cargo test -p bathy-packetd");
+        let joined = argv.join(" ");
+        assert!(joined.contains("--cap-add NET_RAW"), "{joined}");
+        assert!(joined.contains("--user 0:0"), "{joined}");
+        assert!(
+            joined.contains(&format!("{PACKETD_DEMAND_ENV}=1")),
+            "without this the tests inside skip instead of failing: {joined}"
+        );
+        assert!(
+            !joined.contains("no-new-privileges"),
+            "the daemon sets PR_SET_NO_NEW_PRIVS itself; a container that had already set \
+             it would make that call unobservable: {joined}"
+        );
+    }
+
+    /// It must not build into `linux-gate`'s directories: this one runs as
+    /// root and that one does not.
+    #[test]
+    fn the_privileged_container_does_not_share_a_target_directory_with_linux_gate() {
+        let argv = packetd_privileged_argv("img", "/repo", "x").join(" ");
+        for dir in LINUX_GATE_DIRS {
+            assert!(!argv.contains(&format!("/w/target/{dir}")), "{dir}: {argv}");
+        }
+        for dir in PACKETD_PRIVILEGED_DIRS {
+            assert!(argv.contains(&format!("/w/target/{dir}")), "{dir}: {argv}");
+        }
+    }
 
     fn run(head_sha: &str, status: &str, conclusion: &str) -> LatestRun {
         LatestRun {

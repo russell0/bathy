@@ -1,4 +1,4 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 #![cfg_attr(
     not(test),
     deny(
@@ -26,15 +26,29 @@
 //! the first thing in the tree to run: everything else `packetd` does happens
 //! only because a line arrived and this module accepted it.
 //!
-//! # `#![forbid(unsafe_code)]`, for now
+//! # `#![deny(unsafe_code)]`, and the one site that overrides it
 //!
-//! The Global Constraint permits `unsafe` in this crate *and only for raw
-//! socket syscalls*. Task 2 of M6 introduces the sockets and with them the
-//! allowance. Until there is a syscall to make, the forbid stays on, because
-//! "the crate that is allowed unsafe" and "the crate that uses unsafe" should
-//! not be the same sentence a milestone earlier than necessary. When it comes
-//! off, every block carries a `SAFETY:` comment (AC-6.7) and this paragraph
-//! says so instead.
+//! The Global Constraint permits `unsafe` in this crate, and only for the
+//! raw-socket and privilege-dropping syscalls. It is `deny` rather than
+//! `forbid` because `forbid` cannot be overridden even by a site-level
+//! `expect` carrying a reason -- which would mean the whole crate losing the
+//! lint for the sake of one function. Every other file here, and the
+//! `main.rs` binary target beside this one, is still under the lint at
+//! `forbid` or `deny` strength.
+//!
+//! There is **one** `unsafe` block in this crate:
+//! [`privilege::set_no_new_privs`], which makes the capability drop
+//! irrevocable via `prctl(PR_SET_NO_NEW_PRIVS, ...)`. Everything else that
+//! looked like it would need `unsafe` is a safe call into a crate that
+//! already owns the syscall: `socket2::Socket::new` *is* `socket(2)`, and
+//! `caps::clear` *is* `capset(2)`. Writing either of them again by hand
+//! would be adding `unsafe` to reimplement a reviewed dependency, which is
+//! the opposite of what the allowance is for.
+//!
+//! The block carries a `SAFETY:` comment (AC-6.7), enforced by
+//! `cargo run -p xtask -- check-packetd`, which also fails if this crate
+//! ever has zero `unsafe` blocks *and* no crate-level `forbid` -- so the
+//! criterion cannot come to range over nothing without somebody noticing.
 //!
 //! # No panics on the byte path (Global Constraint)
 //!
@@ -57,8 +71,13 @@
 //! Test code is exempt by compilation unit (`cfg_attr(not(test), ...)`), not
 //! by a path list -- see `bathy-probe`'s crate doc for the full reasoning.
 
+pub mod privilege;
 pub mod protocol;
 
+pub use privilege::{
+    PrivilegeError, PrivilegeState, RawSockets, UnprivilegedInput, acquire_raw_sockets,
+    capabilities_are_dropped, drop_all_capabilities,
+};
 pub use protocol::{
     LineError, MAX_LINE_BYTES, PortState, RefusalReason, Request, Response, Session, read_line,
 };

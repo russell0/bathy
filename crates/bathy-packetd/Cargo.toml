@@ -38,10 +38,33 @@ repository.workspace = true
 # `schemars`, `blake3`, `ulid` and `time` into the address space that opens
 # raw sockets. The duplication is four variants; the alternative is four
 # crates.
+#
+# M6 Task 2 adds the socket and capability halves, on the same rule. Both are
+# crates that already own the syscall behind a safe API, which is why this
+# crate ends up with exactly one `unsafe` block rather than a file of them:
+#
+# - `socket2`: `Socket::new(Domain::IPV4, Type::RAW, ..)` IS `socket(2)`, and
+#   `set_header_included_v4` IS `setsockopt(IP_HDRINCL)`. Pure syscall
+#   wrapper over `libc`, no build script, MSRV 1.70.
+# - `caps`: `caps::clear` IS `capset(2)`, over all five capability sets. Pure
+#   `libc`, no build script, MSRV 1.63. Linux-only, hence the target table
+#   below -- there is no capability model to drop on macOS, and `privilege.rs`
+#   fails closed there rather than pretending there is.
+# - `libc`: for the one syscall neither of the above exposes,
+#   `prctl(PR_SET_NO_NEW_PRIVS, ...)`. It is already in this graph twice as a
+#   transitive dependency of the other two, so naming it directly adds no
+#   crate to the address space that opens raw sockets. Taking a fourth
+#   wrapper crate instead, to avoid one argument-only `unsafe` block, would
+#   have cost more review than the block does.
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 ipnet = { workspace = true }
+socket2 = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+caps = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

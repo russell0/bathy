@@ -132,9 +132,21 @@ pub const RULES: &[Rule] = &[
         // Matches `unsafe` followed by a space, `{`, `(`, or end-of-line, so
         // `unsafe fn`, `unsafe{`, `unsafe(no_mangle)`, and a bare trailing  // [phrase-rule]
         // `unsafe` are all caught, not just the space-delimited form. Scans
-        // both crates/ and xtask/ -- the binding constraint is "no crate
+        // crates/, xtask/ AND fuzz/ -- the binding constraint is "no crate
         // outside bathy-packetd", not "no crate under crates/ outside
         // bathy-packetd".
+        //
+        // `fuzz` was missing from this list until M6 Task 2. `fuzz/` is a
+        // separate cargo workspace with six Rust targets, every one of them
+        // driving a parser with attacker-shaped bytes, and the rule that says
+        // "no crate outside bathy-packetd" did not read a line of it. They
+        // were in fact all clean, which is the point: nothing had checked, and
+        // the same omission is how ~900 lines of that directory came to sit
+        // outside `cargo fmt --all` and `cargo clippy --workspace`.
+        // `every_rust_crate_in_the_repository_is_under_the_unsafe_rule` now
+        // derives the required roots from the tree's own Cargo.toml files, so
+        // a seventh crate in a new directory cannot be added outside this
+        // rule without failing it.
         //
         // The leading `\b` matters: without it, `unsafe` matches as a plain
         // substring, so `let is_unsafe = true;` (word character `_`
@@ -144,12 +156,24 @@ pub const RULES: &[Rule] = &[
         // Pinned by `a_word_ending_in_unsafe_is_not_a_violation` below rather
         // than by a comment claiming GNU grep supports the escape.
         pattern: r"\bunsafe([ {(]|$)",
-        roots: &["crates", "xtask"],
+        roots: &["crates", "xtask", "fuzz"],
         extensions: Some(&["rs"]),
-        exempt_path_prefixes: &["crates/bathy-packetd/"],
+        // The FILE, not the crate. M6 Task 2 narrowed this from
+        // `crates/bathy-packetd/` because the Global Constraint permits
+        // `unsafe` for the raw-socket and privilege-dropping syscalls, and
+        // those live in exactly one module. A whole-crate exemption would have
+        // let a block appear in `protocol.rs` -- the module that parses lines
+        // sent by a caller this process does not trust -- and stayed green.
+        // The narrower exemption is the difference between "the privileged
+        // crate may use unsafe" and "the privilege syscalls may".
+        exempt_path_prefixes: &["crates/bathy-packetd/src/privilege.rs"],
         exemption_rationale: "The Global Constraint is `#![forbid(unsafe_code)]` in every crate \
-                              except bathy-packetd, which may use `unsafe` only for raw socket \
-                              syscalls and must document every block.",
+                              except bathy-packetd, which may use `unsafe` only for the raw \
+                              socket and privilege-dropping syscalls and must document every \
+                              block with a SAFETY comment. `privilege.rs` is where those \
+                              syscalls are; `cargo run -p xtask -- check-packetd` is what \
+                              checks the SAFETY comments and that no crate target has lost \
+                              its forbid attribute.",
     },
     Rule {
         id: "no-unscoped-determinism-claim",
@@ -722,24 +746,87 @@ mod tests {
         );
     }
 
+    /// The exemption is one FILE, and the test says so in all three
+    /// directions: the privilege module may, its own crate's other modules
+    /// may not, and neither may anything else. The middle case is the one
+    /// that changed in M6 Task 2 -- a whole-crate exemption would have let a
+    /// block appear in `protocol.rs`, which parses lines from a caller this
+    /// process does not trust, and stayed green.
     #[test]
-    fn packetd_may_use_unsafe_and_its_neighbours_may_not() {
+    fn only_packetds_privilege_module_may_use_unsafe() {
+        let block = "unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) }"; // [phrase-rule]
         assert!(
             run(
                 "unsafe-only-in-packetd",
-                "crates/bathy-packetd/src/socket.rs",
-                "unsafe { libc::socket(domain, ty, proto) }", // [phrase-rule]
+                "crates/bathy-packetd/src/privilege.rs",
+                block,
             )
             .is_empty()
         );
-        assert_eq!(
-            run(
-                "unsafe-only-in-packetd",
-                "crates/bathy-engine/src/connect.rs",
-                "unsafe { libc::socket(domain, ty, proto) }", // [phrase-rule]
-            )
-            .len(),
-            1
+        for elsewhere in [
+            "crates/bathy-packetd/src/protocol.rs",
+            "crates/bathy-packetd/src/main.rs",
+            "crates/bathy-engine/src/connect.rs",
+            "fuzz/fuzz_targets/ipc.rs",
+        ] {
+            assert_eq!(
+                run("unsafe-only-in-packetd", elsewhere, block).len(),
+                1,
+                "{elsewhere} is not the privilege module"
+            );
+        }
+    }
+
+    /// AC-6.8 says "no crate outside bathy-packetd", and a `roots` list is a
+    /// hand-kept register of where the crates are. `fuzz/` was outside it
+    /// until M6 Task 2: six Rust targets, a separate cargo workspace, and a
+    /// rule that had never read a line of them.
+    ///
+    /// Derived from the tree's own `Cargo.toml` files rather than restated,
+    /// so a crate added in a new top-level directory fails this test instead
+    /// of quietly sitting outside the rule.
+    #[test]
+    fn every_rust_crate_in_the_repository_is_under_the_unsafe_rule() {
+        let rule = RULES
+            .iter()
+            .find(|r| r.id == "unsafe-only-in-packetd")
+            .expect("the rule exists");
+        let mut uncovered = Vec::new();
+        let mut stack = vec![PathBuf::from(".")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if path.is_dir() {
+                    if !NEVER_SCANNED.contains(&name.as_str()) {
+                        stack.push(path);
+                    }
+                } else if name == "Cargo.toml" {
+                    let shown = relative(Path::new("."), &dir);
+                    // The workspace manifest itself is not a crate root.
+                    if shown.is_empty()
+                        || dir.join("src").is_dir()
+                        || dir.join("fuzz_targets").is_dir()
+                    {
+                        let covered = shown.is_empty()
+                            || rule.roots.iter().any(|root| {
+                                shown == *root || shown.starts_with(&format!("{root}/"))
+                            });
+                        if !covered {
+                            uncovered.push(shown);
+                        }
+                    }
+                }
+            }
+        }
+        uncovered.sort();
+        assert!(
+            uncovered.is_empty(),
+            "these crates contain Rust the `unsafe` rule never reads: {uncovered:?}. \
+             Add their directory to the rule's `roots`."
         );
     }
 
