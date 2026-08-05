@@ -961,7 +961,7 @@ mod tests {
         let template = {
             let d2 = tempfile::tempdir().unwrap();
             let mut l = EventLog::open(d2.path(), id).unwrap();
-            let e = l.append(progress(1), &clock(), "0.1.0").unwrap();
+            let e = l.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
             serde_json::to_string(&e).unwrap()
         };
 
@@ -1045,7 +1045,7 @@ mod tests {
         // refuses the conversion instead.
         let (_d, mut log) = log();
         for n in 1..=3 {
-            log.append(progress(n), &clock(), "0.1.0").unwrap();
+            log.append(progress(n), &clock(), ENGINE_VERSION).unwrap();
         }
         for after in [3, 4, 100, u32::MAX as u64, 1_u64 << 32, u64::MAX] {
             assert!(
@@ -1067,7 +1067,7 @@ mod tests {
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
             for n in 1..=2 {
-                log.append(progress(n), &clock(), "0.1.0").unwrap();
+                log.append(progress(n), &clock(), ENGINE_VERSION).unwrap();
             }
             assert_eq!(log.index.starts.len() as u64, log.last_sequence());
         }
@@ -1078,7 +1078,7 @@ mod tests {
         let mut log = EventLog::open(dir.path(), id).unwrap();
         assert_eq!(log.index.starts.len() as u64, log.last_sequence());
         assert_eq!(log.last_sequence(), 2);
-        let appended = log.append(progress(3), &clock(), "0.1.0").unwrap();
+        let appended = log.append(progress(3), &clock(), ENGINE_VERSION).unwrap();
         assert_eq!(appended.sequence, 3);
         assert_eq!(log.index.starts.len() as u64, log.last_sequence());
         assert_eq!(
@@ -1094,7 +1094,9 @@ mod tests {
     fn sequences_start_at_one_and_are_gap_free() {
         let (_d, mut log) = log();
         for expected in 1..=5 {
-            let e = log.append(progress(expected), &clock(), "0.1.0").unwrap();
+            let e = log
+                .append(progress(expected), &clock(), ENGINE_VERSION)
+                .unwrap();
             assert_eq!(e.sequence, expected);
         }
         assert_eq!(log.last_sequence(), 5);
@@ -1106,13 +1108,15 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let mut log = EventLog::open(dir.path(), id).unwrap();
         assert_eq!(log.last_sequence(), 2);
         assert_eq!(
-            log.append(progress(3), &clock(), "0.1.0").unwrap().sequence,
+            log.append(progress(3), &clock(), ENGINE_VERSION)
+                .unwrap()
+                .sequence,
             3
         );
     }
@@ -1121,7 +1125,7 @@ mod tests {
     fn read_from_returns_only_events_after_the_given_sequence() {
         let (_d, mut log) = log();
         for i in 1..=5 {
-            log.append(progress(i), &clock(), "0.1.0").unwrap();
+            log.append(progress(i), &clock(), ENGINE_VERSION).unwrap();
         }
         let tail = log.read_from(3).unwrap();
         assert_eq!(tail.len(), 2);
@@ -1135,7 +1139,7 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
         }
         let path = log_path(dir.path(), id);
         let mut raw = std::fs::read(&path).unwrap();
@@ -1147,8 +1151,8 @@ mod tests {
     #[test]
     fn each_record_is_exactly_one_line() {
         let (dir, mut log) = log();
-        log.append(progress(1), &clock(), "0.1.0").unwrap();
-        log.append(progress(2), &clock(), "0.1.0").unwrap();
+        log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+        log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         let raw =
             std::fs::read_to_string(dir.path().join(format!("{}.jsonl", log.scan_id()))).unwrap();
         assert_eq!(raw.lines().count(), 2);
@@ -1178,7 +1182,7 @@ mod tests {
         {
             let mut log = EventLog::open(dir, id).unwrap();
             for i in 1..=n {
-                log.append(progress(i), &clock(), "0.1.0").unwrap();
+                log.append(progress(i), &clock(), ENGINE_VERSION).unwrap();
             }
         }
         std::fs::read_to_string(log_path(dir, id))
@@ -1345,8 +1349,8 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let path = log_path(dir.path(), id);
         let mut raw = std::fs::read(&path).unwrap();
@@ -1384,8 +1388,8 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let path = log_path(dir.path(), id);
         let mut raw = std::fs::read(&path).unwrap();
@@ -1399,7 +1403,9 @@ mod tests {
             "the blank line must not count as a record"
         );
         assert_eq!(
-            log.append(progress(3), &clock(), "0.1.0").unwrap().sequence,
+            log.append(progress(3), &clock(), ENGINE_VERSION)
+                .unwrap()
+                .sequence,
             3,
             "the sequence must continue correctly past a tolerated blank line"
         );
@@ -1419,8 +1425,8 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let path = log_path(dir.path(), id);
         let raw = std::fs::read_to_string(&path).unwrap();
@@ -1442,7 +1448,7 @@ mod tests {
         // confirm `read_from` can still find sequences 2 and 3 correctly,
         // which only holds if the byte offset recorded for sequence 2
         // accounted for the blank line's byte(s) landing before it.
-        log.append(progress(3), &clock(), "0.1.0").unwrap();
+        log.append(progress(3), &clock(), ENGINE_VERSION).unwrap();
         let tail = log.read_from(1).unwrap();
         assert_eq!(
             tail.iter().map(|e| e.sequence).collect::<Vec<_>>(),
@@ -1475,7 +1481,7 @@ mod tests {
             // has its own dedicated coverage in `store.rs`/here elsewhere.
             let mut log = EventLog::open_without_durability_barrier(dir.path(), id).unwrap();
             for i in 1..=COUNT {
-                log.append(progress(i), &clock(), "0.1.0").unwrap();
+                log.append(progress(i), &clock(), ENGINE_VERSION).unwrap();
             }
         }
         // Reopening forces a full `scan_existing` pass over every record
@@ -1503,7 +1509,7 @@ mod tests {
     fn read_from_does_not_reparse_records_before_the_requested_tail() {
         let (dir, mut log) = log();
         for i in 1..=5 {
-            log.append(progress(i), &clock(), "0.1.0").unwrap();
+            log.append(progress(i), &clock(), ENGINE_VERSION).unwrap();
         }
         // Corrupt the on-disk bytes of the FIRST record only, preserving its
         // exact byte length so every later record's offset is unaffected.
@@ -1533,7 +1539,7 @@ mod tests {
     fn read_from_zero_returns_every_event() {
         let (_d, mut log) = log();
         for i in 1..=3 {
-            log.append(progress(i), &clock(), "0.1.0").unwrap();
+            log.append(progress(i), &clock(), ENGINE_VERSION).unwrap();
         }
         let all = log.read_from(0).unwrap();
         assert_eq!(all.len(), 3);
@@ -1546,7 +1552,7 @@ mod tests {
     #[test]
     fn read_from_a_sequence_at_or_beyond_the_end_returns_nothing() {
         let (_d, mut log) = log();
-        log.append(progress(1), &clock(), "0.1.0").unwrap();
+        log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
         assert!(log.read_from(1).unwrap().is_empty());
         assert!(log.read_from(1000).unwrap().is_empty());
     }
@@ -1557,11 +1563,11 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let mut log = EventLog::open(dir.path(), id).unwrap();
-        log.append(progress(3), &clock(), "0.1.0").unwrap();
+        log.append(progress(3), &clock(), ENGINE_VERSION).unwrap();
         let tail = log.read_from(1).unwrap();
         assert_eq!(
             tail.iter().map(|e| e.sequence).collect::<Vec<_>>(),
@@ -1580,13 +1586,13 @@ mod tests {
         let path = log_path(dir.path(), id);
         {
             let mut log = EventLog::open(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let before = std::fs::read(&path).unwrap();
 
         let mut log = EventLog::open(dir.path(), id).unwrap();
-        log.append(progress(3), &clock(), "0.1.0").unwrap();
+        log.append(progress(3), &clock(), ENGINE_VERSION).unwrap();
         let after = std::fs::read(&path).unwrap();
 
         assert!(
@@ -1601,7 +1607,7 @@ mod tests {
     #[test]
     fn append_uses_the_injected_clock_for_the_timestamp() {
         let (_d, mut log) = log();
-        let e = log.append(progress(1), &clock(), "0.1.0").unwrap();
+        let e = log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
         assert_eq!(e.timestamp, "2026-08-01T15:04:31.182Z");
     }
 
@@ -1615,8 +1621,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = scan_id();
         let mut log = EventLog::open_without_durability_barrier(dir.path(), id).unwrap();
-        log.append(progress(1), &clock(), "0.1.0").unwrap();
-        log.append(progress(2), &clock(), "0.1.0").unwrap();
+        log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+        log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         // Before any explicit `sync`, the bytes are still visible to a
         // read within the same process (this is what lets group commit
         // batch fsyncs without batching visibility) -- `read_from` opens
@@ -1632,7 +1638,7 @@ mod tests {
     #[test]
     fn sync_on_a_durable_log_is_harmless() {
         let (_d, mut log) = log();
-        log.append(progress(1), &clock(), "0.1.0").unwrap();
+        log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
         // Every append on a durable log has already synced; calling this
         // again must not error or otherwise disturb the log.
         log.sync().unwrap();
@@ -1657,8 +1663,8 @@ mod tests {
         let id = scan_id();
         let mut log = EventLog::open_without_durability_barrier(dir.path(), id).unwrap();
         assert_eq!(log.sync_calls(), 0);
-        log.append(progress(1), &clock(), "0.1.0").unwrap();
-        log.append(progress(2), &clock(), "0.1.0").unwrap();
+        log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+        log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         assert_eq!(
             log.sync_calls(),
             0,
@@ -1675,7 +1681,8 @@ mod tests {
         let (_d, mut log) = log();
         assert_eq!(log.sync_calls(), 0);
         for expected in 1..=5u64 {
-            log.append(progress(expected), &clock(), "0.1.0").unwrap();
+            log.append(progress(expected), &clock(), ENGINE_VERSION)
+                .unwrap();
             assert_eq!(log.sync_calls(), expected);
         }
     }
@@ -1686,8 +1693,8 @@ mod tests {
         let id = scan_id();
         {
             let mut log = EventLog::open_without_durability_barrier(dir.path(), id).unwrap();
-            log.append(progress(1), &clock(), "0.1.0").unwrap();
-            log.append(progress(2), &clock(), "0.1.0").unwrap();
+            log.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
+            log.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         }
         let log = EventLog::open(dir.path(), id).unwrap();
         assert_eq!(log.last_sequence(), 2);
@@ -1765,10 +1772,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = scan_id();
         let mut first = EventLog::open(dir.path(), id).unwrap();
-        first.append(progress(1), &clock(), "0.1.0").unwrap();
+        first.append(progress(1), &clock(), ENGINE_VERSION).unwrap();
 
         assert!(EventLog::open(dir.path(), id).is_err());
-        first.append(progress(2), &clock(), "0.1.0").unwrap();
+        first.append(progress(2), &clock(), ENGINE_VERSION).unwrap();
         assert_eq!(first.last_sequence(), 2);
 
         drop(first);
@@ -1792,8 +1799,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = scan_id();
         let mut writer = EventLog::open(dir.path(), id).unwrap();
-        writer.append(progress(1), &clock(), "0.1.0").unwrap();
-        writer.append(progress(2), &clock(), "0.1.0").unwrap();
+        writer
+            .append(progress(1), &clock(), ENGINE_VERSION)
+            .unwrap();
+        writer
+            .append(progress(2), &clock(), ENGINE_VERSION)
+            .unwrap();
 
         // The premise: the writer's lock is real and still held.
         assert!(
@@ -1818,14 +1829,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let id = scan_id();
         let mut writer = EventLog::open(dir.path(), id).unwrap();
-        writer.append(progress(1), &clock(), "0.1.0").unwrap();
+        writer
+            .append(progress(1), &clock(), ENGINE_VERSION)
+            .unwrap();
 
         let first = EventLogReader::open(dir.path(), id).unwrap();
         let second = EventLogReader::open(dir.path(), id).unwrap();
         assert_eq!(first.last_sequence(), 1);
         assert_eq!(second.last_sequence(), 1);
 
-        writer.append(progress(2), &clock(), "0.1.0").unwrap();
+        writer
+            .append(progress(2), &clock(), ENGINE_VERSION)
+            .unwrap();
         assert_eq!(writer.last_sequence(), 2);
 
         // A reader opened before the append still reports its own snapshot;
@@ -1852,7 +1867,9 @@ mod tests {
         let id = scan_id();
         {
             let mut writer = EventLog::open(dir.path(), id).unwrap();
-            writer.append(progress(1), &clock(), "0.1.0").unwrap();
+            writer
+                .append(progress(1), &clock(), ENGINE_VERSION)
+                .unwrap();
         }
         let path = log_path(dir.path(), id);
         let mut text = std::fs::read_to_string(&path).unwrap();
@@ -1885,7 +1902,9 @@ mod tests {
         {
             let mut writer = EventLog::open(dir.path(), id).unwrap();
             for i in 1..=3 {
-                writer.append(progress(i), &clock(), "0.1.0").unwrap();
+                writer
+                    .append(progress(i), &clock(), ENGINE_VERSION)
+                    .unwrap();
             }
         }
         let path = log_path(dir.path(), id);
