@@ -297,8 +297,10 @@ pub const SCANNERS: &[Scanner] = &[
         name: "masscan",
         binary: "masscan",
         version_arg: "--version",
-        remedy: "BENCH_APT_PACKAGES=\"nmap masscan\" bench/compare.sh (Debian packages it; \
-                 nothing here installs it for you)",
+        remedy: "BENCH_APT_PACKAGES=\"nmap masscan libpcap0.8\" bench/compare.sh (Debian \
+                 packages it, but its package declares no dependency on libpcap and masscan \
+                 dlopens it at run time, so masscan alone installs and then refuses to open \
+                 an adapter; nothing here installs it for you)",
     },
     Scanner {
         name: "rustscan",
@@ -1426,6 +1428,22 @@ pub fn bench_violations(results: &Results, lab: &Lab, tree: &TreeState<'_>) -> V
                 if !doc.contains(scanner.name) {
                     found.push(format!("{DOC_PATH} never mentions `{}`.", scanner.name));
                 }
+                // The remedy is the only instruction a reader gets for making
+                // an absent tool present, and `bench/results.json` carries a
+                // copy of it taken when the run happened. Nothing else here
+                // compares the two, so a corrected remedy would sit in this
+                // file while the published record kept quoting the wrong one —
+                // and the copy is only *rendered* when the tool is absent, so
+                // the drift would be invisible in exactly the case where the
+                // instruction has to work.
+                if row.remedy != scanner.remedy {
+                    found.push(format!(
+                        "{RESULTS_PATH} records a different remedy for `{}` than `SCANNERS` \
+                         does, so the published record was written by a run of a different \
+                         tree. Re-run `bench/compare.sh`.",
+                        scanner.name
+                    ));
+                }
                 if row.version.is_none() && !doc.contains(&row.remedy[..30.min(row.remedy.len())]) {
                     found.push(format!(
                         "`{}` did not run and {DOC_PATH} does not carry the remedy that would \
@@ -2548,6 +2566,39 @@ jobs:
         let found = violations_of(&doc, &results, &lab);
         assert!(
             found.iter().any(|v| v.contains("no row for `masscan`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_results_file_quoting_a_stale_remedy_is_a_violation() {
+        // The remedy is what a reader runs to make an absent tool present, so
+        // a wrong one is a wrong instruction. `masscan`'s was wrong once: it
+        // named only `nmap masscan`, and Debian's masscan package declares no
+        // dependency on libpcap while masscan dlopens it, so the tool installed
+        // and then refused to open an adapter. Correcting the constant without
+        // re-running would have left `bench/results.json` quoting the broken
+        // one, and nothing else here compares the two.
+        let mut results = results(vec![run(
+            "bathy-connect",
+            "bathy",
+            900,
+            true,
+            accuracy(1, 1),
+        )]);
+        let lab = lab();
+        let doc = document_for(&results, &lab);
+        let masscan = results
+            .scanners
+            .iter_mut()
+            .find(|s| s.name == "masscan")
+            .expect("SCANNERS names masscan");
+        masscan.remedy = "some older instruction".into();
+        let found = violations_of(&doc, &results, &lab);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("different remedy for `masscan`")),
             "{found:?}"
         );
     }

@@ -11,8 +11,22 @@ This exists for `rustscan`, which Debian does not package. For `masscan`, which
 it does, the simpler route is:
 
 ```
-BENCH_APT_PACKAGES="nmap masscan" bench/compare.sh
+BENCH_APT_PACKAGES="nmap masscan libpcap0.8" bench/compare.sh
 ```
+
+`libpcap0.8` is in that list on purpose. Debian's `masscan` package declares
+`Depends: libc6` and nothing else, while masscan loads libpcap with `dlopen` at
+run time — so `masscan` on its own installs cleanly and then dies with `can't
+open adapter: libpcap not loaded`. Co-installing `nmap` happens to satisfy it,
+which is exactly why naming it is worth doing: an instruction that works only
+because of another package on the same line stops working the moment somebody
+edits the line.
+
+A "Linux executable" here means the architecture the runner container is,
+which is the architecture of the machine running Docker — `aarch64` on Apple
+silicon, `x86_64` elsewhere. A macOS build of `rustscan` on the host's `PATH`
+does not take part: the comparison runs inside a Linux container, because
+that is the only place on macOS that can reach the lab at all.
 
 **Nothing in this repository installs a network scanner on your machine.** That
 is your decision. The rows for tools that are not installed stay in the

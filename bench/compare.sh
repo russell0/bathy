@@ -38,9 +38,18 @@
 #
 # Two hooks, both free of code changes:
 #
-#   BENCH_APT_PACKAGES   packages installed in the runner container.
-#                        Default `nmap`. Debian also packages `masscan`, so
-#                        BENCH_APT_PACKAGES="nmap masscan" fills that row in.
+#   BENCH_APT_PACKAGES   packages installed in the runner container. This
+#                        *replaces* the default, which is `nmap`; it does not
+#                        add to it. Debian also packages `masscan`, so
+#                        BENCH_APT_PACKAGES="nmap masscan libpcap0.8" fills
+#                        that row in. `libpcap0.8` is named explicitly because
+#                        Debian's masscan package declares no dependency on it
+#                        and masscan dlopens it at run time: install masscan on
+#                        its own and it will start and then fail with "can't
+#                        open adapter: libpcap not loaded". It happens to work
+#                        alongside `nmap`, which pulls libpcap in -- relying on
+#                        that is how the instruction breaks the day somebody
+#                        drops `nmap` from the list.
 #   bench/tools/         prepended to PATH inside the runner. `rustscan` has
 #                        no Debian package; drop a Linux binary here and it
 #                        joins the comparison.
