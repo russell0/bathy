@@ -256,6 +256,14 @@ traffic a third party can recognise, attribute and complain about.
 
 ## 5. Reporting a vulnerability
 
-`SECURITY.md`, carrying the disclosure contact and the response-time
-expectation, is Task 5 of this milestone and **is not in this commit**. Until it
-lands, report privately to the repository owner rather than in a public issue.
+[`SECURITY.md`](../SECURITY.md) carries the disclosure contact, the
+response-time expectations, and what is and is not in scope as a vulnerability.
+Report privately through GitHub Security Advisories rather than in a public
+issue.
+
+This paragraph previously said `SECURITY.md` was "not in this commit" and told
+the reader to contact the repository owner instead. That was true for exactly
+one task and would have read as current forever after; a forward reference to a
+document that has since landed is the same defect class as a claim that has gone
+stale, and this project has three recorded instances of that in `README.md`
+alone.

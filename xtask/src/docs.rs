@@ -1,12 +1,16 @@
-//! The structural claims of the four documents a stranger reads first.
+//! The structural claims of the documents a stranger reads first, and of the
+//! policy documents a contributor is held to.
 //!
 //! # Why these criteria needed a program
 //!
-//! AC-7.16 and AC-7.18 through AC-7.21 are all statements about what a
+//! AC-7.16 and AC-7.18 through AC-7.24 are all statements about what a
 //! document contains: a limitations section that says why identification
 //! coverage is thin, an authorized-use statement above the fold, a quickstart
 //! that cannot be followed without writing a scope manifest, a clean-room
-//! attestation, a Windows position stated as a licensing constraint.
+//! attestation, a Windows position stated as a licensing constraint, evasion
+//! and anonymization named as non-goals, a clean-room rule stated for
+//! contributors with a citation requirement that says what a citation must be
+//! checkable *against*, and a disclosure contact with a response time.
 //!
 //! Every one of them would have been closed by a person reading the file and
 //! saying so, and this project's Global Constraints are explicit that manual
@@ -64,6 +68,29 @@ const README: &str = "README.md";
 const DESIGN_PAPER: &str = "docs/design-paper.md";
 const PLATFORM: &str = "docs/platform-support.md";
 const THREAT_MODEL: &str = "docs/threat-model.md";
+const SECURITY: &str = "SECURITY.md";
+const CONTRIBUTING: &str = "CONTRIBUTING.md";
+const CONDUCT: &str = "CODE_OF_CONDUCT.md";
+/// The issue-template directory, and the one template whose text carries a
+/// criterion. `.github/ISSUE_TEMPLATE/` is a directory rather than a document,
+/// so what is checkable about it is that the templates a criterion depends on
+/// exist and still say the thing — [`check_docs`] reads this path like any
+/// other document.
+const FEATURE_TEMPLATE: &str = ".github/ISSUE_TEMPLATE/feature_request.md";
+const RULE_TEMPLATE: &str = ".github/ISSUE_TEMPLATE/interpretation_rule.md";
+
+/// Every document this module reads, in the order it reports on them.
+pub const DOCUMENTS: &[&str] = &[
+    README,
+    DESIGN_PAPER,
+    PLATFORM,
+    THREAT_MODEL,
+    SECURITY,
+    CONTRIBUTING,
+    CONDUCT,
+    FEATURE_TEMPLATE,
+    RULE_TEMPLATE,
+];
 
 pub const CLAIMS: &[Claim] = &[
     // --- AC-7.16: the limitations section -------------------------------
@@ -395,6 +422,240 @@ pub const CLAIMS: &[Claim] = &[
                   reader is most likely to assume the opposite of, given the words \
                   'agent-native' on the first line of the README.",
     },
+    // --- AC-7.22: evasion and anonymization as explicit non-goals ---------
+    //
+    // The code already commits to this: `USER_AGENT` in `probes/http.rs` and
+    // `EHLO bathy.invalid` in `probes/smtp.rs` are there so a scanned party
+    // can attribute the traffic, and `probes/http.rs`'s own comment points at
+    // this file for the reason. A policy that did not match them would be the
+    // README-versus-code divergence this project has three recorded instances
+    // of, one document further out.
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.22",
+        requirement: "evasion and anonymization are named as non-goals, in a section of their own",
+        pattern: r"(?i)#+ Non-goals: evasion and anonymization",
+        because: "A non-goal mentioned in passing is a non-goal a feature request argues with. \
+                  This one is a heading, so it can be linked to and closed against -- which is \
+                  exactly what `.github/ISSUE_TEMPLATE/config.yml` does with it.",
+    },
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.22",
+        requirement: "the non-goal is stated as permanent AND as grounds for declining requests",
+        pattern: r"(?i)permanent non-goals of this project\. Feature requests for them will be declined",
+        because: "AC-7.22 has two halves and the second is the one that does work. 'Not planned' \
+                  reads as a backlog item; 'will be declined' is a decision, and it is the \
+                  sentence a maintainer can point at without re-litigating it every time.",
+    },
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.22",
+        requirement: "the identifying User-Agent and EHLO are described as mechanisms, matching \
+                      what the probes actually send",
+        pattern: r"(?i)User-Agent: bathy/<version>.{0,400}EHLO bathy\.invalid",
+        because: "This project ships an identifying User-Agent and `EHLO bathy.invalid` ON \
+                  PURPOSE, and `probes/http.rs` cites this file as the reason. If the policy \
+                  stopped naming them, the code's justification would point at a document that \
+                  no longer makes it -- the same stale-forward-reference defect this task found \
+                  in the threat model's own Section 5.",
+    },
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.22",
+        requirement: "the adjacent things NOT covered by the non-goal are listed",
+        pattern: r"(?i)Adjacent things that are \*not\* covered by this non-goal",
+        because: "A rule that swallows its neighbouring cases is a rule people route around. \
+                  Rate limiting, a smaller port set and disabling service identification are all \
+                  supported, and a reader who cannot tell them apart from evasion will either \
+                  ask for them apologetically or assume they are gone.",
+    },
+    // --- AC-7.24: the disclosure contact and the response time ------------
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.24",
+        requirement: "a disclosure channel is published",
+        pattern: r"(?i)Report privately through GitHub Security Advisories",
+        because: "AC-7.24's first half. A security policy with no channel is a security policy \
+                  that routes vulnerabilities into public issues.",
+    },
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.24",
+        requirement: "a fallback exists for when private reporting is unavailable",
+        pattern: r"(?i)security report, please open a private advisory",
+        because: "Private vulnerability reporting can be switched off, and a fork does not \
+                  inherit it. A single-channel policy whose channel is missing is worse than \
+                  none, because the reporter concludes there is nowhere to go.",
+    },
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.24",
+        requirement: "an acknowledgement window is committed to, in a number of days",
+        pattern: r"(?i)Acknowledgement that the report was received and read \| \*\*3 business days\*\*",
+        because: "AC-7.24's second half is a response-time EXPECTATION, which means a number. \
+                  'We aim to respond promptly' is not one, and a reporter who has heard nothing \
+                  cannot tell whether to bump it or give up.",
+    },
+    Claim {
+        path: SECURITY,
+        criterion: "AC-7.24",
+        requirement: "the authorized-use statement is present, in as many words",
+        pattern: r"(?i)\*\*bathy is for scanning networks you are authorized to scan\.\*\*",
+        because: "The overview's Pre-Publication Gates require `SECURITY.md` to carry an \
+                  explicit authorized-use statement, not only a disclosure path. \
+                  `publish-check` asserts the same sentence independently, because a \
+                  publication gate must not depend on someone having remembered to run \
+                  `check-docs` first.",
+    },
+    // --- AC-7.23: the clean-room rule, stated for contributors ------------
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "the clean-room rule is stated as an instruction to contributors, naming \
+                      the artefact kinds",
+        pattern: r"(?i)\*\*Do not submit code, probe strings, fingerprint data, port lists, or interpretation rules derived from Nmap",
+        because: "AC-7.23 is the rule stated FOR CONTRIBUTORS. The design paper's attestation is \
+                  about what this project did; this is about what an incoming pull request may \
+                  contain, and they are different sentences with different audiences.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "the rule extends beyond Nmap to any incompatibly licensed project",
+        pattern: r"(?i)any other project whose licence is incompatible with Apache-2\.0 OR MIT",
+        because: "The Global Constraint is about licence compatibility, not about one project. A \
+                  rule naming only Nmap invites a contributor to derive from the next scanner \
+                  along and be technically compliant.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "deriving from another tool's OUTPUT is named as derivation",
+        pattern: r"(?i)Do not tune a rule from another scanner's output",
+        because: "This is the hole a copy-nothing rule leaves open, and it is the one a \
+                  well-intentioned contributor falls into: no file is copied, and the \
+                  fingerprint is still derived. Naming it is what makes the boundary usable.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "a source is required for every new interpretation rule",
+        pattern: r"(?i)#+ [\d. ]*Every interpretation rule cites a source, and the citation must be checkable",
+        because: "AC-7.23's second half. The registry's `source` field and \
+                  `every_rule_documents_its_non_nmap_source` already force a citation to EXIST; \
+                  nothing in the tree can force it to be true, so the policy has to.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "the citation is required to be checkable against a named artefact -- RFC \
+                      section, vendor section, or a committed capture",
+        pattern: r"(?i)One of exactly three kinds of source, and nothing else",
+        because: "This repository shipped TWO fabricated RFC quotations and a citation to a \
+                  PostgreSQL section that does not exist. In each case a citation was present. \
+                  'Cite something' was therefore not a strong enough rule, and what closes the \
+                  gap is saying what the citation must be checkable AGAINST: a section number \
+                  that exists, verbatim text a reviewer can search for, or bytes committed to \
+                  `testdata/captures/`.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "quotations are required to be verbatim, and the reviewer's check is \
+                      described",
+        pattern: r"(?i)the quotation must be \*\*verbatim\*\* from that section",
+        because: "The specific failure was a plausible paraphrase inside quotation marks, twice. \
+                  Requiring verbatim text is what makes the reviewer's check mechanical: open \
+                  the section, search for the string, and reject if it is absent.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.23",
+        requirement: "a wrong citation withdraws the rule rather than editing the comment",
+        pattern: r"(?i)a rule justified by a citation that was wrong was never justified",
+        because: "Without this, the remedy for a fabricated citation is to reword the comment, \
+                  which leaves the rule in the tree with no derivation at all. That is the \
+                  outcome the two historical fabrications actually produced until they were \
+                  swept.",
+    },
+    Claim {
+        path: CONTRIBUTING,
+        criterion: "AC-7.17",
+        requirement: "the positioning rule binds contributors too",
+        pattern: r"(?i)#+ [\d. ]*Compare tools, never people",
+        because: "AC-7.17 is enforced over the tree by `check-phrases`, which catches a name \
+                  after it is written. This is the sentence that tells a contributor before \
+                  they write it, and it is the one that covers issues and pull requests, which \
+                  no checker can see.",
+    },
+    // --- the code of conduct (plan Task 5 Step 3; no numbered criterion) ---
+    Claim {
+        path: CONDUCT,
+        criterion: "Task 5 Step 3",
+        requirement: "a reporting route that does not require writing the details in public",
+        pattern: r"(?i)conduct report, please contact me privately",
+        because: "A code of conduct whose only channel is a public issue asks a reporter to \
+                  describe what happened to them in front of everyone. The specific words are \
+                  pinned because the instruction is 'post exactly this and nothing else', and a \
+                  reworded version is a different instruction.",
+    },
+    Claim {
+        path: CONDUCT,
+        criterion: "Task 5 Step 3",
+        requirement: "the scanner-specific rule about a third party's hosts",
+        pattern: r"(?i)do not post scan results identifying a third party's hosts",
+        because: "This is the one clause a generic code of conduct does not have and this \
+                  project needs: issues are public, and a pasted scan result is somebody else's \
+                  network on a public page.",
+    },
+    Claim {
+        path: CONDUCT,
+        criterion: "Task 5 Step 3",
+        requirement: "the adaptation is declared rather than passed off as the original text",
+        pattern: r"(?i)It is an adaptation and not a copy",
+        because: "The Contributor Covenant is CC BY 4.0 and this document is a rewrite, not a \
+                  copy. A project whose CONTRIBUTING.md rejects paraphrase-inside-quotation-marks \
+                  cannot present its own paraphrase as somebody else's text.",
+    },
+    // --- the issue templates (AC-7.22's operational half) ------------------
+    Claim {
+        path: FEATURE_TEMPLATE,
+        criterion: "AC-7.22",
+        requirement: "the feature template declines evasion and anonymization up front",
+        pattern: r"(?i)Detection evasion and anonymization\.",
+        because: "AC-7.22 says requests for them will be declined. The place that is cheapest to \
+                  honour is before the request is written, and the template is the only document \
+                  a requester is guaranteed to see.",
+    },
+    Claim {
+        path: FEATURE_TEMPLATE,
+        criterion: "AC-7.22",
+        requirement: "the template also says what is NOT covered by the non-goal",
+        pattern: r"(?i)rate limiting, connect timeouts, concurrency ceilings, smaller port sets, and disabling service identification entirely are all supported",
+        because: "Same reason as `SECURITY.md`'s list, one step earlier: a requester who cannot \
+                  tell rate limiting apart from evasion will not ask for it.",
+    },
+    Claim {
+        path: RULE_TEMPLATE,
+        criterion: "AC-7.23",
+        requirement: "the rule template demands the citation, verbatim, with the reviewer's check \
+                      stated",
+        pattern: r"(?i)a reviewer will open your citation and\s+search for your string",
+        because: "AC-7.23's requirement has to reach the point where a rule is proposed. The \
+                  template is where a contributor decides how much care the citation needs, and \
+                  telling them exactly what will be done with it is what makes the answer 'a \
+                  lot'.",
+    },
+    Claim {
+        path: RULE_TEMPLATE,
+        criterion: "AC-7.23",
+        requirement: "a clean-room confirmation is required on the form",
+        pattern: r"(?i)and not from Nmap,\s+`nmap-service-probes`",
+        because: "A checkbox is not a licence audit and this does not pretend to be one. It is \
+                  the point at which a contributor who HAS looked at those files has to notice \
+                  that they have, which is the only realistic control available here.",
+    },
 ];
 
 /// Every claim that is missing, as a message that names the criterion, the
@@ -576,7 +837,7 @@ pub fn check_docs() -> Fallible<()> {
     let root = Path::new(".");
     let mut documents: Vec<(&str, String)> = Vec::new();
     let mut missing = Vec::new();
-    for path in [README, DESIGN_PAPER, PLATFORM, THREAT_MODEL] {
+    for path in DOCUMENTS.iter().copied() {
         match std::fs::read_to_string(root.join(path)) {
             Ok(text) => documents.push((path, text)),
             Err(e) => missing.push(format!("{path}: {e}")),
@@ -631,11 +892,82 @@ pub fn check_docs() -> Fallible<()> {
 //     `check-phrases` catches a named individual and a forbidden phrase. It
 //     cannot catch a paragraph that is technically compliant and still reads
 //     as a swipe at another project.
+//   - **Whether the disclosure channel actually works.** AC-7.24 is discharged
+//     here by the presence of a channel and a number of days. Whether GitHub's
+//     private vulnerability reporting is switched on for the repository, and
+//     whether anyone is watching it, is a setting on a website and a promise
+//     about a human being. `publish-check` prints both in its manual-gate
+//     block for exactly that reason.
+//   - **Whether the response times are met.** A committed acknowledgement
+//     window is a claim about the future, and no checker reads the future. It
+//     is here because an uncheckable commitment that someone can hold this
+//     project to is worth more than a checkable evasion.
+//   - **Whether a contributor's citation is true.** CONTRIBUTING.md's rule is
+//     that an RFC section must exist and a quotation must be verbatim. Nothing
+//     in this repository opens an RFC. The two fabricated quotations this
+//     project has shipped were both found by a person reading the source
+//     document, and that is still the only thing that finds them --  which is
+//     why the rule is written as an instruction to the *reviewer* ("open the
+//     link and search for the string") rather than as a property of the tree.
+//   - **The `.github/ISSUE_TEMPLATE/` directory beyond the two templates named
+//     above.** `bug_report.md` and `config.yml` carry no acceptance criterion,
+//     so nothing here pins their contents; a deleted `config.yml` would
+//     silently re-enable blank issues and no check would notice.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A claim over a document [`check_docs`] never reads is a claim that can
+    /// never fire, and it looks exactly like one that passes.
+    ///
+    /// This is the defect `readme.rs`'s `ABSENCE_CLAIMS` shipped in another
+    /// shape: a register entry whose falsifier was a path that could not
+    /// exist, so the check stayed green through three tasks that made the
+    /// claim false. Here the same mistake is one typo away -- a `Claim` naming
+    /// `docs/SECURITY.md` (which is where the overview's File Structure puts
+    /// it, and it is not where it lives) would be reported as "was not read at
+    /// all" rather than silently, but only because `violations` says so; this
+    /// test is what makes the register itself well-formed.
+    #[test]
+    fn every_claim_names_a_document_that_check_docs_actually_reads() {
+        for claim in CLAIMS {
+            assert!(
+                DOCUMENTS.contains(&claim.path),
+                "{} names `{}`, which is not in DOCUMENTS, so check_docs never reads it",
+                claim.criterion,
+                claim.path,
+            );
+        }
+        // And the other direction: a document read but never claimed against
+        // is a file this module pretends to cover. Not fatal -- but it must be
+        // deliberate, so it is asserted rather than left to drift.
+        for path in DOCUMENTS {
+            assert!(
+                CLAIMS.iter().any(|c| c.path == *path),
+                "`{path}` is read by check_docs and no claim covers it",
+            );
+        }
+    }
+
+    /// Every document in the register exists in the tree under exactly the
+    /// path the register spells.
+    ///
+    /// `check_docs` reports a missing file, so this is not the only guard --
+    /// but it fails in one second with the path, rather than in the middle of
+    /// a gate run, and it is the test that catches `SECURITY.md` versus
+    /// `docs/SECURITY.md` before a reviewer does.
+    #[test]
+    fn every_registered_document_exists_at_that_exact_path() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for path in DOCUMENTS {
+            assert!(
+                root.join(path).is_file(),
+                "DOCUMENTS names `{path}`, which is not a file in the repository",
+            );
+        }
+    }
 
     /// The repository's own documents must satisfy every claim. This is the
     /// test that ties `CLAIMS` to the tree rather than to a fixture, and the
@@ -643,8 +975,9 @@ mod tests {
     #[test]
     fn the_repositorys_own_documents_meet_every_claim() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let documents: Vec<(&str, String)> = [README, DESIGN_PAPER, PLATFORM, THREAT_MODEL]
-            .into_iter()
+        let documents: Vec<(&str, String)> = DOCUMENTS
+            .iter()
+            .copied()
             .map(|p| {
                 (
                     p,
@@ -678,8 +1011,9 @@ mod tests {
     /// like a passing one.
     #[test]
     fn no_claim_is_satisfied_by_an_empty_document() {
-        let documents: Vec<(&str, String)> = [README, DESIGN_PAPER, PLATFORM, THREAT_MODEL]
-            .into_iter()
+        let documents: Vec<(&str, String)> = DOCUMENTS
+            .iter()
+            .copied()
             .map(|p| (p, String::new()))
             .collect();
         let found = violations(&documents);
@@ -701,8 +1035,9 @@ mod tests {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         // Read and flatten once. Both are pure, and doing them inside the
         // loop made this test read the same four files 116 times.
-        let originals: Vec<(&str, String)> = [README, DESIGN_PAPER, PLATFORM, THREAT_MODEL]
-            .into_iter()
+        let originals: Vec<(&str, String)> = DOCUMENTS
+            .iter()
+            .copied()
             .map(|p| {
                 (
                     p,

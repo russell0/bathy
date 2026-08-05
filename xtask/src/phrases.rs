@@ -210,7 +210,7 @@ pub const RULES: &[Rule] = &[
     },
     Rule {
         id: "compare-tools-not-people",
-        headline: "a named individual in README.md or docs/ (AC-7.17)",
+        headline: "a named individual in README.md, docs/, or a policy document (AC-7.17)",
         // M7 Task 4's binding positioning rule: this project compares itself
         // to *tools*, publishes measurements, and never argues against a
         // person. The argument "here is an interface designed for a different
@@ -246,7 +246,29 @@ pub const RULES: &[Rule] = &[
         // name is not a secret, and the concern here is positioning rather
         // than disclosure.
         pattern: r"(?i)\bf[y]odor\b|\bgordon[ ]lyon\b",
-        roots: &["docs", "README.md"],
+        // M7 Task 5 widened this from `docs/` + `README.md`. The policy
+        // documents are where positioning prose is *most* likely to slip:
+        // `SECURITY.md` has to explain why evasion is a non-goal without
+        // implying that people who build evasive tools are doing something
+        // wrong, `CONTRIBUTING.md` has to explain a licence boundary without
+        // making it a complaint about whoever chose that licence, and the
+        // issue templates decline requests, which is the single most tempting
+        // place to editorialise. A rule that covered the documents a stranger
+        // reads and not the documents a contributor is told to obey would have
+        // covered the wrong half.
+        //
+        // `.github/ISSUE_TEMPLATE` is the directory rather than the two files
+        // a criterion names, so a template added later is covered without
+        // anyone remembering to add it here -- the drift a second hand-kept
+        // list guarantees.
+        roots: &[
+            "docs",
+            "README.md",
+            "SECURITY.md",
+            "CONTRIBUTING.md",
+            "CODE_OF_CONDUCT.md",
+            ".github/ISSUE_TEMPLATE",
+        ],
         extensions: None,
         exempt_path_prefixes: &[],
         exemption_rationale: "None. Compare tools, never people, and never claim another project \
@@ -457,8 +479,50 @@ pub fn scan(root: &Path) -> Fallible<(Vec<Violation>, usize)> {
     Ok((violations, scanned))
 }
 
+/// Every declared root that is neither a directory nor a file under `root`.
+///
+/// [`scan`] skips a root it cannot find, which is right for the scratch trees
+/// the tests build (a fixture exercising one rule should not have to
+/// materialise `crates/` to do it) and wrong for the repository, where a root
+/// that has moved is coverage that has silently gone away.
+///
+/// Found by falsifying the widened `compare-tools-not-people` rule in M7 Task
+/// 5: with `SECURITY.md` deleted, `check-phrases` printed
+/// `ok (5 rules, 684 file reads, 0 violations)`. That is the sixth instance in
+/// this repository of a check that covers less than it says it does, and with
+/// six roots on one rule a typo in any of them is the same silent hole. So the
+/// repository-facing entry point asserts the roots exist, and the pure walk
+/// stays permissive.
+pub fn missing_roots(root: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    for rule in RULES {
+        for r in rule.roots {
+            let at = root.join(r);
+            if !at.is_dir() && !at.is_file() {
+                out.push(format!(
+                    "rule `{}` declares the root `{r}`, which is neither a directory nor a \
+                     file under {}. A root that does not exist scans nothing and reports \
+                     success. Either the path moved -- fix it -- or the document is gone, in \
+                     which case the rule no longer covers what its headline claims: {}",
+                    rule.id,
+                    root.display(),
+                    rule.headline,
+                ));
+            }
+        }
+    }
+    out
+}
+
 pub fn check_phrases() -> Fallible<()> {
     let root = Path::new(".");
+    let absent = missing_roots(root);
+    if !absent.is_empty() {
+        for a in &absent {
+            eprintln!("check-phrases: {a}");
+        }
+        return Err(format!("{} declared root(s) do not exist", absent.len()).into());
+    }
     let (violations, scanned) = scan(root)?;
     if violations.is_empty() {
         println!(
@@ -924,6 +988,37 @@ mod tests {
             paths,
             ["README.md", "docs/positioning.md"],
             "both roots must be read: the directory and the plain file"
+        );
+    }
+
+    /// Every root every rule declares exists in this repository right now.
+    ///
+    /// The falsifier, and the reason this test is not decoration: deleting
+    /// `SECURITY.md` and re-running `check-phrases` before this landed printed
+    /// `ok (5 rules, 684 file reads, 0 violations)`.
+    #[test]
+    fn every_declared_root_exists_in_this_repository() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let absent = missing_roots(&root);
+        assert!(absent.is_empty(), "{}", absent.join("\n"));
+    }
+
+    #[test]
+    fn a_root_that_does_not_exist_is_reported_with_its_rule() {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let absent = missing_roots(scratch.path());
+        // An empty tree is missing every root, so the check must find at
+        // least one per rule and must name the rule that loses coverage.
+        assert!(
+            absent.len() >= RULES.len(),
+            "an empty tree is missing every declared root; only {} were reported",
+            absent.len()
+        );
+        assert!(
+            absent
+                .iter()
+                .any(|a| a.contains("compare-tools-not-people") && a.contains("SECURITY.md")),
+            "the report must name both the rule and the root that is gone: {absent:#?}"
         );
     }
 

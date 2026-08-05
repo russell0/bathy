@@ -438,9 +438,9 @@ oversight. The HTTP probe sends
 probe identifies itself as `bathy.invalid`. An operator who receives this traffic
 can tell what it is and who to contact. There is no anonymous mode, no evasive
 mode, and no flag to remove the identification. Detection evasion and
-anonymization are permanent non-goals — see
-[`docs/threat-model.md`](docs/threat-model.md) before opening a feature request
-for either.
+anonymization are permanent non-goals — [`SECURITY.md`](SECURITY.md) states
+that, says what it covers and what it deliberately does not, and is what a
+feature request for either will be closed against.
 
 Service identification can be disabled entirely
 (`service_detection.enabled = false`), in which case only the bare connect probe
@@ -514,6 +514,14 @@ elsewhere. Port presets are IANA-derived heuristics, not prevalence measurements
 
 ## Documents
 
+- [`SECURITY.md`](SECURITY.md) — how to report a vulnerability and what to
+  expect back, the safety mechanisms and where they live in the code, and the
+  permanent non-goals.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — the clean-room rule, what a citation
+  for a new interpretation rule has to be checkable against, and every gate in
+  its local form.
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — including the rule specific to a
+  scanner: do not post a third party's hosts in a public issue.
 - [`docs/design-paper.md`](docs/design-paper.md) — why this exists, how it is
   built, what it measured, and where it falls short.
 - [`docs/threat-model.md`](docs/threat-model.md) — what bathy defends against,
@@ -535,8 +543,11 @@ elsewhere. Port presets are IANA-derived heuristics, not prevalence measurements
 No Nmap source, probe file, or fingerprint database is consulted, copied, or derived
 from in this project. Interpretation rules are authored from protocol RFCs, vendor
 documentation, or captures from software run in this project's own test lab, and each
-rule records its source. Contributions must follow the same rule. The full
-attestation, including the one place Nmap is legitimately run, is in
+rule records its source. Contributions must follow the same rule, and
+[`CONTRIBUTING.md`](CONTRIBUTING.md) states what a citation has to be checkable
+against — this project found two fabricated RFC quotations in its own history,
+so "cite something" was not a strong enough rule. The full attestation,
+including the one place Nmap is legitimately run, is in
 [`docs/design-paper.md`](docs/design-paper.md).
 
 ## License

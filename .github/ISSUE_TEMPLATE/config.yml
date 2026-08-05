@@ -1,0 +1,22 @@
+# Blank issues are disabled so that every report arrives with the fields a
+# maintainer would otherwise have to ask for -- and, for the security case, so
+# that a vulnerability does not arrive as a public issue by default.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/russell0/bathy/security/advisories/new
+    about: >-
+      Do not open a public issue for a vulnerability. Report it privately
+      through GitHub Security Advisories. Response-time expectations and what
+      counts as in scope are in SECURITY.md.
+  - name: Evasion, anonymization, or stealth features
+    url: https://github.com/russell0/bathy/blob/main/SECURITY.md#non-goals-evasion-and-anonymization
+    about: >-
+      These are permanent non-goals and requests for them are declined. The
+      reasoning, and the adjacent things that are NOT covered by the non-goal
+      (rate limiting, smaller port sets, disabling service identification), are
+      in SECURITY.md. Read that first.
+  - name: Code of conduct concern
+    url: https://github.com/russell0/bathy/blob/main/CODE_OF_CONDUCT.md#reporting
+    about: >-
+      How to report privately, without writing the details in a public issue.
