@@ -483,6 +483,15 @@ days while every local command was green:
   fixtures depended on the kernel handing out ephemeral ports in ascending
   order, which macOS does and Linux does not.
 
+  **It is not hermetic, and it says so on every run.** The container's
+  `CARGO_TARGET_DIR`, `CARGO_HOME` and `HOME` all live under `target/` and are
+  reused between runs, because a cold Linux rebuild of the whole dependency
+  graph takes minutes and a gate that costs minutes is a gate people stop
+  running. The cost is that a result can be about what the last run left
+  behind: a `target/linux-gate` from a *mutation* build made one run fail and
+  the rerun pass, over an identical tree. Every run now prints whether it is
+  reusing that state, and `linux-gate --fresh` clears it first.
+
 ## Planned scope for v0.1
 
 IPv4 TCP connect scanning, optional privileged SYN and ICMP, host discovery, top-port

@@ -300,7 +300,25 @@ pub fn docker_argv(image: &str, repo_root: &str, uid: u32, gid: u32, script: &st
     ]
 }
 
-pub fn linux_gate() -> Fallible<()> {
+/// The three directories the container writes into, all under `target/` and
+/// all reused between runs.
+///
+/// They are why `linux-gate` is **not hermetic**, and naming them here is what
+/// lets [`linux_gate`] say so on every run and clear them on request. The M7
+/// panic-lint round hit the consequence directly: a `target/linux-gate` left
+/// behind by a *mutation* build made a run fail, and the same tree passed on
+/// the rerun that reused the now-repopulated directory. A gate whose result
+/// depends on what the last run left behind reports on two things at once,
+/// and only one of them is the working tree.
+///
+/// Reuse is still the default, and deliberately: a cold run is a full Linux
+/// rebuild of the workspace and its dependency graph, which is minutes, and a
+/// gate that costs minutes is a gate people stop running — the failure this
+/// repository has measured more than once. So the cost stays low and the state
+/// stops being invisible.
+pub const LINUX_GATE_DIRS: &[&str] = &["linux-gate", "linux-gate-cargo", "linux-gate-home"];
+
+pub fn linux_gate(fresh: bool) -> Fallible<()> {
     let ci = std::fs::read_to_string(Path::new(".").join(CI_PATH))
         .map_err(|e| format!("reading {CI_PATH}: {e}"))?;
     let steps = job_run_steps(&ci, LINUX_GATE_JOB);
@@ -320,9 +338,36 @@ pub fn linux_gate() -> Fallible<()> {
     let gid: u32 = capture("id", &["-g"])?.parse()?;
     // Created here, on the host, so they exist owned by `uid:gid` before a
     // container that cannot create them (no root) tries to write into them.
-    for dir in ["linux-gate", "linux-gate-cargo", "linux-gate-home"] {
-        std::fs::create_dir_all(Path::new(&repo_root).join("target").join(dir))
-            .map_err(|e| format!("creating target/{dir}: {e}"))?;
+    let mut reused = Vec::new();
+    for dir in LINUX_GATE_DIRS {
+        let path = Path::new(&repo_root).join("target").join(dir);
+        if fresh && path.exists() {
+            std::fs::remove_dir_all(&path).map_err(|e| format!("clearing target/{dir}: {e}"))?;
+        } else if path.exists() {
+            reused.push(*dir);
+        }
+        std::fs::create_dir_all(&path).map_err(|e| format!("creating target/{dir}: {e}"))?;
+    }
+    // Said on every run, pass or fail. See [`LINUX_GATE_DIRS`]: this gate is
+    // not hermetic, and a green result over reused state is a weaker statement
+    // than a green result over a cold one.
+    if reused.is_empty() {
+        eprintln!(
+            "linux-gate: cold — nothing under target/ to reuse, so this result is over \
+             this working tree and nothing else"
+        );
+    } else {
+        eprintln!(
+            "linux-gate: NOT HERMETIC — reusing {} from a previous run. A result that \
+             disagrees with the last one may be about that state rather than about the \
+             tree; `cargo run -p xtask -- linux-gate --fresh` clears it (minutes, not \
+             seconds).",
+            reused
+                .iter()
+                .map(|d| format!("target/{d}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
 
     let script = steps.join("\n");

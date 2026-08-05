@@ -39,8 +39,11 @@ trying to hang, exhaust, or exploit the scanner.
 - **No panics in parsing paths, held by the compiler.** Every function that
   consumes network bytes returns `Result`, and `clippy::unwrap_used`,
   `expect_used`, `indexing_slicing`, `panic` and `arithmetic_side_effects` are
-  at **deny** level in `bathy-probe`, `bathy-interpret` and `bathy-scope` —
-  in each crate's `lib.rs`, scoped `cfg_attr(not(test), ...)` so unit tests
+  at **deny** level in `bathy-probe`, `bathy-interpret`, `bathy-scope`,
+  `bathy-types`, `bathy-evidence` and `bathy-query` — every crate
+  `gates::FUZZ_SURFACES` registers as an untrusted-input surface, and
+  `check-panics` fails if a registered surface names a crate outside that set.
+  In each crate's `lib.rs`, scoped `cfg_attr(not(test), ...)` so unit tests
   keep `unwrap()`. `cargo run -p xtask -- check-panics` holds the tree, the
   exceptions and the Global Constraint's own wording to each other, and is a
   CI step.
@@ -66,15 +69,39 @@ trying to hang, exhaust, or exploit the scanner.
   true. A crate-level `#![allow]` is refused by `check-panics` outright,
   because it would reproduce exactly the defect described above.
 
-  **What is still outside this guarantee**, stated for the same reason the hole
-  above was: `bathy-types` (37 measured hits — `canonical_json`/`plan_digest`
-  and `clock.rs`'s RFC 3339 handling), `bathy-evidence` (14 — the event-log
-  reader, over JSONL that may have been written by an older build, a crashed
-  one, or a hand editor) and `bathy-query` (8 — `fold_events` over the same
-  logs). All three are registered untrusted-input surfaces with fuzz targets;
-  none of them yet has the lint. They are registered with their counts in
-  `gates::PANIC_LINT_UNCOVERED` and as the `panic-lint-widening` deferral, so
-  the gap expires against a checker rather than against memory.
+  **The three crates that were outside it, and now are not.** `bathy-types`
+  (37 measured hits — `canonical_json`/`plan_digest` and `clock.rs`'s RFC 3339
+  handling), `bathy-evidence` (15 — the event-log reader, over JSONL that may
+  have been written by an older build, a crashed one, or a hand editor) and
+  `bathy-query` (7 — `fold_events` over the same logs) were registered with
+  their counts in `gates::PANIC_LINT_UNCOVERED` and as the
+  `panic-lint-widening` deferral rather than claimed. All 59 are fixed and all
+  three carry the lint; the deferral reported itself stale and was deleted, and
+  the rule it was an instance of is now checked over `FUZZ_SURFACES` directly.
+
+  The one this round was looking for was in `bathy-evidence`'s tail read:
+  `read_records_from` bounds-checked a caller-supplied cursor against
+  `last_sequence` and then indexed `offsets` with it — two different values,
+  related by an invariant no function established. The cursor arrives from
+  outside the process (`bathy scan events --after-sequence <n>`, and the
+  `scan.events` MCP tool). **It was not reachable**: `scan_records` pushes an
+  offset and advances the expected sequence in the same branch, so the two
+  counts could not diverge for any byte sequence a log file can hold — checked
+  by execution over every log buildable from nine adversarial line shapes,
+  against the pre-fix code, in
+  `no_log_file_and_no_cursor_can_put_a_tail_read_out_of_bounds`. The same sweep
+  with the invariant broken by one panics with `index out of bounds: the len is
+  3 but the index is 3` on a cursor of `3`, which is what a remotely-triggerable
+  denial of service in the MCP server would have looked like. The two values are
+  now one `RecordIndex`, so the check and the lookup are the same operation.
+
+  **What the lint does not cover.** `clippy::indexing_slicing` does not see
+  `str` indexing or a third-party `Index` impl, and `clippy::panic` does not see
+  `assert!` or `unreachable!`. A hand sweep of the newly-covered crates found
+  five such panics — `clock.rs`'s two `s[i..i + n]` sites behind `expect`s,
+  `ids.rs`'s `&hex[i * 2..i * 2 + 2]`, `store.rs`'s `hex[0..2]`/`hex[2..4]`
+  behind a `.expect("digest renders with prefix")`, and `canonical.rs`'s
+  `map[*k]` on a `serde_json::Map`. All are fixed; none would have gone red.
 - **Every parser of untrusted bytes is fuzzed.** Interpretation, event-log
   parsing, canonical JSON and manifest loading each have a libFuzzer target,
   seeded from real recorded data rather than from random bytes, with counters

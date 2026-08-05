@@ -22,6 +22,16 @@ which runs `ci.yml`'s own `test` job steps — read out of `ci.yml` rather than
 restated — inside a Linux container over the working tree, as your own uid
 rather than as root. Run it before claiming a change works.
 
+It is **not hermetic**: the container's `CARGO_TARGET_DIR`, `CARGO_HOME` and
+`HOME` are three directories under `target/` that persist between runs, so a
+green result can be partly about what the previous run left there. That is a
+deliberate trade — a cold run rebuilds the workspace and its whole dependency
+graph on Linux, which is minutes — and it has bitten this project once already,
+when a `target/linux-gate` left by a mutation build failed a run that passed on
+rerun over the same tree. So the state is now announced on every run, and
+`cargo run -p xtask -- linux-gate --fresh` clears all three first. Prefer
+`--fresh` for a result you are going to put in a report.
+
 ## What differs on macOS
 
 **The integration lab is not reachable from the host.** Docker Desktop runs the

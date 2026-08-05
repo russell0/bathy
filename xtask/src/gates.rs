@@ -1890,6 +1890,19 @@ pub struct FuzzSurface {
     /// `packetd-ipc-fuzz-target` entry in `xtask`'s `DEFERRALS`, which is what
     /// makes the deferral expire on its own rather than by memory.
     pub deferred: Option<&'static str>,
+    /// The crates whose *production* code this surface's bytes reach, which
+    /// must therefore be inside the "No panics in parsing paths" constraint.
+    ///
+    /// This field is what replaced the `panic-lint-widening` deferral when it
+    /// was discharged. That deferral named three specific crates; when they
+    /// were covered it went stale and was deleted, and deleting it would have
+    /// left nothing stopping the *next* registered surface from being added
+    /// over a crate with no lint — which is the M1 defect ("a constraint
+    /// everyone believed and nothing enforced") with a new set of crate names.
+    /// [`panic_lint_violations`] now fails if any non-deferred surface names a
+    /// crate outside [`PANIC_LINT_CRATES`], so the two registries cannot drift
+    /// apart. Empty for a deferred surface: there is no code to lint yet.
+    pub lint_crates: &'static [&'static str],
 }
 
 pub const FUZZ_SURFACES: &[FuzzSurface] = &[
@@ -1897,23 +1910,27 @@ pub const FUZZ_SURFACES: &[FuzzSurface] = &[
         name: "interpret",
         parser: "bathy_interpret::interpret — the response side of every probe",
         deferred: None,
+        lint_crates: &["bathy-interpret"],
     },
     FuzzSurface {
         name: "event_log",
         parser: "bathy_evidence::EventLogReader + bathy_query::fold_events — JSONL \
                  written by an older build, a crashed one, or a hand editor",
         deferred: None,
+        lint_crates: &["bathy-evidence", "bathy-query"],
     },
     FuzzSurface {
         name: "canonical_json",
         parser: "bathy_types::canonical::{canonical_json, plan_digest} — every hash \
                  this project computes",
         deferred: None,
+        lint_crates: &["bathy-types"],
     },
     FuzzSurface {
         name: "manifest",
         parser: "bathy_scope::ScopeManifest::load + allows — the authorization boundary",
         deferred: None,
+        lint_crates: &["bathy-scope"],
     },
     FuzzSurface {
         name: "ipc",
@@ -1933,6 +1950,10 @@ pub const FUZZ_SURFACES: &[FuzzSurface] = &[
              lands without `fuzz/fuzz_targets/ipc.rs`, via the `packetd-ipc-fuzz-target` \
              deferral.",
         ),
+        // Deferred: the code these bytes would reach is not in the tree
+        // (`bathy-packetd`) or is not reachable from outside its crate
+        // (`classify`). Nothing to lint yet, so nothing to require.
+        lint_crates: &[],
     },
     FuzzSurface {
         name: "mcp_stdio",
@@ -1955,6 +1976,10 @@ pub const FUZZ_SURFACES: &[FuzzSurface] = &[
              day `classify` becomes reachable, and reports itself stale the day the \
              target lands.",
         ),
+        // Deferred: the code these bytes would reach is not in the tree
+        // (`bathy-packetd`) or is not reachable from outside its crate
+        // (`classify`). Nothing to lint yet, so nothing to require.
+        lint_crates: &[],
     },
 ];
 
@@ -2681,7 +2706,14 @@ pub const PANIC_LINTS: &[&str] = &[
 /// M7 verification round found the gap. This constant exists so that
 /// sentence can never again be true of the document and false of the code:
 /// [`panic_lint_violations`] fails both ways round.
-pub const PANIC_LINT_CRATES: &[&str] = &["bathy-probe", "bathy-interpret", "bathy-scope"];
+pub const PANIC_LINT_CRATES: &[&str] = &[
+    "bathy-probe",
+    "bathy-interpret",
+    "bathy-scope",
+    "bathy-types",
+    "bathy-evidence",
+    "bathy-query",
+];
 
 /// Where the attribute has to be, per crate.
 fn panic_lint_lib_rs(crate_name: &str) -> String {
@@ -2699,25 +2731,22 @@ fn panic_lint_lib_rs(crate_name: &str) -> String {
 /// [`PANIC_LINT_CRATES`] the same day. These three did not, and widening the
 /// *sentence* over them without doing the work would be the M1 defect
 /// committed a second time by the person fixing it.
-pub const PANIC_LINT_UNCOVERED: &[(&str, usize, &str)] = &[
-    (
-        "bathy-types",
-        37,
-        "canonical_json/plan_digest (every hash this project computes) and clock.rs's \
-         RFC 3339 handling; 31 of the 37 are in clock.rs alone",
-    ),
-    (
-        "bathy-evidence",
-        14,
-        "EventLogReader over JSONL written by an older build, a crashed one, or a hand \
-         editor — including an `offsets[after_sequence]` index and an `expected - 1`",
-    ),
-    (
-        "bathy-query",
-        8,
-        "fold_events over the same logs, plus diff.rs's counters",
-    ),
-];
+///
+/// **Empty since the M7 panic-lint widening.** The three entries that were
+/// here — `bathy-types` (37 measured hits), `bathy-evidence` (15) and
+/// `bathy-query` (7) — were fixed and moved into [`PANIC_LINT_CRATES`], which
+/// is what the `panic-lint-widening` deferral existed to force and what it
+/// reported as stale the moment they moved. The deferral is gone with them.
+///
+/// The constant stays because it is where the *next* measurement goes, and
+/// because both directions of [`panic_lint_violations`] read it: an entry
+/// naming a crate that has since been covered, or one that no longer exists,
+/// is reported. It is not standing in for coverage — `check-panics` prints
+/// "0 outstanding" explicitly, and
+/// [`every_untrusted_input_surface_is_inside_the_constraint`] is the check
+/// that actually holds the line now, over `FUZZ_SURFACES` rather than over a
+/// hand-written list of three crate names.
+pub const PANIC_LINT_UNCOVERED: &[(&str, usize, &str)] = &[];
 
 /// A site-level allow of a [`PANIC_LINTS`] lint must carry a `reason`.
 const PANIC_LINT_REASON_MARKER: &str = "reason =";
@@ -2887,9 +2916,39 @@ pub fn panic_lint_violations(root: &Path) -> Vec<String> {
         }
     }
 
-    // The deferral's other direction: a crate listed as outstanding that has
-    // quietly been covered is a registration checking nothing.
-    for (crate_name, _hits, _what) in PANIC_LINT_UNCOVERED {
+    found.extend(panic_lint_uncovered_staleness(root, PANIC_LINT_UNCOVERED));
+    found.extend(panic_lint_surface_violations(FUZZ_SURFACES));
+
+    // The deny attributes only bite if clippy actually compiles every target.
+    let ci_path = ".github/workflows/ci.yml";
+    match std::fs::read_to_string(root.join(ci_path)) {
+        Err(_) => found.push(format!("{ci_path} is unreadable")),
+        Ok(ci) => {
+            if !ci.contains(CLIPPY_ALL_TARGETS_STEP) {
+                found.push(format!(
+                    "{ci_path} no longer runs `{CLIPPY_ALL_TARGETS_STEP}`. Without \
+                     `--all-targets` the deny attributes still fire, but only over the \
+                     targets clippy happens to build — and this gate's whole claim is that \
+                     the lint runs where the other gates run."
+                ));
+            }
+        }
+    }
+
+    found
+}
+
+/// The other direction of [`PANIC_LINT_UNCOVERED`]: an entry naming a crate
+/// that has quietly been covered, or that no longer exists, is a registration
+/// checking nothing.
+///
+/// Takes the entries as an argument rather than reading the constant, so the
+/// tests can drive it with a real entry. `PANIC_LINT_UNCOVERED` is empty since
+/// the M7 widening, and a test that asserts over an empty list passes without
+/// running any of this.
+fn panic_lint_uncovered_staleness(root: &Path, entries: &[(&str, usize, &str)]) -> Vec<String> {
+    let mut found = Vec::new();
+    for (crate_name, _hits, _what) in entries {
         let rel = panic_lint_lib_rs(crate_name);
         let Ok(lib) = std::fs::read_to_string(root.join(&rel)) else {
             found.push(format!(
@@ -2911,23 +2970,50 @@ pub fn panic_lint_violations(root: &Path) -> Vec<String> {
             ));
         }
     }
+    found
+}
 
-    // The deny attributes only bite if clippy actually compiles every target.
-    let ci_path = ".github/workflows/ci.yml";
-    match std::fs::read_to_string(root.join(ci_path)) {
-        Err(_) => found.push(format!("{ci_path} is unreadable")),
-        Ok(ci) => {
-            if !ci.contains(CLIPPY_ALL_TARGETS_STEP) {
+/// Every registered untrusted-input surface must land inside the constraint.
+///
+/// This is what the discharged `panic-lint-widening` deferral turned into: the
+/// deferral tracked three crate names and went stale when they were covered,
+/// and this tracks the *rule* those three were an instance of, so registering
+/// a sixth fuzz surface over an unlinted crate fails here instead of being
+/// noticed by whoever reads `FUZZ_SURFACES` next.
+fn panic_lint_surface_violations(surfaces: &[FuzzSurface]) -> Vec<String> {
+    let mut found = Vec::new();
+    for surface in surfaces {
+        if surface.deferred.is_some() {
+            if !surface.lint_crates.is_empty() {
                 found.push(format!(
-                    "{ci_path} no longer runs `{CLIPPY_ALL_TARGETS_STEP}`. Without \
-                     `--all-targets` the deny attributes still fire, but only over the \
-                     targets clippy happens to build — and this gate's whole claim is that \
-                     the lint runs where the other gates run."
+                    "the `{}` fuzz surface is deferred but names lint crates ({}); a \
+                     surface whose code is not in the tree has nothing to lint, so either \
+                     the deferral is stale or the list is",
+                    surface.name,
+                    surface.lint_crates.join(", ")
+                ));
+            }
+            continue;
+        }
+        if surface.lint_crates.is_empty() {
+            found.push(format!(
+                "the `{}` fuzz surface is registered, not deferred, and names no crate in \
+                 `lint_crates` — so nothing checks that the code it feeds untrusted bytes \
+                 to is inside the \"No panics in parsing paths\" constraint",
+                surface.name
+            ));
+        }
+        for crate_name in surface.lint_crates {
+            if !PANIC_LINT_CRATES.contains(crate_name) {
+                found.push(format!(
+                    "the `{}` fuzz surface feeds untrusted bytes to `{crate_name}`, which is \
+                     not in `PANIC_LINT_CRATES`: a registered parser surface outside the \
+                     \"No panics in parsing paths\" constraint",
+                    surface.name
                 ));
             }
         }
     }
-
     found
 }
 
@@ -2953,49 +3039,29 @@ fn allow_attribute_block(text: &str, start: usize) -> String {
     block
 }
 
-/// The condition for the `panic-lint-widening` entry in `xtask`'s
-/// `DEFERRALS`: the three measured-but-uncovered crates, checked in both
-/// directions by [`panic_lint_violations`].
-pub fn panic_lint_widening_deferral_violations(root: &Path) -> Vec<String> {
-    if PANIC_LINT_UNCOVERED.is_empty() {
-        return vec![
-            "`PANIC_LINT_UNCOVERED` is empty, so every untrusted-input crate is covered and \
-             this deferral is checking nothing: delete its entry from DEFERRALS"
-                .to_string(),
-        ];
-    }
-    panic_lint_violations(root)
-        .into_iter()
-        .filter(|v| v.contains("PANIC_LINT_UNCOVERED"))
-        .collect()
-}
-
 pub fn check_panics() -> Fallible<()> {
     let root = Path::new(".");
     let violations = panic_lint_violations(root);
     if violations.is_empty() {
         let outstanding: usize = PANIC_LINT_UNCOVERED.iter().map(|(_, hits, _)| hits).sum();
         println!(
-            "check-panics: ok ({} lint(s) denied in {} crate(s): {}; every exception is \
-             site-level and carries a reason; the overview's constraint names exactly \
-             those crates)",
+            "check-panics: ok ({} lint(s) denied in {} crate(s): {}; every registered \
+             untrusted-input surface is inside that set; every exception is site-level and \
+             carries a reason; the overview's constraint names exactly those crates)",
             PANIC_LINTS.len(),
             PANIC_LINT_CRATES.len(),
             PANIC_LINT_CRATES.join(" "),
         );
         println!(
-            "check-panics: WHAT THIS DOES NOT SEE — {} measured hit(s) across {} \
-             untrusted-input crate(s) still outside the constraint ({}), registered as the \
-             `panic-lint-widening` deferral. It also cannot see whether a `reason` string is \
-             *true*: that a panic is unreachable is an argument, and this gate only checks \
-             that someone made one.",
-            outstanding,
+            "check-panics: WHAT THIS DOES NOT SEE — {outstanding} measured hit(s) across {} \
+             untrusted-input crate(s) still outside the constraint. `clippy::indexing_slicing` \
+             does not see *str* indexing (`&s[i..j]`) or a third-party `Index` impl such as \
+             `serde_json::Map`'s, and `clippy::panic` does not see `assert!` or \
+             `unreachable!` — five panics of this class were found in these crates by hand, \
+             not by the lint. It also cannot see whether a `reason` string is *true*: that a \
+             panic is unreachable is an argument, and this gate only checks that someone \
+             made one.",
             PANIC_LINT_UNCOVERED.len(),
-            PANIC_LINT_UNCOVERED
-                .iter()
-                .map(|(name, hits, _)| format!("{name}: {hits}"))
-                .collect::<Vec<_>>()
-                .join(", "),
         );
         Ok(())
     } else {
@@ -3239,23 +3305,85 @@ mod tests {
     }
 
     #[test]
-    fn a_deferred_crate_that_has_quietly_been_covered_is_reported_stale() {
-        // The registration's second direction, which is why these are not
-        // `assert!`s: a deferral that has stopped applying reads as coverage.
+    fn a_crate_registered_as_uncovered_that_has_quietly_been_covered_is_reported_stale() {
+        // The registration's second direction, and the reason
+        // `PANIC_LINT_UNCOVERED` survives being empty: a list that has stopped
+        // applying reads as coverage. `PANIC_LINT_UNCOVERED` is empty today,
+        // so this test supplies the entry the machinery would act on rather
+        // than asserting over a list with nothing in it — a test over an empty
+        // constant passes by vacuity and proves the code was never run.
         let scratch = healthy_panic_lint_tree();
-        let (name, _, _) = PANIC_LINT_UNCOVERED[0];
-        std::fs::write(
-            scratch.path().join(format!("crates/{name}/src/lib.rs")),
-            panic_lint_attribute(),
-        )
-        .unwrap();
-        let found = panic_lint_widening_deferral_violations(scratch.path());
+        let name = "bathy-store";
+        let dir = scratch.path().join(format!("crates/{name}/src"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("lib.rs"), panic_lint_attribute()).unwrap();
+        let found = panic_lint_uncovered_staleness(scratch.path(), &[(name, 3, "an example")]);
         assert!(
             found
                 .iter()
                 .any(|v| v.contains(name) && v.contains("stale")),
             "{found:?}"
         );
+        // And the other direction: an entry naming a crate that has gone.
+        let gone = panic_lint_uncovered_staleness(
+            scratch.path(),
+            &[("bathy-does-not-exist", 3, "an example")],
+        );
+        assert!(
+            gone.iter().any(|v| v.contains("delete the entry")),
+            "{gone:?}"
+        );
+    }
+
+    #[test]
+    fn every_untrusted_input_surface_is_inside_the_constraint() {
+        // The check that replaced the `panic-lint-widening` deferral. Every
+        // non-deferred `FUZZ_SURFACES` entry names the crates its bytes reach,
+        // and every one of those must carry the lint.
+        for surface in FUZZ_SURFACES {
+            if surface.deferred.is_some() {
+                assert!(
+                    surface.lint_crates.is_empty(),
+                    "{} is deferred but names lint crates",
+                    surface.name
+                );
+                continue;
+            }
+            assert!(
+                !surface.lint_crates.is_empty(),
+                "{} names no crate for the panic-lint constraint to cover",
+                surface.name
+            );
+            for crate_name in surface.lint_crates {
+                assert!(
+                    PANIC_LINT_CRATES.contains(crate_name),
+                    "the `{}` fuzz surface feeds untrusted bytes to `{crate_name}`, which is \
+                     outside PANIC_LINT_CRATES",
+                    surface.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_fuzz_surface_over_an_unlinted_crate_fails_the_gate() {
+        // The mutation this gate exists for, driven rather than argued: the
+        // real `FUZZ_SURFACES` is consistent, so break a copy of one entry and
+        // confirm the violation names the crate.
+        let scratch = healthy_panic_lint_tree();
+        let found = panic_lint_surface_violations(&[FuzzSurface {
+            name: "example",
+            parser: "an example",
+            deferred: None,
+            lint_crates: &["bathy-store"],
+        }]);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("bathy-store") && v.contains("PANIC_LINT_CRATES")),
+            "{found:?}"
+        );
+        drop(scratch);
     }
 
     #[test]
@@ -3278,10 +3406,11 @@ mod tests {
 
     #[test]
     fn every_uncovered_crate_is_registered_with_a_measurement_and_a_reason() {
-        // A deferral whose entry is a crate name and nothing else is a
+        // A registration whose entry is a crate name and nothing else is a
         // to-do. Each has to carry the count that was actually measured and
         // what the code parses, because the next person's first question is
-        // "how big is this".
+        // "how big is this". Empty today, and the assertion below is what
+        // stops that emptiness from being mistaken for the rule not existing.
         for (name, hits, what) in PANIC_LINT_UNCOVERED {
             assert!(!name.is_empty());
             assert!(*hits > 0, "{name} is registered as outstanding at 0 hits");
@@ -3290,6 +3419,13 @@ mod tests {
                 "{name}'s entry does not say what it parses"
             );
         }
+        assert!(
+            PANIC_LINT_UNCOVERED.is_empty(),
+            "PANIC_LINT_UNCOVERED gained {} entr(ies); the `panic-lint-widening` deferral \
+             that used to escalate them was discharged and deleted, so a new entry needs a \
+             new registration to make it due rather than sitting here as a note",
+            PANIC_LINT_UNCOVERED.len()
+        );
     }
 
     /// A gate's own evidence must not depend on whether someone has run the

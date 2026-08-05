@@ -149,7 +149,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Some("check-ci") => gates::check_ci(SUBCOMMANDS),
         Some("check-ci-status") => visibility::check_ci_status(),
-        Some("linux-gate") => visibility::linux_gate(),
+        Some("linux-gate") => visibility::linux_gate(args.iter().any(|a| a == "--fresh")),
         Some("publish-check") => gates::publish_check(),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
         None => Err(format!("usage: xtask <{}>", SUBCOMMANDS.join("|")).into()),
@@ -470,24 +470,6 @@ const DEFERRALS: &[Deferral] = &[
     Deferral {
         id: "mcp-stdio-fuzz-target",
         check: gates::mcp_stdio_deferral_violations,
-    },
-    // The "No panics in parsing paths" constraint, widened as far as it was
-    // measured and no further. `gates::FUZZ_SURFACES` has registered five
-    // untrusted-input surfaces since M7 Task 1, and the constraint named two
-    // crates. The M7 panic-lint round measured every candidate rather than
-    // arguing about it: `bathy-scope` -- the authorization boundary, where a
-    // panic is the deny-by-default gate failing -- came back at zero hits and
-    // was covered the same day. `bathy-types` (37), `bathy-evidence` (14) and
-    // `bathy-query` (8) did not, and their code parses event logs written by
-    // an older build, a crashed one, or a hand editor. Widening the sentence
-    // over them without doing the work would be the M1 defect committed a
-    // second time by the person fixing it, so the counts are registered here
-    // instead, with `gates::PANIC_LINT_UNCOVERED` as the list and
-    // `check-panics` as the checker. It fires the day one of those crates is
-    // covered (the entry is then stale) or disappears.
-    Deferral {
-        id: "panic-lint-widening",
-        check: gates::panic_lint_widening_deferral_violations,
     },
 ];
 
@@ -1201,13 +1183,16 @@ mod tests {
         // honest and this assertion the thing that keeps it non-trivial.
         assert_eq!(
             DEFERRALS.len(),
-            5,
-            "the deferral registry changed size; the five entries are the ops-layer \
+            4,
+            "the deferral registry changed size; the four entries are the ops-layer \
              move (AC-5.39), the rmcp stdio workaround, the `packetd` IPC fuzz target \
-             that AC-7.7 names and M6 has not yet made writable, the MCP stdio fuzz \
-             target whose blocker is `classify`'s visibility, and the three \
-             untrusted-input crates the M7 panic-lint round measured and left outside \
-             the \"No panics in parsing paths\" constraint"
+             that AC-7.7 names and M6 has not yet made writable, and the MCP stdio fuzz \
+             target whose blocker is `classify`'s visibility. The fifth, \
+             `panic-lint-widening`, was discharged: `bathy-types`, `bathy-evidence` and \
+             `bathy-query` now carry the lint, the entry reported itself stale on the \
+             spot (`PANIC_LINT_UNCOVERED` is empty, so every untrusted-input crate is \
+             covered and this deferral is checking nothing), and it was deleted rather \
+             than left reading as an open item"
         );
         let ids: Vec<&str> = DEFERRALS.iter().map(|d| d.id).collect();
         assert_eq!(
@@ -1216,8 +1201,7 @@ mod tests {
                 "ops-layer-move",
                 "rmcp-stdio-workaround",
                 "packetd-ipc-fuzz-target",
-                "mcp-stdio-fuzz-target",
-                "panic-lint-widening"
+                "mcp-stdio-fuzz-target"
             ]
         );
     }
