@@ -557,6 +557,23 @@ mod tests {
             matches!(after_probe, Some(Response::Fatal { .. })),
             "a terminated session must never answer a probe, got {after_probe:?}"
         );
+
+        // 4. and it does not *parse* anything either. The two guards on this
+        //    path -- the early return in `handle_line` and the `Terminated`
+        //    arm in `dispatch` -- are otherwise indistinguishable from
+        //    outside, so removing the first one is a mutant that survives
+        //    every assertion above. What it actually costs is this: with only
+        //    the second guard, a dead session still runs attacker-controlled
+        //    bytes through `serde_json` before refusing them, and says so in
+        //    its own error message. A privileged process should stop reading,
+        //    not stop believing.
+        match session.handle_line("{not json") {
+            Some(Response::Fatal { detail }) => assert!(
+                detail.contains("already terminated"),
+                "a terminated session parsed the line before refusing it: {detail}"
+            ),
+            other => panic!("expected Fatal, got {other:?}"),
+        }
     }
 
     // -- AC-6.1 -------------------------------------------------------------
@@ -892,27 +909,111 @@ mod tests {
 
     // -- properties over arbitrary bytes -------------------------------------
 
+    /// A line the protocol might actually see, mixed with lines it never
+    /// should.
+    ///
+    /// `".{0,120}"` alone was the first version of this, and it is the
+    /// strategy failure this project has already measured once: random text
+    /// is valid JSON with probability approximately zero, so every case
+    /// bounced off `serde_json` and the properties below never once reached
+    /// a *well-formed* request arriving in the wrong state — which is the
+    /// entire subject of AC-6.1 and AC-6.2. Measured, not assumed: under the
+    /// old strategy, mutating the `AwaitingInit` arm to accept a probe left
+    /// `no_first_line_but_a_valid_init_is_ever_accepted` passing. The named
+    /// lines are what make the strategy reach the code, and the arbitrary
+    /// arm is what keeps it a property test rather than a table.
+    fn any_line() -> impl Strategy<Value = String> {
+        prop_oneof![
+            3 => Just(init_line(&["10.30.0.0/24"])),
+            2 => Just(init_line(&["0.0.0.0/0"])),
+            2 => Just(init_line(&[])),
+            3 => Just(PROBE.to_string()),
+            2 => Just(r#"{"type":"shutdown"}"#.to_string()),
+            3 => ".{0,120}",
+        ]
+    }
+
+    /// Whether a line is the one thing that may legally arrive first.
+    /// Derived from the bytes with an independent parse, never from the
+    /// session's own verdict.
+    fn is_an_init_that_may_be_accepted(line: &str) -> bool {
+        matches!(
+            serde_json::from_str::<Request>(line),
+            Ok(Request::Init { allowed_cidrs, .. }) if !allowed_cidrs.is_empty()
+        )
+    }
+
+    /// Bytes for the reader, half of them shaped so they can actually reach
+    /// the cap.
+    ///
+    /// Uniformly random bytes contain a newline roughly every 256 bytes, so a
+    /// purely arbitrary strategy produces lines two orders of magnitude below
+    /// [`MAX_LINE_BYTES`] and the bound is satisfied before `read_line` does
+    /// anything at all. Measured, not assumed: in the Task 1 mutation run,
+    /// deleting the cap check outright left this property **passing** over
+    /// `vec(any::<u8>(), 0..4096)`. The second arm is a newline-free run
+    /// straddling the cap, which is the only shape that reaches it.
+    fn reader_input() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            prop::collection::vec(any::<u8>(), 0..(MAX_LINE_BYTES * 2)),
+            (MAX_LINE_BYTES - 4..MAX_LINE_BYTES + 8, any::<bool>()).prop_map(
+                |(len, terminated)| {
+                    let mut data = vec![b'x'; len];
+                    if terminated {
+                        data.push(b'\n');
+                    }
+                    data
+                }
+            ),
+        ]
+    }
+
     proptest! {
-        /// The parser must never panic, and must never let an arbitrary line
-        /// past the `Init` gate. This is AC-6.1 stated over every input
-        /// rather than over one.
+        /// AC-6.1 and AC-6.3 stated over every input rather than over one:
+        /// the only line that may be accepted first is an `Init` carrying a
+        /// non-empty allow set. Everything else is fatal, and terminates.
         #[test]
-        fn no_first_line_but_a_valid_init_is_ever_accepted(line in ".{0,400}") {
+        fn no_first_line_but_an_init_with_an_allowlist_is_ever_accepted(line in any_line()) {
             let mut session = Session::new(true);
             let response = session.handle_line(&line);
-            let is_init = serde_json::from_str::<Request>(&line)
-                .map(|r| matches!(r, Request::Init { .. }))
-                .unwrap_or(false);
-            if !is_init {
+            if is_an_init_that_may_be_accepted(&line) {
+                let ready = matches!(response, Some(Response::Ready { .. }));
+                prop_assert!(ready, "a valid init was answered with {response:?}");
+                prop_assert!(!session.is_terminated());
+            } else {
                 let fatal = matches!(response, Some(Response::Fatal { .. }));
-                prop_assert!(fatal, "{line:?} was not refused before init");
+                prop_assert!(fatal, "{line:?} was not refused before init: {response:?}");
                 prop_assert!(session.is_terminated());
+                prop_assert!(session.scope().is_none());
             }
         }
 
-        /// Termination is absorbing over arbitrary follow-on traffic.
+        /// AC-6.2 over every follow-on line: a running session's allow set
+        /// is either exactly what `Init` fixed or gone, never something
+        /// else, whatever arrives next.
         #[test]
-        fn nothing_revives_a_terminated_session(lines in prop::collection::vec(".{0,200}", 1..8)) {
+        fn a_running_sessions_scope_is_never_widened(lines in prop::collection::vec(any_line(), 1..8)) {
+            let mut session = initialized_session();
+            let fixed: Vec<IpNet> = session
+                .scope()
+                .map(|s| s.allowed().to_vec())
+                .unwrap_or_default();
+            for line in lines {
+                let response = session.handle_line(&line);
+                if is_an_init_that_may_be_accepted(&line) && !session.ended_fatally() {
+                    prop_assert!(false, "a second init was answered with {response:?}");
+                }
+                match session.scope() {
+                    Some(scope) => prop_assert_eq!(scope.allowed(), fixed.as_slice()),
+                    None => prop_assert!(session.is_terminated()),
+                }
+            }
+        }
+
+        /// Termination is absorbing over arbitrary follow-on traffic,
+        /// including well-formed traffic.
+        #[test]
+        fn nothing_revives_a_terminated_session(lines in prop::collection::vec(any_line(), 1..8)) {
             let mut session = Session::new(true);
             let first = matches!(session.handle_line("{not json"), Some(Response::Fatal { .. }));
             prop_assert!(first);
@@ -927,10 +1028,10 @@ mod tests {
         /// The reader terminates and stays inside its bound on any bytes at
         /// all -- including bytes with no newline in them, which is the
         /// shape that makes an unbounded reader unbounded.
+        ///
+        /// See [`reader_input`] for why half the cases are not arbitrary.
         #[test]
-        fn the_reader_never_exceeds_its_bound_on_arbitrary_bytes(
-            data in prop::collection::vec(any::<u8>(), 0..4096)
-        ) {
+        fn the_reader_never_exceeds_its_bound_on_arbitrary_bytes(data in reader_input()) {
             let mut reader = Cursor::new(data);
             for _ in 0..8 {
                 let mut buf = Vec::new();
