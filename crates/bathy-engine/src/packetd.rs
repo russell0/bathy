@@ -883,8 +883,8 @@ mod tests {
         );
     }
 
-    /// A daemon that answers one probe and then exits is **gone**, not a
-    /// filtered port.
+    /// A daemon that answers one probe and then stops answering is **gone**,
+    /// not a filtered port.
     ///
     /// This is the *clean* disappearance -- stdout at end of file rather
     /// than a broken pipe -- and it is a different code path from the one
@@ -904,13 +904,21 @@ mod tests {
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("one-then-exit.sh");
+        let path = dir.path().join("one-then-eof.sh");
         let mut file = std::fs::File::create(&path).unwrap();
+        // Closes its **stdout** and goes on reading stdin. That is what makes
+        // this the end-of-stream case rather than the broken-pipe case: the
+        // engine's next write still succeeds, and it is the *read* that
+        // discovers the daemon has stopped answering. Letting the whole
+        // process exit instead makes the two races -- EPIPE on the write, EOF
+        // on the read -- decide the outcome, which is how this test first
+        // passed on macOS and failed under `linux-gate`.
         write!(
             file,
             "#!/bin/sh\n{WARMUP}\nread init\n\
              echo '{{\"type\":\"ready\",\"dropped_capabilities\":true}}'\n\
-             read probe\necho '{{\"type\":\"result\",\"id\":1,\"state\":\"closed\"}}'\nexit 0\n"
+             read probe\necho '{{\"type\":\"result\",\"id\":1,\"state\":\"closed\"}}'\n\
+             exec 1>&-\ncat >/dev/null\n"
         )
         .unwrap();
         drop(file);
@@ -938,14 +946,17 @@ mod tests {
             .await
             .expect_err("and it does not come back");
         assert_eq!(e.terminal_reason(), Some("packetd_unavailable"), "{e}");
-        // And the worker stood down at the first fatal rather than writing
-        // another probe into a dead pipe: this error came from the closed
-        // channel, not from a failed `write_all`. Without the check, the
-        // worker looping on after a fatal produces the same verdict by a
-        // different route and nothing notices it is still there.
+        // And the worker stood down at the first fatal rather than going on
+        // talking to a daemon that has stopped answering. This error came
+        // from the *closed channel* -- the worker is gone -- and not from a
+        // second round trip, which would have reported the end of stream
+        // again. Without the check, a worker that looped on after a fatal
+        // produces the same verdict by a different route and nothing
+        // notices it is still there.
         assert!(
-            !format!("{e}").contains("writing a probe"),
-            "the worker must have exited at the first fatal: {e}"
+            format!("{e}").contains("exited without saying why"),
+            "the worker must have exited at the first fatal, so this must come from the \
+             closed channel rather than another exchange: {e}"
         );
     }
 
