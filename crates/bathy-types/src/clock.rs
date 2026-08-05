@@ -107,7 +107,18 @@ impl Default for SystemClock {
 
 impl SystemClock {
     fn next_ulid(&self) -> ulid::Ulid {
-        let mut g = self.generator.lock().expect("ulid generator poisoned");
+        // `into_inner` rather than `expect`: a poisoned lock means some
+        // other thread panicked while holding it, and the only code this
+        // mutex ever guards is `ulid::Generator`'s own state machine. That
+        // state is still structurally valid (worst case a `previous` id from
+        // before the panic), so refusing to hand out ids for the rest of the
+        // process's life -- which is what an `expect` here does, on every
+        // subsequent call -- turns one unrelated panic into a permanent
+        // outage of every timestamp and identifier in the workspace.
+        let mut g = self
+            .generator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Monotonic overflow means >2^80 ids generated within one
         // millisecond, which cannot happen on any real workload this project
         // runs. Smaller item A (whole-branch review): the previous fallback
@@ -129,10 +140,8 @@ impl SystemClock {
 
 impl Clock for SystemClock {
     fn now_rfc3339(&self) -> String {
-        let d = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock before epoch");
-        format_rfc3339_millis(d.as_secs() as i64, d.subsec_millis())
+        let (secs, millis) = unix_epoch_offset(SystemTime::now());
+        format_rfc3339_millis_clamped(secs, millis)
     }
     fn new_scan_id(&self) -> ScanId {
         ScanId::from_ulid(self.next_ulid())
@@ -147,10 +156,24 @@ impl Clock for SystemClock {
     }
 }
 
+/// The earliest instant [`format_rfc3339_millis`] is defined over:
+/// `0000-01-01T00:00:00Z`, verified against Python's `datetime` in
+/// `the_formattable_domain_endpoints_are_the_years_the_shape_can_hold`.
+const MIN_FORMATTABLE_EPOCH_SECS: i64 = -62_167_219_200;
+
+/// The latest instant [`format_rfc3339_millis`] is defined over:
+/// `9999-12-31T23:59:59Z`.
+const MAX_FORMATTABLE_EPOCH_SECS: i64 = 253_402_300_799;
+
+/// What [`format_rfc3339_millis_clamped`] falls back to if its clamp ever
+/// stops covering [`format_rfc3339_millis`]'s domain. Unreachable today, and
+/// `the_clamped_formatter_never_reaches_its_fallback` is what says so.
+const EARLIEST_FORMATTABLE_TIMESTAMP: &str = "0000-01-01T00:00:00.000Z";
+
 /// Civil-time conversion without a date dependency, using the days-from-civil
 /// algorithm (Howard Hinnant's `civil_from_days`, run in the encode
-/// direction). Valid for all years we care about; UTC only, by construction
-/// (there is no timezone parameter to get wrong).
+/// direction). UTC only, by construction (there is no timezone parameter to
+/// get wrong).
 ///
 /// Cross-checked against known epochs in the test module below -- the Unix
 /// epoch, a leap day, both sides of a century year-boundary (2000 is a leap
@@ -158,38 +181,109 @@ impl Clock for SystemClock {
 /// verified independently against both `date -u` and Python's `datetime`,
 /// not by round-tripping this function against itself.
 ///
-/// Smaller item C (whole-branch review): the 24-byte
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ` shape this function promises breaks for years
-/// `<= -1000`, because `{:04}` only zero-pads and does not truncate --
-/// `y = -1000` renders as `-1000`, five digits, not four. Not reachable via
-/// [`SystemClock`], the only caller in this crate: `epoch_secs` there always
-/// comes from `SystemTime::now()`, i.e. the present day, many millennia
-/// inside the safe domain. Documented rather than fixed because the fix
-/// (deciding how a five-digit year should even render in this format) is a
-/// design question with no caller that needs an answer today.
-fn format_rfc3339_millis(epoch_secs: i64, millis: u32) -> String {
+/// Returns `None` outside `MIN_FORMATTABLE_EPOCH_SECS..=MAX`, i.e. outside the
+/// years `0000..=9999`. Smaller item C (whole-branch review) recorded that the
+/// 24-byte `YYYY-MM-DDTHH:MM:SS.mmmZ` shape this function promises silently
+/// breaks below year `-1000`, because `{:04}` zero-pads and does not truncate,
+/// and left it documented rather than fixed. The M7 panic-lint widening turned
+/// that into an answer instead of a note: an instant this shape cannot
+/// represent is now *refused* rather than mis-rendered, and the same bound is
+/// what makes every arithmetic step below provably in range for `i64`. The
+/// `checked_*` chain is therefore total over the declared domain --
+/// `the_formatter_is_total_over_its_whole_declared_domain` sweeps it -- and
+/// the `?`s exist so that a future edit to the bound cannot reintroduce a
+/// panicking overflow.
+fn format_rfc3339_millis(epoch_secs: i64, millis: u32) -> Option<String> {
+    if !(MIN_FORMATTABLE_EPOCH_SECS..=MAX_FORMATTABLE_EPOCH_SECS).contains(&epoch_secs)
+        || millis > 999
+    {
+        return None;
+    }
     let days = epoch_secs.div_euclid(86_400);
     let secs_of_day = epoch_secs.rem_euclid(86_400);
-    let z = days + 719_468;
+    let z = days.checked_add(719_468)?;
     let era = z.div_euclid(146_097);
+    // `doe` is in `0..146_097` and `yoe` in `0..400`, so every `div_euclid`
+    // below is a non-negative value divided by a positive constant: identical
+    // to `/` there, and unable to panic (the only division that can is
+    // `i64::MIN / -1`).
     let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    let y = if m <= 2 { y + 1 } else { y };
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y,
-        m,
-        d,
-        secs_of_day / 3600,
-        (secs_of_day % 3600) / 60,
-        secs_of_day % 60,
-        millis
-    )
+    let yoe = doe
+        .checked_sub(doe.div_euclid(1460))?
+        .checked_add(doe.div_euclid(36_524))?
+        .checked_sub(doe.div_euclid(146_096))?
+        .div_euclid(365);
+    let y = yoe.checked_add(era.checked_mul(400)?)?;
+    let doy = doe.checked_sub(
+        yoe.checked_mul(365)?
+            .checked_add(yoe.div_euclid(4))?
+            .checked_sub(yoe.div_euclid(100))?,
+    )?;
+    let mp = doy.checked_mul(5)?.checked_add(2)?.div_euclid(153);
+    let d = doy
+        .checked_sub(mp.checked_mul(153)?.checked_add(2)?.div_euclid(5))?
+        .checked_add(1)?;
+    let m = if mp < 10 {
+        mp.checked_add(3)?
+    } else {
+        mp.checked_sub(9)?
+    };
+    let y = if m <= 2 { y.checked_add(1)? } else { y };
+    Some(format!(
+        "{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z",
+        hour = secs_of_day.div_euclid(3600),
+        minute = secs_of_day.rem_euclid(3600).div_euclid(60),
+        second = secs_of_day.rem_euclid(60),
+    ))
+}
+
+/// [`format_rfc3339_millis`] for a caller that has no `Result` to return and
+/// no instant it is willing to be wrong about -- i.e. [`Clock::now_rfc3339`],
+/// whose signature is a bare `String`.
+///
+/// An instant outside the representable years is clamped to the nearest
+/// endpoint rather than panicking or inventing one. That is a *misconfigured
+/// system clock*, not untrusted input, and reporting `9999-12-31T…` for a
+/// machine whose clock says the year 30000 is both truthful about the
+/// saturation and unable to abort a scan mid-flight, which is what the
+/// `expect("clock before epoch")` this replaced did for the symmetric case.
+fn format_rfc3339_millis_clamped(epoch_secs: i64, millis: u32) -> String {
+    let secs = epoch_secs.clamp(MIN_FORMATTABLE_EPOCH_SECS, MAX_FORMATTABLE_EPOCH_SECS);
+    format_rfc3339_millis(secs, millis.min(999))
+        .unwrap_or_else(|| EARLIEST_FORMATTABLE_TIMESTAMP.to_owned())
+}
+
+/// `t` as `(whole seconds since the Unix epoch, milliseconds into that
+/// second)`, for instants on either side of the epoch.
+///
+/// `SystemTime::duration_since(UNIX_EPOCH)` returns `Err` for a clock set
+/// before 1970 -- `SystemClock::now_rfc3339` used to `expect` on that, so a
+/// machine with a badly-set RTC took down every scan running on it. The `Err`
+/// carries the magnitude of the gap, and a *negative* offset with a
+/// sub-second part borrows a second: 1.5 s before the epoch is second `-2`
+/// plus 500 ms, not second `-1` plus 500 ms.
+fn unix_epoch_offset(t: SystemTime) -> (i64, u32) {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => (
+            i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+            d.subsec_millis(),
+        ),
+        Err(before_epoch) => {
+            let d = before_epoch.duration();
+            let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
+            let sub = d.subsec_millis();
+            if sub == 0 {
+                (secs.checked_neg().unwrap_or(i64::MIN), 0)
+            } else {
+                (
+                    secs.checked_neg()
+                        .and_then(|s| s.checked_sub(1))
+                        .unwrap_or(i64::MIN),
+                    1_000_u32.saturating_sub(sub),
+                )
+            }
+        }
+    }
 }
 
 /// Deterministic clock for tests and for evidence replay.
@@ -233,7 +327,20 @@ pub enum ClockError {
     InvalidTimestamp { input: String },
 }
 
-/// Mirrors the exact shape `format_rfc3339_millis` above always produces:
+/// The calendar fields of a timestamp that has passed
+/// [`parse_rfc3339_millis`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CivilTime {
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+    millis: i64,
+}
+
+/// Parses the exact shape `format_rfc3339_millis` above always produces:
 /// 24 bytes, digits everywhere but four fixed punctuation positions, and
 /// (per this function's own extra checks, beyond pure shape) each numeric
 /// field inside the range that shape allows. This is a format check, not
@@ -243,51 +350,92 @@ pub enum ClockError {
 /// Unix timestamp typed in by mistake) silently reaching an event's
 /// `timestamp` field, not calendar correctness for well-formed-looking
 /// input.
-fn validate_rfc3339_millis(s: &str) -> Result<(), ClockError> {
+///
+/// It **returns** the fields rather than only validating them. This used to
+/// be a `validate` returning `Result<(), _>` followed by a separate
+/// `epoch_millis_from_rfc3339` that re-derived all seven fields from the
+/// string with `.expect("validated as ascii digits before this is called")` --
+/// two `expect`s whose correctness was an argument about a caller in another
+/// function, over `s[i..i + 2]` string slicing that `clippy::indexing_slicing`
+/// cannot even see. Parsing once and passing the values along removes the
+/// argument along with the panics.
+fn parse_rfc3339_millis(s: &str) -> Result<CivilTime, ClockError> {
     let err = || ClockError::InvalidTimestamp {
         input: s.to_owned(),
     };
-    let b = s.as_bytes();
-    if b.len() != 24 {
+    // A single 24-element slice pattern, so the length requirement and every
+    // field position are one thing the compiler checks.
+    let &[
+        y0,
+        y1,
+        y2,
+        y3,
+        dash1,
+        mo0,
+        mo1,
+        dash2,
+        d0,
+        d1,
+        tee,
+        h0,
+        h1,
+        colon1,
+        mi0,
+        mi1,
+        colon2,
+        s0,
+        s1,
+        dot,
+        ms0,
+        ms1,
+        ms2,
+        zulu,
+    ] = s.as_bytes()
+    else {
         return Err(err());
-    }
-    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18, 20, 21, 22] {
-        if !b[i].is_ascii_digit() {
-            return Err(err());
-        }
-    }
-    if b[4] != b'-'
-        || b[7] != b'-'
-        || b[10] != b'T'
-        || b[13] != b':'
-        || b[16] != b':'
-        || b[19] != b'.'
-        || b[23] != b'Z'
+    };
+    if (dash1, dash2, tee, colon1, colon2, dot, zulu) != (b'-', b'-', b'T', b':', b':', b'.', b'Z')
     {
         return Err(err());
     }
-    let two = |i: usize| -> u32 { s[i..i + 2].parse().expect("checked ascii digits above") };
-    let month = two(5);
-    let day = two(8);
-    let hour = two(11);
-    let minute = two(14);
-    let second = two(17);
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
+    // `to_digit` is both the "is an ASCII digit" check and the conversion, so
+    // there is no second place for the two to disagree.
+    let field = |digits: &[u8]| -> Result<i64, ClockError> {
+        let mut n: i64 = 0;
+        for byte in digits {
+            let d = char::from(*byte).to_digit(10).ok_or_else(err)?;
+            n = n
+                .checked_mul(10)
+                .and_then(|n| n.checked_add(i64::from(d)))
+                .ok_or_else(err)?;
+        }
+        Ok(n)
+    };
+    let parsed = CivilTime {
+        year: field(&[y0, y1, y2, y3])?,
+        month: field(&[mo0, mo1])?,
+        day: field(&[d0, d1])?,
+        hour: field(&[h0, h1])?,
+        minute: field(&[mi0, mi1])?,
+        second: field(&[s0, s1])?,
+        millis: field(&[ms0, ms1, ms2])?,
+    };
+    if !(1..=12).contains(&parsed.month)
+        || !(1..=31).contains(&parsed.day)
+        || parsed.hour > 23
+        || parsed.minute > 59
         // 60 tolerates a leap second; `format_rfc3339_millis` itself never
         // emits one, but rejecting a real leap second reading would be a
         // false negative this check has no reason to introduce.
-        || second > 60
+        || parsed.second > 60
     {
         return Err(err());
     }
-    Ok(())
+    Ok(parsed)
 }
 
-/// The inverse of [`format_rfc3339_millis`], for a string that has already
-/// passed [`validate_rfc3339_millis`].
+/// The inverse of [`format_rfc3339_millis`], over the fields
+/// [`parse_rfc3339_millis`] returned.
 ///
 /// Uses Howard Hinnant's `days_from_civil` -- the decode direction of the
 /// `civil_from_days` algorithm `format_rfc3339_millis` runs in the encode
@@ -298,39 +446,61 @@ fn validate_rfc3339_millis(s: &str) -> Result<(), ClockError> {
 /// round-trips perfectly.
 ///
 /// Saturates to `0` before the epoch: the result is a count of milliseconds
-/// *since* 1970, and `FixedClock` will accept `1969-12-31T23:59:59.999Z`.
-fn epoch_millis_from_rfc3339(s: &str) -> u64 {
-    let n = |i: usize, len: usize| -> i64 {
-        s[i..i + len]
-            .parse()
-            .expect("validated as ascii digits before this is called")
-    };
-    let (year, month, day) = (n(0, 4), n(5, 2), n(8, 2));
-    let (hour, minute, second, millis) = (n(11, 2), n(14, 2), n(17, 2), n(20, 3));
+/// *since* 1970, and `FixedClock` will accept `1969-12-31T23:59:59.999Z`. It
+/// saturates to `0` on arithmetic overflow too, which is unreachable for any
+/// four-digit year `parse_rfc3339_millis` can produce and is written out
+/// rather than asserted away.
+fn epoch_millis_from_civil(t: CivilTime) -> u64 {
+    u64::try_from(epoch_millis_checked(t).unwrap_or(0)).unwrap_or(0)
+}
 
+fn epoch_millis_checked(t: CivilTime) -> Option<i64> {
     // `days_from_civil`: March-based year, so a leap day is the last day of
     // the internal year and needs no special case anywhere.
-    let y = if month <= 2 { year - 1 } else { year };
+    let y = if t.month <= 2 {
+        t.year.checked_sub(1)?
+    } else {
+        t.year
+    };
     let era = y.div_euclid(400);
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
+    let mp = if t.month > 2 {
+        t.month.checked_sub(3)?
+    } else {
+        t.month.checked_add(9)?
+    };
+    // `yoe` is in `0..400` and `mp` in `0..12`, both non-negative, so these
+    // `div_euclid`s are plain division and cannot panic.
+    let doy = mp
+        .checked_mul(153)?
+        .checked_add(2)?
+        .div_euclid(5)
+        .checked_add(t.day)?
+        .checked_sub(1)?;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe.div_euclid(4))?
+        .checked_sub(yoe.div_euclid(100))?
+        .checked_add(doy)?;
+    let days = era
+        .checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)?;
 
-    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    let total = secs
-        .checked_mul(1_000)
-        .and_then(|ms| ms.checked_add(millis));
-    u64::try_from(total.unwrap_or(0)).unwrap_or(0)
+    let secs = days
+        .checked_mul(86_400)?
+        .checked_add(t.hour.checked_mul(3_600)?)?
+        .checked_add(t.minute.checked_mul(60)?)?
+        .checked_add(t.second)?;
+    secs.checked_mul(1_000)?.checked_add(t.millis)
 }
 
 impl FixedClock {
     pub fn new(now: &str, seed: u64) -> Result<Self, ClockError> {
-        validate_rfc3339_millis(now)?;
+        let parsed = parse_rfc3339_millis(now)?;
         Ok(Self {
             now: now.to_owned(),
-            now_millis: epoch_millis_from_rfc3339(now),
+            now_millis: epoch_millis_from_civil(parsed),
             counter: AtomicU64::new(0),
             seed,
         })
@@ -456,7 +626,10 @@ mod tests {
 
     #[test]
     fn format_rfc3339_millis_unix_epoch() {
-        assert_eq!(format_rfc3339_millis(0, 0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(
+            format_rfc3339_millis(0, 0).unwrap(),
+            "1970-01-01T00:00:00.000Z"
+        );
     }
 
     #[test]
@@ -464,7 +637,7 @@ mod tests {
         // 2024-02-29T12:00:00Z -> 1709208000 (2024 is a leap year: divisible
         // by 4, not by 100).
         assert_eq!(
-            format_rfc3339_millis(1_709_208_000, 250),
+            format_rfc3339_millis(1_709_208_000, 250).unwrap(),
             "2024-02-29T12:00:00.250Z"
         );
     }
@@ -476,13 +649,13 @@ mod tests {
         // wrong and the days-from-civil algorithm must get right via its
         // `doe/146_096` era-boundary term.
         assert_eq!(
-            format_rfc3339_millis(946_684_800, 0),
+            format_rfc3339_millis(946_684_800, 0).unwrap(),
             "2000-01-01T00:00:00.000Z"
         );
         // One second earlier must land on the last second of 1999, still
         // inside February's non-leap boundary from the *previous* year.
         assert_eq!(
-            format_rfc3339_millis(946_684_799, 999),
+            format_rfc3339_millis(946_684_799, 999).unwrap(),
             "1999-12-31T23:59:59.999Z"
         );
     }
@@ -494,7 +667,7 @@ mod tests {
         // February 1900 has 28 days. Also exercises the negative-epoch path
         // (`div_euclid`/`rem_euclid`).
         assert_eq!(
-            format_rfc3339_millis(-2_203_891_200, 0),
+            format_rfc3339_millis(-2_203_891_200, 0).unwrap(),
             "1900-03-01T00:00:00.000Z"
         );
     }
@@ -504,7 +677,7 @@ mod tests {
         // 1969-07-20T20:17:00Z -> -14182980 (Apollo 11 landing, chosen only
         // for being an easy-to-verify well-known pre-epoch timestamp).
         assert_eq!(
-            format_rfc3339_millis(-14_182_980, 0),
+            format_rfc3339_millis(-14_182_980, 0).unwrap(),
             "1969-07-20T20:17:00.000Z"
         );
     }
@@ -513,7 +686,7 @@ mod tests {
     fn format_rfc3339_millis_recent_timestamp() {
         // 2026-07-31T18:22:05Z -> 1785522125.
         assert_eq!(
-            format_rfc3339_millis(1_785_522_125, 500),
+            format_rfc3339_millis(1_785_522_125, 500).unwrap(),
             "2026-07-31T18:22:05.500Z"
         );
     }
@@ -713,7 +886,7 @@ mod tests {
             (-14_182_980, 0),
             (1_785_522_125, 500),
         ] {
-            let s = format_rfc3339_millis(secs, millis);
+            let s = format_rfc3339_millis(secs, millis).unwrap();
             assert!(
                 FixedClock::new(&s, 7).is_ok(),
                 "format_rfc3339_millis produced {s:?}, which the validator rejected"
@@ -752,7 +925,7 @@ mod tests {
             let c = FixedClock::new(stamp, 7).unwrap();
             let ms = c.now_unix_millis();
             assert_eq!(
-                format_rfc3339_millis((ms / 1_000) as i64, (ms % 1_000) as u32),
+                format_rfc3339_millis((ms / 1_000) as i64, (ms % 1_000) as u32).unwrap(),
                 c.now_rfc3339(),
                 "the two accessors must name the same instant"
             );
@@ -770,11 +943,187 @@ mod tests {
         }
     }
 
+    // --- M7 panic-lint widening. `format_rfc3339_millis` was infallible and
+    // did its civil-time arithmetic with bare `+`/`-`/`*`, which is a panic on
+    // overflow in a debug build and a silently wrong timestamp in a release
+    // one. It now declares a domain and is total over it; these three tests
+    // are what make "total over it" a fact rather than a comment. ---
+
+    #[test]
+    fn the_formattable_domain_endpoints_are_the_years_the_shape_can_hold() {
+        // Both values were computed outside this file (Python:
+        // `calendar.timegm((1, 1, 1, 0, 0, 0))` minus one year's worth of days
+        // for year 0, cross-checked against the days-from-civil algorithm by
+        // hand). Asserting them through the formatter, not against it, would
+        // be circular -- so assert the rendered strings, which are readable
+        // and independently checkable.
+        assert_eq!(
+            format_rfc3339_millis(MIN_FORMATTABLE_EPOCH_SECS, 0).unwrap(),
+            "0000-01-01T00:00:00.000Z"
+        );
+        assert_eq!(
+            format_rfc3339_millis(MAX_FORMATTABLE_EPOCH_SECS, 999).unwrap(),
+            "9999-12-31T23:59:59.999Z"
+        );
+        // One second outside in each direction is a five-digit or negative
+        // year, which the 24-byte shape cannot render -- the defect "smaller
+        // item C" documented and did not fix.
+        assert_eq!(
+            format_rfc3339_millis(MIN_FORMATTABLE_EPOCH_SECS - 1, 0),
+            None
+        );
+        assert_eq!(
+            format_rfc3339_millis(MAX_FORMATTABLE_EPOCH_SECS + 1, 0),
+            None
+        );
+        assert_eq!(
+            format_rfc3339_millis(0, 1_000),
+            None,
+            "millis must be < 1000"
+        );
+    }
+
+    #[test]
+    fn the_formatter_is_total_over_its_whole_declared_domain() {
+        // The `?`s inside `format_rfc3339_millis` mean "cannot overflow here",
+        // and an argument is not a proof. Sweep the declared domain (both
+        // endpoints, the epoch, and a large stride across the whole range) and
+        // assert every single one produces the 24-byte shape.
+        let stride = 1_000_000_007_i64;
+        let mut secs = MIN_FORMATTABLE_EPOCH_SECS;
+        let mut checked = 0_usize;
+        loop {
+            for millis in [0, 999] {
+                let rendered = format_rfc3339_millis(secs, millis).unwrap_or_else(|| {
+                    panic!("format_rfc3339_millis({secs}, {millis}) returned None inside its own domain")
+                });
+                assert_eq!(rendered.len(), 24, "{secs}/{millis} rendered {rendered}");
+                assert!(
+                    parse_rfc3339_millis(&rendered).is_ok(),
+                    "{secs}/{millis} rendered {rendered}, which this crate's own parser rejects"
+                );
+            }
+            checked += 1;
+            match secs.checked_add(stride) {
+                Some(next) if next <= MAX_FORMATTABLE_EPOCH_SECS => secs = next,
+                _ => break,
+            }
+        }
+        assert!(checked > 300, "the sweep only covered {checked} instants");
+        for edge in [MAX_FORMATTABLE_EPOCH_SECS, 0, -1] {
+            assert!(format_rfc3339_millis(edge, 500).is_some(), "{edge}");
+        }
+    }
+
+    #[test]
+    fn the_clamped_formatter_never_reaches_its_fallback() {
+        // `format_rfc3339_millis_clamped` exists because `Clock::now_rfc3339`
+        // returns a bare `String`. Its `unwrap_or_else` fallback is dead only
+        // while the clamp bounds and the formatter's domain are the same two
+        // numbers; if someone widens one without the other, this dies.
+        for secs in [
+            i64::MIN,
+            i64::MAX,
+            MIN_FORMATTABLE_EPOCH_SECS - 1,
+            MAX_FORMATTABLE_EPOCH_SECS + 1,
+            MIN_FORMATTABLE_EPOCH_SECS,
+            MAX_FORMATTABLE_EPOCH_SECS,
+            0,
+        ] {
+            for millis in [0, 999, 1_000, u32::MAX] {
+                let rendered = format_rfc3339_millis_clamped(secs, millis);
+                assert_eq!(rendered.len(), 24, "{secs}/{millis} rendered {rendered}");
+                if !(MIN_FORMATTABLE_EPOCH_SECS..=MAX_FORMATTABLE_EPOCH_SECS).contains(&secs) {
+                    // Clamped, so it must be one of the two endpoints -- never
+                    // the fallback constant standing in for "I gave up".
+                    assert!(
+                        rendered.starts_with("0000-01-01") || rendered.starts_with("9999-12-31"),
+                        "{secs} clamped to {rendered}"
+                    );
+                }
+                assert!(
+                    parse_rfc3339_millis(&rendered).is_ok(),
+                    "{secs}/{millis} rendered {rendered}, which this crate's own parser rejects"
+                );
+            }
+        }
+        // The one input that would reach the fallback is one the clamp lets
+        // through and the formatter refuses. There is none.
+        assert!(
+            format_rfc3339_millis(MIN_FORMATTABLE_EPOCH_SECS, 999)
+                .zip(format_rfc3339_millis(MAX_FORMATTABLE_EPOCH_SECS, 999))
+                .is_some(),
+            "the clamp endpoints are outside the formatter's domain, so the \
+             fallback in format_rfc3339_millis_clamped is now reachable"
+        );
+    }
+
+    #[test]
+    fn a_system_clock_set_before_the_epoch_renders_rather_than_panicking() {
+        // `SystemClock::now_rfc3339` used to be
+        // `duration_since(UNIX_EPOCH).expect("clock before epoch")`: a machine
+        // with a badly-set RTC aborted every scan running on it. This drives
+        // the same conversion the clock does, since `SystemTime::now()` itself
+        // cannot be moved.
+        let pre_epoch = UNIX_EPOCH - std::time::Duration::from_millis(1_500);
+        assert_eq!(unix_epoch_offset(pre_epoch), (-2, 500));
+        assert_eq!(
+            format_rfc3339_millis_clamped(-2, 500),
+            "1969-12-31T23:59:58.500Z"
+        );
+        assert_eq!(
+            unix_epoch_offset(UNIX_EPOCH - std::time::Duration::from_secs(1)),
+            (-1, 0),
+            "a whole second before the epoch must not borrow a second it did not need"
+        );
+        assert_eq!(unix_epoch_offset(UNIX_EPOCH), (0, 0));
+        assert_eq!(
+            unix_epoch_offset(UNIX_EPOCH + std::time::Duration::from_millis(1_500)),
+            (1, 500)
+        );
+    }
+
+    #[test]
+    fn parsing_happens_once_and_rejects_every_shape_that_is_not_the_format() {
+        // `parse_rfc3339_millis` replaced a validate-then-reparse pair whose
+        // second half carried two `expect`s over `s[i..i + 2]`. The single
+        // slice pattern must still reject every length and every misplaced
+        // separator, not just the fields the old `validate` happened to check.
+        for bad in [
+            "",
+            "2026-08-01T15:04:31.182",   // 23 bytes
+            "2026-08-01T15:04:31.182ZZ", // 25 bytes
+            "2026:08-01T15:04:31.182Z",  // wrong separator at 4
+            "2026-08-01 15:04:31.182Z",  // space instead of T
+            "2026-08-01T15:04:31,182Z",  // comma instead of .
+            "2026-08-01T15:04:31.182z",  // lowercase z
+            "20a6-08-01T15:04:31.182Z",  // non-digit in the year
+            "2026-08-01T15:04:31.18aZ",  // non-digit in the millis
+        ] {
+            assert!(
+                parse_rfc3339_millis(bad).is_err(),
+                "{bad:?} must not parse as an RFC 3339 timestamp"
+            );
+        }
+        assert_eq!(
+            parse_rfc3339_millis("2026-08-01T15:04:31.182Z").unwrap(),
+            CivilTime {
+                year: 2026,
+                month: 8,
+                day: 1,
+                hour: 15,
+                minute: 4,
+                second: 31,
+                millis: 182,
+            }
+        );
+    }
+
     #[test]
     fn a_system_clock_reports_one_instant_two_ways_not_two_instants() {
         let c = SystemClock::default();
         let ms = c.now_unix_millis();
-        let from_string = epoch_millis_from_rfc3339(&c.now_rfc3339());
+        let from_string = epoch_millis_from_civil(parse_rfc3339_millis(&c.now_rfc3339()).unwrap());
         // Two separate readings of a running clock, so not equality -- but a
         // `now_unix_millis` returning seconds, microseconds, or a value from
         // a different epoch is off by orders of magnitude, not by a second.

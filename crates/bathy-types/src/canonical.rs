@@ -42,6 +42,31 @@ use crate::ids::Digest;
 pub enum CanonicalError {
     #[error("non-integer numbers are not canonicalizable in this profile")]
     NonIntegerNumber,
+    /// A string (an object key, or a string value) could not be encoded as a
+    /// JSON string literal.
+    ///
+    /// Unreachable through `serde_json` for any `&str`, which is why the two
+    /// sites that can produce this were `.expect("string encodes")` and
+    /// `.expect("key encodes")` until the M7 panic-lint widening. It is a
+    /// variant rather than an `#[allow]` because the alternative -- hand-rolling
+    /// the escaping so the call becomes infallible -- would change *which bytes
+    /// get hashed*, and every `plan_hash` this project has ever emitted depends
+    /// on `serde_json`'s exact escaping being the canonical form. Refusing to
+    /// hash is a recoverable error; hashing differently is a silent, permanent
+    /// divergence.
+    #[error("string {input:?} could not be encoded as a JSON string literal")]
+    StringNotEncodable { input: String },
+}
+
+/// One JSON string literal, encoded exactly as `serde_json` would.
+///
+/// Both call sites go through here so that "canonical form" has a single
+/// definition -- see [`CanonicalError::StringNotEncodable`] for why this is
+/// not hand-rolled.
+fn json_string(s: &str) -> Result<String, CanonicalError> {
+    serde_json::to_string(s).map_err(|_| CanonicalError::StringNotEncodable {
+        input: s.to_owned(),
+    })
 }
 
 /// Serializes `value` as canonical JSON: object keys sorted, no
@@ -72,7 +97,7 @@ fn write_canonical(value: &Value, out: &mut String) -> Result<(), CanonicalError
                 return Err(CanonicalError::NonIntegerNumber);
             }
         }
-        Value::String(s) => out.push_str(&serde_json::to_string(s).expect("string encodes")),
+        Value::String(s) => out.push_str(&json_string(s)?),
         Value::Array(items) => {
             out.push('[');
             for (i, item) in items.iter().enumerate() {
@@ -95,16 +120,23 @@ fn write_canonical(value: &Value, out: &mut String) -> Result<(), CanonicalError
             // map already iterates alphabetically today -- but relying on
             // that would make correctness an accident of the current
             // dependency graph rather than a property of this function.
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort_unstable();
+            // Sorted *entries*, not sorted keys followed by `map[key]`.
+            // `serde_json::Map`'s `Index` impl panics on a missing key, and
+            // `clippy::indexing_slicing` does not see it (it covers slices and
+            // arrays, not third-party `Index` impls) -- so that lookup was a
+            // panic no lint in this set would ever have reported, held safe
+            // only by the keys having come from this same map two lines above.
+            // Carrying the values along removes the second lookup entirely.
+            let mut entries: Vec<(&String, &Value)> = map.iter().collect();
+            entries.sort_unstable_by_key(|(k, _)| *k);
             out.push('{');
-            for (i, k) in keys.iter().enumerate() {
+            for (i, (k, v)) in entries.iter().enumerate() {
                 if i > 0 {
                     out.push(',');
                 }
-                out.push_str(&serde_json::to_string(k).expect("key encodes"));
+                out.push_str(&json_string(k)?);
                 out.push(':');
-                write_canonical(&map[*k], out)?;
+                write_canonical(v, out)?;
             }
             out.push('}');
         }

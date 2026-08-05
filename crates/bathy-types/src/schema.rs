@@ -122,8 +122,16 @@ pub fn all() -> BTreeMap<&'static str, Value> {
     m
 }
 
+/// `schemars::Schema` is a newtype over `serde_json::Value`, so this is a
+/// move, not a serialization.
+///
+/// It used to be `serde_json::to_value(schema).expect("schema serializes")` --
+/// a round trip through a fallible API to recover a value the type was already
+/// holding. `Schema::to_value` (`schemars-1.2.2/src/schema.rs`) hands it back
+/// directly and cannot fail, so the panic is gone by removing the work rather
+/// than by justifying it.
 fn to_value(schema: schemars::Schema) -> Value {
-    serde_json::to_value(schema).expect("schema serializes")
+    schema.to_value()
 }
 
 #[cfg(test)]

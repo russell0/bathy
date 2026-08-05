@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 pub mod canonical;
 pub mod capture;

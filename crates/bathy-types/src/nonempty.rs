@@ -53,8 +53,33 @@ impl<T> NonEmpty<T> {
     pub fn new(first: T) -> Self {
         Self(vec![first])
     }
+    /// The first element, which always exists.
+    ///
+    /// The one site-level exception in this crate. Returning `Option<&T>`
+    /// here would push an `unwrap()` into every caller (`bathy-engine`'s
+    /// `*evidence_refs.first()`, `bathy-query`'s fold) and move the panic
+    /// rather than remove it; storing `(T, Vec<T>)` instead of `Vec<T>` --
+    /// which would make the invariant a compiler fact -- cannot support
+    /// [`Self::as_slice`], which two crates use to hand `&[T]` to code that
+    /// wants a contiguous slice.
+    ///
+    /// So the invariant stays structural in the *constructors*: `0` is
+    /// private, [`Self::new`] pushes one element, [`TryFrom<Vec<T>>`] rejects
+    /// an empty vector, `Deserialize` goes through that `TryFrom`, and the
+    /// only mutator is [`Self::push`], which grows. Two tests hold that up:
+    /// `every_way_to_build_a_non_empty_yields_a_non_empty_one` drives all four
+    /// paths, and `the_only_methods_on_non_empty_are_the_ones_that_cannot_shrink_it`
+    /// reads this file and fails if a method is added to the block below --
+    /// because "no method removes elements" is the half a behavioural test
+    /// cannot see coming.
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "`self.0` is never empty: the field is private, both constructors \
+                  produce at least one element, and no method removes any -- see this \
+                  method's doc comment for the two tests that enforce both halves"
+    )]
     pub fn first(&self) -> &T {
-        &self.0[0] // safe: the invariant guarantees index 0 exists
+        &self.0[0]
     }
     pub fn len(&self) -> usize {
         self.0.len()
@@ -150,6 +175,60 @@ mod tests {
     fn empty_error_message_is_stable() {
         let err = NonEmpty::<u8>::try_from(Vec::new()).unwrap_err();
         assert_eq!(err.to_string(), "value must contain at least one element");
+    }
+
+    // --- M7 panic-lint widening: the two tests that back `first()`'s
+    // site-level `#[allow(clippy::indexing_slicing)]`. See its doc comment. ---
+
+    #[test]
+    fn every_way_to_build_a_non_empty_yields_a_non_empty_one() {
+        // All four paths into the type, each ending in the indexing `first()`
+        // performs. A constructor that ever produced an empty inner vector
+        // would abort here rather than in whichever caller happened to ask
+        // for the first element first.
+        assert_eq!(*NonEmpty::new(9u8).first(), 9);
+        assert_eq!(*NonEmpty::try_from(vec![9u8]).unwrap().first(), 9);
+        assert!(NonEmpty::<u8>::try_from(Vec::new()).is_err());
+        let deserialized: NonEmpty<u8> = serde_json::from_str("[9]").unwrap();
+        assert_eq!(*deserialized.first(), 9);
+        assert!(serde_json::from_str::<NonEmpty<u8>>("[]").is_err());
+        let mut grown = NonEmpty::new(9u8);
+        grown.push(10);
+        assert_eq!(*grown.first(), 9, "push must not disturb the first element");
+        assert!(!grown.is_empty());
+    }
+
+    #[test]
+    fn the_only_methods_on_non_empty_are_the_ones_that_cannot_shrink_it() {
+        // `first()`'s allow rests on "no method removes elements", which no
+        // behavioural test can check for a method that does not exist yet.
+        // This reads the inherent impl block out of this file and pins its
+        // membership, so adding a `pop`, `remove`, `retain`, `clear`,
+        // `truncate` or `drain` fails here -- at which point either the method
+        // preserves the invariant and joins this list, or `first()` was just
+        // made unsound and the allow has to go.
+        let source = include_str!("nonempty.rs");
+        let (_, after) = source
+            .split_once("impl<T> NonEmpty<T> {")
+            .expect("the inherent impl block must still be declared this way");
+        let (block, _) = after
+            .split_once("\n}\n")
+            .expect("the inherent impl block must be closed at column 0");
+        let mut found: Vec<&str> = block
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("pub fn "))
+            .filter_map(|l| l.split(['(', '<']).next())
+            .collect();
+        found.sort_unstable();
+        assert_eq!(
+            found,
+            [
+                "as_slice", "first", "into_vec", "is_empty", "iter", "len", "new", "push"
+            ],
+            "the methods on NonEmpty changed; the site-level allow of \
+             clippy::indexing_slicing on `first()` is only correct while none of \
+             them can remove an element"
+        );
     }
 
     // --- AC-1.9: JSON Schema exposes `minItems: 1` constraining the array ---

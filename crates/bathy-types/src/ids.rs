@@ -73,8 +73,17 @@ impl FromStr for Digest {
             return Err(IdError::BadHex);
         }
         let mut out = [0u8; 32];
-        for (i, byte) in out.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).map_err(|_| IdError::BadHex)?;
+        // `chunks_exact(2)` rather than `&hex[i * 2..i * 2 + 2]`: the string
+        // slicing was in bounds (the length was checked above) but `i * 2 + 2`
+        // is unchecked arithmetic, and *string* indexing is invisible to
+        // `clippy::indexing_slicing` -- so the bound was held by the reader's
+        // attention in both directions. Pairing the output bytes with the
+        // input pairs makes the two lengths agree by construction; `zip` stops
+        // at the shorter, and `hex.len() == 64 == out.len() * 2` is what makes
+        // them the same length.
+        for (byte, pair) in out.iter_mut().zip(hex.as_bytes().chunks_exact(2)) {
+            let pair = std::str::from_utf8(pair).map_err(|_| IdError::BadHex)?;
+            *byte = u8::from_str_radix(pair, 16).map_err(|_| IdError::BadHex)?;
         }
         Ok(Self(out))
     }
