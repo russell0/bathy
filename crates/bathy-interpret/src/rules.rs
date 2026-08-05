@@ -50,6 +50,25 @@
 //! (span validity) over arbitrary bytes for the whole rule set at once, not
 //! just per protocol.
 //!
+//! **Both disciplines were prose until the M7 panic-lint round.** The
+//! sentence above about binary-shaped rules using "only checked arithmetic
+//! ... and never index past a bound" was *false when written*: `utf8_lines`
+//! sliced `bytes[start..i]`, `u16_at` indexed `s[0]`/`s[1]`,
+//! `mysql_handshake_v10` sliced `bytes[VERSION_STRING_START..version_end]`
+//! after an unchecked `+`, `dns_bind_version` sliced
+//! `bytes[txt_start..txt_end]`, `tls_server_hello` indexed `header[0]` and
+//! `header[5]`, and every text-shaped rule computed its span with a bare
+//! `line_start + m.start()`. Each was in fact in bounds, and none was
+//! *checked* by anything except a reader's attention -- which is precisely
+//! how the `from_utf8_lossy` offset defect this module's own comment
+//! describes got written in the first place, and how seven span-corrupting
+//! mutants survived into three review rounds. The Global Constraint that
+//! claimed `unwrap`/`expect`/indexing panics were "denied by lint" in this
+//! crate was aspirational from M1 until then; `src/lib.rs` now carries the
+//! lint that makes it true, and the arithmetic in this file is checked or
+//! it does not compile. See [`absolute_span`], which is the one place the
+//! offset arithmetic those seven mutants attacked now lives.
+//!
 //! # Provenance
 //!
 //! Every rule's `source` names an RFC section, a vendor's own protocol
@@ -84,14 +103,55 @@ pub enum Specificity {
 }
 
 impl Specificity {
-    pub fn confidence(self) -> Confidence {
-        let v = match self {
+    /// Every rung, in ladder order.
+    ///
+    /// Exists so the exhaustiveness of the ladder is testable rather than
+    /// eyeballed: `tests::every_rung_of_the_ladder_is_a_valid_confidence`
+    /// walks this array, and `tests::the_ladder_array_lists_every_variant`
+    /// matches on each variant exhaustively, so adding a fifth rung without
+    /// adding it here fails to compile.
+    pub const ALL: [Self; 4] = [
+        Self::ProductAndVersion,
+        Self::ProductOnly,
+        Self::ProtocolOnly,
+        Self::Weak,
+    ];
+
+    /// The `f64` this rung means. Split out from [`Self::confidence`] so the
+    /// four numbers can be range-checked by a test without going through the
+    /// fallible constructor.
+    const fn value(self) -> f64 {
+        match self {
             Self::ProductAndVersion => 0.95,
             Self::ProductOnly => 0.85,
             Self::ProtocolOnly => 0.70,
             Self::Weak => 0.50,
-        };
-        Confidence::new(v).expect("ladder values are in range")
+        }
+    }
+
+    pub fn confidence(self) -> Confidence {
+        // NARROW ALLOW (M7 panic-lint round). `expect` is denied crate-wide
+        // in non-test builds because this crate parses attacker-controlled
+        // bytes; this call site takes no bytes at all. Its argument is
+        // `self.value()`, a `match` over a four-variant enum returning one
+        // of four literals, every one of them inside `Confidence`'s 0.0..=1.0
+        // domain -- so the `Err` arm is unreachable for every value the type
+        // system permits. `Confidence`'s field is private, so there is no
+        // infallible constructor to reach for, and the alternatives are both
+        // worse: `unwrap_or(..)` would silently substitute a confidence
+        // nobody wrote, and returning `Result` would push an error nobody can
+        // trigger through every rule in the file.
+        //
+        // The reasoning is enforced, not asserted:
+        // `tests::every_rung_of_the_ladder_is_a_valid_confidence` walks
+        // `Specificity::ALL` and fails if any rung's value leaves the domain,
+        // and `tests::the_ladder_array_lists_every_variant` fails to compile
+        // if a rung is added without joining `ALL`.
+        #[allow(
+            clippy::expect_used,
+            reason = "four in-range literals; enforced by every_rung_of_the_ladder_is_a_valid_confidence"
+        )]
+        Confidence::new(self.value()).expect("ladder values are in range")
     }
 }
 
@@ -187,26 +247,83 @@ fn utf8_lines(bytes: &[u8]) -> Vec<(usize, &str)> {
     let mut start = 0usize;
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'\n' {
-            if let Ok(s) = std::str::from_utf8(&bytes[start..i]) {
+            if let Some(Ok(s)) = bytes.get(start..i).map(std::str::from_utf8) {
                 out.push((start, s));
             }
-            start = i + 1;
+            // `i < bytes.len()`, so this cannot overflow -- but it is
+            // written checked anyway, because that is exactly the kind of
+            // "obviously fine" offset arithmetic this module's own history
+            // is about. A `None` here would mean `start` stops advancing,
+            // so bail rather than loop on a stale offset.
+            let Some(next) = i.checked_add(1) else {
+                return out;
+            };
+            start = next;
         }
     }
     if start < bytes.len()
-        && let Ok(s) = std::str::from_utf8(&bytes[start..])
+        && let Some(Ok(s)) = bytes.get(start..).map(std::str::from_utf8)
     {
         out.push((start, s));
     }
     out
 }
 
+/// An absolute byte range into the response, from a regex match against one
+/// of [`utf8_lines`]'s lines plus that line's own start offset.
+///
+/// The single home for the `line_start + m.start()` arithmetic that every
+/// text-shaped rule below needs. It is one function rather than six copies
+/// for the reason this module's "Byte safety" note gives: this exact
+/// expression is what the `from_utf8_lossy` defect corrupted and what seven
+/// span mutants attacked across three review rounds, and a checked add
+/// written six times is six chances to write the seventh unchecked.
+///
+/// Returns `None` on overflow rather than wrapping or saturating: a
+/// saturated span would be a *wrong* claim about which bytes justified an
+/// interpretation, and this crate's whole contract is that a span points at
+/// the evidence. No match, no claim.
+fn absolute_span(line_start: usize, m: &regex::Match<'_>) -> Option<Range<usize>> {
+    Some(line_start.checked_add(m.start())?..line_start.checked_add(m.end())?)
+}
+
+/// Compiles one of this module's own literal, compile-time-constant regex
+/// patterns.
+///
+/// # Why this panics, and why that is the right behaviour
+///
+/// `expect` is denied crate-wide in non-test builds (see `src/lib.rs`)
+/// because this crate parses attacker-controlled bytes. This function takes
+/// no bytes: its only callers pass a `&'static str` literal written in this
+/// file, so whether it compiles is decided when the source is written, not
+/// by anything a scanned peer sends. There is no input that reaches this
+/// `Err` arm.
+///
+/// The alternative -- returning `Option<Regex>` and having the rule quietly
+/// not fire -- is strictly worse than a panic: it would turn a typo in a
+/// pattern into a rule that silently recognizes nothing, which is the
+/// "reaches nothing while reading as coverage" failure this project has
+/// already measured once in a property-test strategy. A `LazyLock` that
+/// dies loudly on first use is a bug you find; a rule that never matches is
+/// a bug you ship.
+///
+/// The reasoning is enforced rather than asserted:
+/// `tests::every_static_regex_in_this_module_compiles` forces every
+/// `LazyLock` below, so a bad pattern fails `cargo test` rather than a scan.
+#[allow(
+    clippy::expect_used,
+    reason = "compile-time-constant patterns only; enforced by every_static_regex_in_this_module_compiles"
+)]
+fn static_regex(pattern: &'static str) -> Regex {
+    Regex::new(pattern).expect("a pattern literal in this module does not compile")
+}
+
 /// Reads a big-endian `u16` at `bytes[at..at+2]`, or `None` if that range
 /// runs off the end of `bytes`. The one primitive every binary-shaped
 /// matcher below builds its bounds-checked parsing on.
 fn u16_at(bytes: &[u8], at: usize) -> Option<u16> {
-    let s = bytes.get(at..at.checked_add(2)?)?;
-    Some(u16::from_be_bytes([s[0], s[1]]))
+    let s: [u8; 2] = bytes.get(at..at.checked_add(2)?)?.try_into().ok()?;
+    Some(u16::from_be_bytes(s))
 }
 
 // =====================================================================
@@ -238,10 +355,8 @@ fn http_status_line(bytes: &[u8]) -> Option<(usize, &str)> {
     }
 }
 
-static NGINX_SERVER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^Server:[ \t]*nginx(?:/([0-9][0-9A-Za-z.\-]*))?")
-        .expect("static regex compiles")
-});
+static NGINX_SERVER_RE: LazyLock<Regex> =
+    LazyLock::new(|| static_regex(r"(?i)^Server:[ \t]*nginx(?:/([0-9][0-9A-Za-z.\-]*))?"));
 
 fn http_nginx(bytes: &[u8]) -> Option<Hit> {
     http_status_line(bytes)?;
@@ -260,7 +375,7 @@ fn http_nginx(bytes: &[u8]) -> Option<Hit> {
             product: Some("nginx".to_owned()),
             version,
             specificity,
-            span: (line_start + m.start())..(line_start + m.end()),
+            span: absolute_span(line_start, &m)?,
         });
     }
     None
@@ -272,7 +387,7 @@ fn http_bare_protocol(bytes: &[u8]) -> Option<Hit> {
         product: None,
         version: None,
         specificity: Specificity::ProtocolOnly,
-        span: start..(start + first.len()),
+        span: start..start.checked_add(first.len())?,
     })
 }
 
@@ -298,10 +413,9 @@ fn http_bare_protocol(bytes: &[u8]) -> Option<Hit> {
 // =====================================================================
 
 static SSH_OPENSSH_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^SSH-\d\.\d+-OpenSSH_(\S+)").expect("static regex compiles"));
+    LazyLock::new(|| static_regex(r"^SSH-\d\.\d+-OpenSSH_(\S+)"));
 
-static SSH_BANNER_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^SSH-\d\.\d+-").expect("static regex compiles"));
+static SSH_BANNER_RE: LazyLock<Regex> = LazyLock::new(|| static_regex(r"^SSH-\d\.\d+-"));
 
 fn ssh_openssh(bytes: &[u8]) -> Option<Hit> {
     for (line_start, line) in utf8_lines(bytes) {
@@ -314,7 +428,7 @@ fn ssh_openssh(bytes: &[u8]) -> Option<Hit> {
             product: Some("OpenSSH".to_owned()),
             version: Some(version),
             specificity: Specificity::ProductAndVersion,
-            span: (line_start + m.start())..(line_start + m.end()),
+            span: absolute_span(line_start, &m)?,
         });
     }
     None
@@ -327,7 +441,7 @@ fn ssh_bare_protocol(bytes: &[u8]) -> Option<Hit> {
                 product: None,
                 version: None,
                 specificity: Specificity::ProtocolOnly,
-                span: (line_start + m.start())..(line_start + m.end()),
+                span: absolute_span(line_start, &m)?,
             });
         }
     }
@@ -437,7 +551,7 @@ fn redis_resp_shaped_reply(bytes: &[u8]) -> Option<Hit> {
         product: None,
         version: None,
         specificity: Specificity::Weak,
-        span: 0..(crlf_at + 2),
+        span: 0..crlf_at.checked_add(2)?,
     })
 }
 
@@ -471,8 +585,8 @@ fn mysql_handshake_v10(bytes: &[u8]) -> Option<Hit> {
     if nul == 0 {
         return None; // empty version string: nothing to report
     }
-    let version_end = VERSION_STRING_START + nul;
-    let version = std::str::from_utf8(&bytes[VERSION_STRING_START..version_end]).ok()?;
+    let version_end = VERSION_STRING_START.checked_add(nul)?;
+    let version = std::str::from_utf8(bytes.get(VERSION_STRING_START..version_end)?).ok()?;
     Some(Hit {
         product: Some("MySQL".to_owned()),
         version: Some(version.to_owned()),
@@ -562,7 +676,7 @@ fn dns_bind_version(bytes: &[u8]) -> Option<Hit> {
             if txt_end > rdata_end {
                 return None;
             }
-            let version = std::str::from_utf8(&bytes[txt_start..txt_end]).ok()?;
+            let version = std::str::from_utf8(bytes.get(txt_start..txt_end)?).ok()?;
             if version.is_empty() {
                 return None;
             }
@@ -599,11 +713,9 @@ fn dns_bind_version(bytes: &[u8]) -> Option<Hit> {
 // (M4 Task 2 report), which replied `220 <host> ESMTP Postfix (Debian)\r\n`.
 // =====================================================================
 
-static SMTP_GREETING_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^220[ -]").expect("static regex compiles"));
+static SMTP_GREETING_RE: LazyLock<Regex> = LazyLock::new(|| static_regex(r"^220[ -]"));
 
-static SMTP_POSTFIX_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^220[ -].*\bPostfix\b").expect("static regex compiles"));
+static SMTP_POSTFIX_RE: LazyLock<Regex> = LazyLock::new(|| static_regex(r"^220[ -].*\bPostfix\b"));
 
 /// Scans every line, not just the first: RFC 5321 §4.2's own ABNF for the
 /// `Greeting` allows a *multiline* 220 reply -- verbatim: `( "220-"
@@ -630,7 +742,7 @@ fn smtp_postfix(bytes: &[u8]) -> Option<Hit> {
                 product: Some("Postfix".to_owned()),
                 version: None,
                 specificity: Specificity::ProductOnly,
-                span: (line_start + m.start())..(line_start + m.end()),
+                span: absolute_span(line_start, &m)?,
             });
         }
     }
@@ -644,7 +756,7 @@ fn smtp_bare_protocol(bytes: &[u8]) -> Option<Hit> {
         product: None,
         version: None,
         specificity: Specificity::ProtocolOnly,
-        span: (start + m.start())..(start + m.end()),
+        span: absolute_span(start, &m)?,
     })
 }
 
@@ -672,10 +784,21 @@ fn tls_server_hello(bytes: &[u8]) -> Option<Hit> {
     const CONTENT_TYPE_HANDSHAKE: u8 = 0x16;
     const HANDSHAKE_TYPE_SERVER_HELLO: u8 = 0x02;
     const HEADER_LEN: usize = 6; // 5-byte record header + 1-byte handshake type
-    let header = bytes.get(0..HEADER_LEN)?;
-    if header[0] != CONTENT_TYPE_HANDSHAKE || header[5] != HANDSHAKE_TYPE_SERVER_HELLO {
+    // Destructured, not indexed: the array pattern is what makes the
+    // six-byte length requirement and the two field positions one check the
+    // compiler sees, rather than a `get(0..6)` whose result is then indexed
+    // on the reader's word that six is bigger than five.
+    let &[
+        CONTENT_TYPE_HANDSHAKE,
+        _,
+        _,
+        _,
+        _,
+        HANDSHAKE_TYPE_SERVER_HELLO,
+    ] = bytes.get(0..HEADER_LEN)?
+    else {
         return None;
-    }
+    };
     Some(Hit {
         product: None,
         version: None,
@@ -904,6 +1027,82 @@ mod tests {
     // own public entry point rather than `rules_for` directly.
     use crate::interpret;
     use bathy_types::{ProbeCapture, Transport};
+
+    // --- the two narrow `#[allow(clippy::expect_used)]`s in this file ---
+    //
+    // Both allows in this module claim their `Err` arm is unreachable. These
+    // three tests are what make that a checked claim rather than a comment;
+    // deleting one re-opens exactly the hole the M7 panic-lint round closed.
+
+    #[test]
+    fn every_rung_of_the_ladder_is_a_valid_confidence() {
+        // `Specificity::confidence`'s `expect` is allowed because every rung
+        // is one of four literals inside `Confidence`'s domain. This is the
+        // check on that: a rung edited to 1.5 or -0.1 fails here rather than
+        // panicking in the middle of a scan.
+        for rung in Specificity::ALL {
+            assert!(
+                Confidence::new(rung.value()).is_ok(),
+                "rung {rung:?} has value {} , which Confidence rejects",
+                rung.value()
+            );
+        }
+    }
+
+    #[test]
+    fn the_ladder_array_lists_every_variant() {
+        // Exhaustiveness, checked by the compiler rather than by counting:
+        // a fifth `Specificity` variant makes this `match` fail to build, and
+        // the `assert_eq!` catches a variant dropped from `ALL` instead.
+        for rung in Specificity::ALL {
+            match rung {
+                Specificity::ProductAndVersion
+                | Specificity::ProductOnly
+                | Specificity::ProtocolOnly
+                | Specificity::Weak => {}
+            }
+        }
+        let mut seen: Vec<f64> = Specificity::ALL.iter().map(|s| s.value()).collect();
+        seen.sort_by(f64::total_cmp);
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            Specificity::ALL.len(),
+            "two rungs of the ladder carry the same confidence, so one of them is not a rung"
+        );
+    }
+
+    #[test]
+    fn every_static_regex_in_this_module_compiles() {
+        // `static_regex`'s `expect` is allowed because its arguments are
+        // literals in this file. This forces every one of those `LazyLock`s,
+        // so a bad pattern is a red test rather than a panic on the first
+        // response that reaches the rule. A regex added below without a line
+        // here is caught by `every_rule_has_its_static_regex_forced`.
+        let _ = NGINX_SERVER_RE.as_str();
+        let _ = SSH_OPENSSH_RE.as_str();
+        let _ = SSH_BANNER_RE.as_str();
+        let _ = SMTP_GREETING_RE.as_str();
+        let _ = SMTP_POSTFIX_RE.as_str();
+    }
+
+    #[test]
+    fn every_rule_has_its_static_regex_forced() {
+        // The test above is a hand-written list, which is the shape this
+        // project has repeatedly watched go stale. This is the check on the
+        // list: it counts `LazyLock<Regex>` declarations in this file's own
+        // source and fails if one was added without joining the test.
+        let source = include_str!("rules.rs");
+        let declared = source
+            .lines()
+            .filter(|l| l.contains("LazyLock<Regex>") && l.trim_start().starts_with("static "))
+            .count();
+        assert_eq!(
+            declared, 5,
+            "this file declares {declared} `LazyLock<Regex>` statics, not 5; add the new one to \
+             every_static_regex_in_this_module_compiles and update this count"
+        );
+    }
 
     // --- known_probe_ids ---
 

@@ -36,6 +36,30 @@ pub enum ProbeError {
     Timeout(Duration),
     #[error("connection closed before any response")]
     EmptyResponse,
+    /// `Instant::now() + deadline` is not representable, so the absolute
+    /// deadline every bounded read is measured against cannot be computed.
+    ///
+    /// Added in the M7 panic-lint round. `Instant + Duration` **panics** on
+    /// overflow, and both bounded read paths performed exactly that add on
+    /// entry with a `Duration` supplied by the caller. Refusing the read is
+    /// the honest outcome: a deadline that cannot be represented cannot be
+    /// enforced, and the whole point of [`ProbeIo`] is that no read outlives
+    /// one. Reachable in practice only with an absurd `deadline` -- see
+    /// `read_bounded_refuses_a_deadline_the_clock_cannot_represent`, which
+    /// drives it with [`Duration::MAX`] rather than asserting it is
+    /// unreachable.
+    #[error("deadline {0:?} is too large to be represented as an instant")]
+    DeadlineUnrepresentable(Duration),
+    /// A socket read reported having filled more bytes than the buffer it
+    /// was handed.
+    ///
+    /// Impossible for a correct [`tokio::io::AsyncRead`], and this module
+    /// declines to assume it anyway: before the M7 panic-lint round the
+    /// returned count was used directly as a slice bound (`&chunk[..n]`,
+    /// `&mut out[filled..]`), so a wrong count was a panic in the read path
+    /// of a probe against a hostile peer. It is now a checked error.
+    #[error("socket read reported {reported} bytes into a {buffer}-byte buffer")]
+    OversizedRead { reported: usize, buffer: usize },
 }
 
 /// Bounded socket wrapper handed to a probe.
@@ -137,6 +161,23 @@ impl ProbeIo {
         }
     }
 
+    /// The single absolute instant a bounded read is measured against:
+    /// `now + self.deadline`, computed once per call.
+    ///
+    /// Exists as a function purely so the overflow check is written once.
+    /// `Instant + Duration` is a **panicking** operation -- the `Add` impl
+    /// unwraps `checked_add` -- and both read paths performed it on entry
+    /// with a caller-supplied `Duration`. See
+    /// [`ProbeError::DeadlineUnrepresentable`] for why refusing the read is
+    /// the right answer rather than saturating: a deadline that cannot be
+    /// represented cannot be enforced, and enforcing one is this type's
+    /// entire job.
+    fn absolute_deadline(&self) -> Result<tokio::time::Instant, ProbeError> {
+        tokio::time::Instant::now()
+            .checked_add(self.deadline)
+            .ok_or(ProbeError::DeadlineUnrepresentable(self.deadline))
+    }
+
     /// Writes `bytes` in full, bounded by `deadline`. See this type's own
     /// doc comment for why `deadline` applies fresh to this call rather
     /// than being shared with a following [`Self::read_bounded`].
@@ -225,7 +266,10 @@ impl ProbeIo {
         // for why this, and not a fresh per-read timeout, is what actually
         // bounds this function against a peer that never stops sending a
         // trickle of bytes.
-        let deadline = tokio::time::Instant::now() + self.deadline;
+        //
+        // `Instant + Duration` panics on overflow; this is the checked form
+        // (M7 panic-lint round). See `ProbeError::DeadlineUnrepresentable`.
+        let deadline = self.absolute_deadline()?;
 
         loop {
             let room = self.read_cap.saturating_sub(out.len());
@@ -249,11 +293,30 @@ impl ProbeIo {
                 };
             }
 
-            match tokio::time::timeout(remaining, self.stream.read(&mut chunk[..room.min(CHUNK)]))
-                .await
-            {
+            // NARROW ALLOW (M7 panic-lint round). `indexing_slicing` is
+            // denied crate-wide because this crate reads attacker-controlled
+            // bytes; the bound here comes from nothing the peer sends. It is
+            // `room.min(CHUNK)`, and `CHUNK` is the declared length of
+            // `chunk` two dozen lines up -- the expression is its own proof
+            // that it cannot exceed the buffer, for any value of `room`,
+            // including one a flooding peer influenced. The peer-supplied
+            // number in this loop is `n`, and `n` is NOT trusted as a bound:
+            // see the `chunk.get(..n)` below.
+            #[allow(
+                clippy::indexing_slicing,
+                reason = "`room.min(CHUNK)` <= `CHUNK` == `chunk.len()` by construction of the expression"
+            )]
+            let buf = &mut chunk[..room.min(CHUNK)];
+            let buf_len = buf.len();
+            match tokio::time::timeout(remaining, self.stream.read(buf)).await {
                 Ok(Ok(0)) => return Ok((out, false)), // clean EOF: response is complete
-                Ok(Ok(n)) => out.extend_from_slice(&chunk[..n]),
+                Ok(Ok(n)) => {
+                    let filled = chunk.get(..n).ok_or(ProbeError::OversizedRead {
+                        reported: n,
+                        buffer: buf_len,
+                    })?;
+                    out.extend_from_slice(filled);
+                }
                 Ok(Err(e)) => return Err(ProbeError::Io(e)),
                 Err(_elapsed) => {
                     let truncated = !out.is_empty();
@@ -332,16 +395,36 @@ impl ProbeIo {
         let target = n.min(self.read_cap);
         let mut out = vec![0u8; target];
         let mut filled = 0usize;
-        let deadline = tokio::time::Instant::now() + self.deadline;
+        let deadline = self.absolute_deadline()?;
 
         while filled < target {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            match tokio::time::timeout(remaining, self.stream.read(&mut out[filled..])).await {
+            // `filled < target == out.len()` is this loop's own condition,
+            // so `get_mut` here never yields `None` -- but the bound is
+            // recomputed from `out` rather than assumed, because `filled`'s
+            // increment below is a peer-supplied count.
+            let buf = out.get_mut(filled..).ok_or(ProbeError::OversizedRead {
+                reported: filled,
+                buffer: target,
+            })?;
+            let buf_len = buf.len();
+            match tokio::time::timeout(remaining, self.stream.read(buf)).await {
                 Ok(Ok(0)) => {
                     out.truncate(filled);
                     return Ok((out, false)); // clean EOF before `n` bytes arrived
                 }
-                Ok(Ok(k)) => filled += k,
+                Ok(Ok(k)) if k <= buf_len => {
+                    filled = filled.checked_add(k).ok_or(ProbeError::OversizedRead {
+                        reported: k,
+                        buffer: buf_len,
+                    })?;
+                }
+                Ok(Ok(k)) => {
+                    return Err(ProbeError::OversizedRead {
+                        reported: k,
+                        buffer: buf_len,
+                    });
+                }
                 Ok(Err(e)) => return Err(ProbeError::Io(e)),
                 Err(_elapsed) => {
                     out.truncate(filled);
@@ -469,11 +552,14 @@ impl ProbeRegistry {
 /// `has_version_suffix_rejects_a_bare_dash_v_substring_without_digits`
 /// below.
 fn has_version_suffix(id: &str) -> bool {
-    match id.rfind("-v") {
-        Some(idx) => {
-            let digits = &id[idx + 2..];
-            !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit())
-        }
+    // `id.get(..)` rather than `&id[..]`, and `checked_add` rather than `+`:
+    // `-v` is ASCII so `idx + 2` is always a char boundary and always in
+    // bounds, which is exactly the kind of "obviously fine" reasoning the M7
+    // panic-lint round stopped accepting on faith. `str` indexing is outside
+    // `clippy::indexing_slicing`'s reach, so nothing but this comment would
+    // have caught it if the reasoning were ever made false by a change here.
+    match id.rfind("-v").and_then(|idx| id.get(idx.checked_add(2)?..)) {
+        Some(digits) => !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
 }
@@ -726,6 +812,33 @@ mod tests {
         let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
         let (server, _peer_addr) = accepted.unwrap();
         (client.unwrap(), server)
+    }
+
+    // --- The panic-lint round's own error paths (M7) ---
+
+    #[tokio::test]
+    async fn read_bounded_refuses_a_deadline_the_clock_cannot_represent() {
+        // Before the panic-lint round both read paths opened with
+        // `Instant::now() + self.deadline`, whose `Add` impl unwraps
+        // `checked_add` -- so this exact call aborted the process instead of
+        // returning. It is now a refusal, and this is the test that says so
+        // by driving it rather than by asserting it cannot happen.
+        let (client, _server) = loopback_pair().await;
+        let mut io = ProbeIo::new(client, 9, Duration::MAX);
+        assert!(matches!(
+            io.read_bounded().await,
+            Err(ProbeError::DeadlineUnrepresentable(d)) if d == Duration::MAX
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_at_most_refuses_a_deadline_the_clock_cannot_represent() {
+        let (client, _server) = loopback_pair().await;
+        let mut io = ProbeIo::new(client, 9, Duration::MAX);
+        assert!(matches!(
+            io.read_at_most(1).await,
+            Err(ProbeError::DeadlineUnrepresentable(d)) if d == Duration::MAX
+        ));
     }
 
     #[tokio::test]

@@ -50,7 +50,11 @@ fn build_query() -> Vec<u8> {
     msg.extend_from_slice(&16u16.to_be_bytes()); // QTYPE = TXT
     msg.extend_from_slice(&3u16.to_be_bytes()); // QCLASS = CH (Chaos)
 
-    let mut framed = Vec::with_capacity(2 + msg.len());
+    // `saturating_add`, not `+`: a capacity hint is the one place where
+    // saturating is unambiguously correct (`with_capacity` is advisory, and
+    // the `extend_from_slice` calls below grow the vector regardless), and
+    // `+` here was unchecked arithmetic in a crate that must not panic.
+    let mut framed = Vec::with_capacity(msg.len().saturating_add(2));
     framed.extend_from_slice(&(msg.len() as u16).to_be_bytes());
     framed.extend_from_slice(&msg);
     framed

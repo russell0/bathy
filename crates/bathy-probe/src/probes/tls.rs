@@ -86,6 +86,19 @@ use crate::framework::{Probe, ProbeError, ProbeIo, ProbeKind};
 
 /// Fixed 32-byte `ClientHello.random` -- not real entropy. See this
 /// module's "Every field is fixed" note.
+// NARROW ALLOW (M7 panic-lint round). `indexing_slicing` is denied
+// crate-wide because this crate reads attacker-controlled bytes; this is a
+// `const` initializer, evaluated by the compiler, over a fixed 32-byte array
+// with a loop bound that is the same literal 32. An out-of-bounds index here
+// is a *compile* error, not a runtime panic -- there is no execution in which
+// it could fail. Clippy says as much in its own note on this lint ("the
+// suggestion might not be applicable in constant blocks"): `.get()` returns
+// an `Option` there is no way to unwrap in a const context without
+// reintroducing a panic path that does not exist today.
+#[allow(
+    clippy::indexing_slicing,
+    reason = "const initializer: an out-of-bounds index here is a compile error, not a panic"
+)]
 const CLIENT_RANDOM: [u8; 32] = {
     let mut r = [0u8; 32];
     let mut i = 0;
@@ -105,6 +118,45 @@ fn u16be(n: u16) -> [u8; 2] {
     n.to_be_bytes()
 }
 
+// The three list-length constants below are `const` rather than expressions
+// inline in `build_client_hello`, and that is a panic fix, not a tidy-up
+// (M7 panic-lint round). `groups.len() as u16 * 2` and its two siblings were
+// unchecked runtime arithmetic on values that are in fact compile-time
+// constants; as `const` items the same expressions are evaluated by the
+// compiler, where an overflow is a build failure rather than a wrapped
+// length that would put a wrong byte count on the wire. Every one of these
+// is a *request* the probe sends, so none of them depends on a peer -- which
+// is exactly why the right answer is to make them constants rather than to
+// wrap them in `checked_mul`.
+
+/// RFC 8446 B.4. Sent verbatim, in this order, on every call (AC-4.9).
+const CIPHER_SUITES: [u16; 5] = [0x1301, 0x1302, 0x1303, 0x1304, 0x1305];
+/// x25519, secp256r1, secp384r1.
+const SUPPORTED_GROUPS: [u16; 3] = [0x001D, 0x0017, 0x0018];
+/// Mandatory per RFC 8446 4.2.3.
+const SIGNATURE_ALGORITHMS: [u16; 10] = [
+    0x0403, 0x0503, 0x0603, // ecdsa_secp{256r1,384r1,521r1}_sha{256,384,512}
+    0x0804, 0x0805, 0x0806, // rsa_pss_rsae_sha{256,384,512}
+    0x0401, 0x0501, 0x0601, // rsa_pkcs1_sha{256,384,512}
+    0x0807, // ed25519
+];
+
+/// Byte length of the `cipher_suites` vector: two bytes per suite.
+const CIPHER_SUITES_BYTES: u16 = (CIPHER_SUITES.len() * 2) as u16;
+/// Byte length of the `supported_groups` *list*, and of the extension body
+/// that carries it (the list plus its own 2-byte length prefix).
+const SUPPORTED_GROUPS_BYTES: u16 = (SUPPORTED_GROUPS.len() * 2) as u16;
+const SUPPORTED_GROUPS_EXT_BYTES: u16 = SUPPORTED_GROUPS_BYTES + 2;
+/// The same pair for `signature_algorithms`.
+const SIGNATURE_ALGORITHMS_BYTES: u16 = (SIGNATURE_ALGORITHMS.len() * 2) as u16;
+const SIGNATURE_ALGORITHMS_EXT_BYTES: u16 = SIGNATURE_ALGORITHMS_BYTES + 2;
+/// The single `key_share` entry: group (2) + key length (2) + the key
+/// itself, and the extension body that carries it (the entry plus its own
+/// 2-byte list length). Pinned to the bytes actually built by
+/// `build_client_hello` by `the_key_share_lengths_match_the_bytes_built`.
+const KEY_SHARE_ENTRY_BYTES: u16 = 2 + 2 + FIXED_X25519_KEY.len() as u16;
+const KEY_SHARE_EXT_BYTES: u16 = KEY_SHARE_ENTRY_BYTES + 2;
+
 /// Builds the raw `ClientHello` record: TLS 1.3, SNI omitted, no ALPN.
 /// Pure and fixed -- identical bytes on every call (AC-4.9).
 fn build_client_hello() -> Vec<u8> {
@@ -113,9 +165,8 @@ fn build_client_hello() -> Vec<u8> {
     body.extend_from_slice(&CLIENT_RANDOM);
     body.push(0); // legacy_session_id: empty (no middlebox-compat need here)
 
-    let cipher_suites: [u16; 5] = [0x1301, 0x1302, 0x1303, 0x1304, 0x1305]; // RFC 8446 B.4
-    body.extend_from_slice(&u16be((cipher_suites.len() * 2) as u16));
-    for cs in cipher_suites {
+    body.extend_from_slice(&u16be(CIPHER_SUITES_BYTES));
+    for cs in CIPHER_SUITES {
         body.extend_from_slice(&u16be(cs));
     }
     body.extend_from_slice(&[1, 0]); // legacy_compression_methods = [null]
@@ -127,24 +178,17 @@ fn build_client_hello() -> Vec<u8> {
     ext.push(2); // versions list length in bytes
     ext.extend_from_slice(&u16be(0x0304));
     // supported_groups (0x000a).
-    let groups: [u16; 3] = [0x001D, 0x0017, 0x0018]; // x25519, secp256r1, secp384r1
     ext.extend_from_slice(&u16be(0x000a));
-    ext.extend_from_slice(&u16be(2 + groups.len() as u16 * 2));
-    ext.extend_from_slice(&u16be(groups.len() as u16 * 2));
-    for g in groups {
+    ext.extend_from_slice(&u16be(SUPPORTED_GROUPS_EXT_BYTES));
+    ext.extend_from_slice(&u16be(SUPPORTED_GROUPS_BYTES));
+    for g in SUPPORTED_GROUPS {
         ext.extend_from_slice(&u16be(g));
     }
     // signature_algorithms (0x000d) -- mandatory per RFC 8446 4.2.3.
-    let sigalgs: [u16; 10] = [
-        0x0403, 0x0503, 0x0603, // ecdsa_secp{256r1,384r1,521r1}_sha{256,384,512}
-        0x0804, 0x0805, 0x0806, // rsa_pss_rsae_sha{256,384,512}
-        0x0401, 0x0501, 0x0601, // rsa_pkcs1_sha{256,384,512}
-        0x0807, // ed25519
-    ];
     ext.extend_from_slice(&u16be(0x000d));
-    ext.extend_from_slice(&u16be(2 + sigalgs.len() as u16 * 2));
-    ext.extend_from_slice(&u16be(sigalgs.len() as u16 * 2));
-    for s in sigalgs {
+    ext.extend_from_slice(&u16be(SIGNATURE_ALGORITHMS_EXT_BYTES));
+    ext.extend_from_slice(&u16be(SIGNATURE_ALGORITHMS_BYTES));
+    for s in SIGNATURE_ALGORITHMS {
         ext.extend_from_slice(&u16be(s));
     }
     // key_share (0x0033): one entry, x25519.
@@ -153,8 +197,8 @@ fn build_client_hello() -> Vec<u8> {
     ks_entry.extend_from_slice(&u16be(32));
     ks_entry.extend_from_slice(&FIXED_X25519_KEY);
     ext.extend_from_slice(&u16be(0x0033));
-    ext.extend_from_slice(&u16be(2 + ks_entry.len() as u16));
-    ext.extend_from_slice(&u16be(ks_entry.len() as u16));
+    ext.extend_from_slice(&u16be(KEY_SHARE_EXT_BYTES));
+    ext.extend_from_slice(&u16be(KEY_SHARE_ENTRY_BYTES));
     ext.extend_from_slice(&ks_entry);
     // Deliberately omitted, per this probe's spec: server_name (SNI) and
     // application_layer_protocol_negotiation (ALPN).
@@ -212,6 +256,52 @@ impl Probe for TlsProbe {
 mod tests {
     use super::*;
     use crate::probes::test_support::*;
+
+    #[test]
+    fn the_key_share_lengths_match_the_bytes_built() {
+        // `KEY_SHARE_ENTRY_BYTES` is a `const` (M7 panic-lint round) so its
+        // arithmetic is evaluated by the compiler rather than unchecked at
+        // run time. The cost of that move is that the constant and the bytes
+        // `build_client_hello` actually appends are now two statements
+        // instead of one; this is the check that keeps them equal. A key
+        // share whose declared length disagrees with its contents is a
+        // malformed `ClientHello`, which is exactly the kind of silent wire
+        // defect this project treats as worse than a crash.
+        let mut ks_entry = Vec::new();
+        ks_entry.extend_from_slice(&u16be(0x001D));
+        ks_entry.extend_from_slice(&u16be(32));
+        ks_entry.extend_from_slice(&FIXED_X25519_KEY);
+        assert_eq!(ks_entry.len(), usize::from(KEY_SHARE_ENTRY_BYTES));
+        assert_eq!(
+            usize::from(KEY_SHARE_EXT_BYTES),
+            ks_entry.len() + 2,
+            "the extension body is the entry plus its own 2-byte list length"
+        );
+    }
+
+    #[test]
+    fn the_fixed_list_lengths_match_their_lists() {
+        // Same check for the other three constants moved to `const` in the
+        // panic-lint round: two bytes per `u16` entry, and each extension
+        // body is its list plus a 2-byte length prefix.
+        assert_eq!(usize::from(CIPHER_SUITES_BYTES), CIPHER_SUITES.len() * 2);
+        assert_eq!(
+            usize::from(SUPPORTED_GROUPS_BYTES),
+            SUPPORTED_GROUPS.len() * 2
+        );
+        assert_eq!(
+            usize::from(SUPPORTED_GROUPS_EXT_BYTES),
+            SUPPORTED_GROUPS.len() * 2 + 2
+        );
+        assert_eq!(
+            usize::from(SIGNATURE_ALGORITHMS_BYTES),
+            SIGNATURE_ALGORITHMS.len() * 2
+        );
+        assert_eq!(
+            usize::from(SIGNATURE_ALGORITHMS_EXT_BYTES),
+            SIGNATURE_ALGORITHMS.len() * 2 + 2
+        );
+    }
 
     #[test]
     fn client_hello_starts_with_a_handshake_record_header() {

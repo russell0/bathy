@@ -1,4 +1,14 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects
+    )
+)]
 //! `bathy-interpret`: the pure interpretation layer.
 //!
 //! This crate turns the raw bytes a [`bathy_types::ProbeCapture`] recorded
@@ -48,6 +58,43 @@
 //! order (`xtask`'s `LAYERS`), specifically so `ProbeCapture` fixtures can
 //! be built by hand in a test or fuzz target with no socket anywhere in
 //! the dependency graph at all.
+//!
+//! # No panics on the byte path (Global Constraint), and how it is scoped
+//!
+//! The `#![cfg_attr(not(test), deny(...))]` above is the executable form of
+//! the overview's "No panics in parsing paths" constraint. That constraint
+//! said `unwrap()`/`expect()`/indexing-slice panics were "denied by lint" in
+//! this crate and in `bathy-probe` **from M1**, and no such lint existed
+//! anywhere in the tree until the M7 verification round. It was an
+//! aspiration written in the indicative mood for six milestones, in the one
+//! crate whose entire input is bytes a scanned peer chose.
+//!
+//! It found real hits here, and they are not stylistic: `utf8_lines` sliced
+//! `bytes[start..i]`, `u16_at` indexed a two-byte window it had just
+//! `get`-checked, `mysql_handshake_v10` and `dns_bind_version` sliced with
+//! offsets built by unchecked `+`, `tls_server_hello` indexed a header, and
+//! every text-shaped rule computed its `matched_span` as a bare `line_start
+//! + m.start()`. That last expression is the one the `from_utf8_lossy`
+//! defect corrupted and the one seven span mutants attacked across three
+//! review rounds; it now lives in exactly one place, `rules::absolute_span`,
+//! and it is checked. See `rules.rs`'s own "Byte safety" note.
+//!
+//! **How test code is exempt.** `cfg_attr(not(test), ...)`, not a bare
+//! `deny`. Under `cargo clippy --all-targets` the library is compiled twice:
+//! once as the lib, where `cfg(test)` is off and the deny is live over every
+//! line of production code, and once as the unit-test harness, where
+//! `cfg(test)` is on and the deny is absent -- so `#[cfg(test)] mod tests`
+//! keeps `unwrap()`. `tests/replay.rs`, `tests/span_edge_corpus.rs` and
+//! `benches/interpret.rs` are separate crates that never see the attribute.
+//!
+//! **A crate-level `#![allow]` of any of these would reproduce the exact
+//! defect being closed**, so the two exceptions in this crate
+//! (`Specificity::confidence` and `rules::static_regex`, both over
+//! compile-time-constant inputs) are site-level, carry a `reason`, and are
+//! each backed by a test that fails if the reasoning stops being true.
+//! `cargo run -p xtask -- check-panics` enforces that shape, and
+//! additionally holds the overview's constraint text to the set of crates
+//! that actually carry the attribute.
 //!
 //! # Never guess (AC-4.13)
 //!
