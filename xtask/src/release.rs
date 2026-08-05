@@ -692,32 +692,45 @@ fn already_published(names: &[String], version: &str) -> Fallible<Vec<String>> {
             .args([
                 "--silent",
                 "--show-error",
-                "--fail-with-body",
                 "--max-time",
                 "30",
+                // The status code, on its own last line, after the body. The
+                // first version of this used `--fail-with-body` and inferred a
+                // 404 from an empty body, which was wrong twice over: the
+                // index serves a non-empty body with its 404, so every
+                // unpublished crate looked like a transport failure. Read the
+                // code rather than guessing from the payload.
+                "--write-out",
+                "\n%{http_code}",
                 &url,
             ])
             .output()
             .map_err(|e| format!("running `curl` for {name}: {e}"))?;
-        let body = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() {
-            // A 404 is the ordinary answer for a crate nobody has published
-            // yet, and `--fail-with-body` makes it a non-zero exit. Anything
-            // else -- no network, DNS, a 5xx -- must NOT be read as "the name
-            // is free", so it is only tolerated when the body is empty.
-            if body.trim().is_empty() {
-                continue;
+        let out = String::from_utf8_lossy(&output.stdout);
+        let (body, code) = match out.rsplit_once('\n') {
+            Some((body, code)) => (body, code.trim()),
+            None => ("", out.trim()),
+        };
+        match code {
+            // The ordinary answer for a crate nobody has published yet.
+            "404" => continue,
+            "200" => {
+                if versions_in_index(body).iter().any(|v| v == version) {
+                    taken.push(name.clone());
+                }
             }
-            return Err(format!(
-                "querying the crates.io index for `{name}` failed: {}. Refusing to \
-                 continue: an unanswered question about whether a version already exists \
-                 is not the same as the answer `no`.",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
-            .into());
-        }
-        if versions_in_index(&body).iter().any(|v| v == version) {
-            taken.push(name.clone());
+            // No network, DNS, a 5xx, a proxy login page. None of these is the
+            // answer `no`, and treating an unanswered question as one is how a
+            // release republishes over a version that already exists.
+            other => {
+                return Err(format!(
+                    "querying the crates.io index for `{name}` returned HTTP `{other}` \
+                     {}. Refusing to continue: an unanswered question about whether a \
+                     version already exists is not the same as the answer `no`.",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )
+                .into());
+            }
         }
     }
     Ok(taken)
