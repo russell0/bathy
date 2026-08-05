@@ -71,7 +71,13 @@ proptest = { workspace = true }
 # `xtask`'s `LAYERS`, so these edges are downhill and `check-deps` accepts
 # them. They are the reason this package's `--all-targets` floor is 1.95
 # while its library floor is 1.88; see the `rust-version` comment above. ---
-bathy-engine = { path = "../bathy-engine" }
+# `test-util` is what exposes `bathy_engine::test_support` --
+# `reserving_listener`/`seal`, the fixture behind `closeable_port_serving_nginx`
+# below the `[dev-dependencies]` line in `tests/real_log_fold.rs`. That
+# fixture used to drop its listener and call the port unbound, which is a
+# claim about the machine rather than this process; see that crate's
+# `src/test_support.rs` for the measured failure rate that produced.
+bathy-engine = { path = "../bathy-engine", features = ["test-util"] }
 bathy-evidence = { path = "../bathy-evidence" }
 bathy-plan = { path = "../bathy-plan" }
 bathy-probe = { path = "../bathy-probe" }

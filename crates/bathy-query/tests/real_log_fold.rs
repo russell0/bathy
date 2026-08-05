@@ -36,6 +36,7 @@ use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
+use bathy_engine::test_support::ClosedPort;
 use bathy_engine::{GroupCommitConfig, GroupCommitLog, Scheduler, SchedulerConfig};
 use bathy_evidence::EvidenceStore;
 use bathy_plan::ScanPlan;
@@ -160,16 +161,73 @@ async fn open_port_serving_nginx() -> u16 {
     port
 }
 
-/// [`open_port_serving_nginx`] with a shutdown handle, so a later scan of the
-/// same port can observe it *closed* -- the differential-scanning case, and
-/// the only way to get real supersession into a real log without hand-writing
-/// an `Event`.
-async fn closeable_port_serving_nginx() -> (u16, CancellationToken) {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
+/// [`open_port_serving_nginx`] that can be *closed*, so a later scan of the
+/// same port observes `closed` -- the differential-scanning case, and the
+/// only way to get real supersession into a real log without hand-writing an
+/// `Event`.
+///
+/// Holds its port for the whole test, in both states. The first version of
+/// this fixture dropped the listener on shutdown and commented that the port
+/// was then unbound; that is a claim about the machine, not about this
+/// process, and it is the defect the sweep in
+/// `.superpowers/sdd/2026-07-31-bathy-m7-verification/flaky-tests-report.md`
+/// found in four `bathy-engine` fixtures and measured at 16 red runs in 30
+/// under a narrowed ephemeral range. The moment the port is released, any
+/// sibling test's `bind(:0)` can take it -- and then this test sees `open`
+/// where it asserts `closed`, *and* the test that won the port gets scanned
+/// by a stranger. Both halves were observed.
+///
+/// So shutdown *seals* the listener instead of dropping it: the port keeps
+/// refusing, and stays out of the ephemeral pool until this value drops. See
+/// `bathy_engine::test_support` for the kernel behaviour that rests on, on
+/// both platforms.
+struct CloseablePortServingNginx {
+    port: u16,
+    shutdown: CancellationToken,
+    /// The accept loop, which yields the listener back when it stops.
+    serving: Option<tokio::task::JoinHandle<std::net::TcpListener>>,
+    /// The reservation, from [`Self::close`] onwards. Dropping this struct
+    /// is what releases the port.
+    _reserved: Option<ClosedPort>,
+}
+
+impl CloseablePortServingNginx {
+    fn port(&self) -> u16 {
+        self.port
+    }
+
+    /// Stops serving and reserves the port in its refusing state.
+    ///
+    /// Awaits the accept loop rather than sleeping: the previous form
+    /// cancelled a token and then slept 50 ms "so the loop observes it",
+    /// which is a wall-clock guess about another task. Here the loop hands
+    /// the listener back, so there is nothing left to wait for.
+    async fn close(&mut self) {
+        self.shutdown.cancel();
+        let listener = self
+            .serving
+            .take()
+            .expect("close() called twice")
+            .await
+            .expect("the accept loop must not panic");
+        self._reserved = Some(bathy_engine::test_support::seal(listener));
+    }
+}
+
+async fn closeable_port_serving_nginx() -> CloseablePortServingNginx {
+    // Built by `reserving_listener`, not `TcpListener::bind`, because only a
+    // listener without `SO_REUSEADDR` can be sealed into a port the kernel
+    // will keep out of the ephemeral pool -- see that function's doc.
+    let std_listener =
+        bathy_engine::test_support::reserving_listener("127.0.0.1:0".parse().unwrap());
+    std_listener
+        .set_nonblocking(true)
+        .expect("tokio requires a non-blocking listener");
+    let port = std_listener.local_addr().unwrap().port();
+    let listener = TcpListener::from_std(std_listener).unwrap();
     let shutdown = CancellationToken::new();
     let listen_until = shutdown.clone();
-    tokio::spawn(async move {
+    let serving = tokio::spawn(async move {
         loop {
             let accepted = tokio::select! {
                 _ = listen_until.cancelled() => break,
@@ -192,11 +250,19 @@ async fn closeable_port_serving_nginx() -> (u16, CancellationToken) {
                 }
             });
         }
-        // Dropping the listener unbinds the port, so the next connect to it
-        // gets a genuine OS-produced refusal rather than a timeout.
-        drop(listener);
+        // Handed back, not dropped: the caller seals it, which is what makes
+        // the next connect a genuine OS-produced refusal *on a port nothing
+        // else can have taken in the meantime*.
+        listener
+            .into_std()
+            .expect("a tokio listener converts back to std")
     });
-    (port, shutdown)
+    CloseablePortServingNginx {
+        port,
+        shutdown,
+        serving: Some(serving),
+        _reserved: None,
+    }
 }
 
 /// Runs one real scan against `ports` and returns its event log. Each call
@@ -423,12 +489,12 @@ async fn a_real_log_of_a_port_that_closed_supersedes_by_sequence_in_any_order() 
     // down in between: `Open` plus an nginx identification, then `Closed`. That
     // is the differential-scanning case M5 Task 2 is built on, and it is the
     // smallest real log in which order actually decides the answer.
-    let (port, shutdown) = closeable_port_serving_nginx().await;
+    let mut closing = closeable_port_serving_nginx().await;
+    let port = closing.port();
     let first = scan_real_ports(&[port], "m5-task-1-supersession-open").await;
-    shutdown.cancel();
-    // Let the accept loop observe the cancellation and drop the listener, so
-    // the second scan meets a genuinely unbound port.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Stops serving and *reserves* the port refusing. No sleep: `close`
+    // awaits the accept loop, and nothing else can take the port after it.
+    closing.close().await;
     let second = scan_real_ports(&[port], "m5-task-1-supersession-closed").await;
 
     // Splice the two into the one log a resumed scan would have left behind:
@@ -594,15 +660,14 @@ async fn diffing_two_real_scans_across_a_listener_shutdown_reports_the_state_cha
     // otherwise), that a real completed scan really does fold to
     // `Terminal::Completed`, and that a port whose listener is gone is
     // observed `Closed` rather than vanishing from the log.
-    let (closing_port, shutdown) = closeable_port_serving_nginx().await;
+    let mut closing = closeable_port_serving_nginx().await;
+    let closing_port = closing.port();
     let steady_port = silent_open_port().await;
     let ports = [closing_port, steady_port];
 
     let monday = fold_events(&scan_real_ports(&ports, "m5-task-2-diff-monday").await);
-    shutdown.cancel();
-    // Let the accept loop observe the cancellation and drop the listener, so
-    // the second scan meets a genuinely unbound port.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Stops serving and reserves the port refusing; see the fixture.
+    closing.close().await;
     let tuesday = fold_events(&scan_real_ports(&ports, "m5-task-2-diff-tuesday").await);
 
     // Fixture sanity, asserted rather than assumed: two runs of the same

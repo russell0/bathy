@@ -57,6 +57,18 @@ bathy-plan = { path = "../bathy-plan" }
 # the layer order `check-deps` enforces.
 bathy-probe = { path = "../bathy-probe" }
 bathy-interpret = { path = "../bathy-interpret" }
+# OPTIONAL, and pulled in by nothing but the `test-util` feature below --
+# `cargo build -p bathy-engine` and every consumer that does not ask for
+# `test-util` resolve exactly the graph they did before, which is checkable
+# with `cargo tree -p bathy-engine` and is why this is not simply a normal
+# dependency. It has to be reachable from a NON-dev build because
+# `src/test_support.rs` is now `pub` behind that feature (see `src/lib.rs`),
+# and a crate above this one reaches this one through `[dependencies]`, where
+# this crate's own `[dev-dependencies]` do not exist. The `[dev-dependencies]`
+# entry below stays: this crate's own `cfg(test)` build does not turn
+# `test-util` on, and `connect.rs`'s `EADDRNOTAVAIL` test needs `socket2`
+# regardless of any feature.
+socket2 = { version = "0.6", optional = true }
 
 [dev-dependencies]
 # M3 whole-branch review, CRITICAL-1: `ScopeManifest::for_tests_allowing_loopback`
@@ -109,4 +121,9 @@ socket2 = "0.6"
 # `feature` name referenced in a `cfg` to be declared in `[features]`, and
 # an undeclared-but-referenced feature name is exactly the kind of drift
 # this lint exists to catch.
-test-util = []
+#
+# It now also exposes `pub mod test_support` (`closed_port`), which is why
+# it carries `dep:socket2`: that module cannot compile without it, and a
+# feature that turns on a module while leaving its dependency to chance is a
+# build that works only where something else happened to enable it.
+test-util = ["dep:socket2"]

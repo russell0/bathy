@@ -64,6 +64,16 @@ tokio-util.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The same crate as the `[dependencies]` edge above, with `test-util` added
+# for the tests only: it exposes `bathy_engine::test_support::closed_port_on`,
+# which `tests/workflow.rs`'s `Lab` uses for the endpoint the workflow's
+# filter has to exclude on `state`. That port used to be bound and dropped on
+# the machine's *routable* IP, i.e. handed back to a pool shared with every
+# process on the box. Feature unification does not carry this into
+# `cargo build -p bathy`: dev-dependency features are resolved separately
+# from normal ones, so the shipped binary's graph is unchanged. Same shape as
+# `bathy-engine`'s own dev-dependency on `bathy-scope`'s `test-util`.
+bathy-engine = { path = "../bathy-engine", features = ["test-util"] }
 # Test-only. `crates/bathy/tests/mcp.rs` checks every tool result against the
 # `outputSchema` its own tool published, and `pattern` is the keyword every
 # identifier and digest in those schemas is constrained by -- 29 declarations

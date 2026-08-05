@@ -23,9 +23,9 @@
 //! eleven tools can finish the job.
 
 use std::collections::BTreeSet;
-use std::net::TcpListener;
 use std::time::{Duration, Instant};
 
+use bathy_engine::test_support::ClosedPort;
 use serde_json::{Value, json};
 
 mod harness;
@@ -249,22 +249,31 @@ struct Lab {
     /// Open, and closes every connection without saying anything: no service
     /// is identified, so the `service` half of the filter must drop it.
     silent: Listener,
-    /// Nothing is listening: the `state` half of the filter must drop it.
-    closed_port: u16,
+    /// Nothing is listening, and nothing can start: the `state` half of the
+    /// filter must drop it. A reservation rather than a number, because a
+    /// number is only a claim -- see [`Lab::bind`].
+    closed: ClosedPort,
 }
 
 impl Lab {
     fn bind(ip: std::net::Ipv4Addr) -> Self {
-        // Bound and immediately released, so the port is real, routable and
-        // has nothing behind it -- which is what makes a `closed` port state
-        // an observation rather than a timeout.
-        let vacated = TcpListener::bind((ip, 0)).expect("bind");
-        let closed_port = vacated.local_addr().unwrap().port();
-        drop(vacated);
+        // Reserved, not vacated. This port is real, routable, refuses every
+        // connection -- and cannot be taken while the reservation is alive,
+        // which is the part a `bind` followed by `drop` could not deliver.
+        //
+        // The vacating form was the worst instance of that defect in the
+        // workspace, because it vacated on the machine's ROUTABLE address:
+        // the ephemeral pool there is shared with every process on the box,
+        // not merely with the other tests in this binary. Nothing in the
+        // failure would have named this test either -- the assertion that
+        // would have gone red is "the port this test vacated answered as
+        // open", 300 lines below, on a run where the scanner and the filter
+        // were both working perfectly.
+        let closed = bathy_engine::test_support::closed_port_on(ip);
         Self {
             http: Listener::bind(ip, true),
             silent: Listener::bind(ip, false),
-            closed_port,
+            closed,
         }
     }
 
@@ -272,7 +281,7 @@ impl Lab {
         vec![
             self.http.port(),
             self.silent.port(),
-            self.closed_port.to_string(),
+            self.closed.port().to_string(),
         ]
     }
 }
@@ -558,7 +567,7 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
         "the filter excluded nothing, so nothing above tested it"
     );
 
-    let closed = endpoint_on(&all, lab.closed_port)
+    let closed = endpoint_on(&all, lab.closed.port())
         .unwrap_or_else(|| panic!("the vacated port is missing from the fold: {all:#?}"));
     assert_ne!(
         closed["state"], "open",
@@ -566,7 +575,7 @@ fn an_agent_completes_an_authorized_inventory_in_ten_typed_calls() {
          the `state` half of the filter had nothing to exclude"
     );
     assert!(
-        endpoint_on(&found, lab.closed_port).is_none(),
+        endpoint_on(&found, lab.closed.port()).is_none(),
         "a non-open endpoint survived a `state: open` filter"
     );
 

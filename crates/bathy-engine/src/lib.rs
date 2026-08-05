@@ -48,13 +48,23 @@ pub mod discovery;
 pub mod durable_log;
 pub mod rate;
 pub mod scheduler;
-// Fixtures shared by the modules above's own `#[cfg(test)] mod tests`, and
-// compiled only for them. It exists because "a port with nothing listening"
-// is a claim about the whole machine that four tests here used to make by
-// binding a port and dropping it -- see the module doc for the measured
-// failure rates that produced, in those tests AND in bystanders.
-#[cfg(test)]
-mod test_support;
+// Fixtures for tests, and compiled only for them. It exists because "a port
+// with nothing listening" is a claim about the whole machine that four tests
+// here used to make by binding a port and dropping it -- see the module doc
+// for the measured failure rates that produced, in those tests AND in
+// bystanders.
+//
+// `pub` behind `test-util` rather than `#[cfg(test)] mod`, because the same
+// defect was found in two crates ABOVE this one --
+// `bathy-query`'s `tests/real_log_fold.rs` and `bathy`'s `tests/workflow.rs`
+// -- and the alternative to sharing it is three copies of a fixture whose
+// correctness argument is a page of kernel behaviour on two platforms. The
+// second copy is where that argument starts drifting. `bathy-scope`'s
+// `test-util` feature (`ScopeManifest::for_tests_allowing_loopback`) is the
+// same pattern for the same reason, and both are reached only through
+// dev-dependency edges.
+#[cfg(any(test, feature = "test-util"))]
+pub mod test_support;
 
 pub use connect::{ConnectOutcome, classify_io_error, probe_connect};
 pub use discovery::{DiscoveryConfig, DiscoveryConfigError, DiscoveryResult, discover_host};

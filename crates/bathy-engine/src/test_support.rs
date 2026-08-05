@@ -1,4 +1,12 @@
-//! Fixtures shared by this crate's own tests, and only by them.
+//! Fixtures for tests that need a port nothing can listen on.
+//!
+//! Reachable from outside this crate through the `test-util` feature, and
+//! only through a dev-dependency edge. It started as this crate's
+//! private module; the same defect was then found above it, in
+//! `bathy-query`'s `tests/real_log_fold.rs` and `bathy`'s
+//! `tests/workflow.rs`, and the argument below is a page of kernel
+//! behaviour on two platforms -- the kind of thing that is right once and
+//! subtly wrong in its second copy.
 //!
 //! # Why this module exists: "a port with nothing listening"
 //!
@@ -101,7 +109,7 @@
 //! What this removes entirely is the in-process ephemeral race, which is
 //! the one that was actually firing.
 
-use std::net::SocketAddr;
+use std::net::{Ipv4Addr, SocketAddr};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
@@ -116,7 +124,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 /// See this module's doc comment for the measurements behind both claims.
 #[must_use = "dropping a ClosedPort releases the port it is reserving, which \
               is the race this fixture exists to remove"]
-pub(crate) struct ClosedPort {
+pub struct ClosedPort {
     /// The client end. Held only so the connection stays established.
     _client: Socket,
     /// The server end, whose *local* address is `port`. This is what holds
@@ -126,7 +134,9 @@ pub(crate) struct ClosedPort {
 }
 
 impl ClosedPort {
-    pub(crate) fn port(&self) -> u16 {
+    /// The reserved port. Refused, and unavailable to any ephemeral bind,
+    /// for as long as `self` is alive.
+    pub fn port(&self) -> u16 {
         self.port
     }
 }
@@ -136,19 +146,69 @@ impl ClosedPort {
 /// Synchronous, and safe to call from an async test: the only blocking call
 /// is a loopback `connect` to a socket that is already listening with a
 /// free backlog slot, which the kernel completes inline.
-pub(crate) fn closed_port() -> ClosedPort {
+pub fn closed_port() -> ClosedPort {
+    closed_port_on(Ipv4Addr::LOCALHOST)
+}
+
+/// [`closed_port`] on an address other than `127.0.0.1`.
+///
+/// `crates/bathy/tests/workflow.rs` needs one on the machine's *routable*
+/// IP, because the workflow it drives scans that address. That case is the
+/// worse of the two the vacating form left: the ephemeral pool for a
+/// routable interface is shared with every other process on the box, not
+/// just with sibling tests.
+pub fn closed_port_on(ip: Ipv4Addr) -> ClosedPort {
+    seal(reserving_listener(SocketAddr::from((ip, 0))))
+}
+
+/// A bound, listening TCP socket that [`seal`] can later turn into a
+/// [`ClosedPort`] **on the same port it was serving**.
+///
+/// This exists for the open-then-closed case: `bathy-query`'s
+/// `real_log_fold.rs` serves an nginx banner on a port, shuts the listener
+/// down, and scans it a second time expecting `closed` -- which is how a
+/// real log gets real supersession in it. [`closed_port`] cannot serve that
+/// case, because the port has to be open first.
+///
+/// Returned blocking; a caller handing it to `tokio::net::TcpListener::from_std`
+/// must set it non-blocking itself, and [`seal`] puts it back either way.
+///
+/// The reason this is a constructor and not "bind it however you like, then
+/// call `seal`" is `SO_REUSEADDR`. `std` and `tokio` set it unconditionally
+/// on every listener and expose no way off, and on Linux a socket that sets
+/// it may share a port with another that sets it whenever neither is
+/// listening -- which is exactly the state a sealed port is in. A listener
+/// built by `std` and then sealed would hand the port straight back to the
+/// allocator this whole module exists to hide it from, silently, with every
+/// assertion still passing.
+pub fn reserving_listener(addr: SocketAddr) -> std::net::TcpListener {
     let listener = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
-        .expect("creating a loopback TCP socket");
-    // Deliberately NO `set_reuse_address(true)` -- see this module's doc
-    // comment. `Socket::new` leaves it off; `tokio`'s and `std`'s listeners
-    // turn it on, which is why this fixture does not build on either.
-    let wildcard: SocketAddr = "127.0.0.1:0".parse().expect("a literal loopback address");
+        .expect("creating a TCP socket");
+    // Deliberately NO `set_reuse_address(true)` -- see above.
+    listener.bind(&addr.into()).expect("binding the address");
+    listener.listen(128).expect("listening");
+    listener.into()
+}
+
+/// Turns a listener into a [`ClosedPort`] holding the port it was on.
+///
+/// Establishes a real connection to the listener, accepts it, and closes
+/// the listener. From that moment the port has no listening socket -- every
+/// inbound SYN carries a four-tuple the established connection does not
+/// match, so the kernel answers `RST` -- while the accepted socket's local
+/// address keeps the number out of the ephemeral pool.
+///
+/// The listener must have been created by [`reserving_listener`]; see there
+/// for why its `SO_REUSEADDR` state decides whether any of this works.
+pub fn seal(listener: std::net::TcpListener) -> ClosedPort {
+    // A listener handed to `tokio` comes back non-blocking, and the connect
+    // and accept below are deliberately blocking: on loopback, to a socket
+    // that is already listening with a free backlog slot, the kernel
+    // completes both inline.
     listener
-        .bind(&wildcard.into())
-        .expect("binding 127.0.0.1:0");
-    listener
-        .listen(1)
-        .expect("listening with a one-slot backlog");
+        .set_nonblocking(false)
+        .expect("a blocking listener for the handshake below");
+    let listener = Socket::from(listener);
     let addr: SocketAddr = listener
         .local_addr()
         .expect("a bound socket has a local address")
@@ -159,10 +219,35 @@ pub(crate) fn closed_port() -> ClosedPort {
         .expect("creating the client end");
     client
         .connect(&addr.into())
-        .expect("connecting to a listening loopback socket");
-    let (server, _) = listener
-        .accept()
-        .expect("accepting the connection just made");
+        .expect("connecting to a listening socket");
+    let client_addr: SocketAddr = client
+        .local_addr()
+        .expect("a connected socket has a local address")
+        .as_socket()
+        .expect("an IPv4 socket address");
+
+    // Accept until the connection just made comes back, rather than
+    // accepting once. A listener that has been serving may have completed
+    // handshakes still sitting in its backlog, and accepting one of those
+    // instead would leave the deliberate connection unaccepted -- and then
+    // RST when the listener drops, releasing the port. Any established
+    // socket bound to the port would in fact hold it, but "in fact" is the
+    // register this module is trying not to write in.
+    let mut server = None;
+    for _ in 0..64 {
+        let (candidate, peer) = listener.accept().expect("accepting a connection");
+        if peer.as_socket() == Some(client_addr) {
+            server = Some(candidate);
+            break;
+        }
+        // A leftover from whatever this listener was serving. Closing it is
+        // what dropping the listener would have done to it anyway.
+        drop(candidate);
+    }
+    let server = server.expect(
+        "the connection this fixture made was not in the listener's backlog after 64 accepts",
+    );
+
     // From here the port has no listener, but the established connection
     // keeps it out of the ephemeral pool.
     drop(listener);
@@ -212,6 +297,67 @@ mod tests {
         tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("a released port must be bindable again");
+    }
+
+    /// The open-then-closed path: a listener that has been *serving* is
+    /// still holding its port after [`seal`], and refuses.
+    ///
+    /// This is the case `bathy-query`'s `real_log_fold.rs` needs and
+    /// [`closed_port`] cannot supply, and it is not the same test as the one
+    /// above it. Two things are true here that are not true of a fresh
+    /// listener: the port has already been advertised to whatever scanned
+    /// it, and the backlog may hold completed handshakes. The second is why
+    /// [`seal`] accepts until it recognises its own connection -- accepting
+    /// a leftover instead leaves the deliberate one to be RST when the
+    /// listener drops. So the fixture below deliberately leaves an
+    /// unaccepted connection in the backlog before sealing.
+    #[tokio::test]
+    async fn a_port_that_was_serving_is_still_reserved_and_refusing_after_it_is_sealed() {
+        let listener = reserving_listener(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
+        let port = listener.local_addr().expect("a local address").port();
+
+        // One connection served and accepted, and one left in the backlog:
+        // the state a real fixture is in when its scan ends.
+        let served = std::net::TcpStream::connect(("127.0.0.1", port)).expect("a first connect");
+        let (accepted, _) = listener.accept().expect("accepting the first connection");
+        drop(accepted);
+        drop(served);
+        let _pending = std::net::TcpStream::connect(("127.0.0.1", port)).expect("a second connect");
+
+        let reserved = seal(listener);
+        assert_eq!(
+            reserved.port(),
+            port,
+            "sealing must keep the port it served"
+        );
+
+        for attempt in 0..3 {
+            assert_eq!(
+                crate::connect::probe_connect(
+                    "127.0.0.1".parse().unwrap(),
+                    port,
+                    std::time::Duration::from_secs(2),
+                )
+                .await,
+                crate::ConnectOutcome::Closed,
+                "attempt {attempt}: a sealed port must refuse like any other reserved one"
+            );
+        }
+
+        let conflicting = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))
+            .expect("creating the conflicting socket");
+        let same: SocketAddr = format!("127.0.0.1:{port}")
+            .parse()
+            .expect("a literal loopback address");
+        assert_eq!(
+            conflicting
+                .bind(&same.into())
+                .expect_err("a sealed port must still be in use")
+                .kind(),
+            std::io::ErrorKind::AddrInUse,
+            "the kernel does not consider the sealed port {port} in use, so the \
+             ephemeral allocator can hand it out again"
+        );
     }
 
     /// What actually holds the port: a **live, established** connection
