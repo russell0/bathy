@@ -71,6 +71,17 @@ const SUBCOMMANDS: &[&str] = &[
     // `fixtures::UNCHECKABLE` and printed by every successful run.
     "check-fixtures",
     "check-purity",
+    // The "No panics in parsing paths" Global Constraint, which said
+    // `unwrap`/`expect`/indexing panics were "denied by lint" in `bathy-probe`
+    // and `bathy-interpret` from M1 and was enforced by nothing anywhere in
+    // the tree until M7. `check-panics` holds three things together that had
+    // never been tied to each other: the deny attribute in each covered
+    // crate's `lib.rs`, the shape of every exception to it (site-level, with a
+    // stated reason -- a crate-level `#![allow]` would reproduce the defect),
+    // and the constraint's own sentence in the overview, which must name
+    // exactly the crates that carry the lint. What it cannot see is printed on
+    // every successful run.
+    "check-panics",
     "check-msrv",
     "check-deny",
     "check-lab",
@@ -118,6 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("check-phrases") => phrases::check_phrases(),
         Some("check-fixtures") => fixtures::check_fixtures(),
         Some("check-purity") => gates::check_purity(),
+        Some("check-panics") => gates::check_panics(),
         Some("check-msrv") => gates::check_msrv(args.iter().any(|a| a == "--run")),
         Some("check-deny") => gates::check_deny(),
         Some("check-lab") => gates::check_lab(),
@@ -458,6 +470,24 @@ const DEFERRALS: &[Deferral] = &[
     Deferral {
         id: "mcp-stdio-fuzz-target",
         check: gates::mcp_stdio_deferral_violations,
+    },
+    // The "No panics in parsing paths" constraint, widened as far as it was
+    // measured and no further. `gates::FUZZ_SURFACES` has registered five
+    // untrusted-input surfaces since M7 Task 1, and the constraint named two
+    // crates. The M7 panic-lint round measured every candidate rather than
+    // arguing about it: `bathy-scope` -- the authorization boundary, where a
+    // panic is the deny-by-default gate failing -- came back at zero hits and
+    // was covered the same day. `bathy-types` (37), `bathy-evidence` (14) and
+    // `bathy-query` (8) did not, and their code parses event logs written by
+    // an older build, a crashed one, or a hand editor. Widening the sentence
+    // over them without doing the work would be the M1 defect committed a
+    // second time by the person fixing it, so the counts are registered here
+    // instead, with `gates::PANIC_LINT_UNCOVERED` as the list and
+    // `check-panics` as the checker. It fires the day one of those crates is
+    // covered (the entry is then stale) or disappears.
+    Deferral {
+        id: "panic-lint-widening",
+        check: gates::panic_lint_widening_deferral_violations,
     },
 ];
 
@@ -1171,11 +1201,13 @@ mod tests {
         // honest and this assertion the thing that keeps it non-trivial.
         assert_eq!(
             DEFERRALS.len(),
-            4,
-            "the deferral registry changed size; the four entries are the ops-layer \
+            5,
+            "the deferral registry changed size; the five entries are the ops-layer \
              move (AC-5.39), the rmcp stdio workaround, the `packetd` IPC fuzz target \
-             that AC-7.7 names and M6 has not yet made writable, and the MCP stdio fuzz \
-             target whose blocker is `classify`'s visibility"
+             that AC-7.7 names and M6 has not yet made writable, the MCP stdio fuzz \
+             target whose blocker is `classify`'s visibility, and the three \
+             untrusted-input crates the M7 panic-lint round measured and left outside \
+             the \"No panics in parsing paths\" constraint"
         );
         let ids: Vec<&str> = DEFERRALS.iter().map(|d| d.id).collect();
         assert_eq!(
@@ -1184,7 +1216,8 @@ mod tests {
                 "ops-layer-move",
                 "rmcp-stdio-workaround",
                 "packetd-ipc-fuzz-target",
-                "mcp-stdio-fuzz-target"
+                "mcp-stdio-fuzz-target",
+                "panic-lint-widening"
             ]
         );
     }

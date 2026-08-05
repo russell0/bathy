@@ -36,18 +36,45 @@ trying to hang, exhaust, or exploit the scanner.
   the whole read rather than each individual `recv`. A peer that dribbles one
   byte per second forever, or floods without end, does neither harm — the
   deadline covers the aggregate, and the cap covers the volume.
-- **No panics in parsing paths.** Every function that consumes network bytes
-  returns `Result`, and the only `expect()` calls left in either parsing crate
-  are on `LazyLock` regex compilation and on a confidence constant — neither
-  of which touches a network byte. **What is not true, and is stated here
-  because a threat model that overstates its own guards is worse than one that
-  admits a hole:** the project's Global Constraints say `unwrap()`, `expect()`
-  and panicking slice indexing are *denied by lint* in `bathy-probe` and
-  `bathy-interpret`, and no such lint exists anywhere in this tree. The
-  property is currently held by review and by the fuzz targets below, not by
-  the compiler. Found while re-verifying documentation claims against the code
-  in M7 Task 4; adding the lints is an audit of every remaining call site,
-  which is its own piece of work and not a documentation edit.
+- **No panics in parsing paths, held by the compiler.** Every function that
+  consumes network bytes returns `Result`, and `clippy::unwrap_used`,
+  `expect_used`, `indexing_slicing`, `panic` and `arithmetic_side_effects` are
+  at **deny** level in `bathy-probe`, `bathy-interpret` and `bathy-scope` —
+  in each crate's `lib.rs`, scoped `cfg_attr(not(test), ...)` so unit tests
+  keep `unwrap()`. `cargo run -p xtask -- check-panics` holds the tree, the
+  exceptions and the Global Constraint's own wording to each other, and is a
+  CI step.
+
+  **The history, kept because it is the point.** This paragraph previously
+  admitted the opposite: the Global Constraints had claimed *since M1* that
+  those lints were on, and no such lint existed anywhere in the tree — not in
+  either named crate's `lib.rs`, not in `ci.yml`, not in any `Cargo.toml` lint
+  table. The property was held by review and by the fuzz targets below, not by
+  the compiler, and that was found by re-verifying documentation claims against
+  code in M7 Task 4. Turning the lints on found **43 real hits** in the two
+  originally named crates, every one of them a candidate panic on hostile
+  input: the offset arithmetic behind six `matched_span` computations, two
+  slices built from unchecked `+` in the MySQL and DNS parsers, an indexed TLS
+  record header, and — worst — `Instant::now() + deadline` at the top of both
+  bounded read paths, which panics on overflow and is the *only* thing bounding
+  a probe against a peer that never stops sending.
+
+  **The two `expect()` calls that remain** in `bathy-interpret` are on
+  `LazyLock` regex compilation and on the confidence ladder's four constants.
+  Neither touches a network byte, each is a site-level `#[allow]` with a stated
+  reason, and each is backed by a test that fails if its reasoning stops being
+  true. A crate-level `#![allow]` is refused by `check-panics` outright,
+  because it would reproduce exactly the defect described above.
+
+  **What is still outside this guarantee**, stated for the same reason the hole
+  above was: `bathy-types` (37 measured hits — `canonical_json`/`plan_digest`
+  and `clock.rs`'s RFC 3339 handling), `bathy-evidence` (14 — the event-log
+  reader, over JSONL that may have been written by an older build, a crashed
+  one, or a hand editor) and `bathy-query` (8 — `fold_events` over the same
+  logs). All three are registered untrusted-input surfaces with fuzz targets;
+  none of them yet has the lint. They are registered with their counts in
+  `gates::PANIC_LINT_UNCOVERED` and as the `panic-lint-widening` deferral, so
+  the gap expires against a checker rather than against memory.
 - **Every parser of untrusted bytes is fuzzed.** Interpretation, event-log
   parsing, canonical JSON and manifest loading each have a libFuzzer target,
   seeded from real recorded data rather than from random bytes, with counters

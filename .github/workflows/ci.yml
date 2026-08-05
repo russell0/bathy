@@ -113,6 +113,28 @@ jobs:
       # and assert it is caught with its rationale. This step is the single
       # call site, and `check-ci` below refuses a new inline block.
       - run: cargo run -p xtask -- check-purity
+      # The "No panics in parsing paths" Global Constraint. It said
+      # `unwrap()`/`expect()`/indexing-slice panics were "denied by lint" in
+      # `bathy-probe` and `bathy-interpret` -- from M1, in the indicative mood
+      # -- and there was no such lint anywhere in the tree: not in either
+      # crate's `lib.rs`, not in this file, not in any `Cargo.toml` lint table.
+      # Six milestones of code were written against a guarantee that did not
+      # exist, in the two crates whose input is by definition chosen by the
+      # thing being scanned. Enabling it found 43 real hits, every one of them
+      # a candidate panic on hostile input, including six `matched_span`
+      # computations of the exact shape that has already produced one shipped
+      # offset bug and seven mutants across three review rounds.
+      #
+      # The deny attributes themselves are enforced by `cargo clippy
+      # --workspace --all-targets -- -D warnings` above -- that step is what
+      # compiles the crates at all. This one holds the *claim* together: that
+      # each covered crate still carries the attribute with every lint in it,
+      # that every exception is site-level and says why (a crate-level
+      # `#![allow]` would reproduce the exact defect), and that the
+      # constraint's sentence in the overview names exactly the crates the tree
+      # lints -- in both directions, so neither the document nor the code can
+      # move without the other. What it cannot see is printed on every pass.
+      - run: cargo run -p xtask -- check-panics
       # The membership rule the two MSRV jobs below state in a comment
       # (":a crate declaring a floor must appear in exactly one of these two
       # jobs"), made executable. It had NO executable form at all and three

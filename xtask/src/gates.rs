@@ -2649,9 +2649,648 @@ pub fn run_fuzz(seconds: u64, only: Option<&str>) -> Fallible<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The "No panics in parsing paths" Global Constraint, made executable.
+// ---------------------------------------------------------------------------
+
+/// The lints the constraint's own sentence names, plus the two the M7
+/// panic-lint round judged inseparable from it.
+///
+/// `unwrap_used`, `expect_used` and `indexing_slicing` are the three the
+/// overview writes out. `panic` is the same failure spelled differently.
+/// `arithmetic_side_effects` is here because an overflowing offset is a panic
+/// in a debug build and a *silently wrong span* in a release one, and a wrong
+/// span is a claim about which bytes justified a finding — this project has
+/// already shipped that bug once, via `from_utf8_lossy` offsets used as
+/// indices into the original slice, and killed seven span-corrupting mutants
+/// across three review rounds.
+pub const PANIC_LINTS: &[&str] = &[
+    "clippy::unwrap_used",
+    "clippy::expect_used",
+    "clippy::indexing_slicing",
+    "clippy::panic",
+    "clippy::arithmetic_side_effects",
+];
+
+/// The crates the constraint covers: every one must carry the deny attribute,
+/// and the constraint's text in the overview must name exactly this set.
+///
+/// The overview said this was true of `bathy-probe` and `bathy-interpret`
+/// **from M1**, and no such lint existed anywhere in the tree — not in either
+/// `lib.rs`, not in `ci.yml`, not in any `Cargo.toml` lint table — until the
+/// M7 verification round found the gap. This constant exists so that
+/// sentence can never again be true of the document and false of the code:
+/// [`panic_lint_violations`] fails both ways round.
+pub const PANIC_LINT_CRATES: &[&str] = &["bathy-probe", "bathy-interpret", "bathy-scope"];
+
+/// Where the attribute has to be, per crate.
+fn panic_lint_lib_rs(crate_name: &str) -> String {
+    format!("crates/{crate_name}/src/lib.rs")
+}
+
+/// An untrusted-input crate the constraint does **not** yet cover, the
+/// measured number of hits enabling [`PANIC_LINTS`] produces there, and what
+/// that code parses.
+///
+/// This is the honest half of widening the constraint. `FUZZ_SURFACES`
+/// registers five untrusted-input surfaces and the constraint named two
+/// crates; the M7 panic-lint round measured every one of the others rather
+/// than reasoning about them. `bathy-scope` came back at zero and joined
+/// [`PANIC_LINT_CRATES`] the same day. These three did not, and widening the
+/// *sentence* over them without doing the work would be the M1 defect
+/// committed a second time by the person fixing it.
+pub const PANIC_LINT_UNCOVERED: &[(&str, usize, &str)] = &[
+    (
+        "bathy-types",
+        37,
+        "canonical_json/plan_digest (every hash this project computes) and clock.rs's \
+         RFC 3339 handling; 31 of the 37 are in clock.rs alone",
+    ),
+    (
+        "bathy-evidence",
+        14,
+        "EventLogReader over JSONL written by an older build, a crashed one, or a hand \
+         editor — including an `offsets[after_sequence]` index and an `expected - 1`",
+    ),
+    (
+        "bathy-query",
+        8,
+        "fold_events over the same logs, plus diff.rs's counters",
+    ),
+];
+
+/// A site-level allow of a [`PANIC_LINTS`] lint must carry a `reason`.
+const PANIC_LINT_REASON_MARKER: &str = "reason =";
+
+/// The exact `ci.yml` step that gives the deny attributes their teeth over
+/// every target, including the ones `cargo clippy` alone would skip.
+pub const CLIPPY_ALL_TARGETS_STEP: &str = "cargo clippy --workspace --all-targets -- -D warnings";
+
+/// Every `.rs` file under `crates/<name>/src`, sorted.
+fn crate_sources(root: &Path, crate_name: &str) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.join(format!("crates/{crate_name}/src"))];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// The crates the overview's constraint sentence names, in the order it names
+/// them.
+///
+/// Deliberately parses the document rather than trusting it: the whole point
+/// of this gate is that the sentence and the tree disagreed for six
+/// milestones and nothing noticed.
+pub fn crates_named_by_the_constraint(overview: &str) -> Vec<String> {
+    let Some(line) = overview
+        .lines()
+        .find(|l| l.contains("**No panics in parsing paths.**"))
+    else {
+        return Vec::new();
+    };
+    let mut named = Vec::new();
+    for candidate in PANIC_LINT_CRATES
+        .iter()
+        .chain(PANIC_LINT_UNCOVERED.iter().map(|(name, _, _)| name))
+    {
+        if line.contains(&format!("`{candidate}`")) {
+            named.push((*candidate).to_string());
+        }
+    }
+    named
+}
+
+/// The whole rule, as pure text analysis so it is testable against fixtures.
+pub fn panic_lint_violations(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+
+    for crate_name in PANIC_LINT_CRATES {
+        let rel = panic_lint_lib_rs(crate_name);
+        let Ok(lib) = std::fs::read_to_string(root.join(&rel)) else {
+            found.push(format!(
+                "{rel} does not exist, but `{crate_name}` is named by the \"No panics in \
+                 parsing paths\" constraint — either the crate moved or the constraint's \
+                 crate list is stale"
+            ));
+            continue;
+        };
+        let attribute: String = lib
+            .split("#![cfg_attr(")
+            .find(|chunk| chunk.contains("not(test)") && chunk.contains("deny("))
+            .unwrap_or("")
+            .to_string();
+        if attribute.is_empty() {
+            found.push(format!(
+                "{rel} carries no `#![cfg_attr(not(test), deny(...))]`. The constraint says \
+                 panics are denied by lint in `{crate_name}`; nothing in this file denies \
+                 anything. This is the exact state the whole tree was in from M1 to M7."
+            ));
+            continue;
+        }
+        for lint in PANIC_LINTS {
+            if !attribute.contains(lint) {
+                found.push(format!(
+                    "{rel}'s deny attribute does not name `{lint}`, so that class of panic \
+                     is unguarded in a crate that consumes bytes it did not write"
+                ));
+            }
+        }
+
+        for path in crate_sources(root, crate_name) {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let shown = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            for (i, line) in text.lines().enumerate() {
+                let number = i + 1;
+                let names_a_panic_lint = PANIC_LINTS.iter().any(|lint| line.contains(lint));
+                if !names_a_panic_lint {
+                    continue;
+                }
+                // A crate-level allow re-opens the hole entirely, which is
+                // worse than never having had the lint: the attribute reads
+                // as coverage.
+                if line.trim_start().starts_with("#![allow(")
+                    || (line.contains("#![allow(") && line.contains("clippy::"))
+                {
+                    found.push(format!(
+                        "{shown}:{number}: crate-level `#![allow]` of a panic lint. An \
+                         exception must be site-level; a crate-level one reproduces the \
+                         defect this constraint exists to close."
+                    ));
+                }
+                // A site-level allow is fine, and must say why.
+                if line.trim_start().starts_with("#[allow(") && !line.contains("#![allow(") {
+                    let block = allow_attribute_block(&text, i);
+                    if !block.contains(PANIC_LINT_REASON_MARKER) {
+                        found.push(format!(
+                            "{shown}:{number}: `#[allow]` of a panic lint with no `reason = \
+                             \"...\"`. An exception that does not say why its panic is \
+                             unreachable is indistinguishable from one that is wrong."
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // The document, held to the code — in both directions.
+    let overview_path = "docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md";
+    match std::fs::read_to_string(root.join(overview_path)) {
+        Err(_) => found.push(format!(
+            "{overview_path} is unreadable, so the constraint's own \
+             text cannot be checked against the tree"
+        )),
+        Ok(overview) => {
+            let named = crates_named_by_the_constraint(&overview);
+            if named.is_empty() {
+                found.push(format!(
+                    "{overview_path} no longer states the \"No panics in parsing paths\" \
+                     constraint in the form this gate reads (a bullet beginning `**No panics \
+                     in parsing paths.**` naming its crates in backticks), so the sentence \
+                     and the tree are no longer tied together at all"
+                ));
+            } else {
+                let mut expected: Vec<String> =
+                    PANIC_LINT_CRATES.iter().map(|c| (*c).to_string()).collect();
+                expected.sort();
+                let mut actual = named.clone();
+                actual.sort();
+                if actual != expected {
+                    found.push(format!(
+                        "{overview_path}'s \"No panics in parsing paths\" constraint names \
+                         [{}] but the lint is carried by [{}]. A constraint that names a \
+                         crate the tree does not lint is exactly what was claimed from M1 \
+                         and never true; a crate that carries the lint and is not named \
+                         under-reports what this project actually guarantees.",
+                        actual.join(", "),
+                        expected.join(", ")
+                    ));
+                }
+            }
+        }
+    }
+
+    // The deferral's other direction: a crate listed as outstanding that has
+    // quietly been covered is a registration checking nothing.
+    for (crate_name, _hits, _what) in PANIC_LINT_UNCOVERED {
+        let rel = panic_lint_lib_rs(crate_name);
+        let Ok(lib) = std::fs::read_to_string(root.join(&rel)) else {
+            found.push(format!(
+                "{rel} does not exist, but `{crate_name}` is registered in \
+                 `PANIC_LINT_UNCOVERED` as an untrusted-input crate still to be covered — \
+                 delete the entry"
+            ));
+            continue;
+        };
+        if lib.contains("#![cfg_attr(")
+            && lib.contains("not(test)")
+            && lib.contains("deny(")
+            && PANIC_LINTS.iter().any(|lint| lib.contains(lint))
+        {
+            found.push(format!(
+                "{rel} now carries the panic-lint deny attribute, so `{crate_name}`'s entry \
+                 in `PANIC_LINT_UNCOVERED` is stale: move it into `PANIC_LINT_CRATES` and \
+                 add it to the constraint's own sentence in the overview"
+            ));
+        }
+    }
+
+    // The deny attributes only bite if clippy actually compiles every target.
+    let ci_path = ".github/workflows/ci.yml";
+    match std::fs::read_to_string(root.join(ci_path)) {
+        Err(_) => found.push(format!("{ci_path} is unreadable")),
+        Ok(ci) => {
+            if !ci.contains(CLIPPY_ALL_TARGETS_STEP) {
+                found.push(format!(
+                    "{ci_path} no longer runs `{CLIPPY_ALL_TARGETS_STEP}`. Without \
+                     `--all-targets` the deny attributes still fire, but only over the \
+                     targets clippy happens to build — and this gate's whole claim is that \
+                     the lint runs where the other gates run."
+                ));
+            }
+        }
+    }
+
+    found
+}
+
+/// The text of an `#[allow(...)]` attribute starting at line `start`,
+/// including its continuation lines.
+///
+/// `rustfmt` wraps a multi-line `#[allow(lint, reason = "...")]`, so a check
+/// that read only the line the lint name appears on would demand a `reason`
+/// that is right there on the next line — a gate that fails correct code is a
+/// gate people switch off.
+fn allow_attribute_block(text: &str, start: usize) -> String {
+    let mut depth = 0i32;
+    let mut block = String::new();
+    for line in text.lines().skip(start) {
+        block.push_str(line);
+        block.push('\n');
+        depth += line.chars().filter(|c| *c == '(').count() as i32;
+        depth -= line.chars().filter(|c| *c == ')').count() as i32;
+        if depth <= 0 {
+            break;
+        }
+    }
+    block
+}
+
+/// The condition for the `panic-lint-widening` entry in `xtask`'s
+/// `DEFERRALS`: the three measured-but-uncovered crates, checked in both
+/// directions by [`panic_lint_violations`].
+pub fn panic_lint_widening_deferral_violations(root: &Path) -> Vec<String> {
+    if PANIC_LINT_UNCOVERED.is_empty() {
+        return vec![
+            "`PANIC_LINT_UNCOVERED` is empty, so every untrusted-input crate is covered and \
+             this deferral is checking nothing: delete its entry from DEFERRALS"
+                .to_string(),
+        ];
+    }
+    panic_lint_violations(root)
+        .into_iter()
+        .filter(|v| v.contains("PANIC_LINT_UNCOVERED"))
+        .collect()
+}
+
+pub fn check_panics() -> Fallible<()> {
+    let root = Path::new(".");
+    let violations = panic_lint_violations(root);
+    if violations.is_empty() {
+        let outstanding: usize = PANIC_LINT_UNCOVERED.iter().map(|(_, hits, _)| hits).sum();
+        println!(
+            "check-panics: ok ({} lint(s) denied in {} crate(s): {}; every exception is \
+             site-level and carries a reason; the overview's constraint names exactly \
+             those crates)",
+            PANIC_LINTS.len(),
+            PANIC_LINT_CRATES.len(),
+            PANIC_LINT_CRATES.join(" "),
+        );
+        println!(
+            "check-panics: WHAT THIS DOES NOT SEE — {} measured hit(s) across {} \
+             untrusted-input crate(s) still outside the constraint ({}), registered as the \
+             `panic-lint-widening` deferral. It also cannot see whether a `reason` string is \
+             *true*: that a panic is unreachable is an argument, and this gate only checks \
+             that someone made one.",
+            outstanding,
+            PANIC_LINT_UNCOVERED.len(),
+            PANIC_LINT_UNCOVERED
+                .iter()
+                .map(|(name, hits, _)| format!("{name}: {hits}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        Ok(())
+    } else {
+        for v in &violations {
+            eprintln!("check-panics: {v}");
+        }
+        Err(format!(
+            "{} panic-lint violation(s) against the \"No panics in parsing paths\" Global \
+             Constraint",
+            violations.len()
+        )
+        .into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // check-panics: the checker, checked.
+    //
+    // The failure this gate exists to prevent is a claim nobody runs, so a
+    // gate closing it that is itself never exercised would be the same
+    // defect one level up. Each test below builds a fake tree in exactly one
+    // broken state and asserts the violation is reported with the file that
+    // is wrong.
+    // -----------------------------------------------------------------
+
+    /// The attribute a covered crate's `lib.rs` must carry, as source text.
+    fn panic_lint_attribute() -> String {
+        format!(
+            "#![cfg_attr(not(test), deny({}))]\n",
+            PANIC_LINTS.join(", ")
+        )
+    }
+
+    /// A tree in which `panic_lint_violations` finds nothing, so each test
+    /// below can break exactly one thing.
+    fn healthy_panic_lint_tree() -> tempfile::TempDir {
+        let scratch = tempfile::tempdir().expect("a scratch directory");
+        let root = scratch.path();
+        for name in PANIC_LINT_CRATES {
+            let dir = root.join(format!("crates/{name}/src"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lib.rs"), panic_lint_attribute()).unwrap();
+        }
+        for (name, _, _) in PANIC_LINT_UNCOVERED {
+            let dir = root.join(format!("crates/{name}/src"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("lib.rs"), "#![forbid(unsafe_code)]\n").unwrap();
+        }
+        std::fs::create_dir_all(root.join("docs/superpowers/plans")).unwrap();
+        std::fs::write(
+            root.join("docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md"),
+            format!(
+                "- **No panics in parsing paths.** ... denied by lint in {}.\n",
+                PANIC_LINT_CRATES
+                    .iter()
+                    .map(|c| format!("`{c}`"))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::write(
+            root.join(".github/workflows/ci.yml"),
+            format!("      - run: {CLIPPY_ALL_TARGETS_STEP}\n"),
+        )
+        .unwrap();
+        scratch
+    }
+
+    #[test]
+    fn a_healthy_tree_has_no_panic_lint_violations() {
+        let scratch = healthy_panic_lint_tree();
+        assert_eq!(
+            panic_lint_violations(scratch.path()),
+            Vec::<String>::new(),
+            "the fixture every other test in this group mutates must start clean"
+        );
+    }
+
+    #[test]
+    fn the_real_tree_passes_check_panics() {
+        // The fixtures above prove the rule fires. This proves it is pointed
+        // at the repository people actually commit -- the half a
+        // fixture-only test suite silently drops.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        assert_eq!(panic_lint_violations(&root), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_crate_with_no_deny_attribute_at_all_is_caught() {
+        // The exact state `bathy-probe` and `bathy-interpret` were in from M1
+        // to M7 while this constraint said otherwise.
+        let scratch = healthy_panic_lint_tree();
+        let lib = scratch.path().join("crates/bathy-probe/src/lib.rs");
+        std::fs::write(&lib, "#![forbid(unsafe_code)]\n").unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("crates/bathy-probe/src/lib.rs")
+                    && v.contains("carries no `#![cfg_attr(not(test), deny(...))]`")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_deny_attribute_missing_one_lint_is_caught_and_names_the_lint() {
+        let scratch = healthy_panic_lint_tree();
+        let lib = scratch.path().join("crates/bathy-interpret/src/lib.rs");
+        let partial: Vec<&str> = PANIC_LINTS.iter().skip(1).copied().collect();
+        std::fs::write(
+            &lib,
+            format!("#![cfg_attr(not(test), deny({}))]\n", partial.join(", ")),
+        )
+        .unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("clippy::unwrap_used") && v.contains("bathy-interpret")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_deny_that_is_not_scoped_to_non_test_builds_is_not_accepted_as_one() {
+        // A bare `#![deny(...)]` would fire on `#[cfg(test)] mod tests` too,
+        // and the way that gets "fixed" under time pressure is a crate-level
+        // allow. The gate only recognises the `cfg_attr(not(test), ...)`
+        // form, so the shortcut reads as no attribute at all.
+        let scratch = healthy_panic_lint_tree();
+        let lib = scratch.path().join("crates/bathy-scope/src/lib.rs");
+        std::fs::write(&lib, format!("#![deny({})]\n", PANIC_LINTS.join(", "))).unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("bathy-scope") && v.contains("carries no")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_crate_level_allow_reopening_the_hole_is_caught() {
+        let scratch = healthy_panic_lint_tree();
+        let lib = scratch.path().join("crates/bathy-probe/src/lib.rs");
+        std::fs::write(
+            &lib,
+            format!(
+                "{}#![allow(clippy::indexing_slicing)]\n",
+                panic_lint_attribute()
+            ),
+        )
+        .unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("crate-level `#![allow]` of a panic lint")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_site_level_allow_without_a_reason_is_caught() {
+        let scratch = healthy_panic_lint_tree();
+        let src = scratch.path().join("crates/bathy-probe/src/parse.rs");
+        std::fs::write(
+            &src,
+            "#[allow(clippy::unwrap_used)]\nfn f() { None::<u8>.unwrap(); }\n",
+        )
+        .unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("parse.rs:1") && v.contains("no `reason")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_site_level_allow_with_a_wrapped_reason_is_accepted() {
+        // rustfmt splits a long `#[allow(lint, reason = "...")]` across
+        // lines. A gate that demanded the reason on the same line as the
+        // lint would fail correct code, and a gate that fails correct code
+        // is a gate someone switches off.
+        let scratch = healthy_panic_lint_tree();
+        let src = scratch.path().join("crates/bathy-probe/src/parse.rs");
+        std::fs::write(
+            &src,
+            "#[allow(\n    clippy::unwrap_used,\n    reason = \"the const is in range\"\n)]\nfn f() {}\n",
+        )
+        .unwrap();
+        assert_eq!(panic_lint_violations(scratch.path()), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_constraint_naming_a_crate_the_tree_does_not_lint_is_caught() {
+        // The M1 defect itself, in its purest form: the sentence claims a
+        // crate the code does not cover.
+        let scratch = healthy_panic_lint_tree();
+        let doc = scratch
+            .path()
+            .join("docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md");
+        std::fs::write(
+            &doc,
+            "- **No panics in parsing paths.** ... denied by lint in `bathy-probe`, \
+             `bathy-interpret`, `bathy-scope` and `bathy-evidence`.\n",
+        )
+        .unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found.iter().any(|v| v.contains("bathy-evidence")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_crate_that_carries_the_lint_and_is_not_named_by_the_constraint_is_caught() {
+        // The other direction. Under-reporting is a smaller sin than
+        // over-reporting, but it still means the document is not the answer
+        // to "what does this project guarantee".
+        let scratch = healthy_panic_lint_tree();
+        let doc = scratch
+            .path()
+            .join("docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md");
+        std::fs::write(
+            &doc,
+            "- **No panics in parsing paths.** ... denied by lint in `bathy-probe` and \
+             `bathy-interpret`.\n",
+        )
+        .unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(found.iter().any(|v| v.contains("bathy-scope")), "{found:?}");
+    }
+
+    #[test]
+    fn a_deferred_crate_that_has_quietly_been_covered_is_reported_stale() {
+        // The registration's second direction, which is why these are not
+        // `assert!`s: a deferral that has stopped applying reads as coverage.
+        let scratch = healthy_panic_lint_tree();
+        let (name, _, _) = PANIC_LINT_UNCOVERED[0];
+        std::fs::write(
+            scratch.path().join(format!("crates/{name}/src/lib.rs")),
+            panic_lint_attribute(),
+        )
+        .unwrap();
+        let found = panic_lint_widening_deferral_violations(scratch.path());
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains(name) && v.contains("stale")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn dropping_the_all_targets_clippy_step_is_caught() {
+        // The deny attributes are compiled by that step and by nothing else
+        // in the workflow. Losing it would leave `check-panics` green over a
+        // lint that never ran -- a gate reporting on a gate that is gone.
+        let scratch = healthy_panic_lint_tree();
+        std::fs::write(
+            scratch.path().join(".github/workflows/ci.yml"),
+            "      - run: cargo clippy --workspace -- -D warnings\n",
+        )
+        .unwrap();
+        let found = panic_lint_violations(scratch.path());
+        assert!(
+            found.iter().any(|v| v.contains("--all-targets")),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn every_uncovered_crate_is_registered_with_a_measurement_and_a_reason() {
+        // A deferral whose entry is a crate name and nothing else is a
+        // to-do. Each has to carry the count that was actually measured and
+        // what the code parses, because the next person's first question is
+        // "how big is this".
+        for (name, hits, what) in PANIC_LINT_UNCOVERED {
+            assert!(!name.is_empty());
+            assert!(*hits > 0, "{name} is registered as outstanding at 0 hits");
+            assert!(
+                what.len() > 30,
+                "{name}'s entry does not say what it parses"
+            );
+        }
+    }
 
     /// A gate's own evidence must not depend on whether someone has run the
     /// fuzzer. `fuzz/corpus` is git-ignored working state of thousands of
