@@ -28,8 +28,9 @@
 //!    was the action's built-in default, written down nowhere here.
 //!
 //! [`check_purity`], [`check_msrv`] and [`check_deny`] are those, in that
-//! order. [`publish_check`] closes a sixth thing the review found: `.publish-deny`
-//! said *"Consumed by `xtask publish-check`"* and no such subcommand existed.
+//! order. The sixth thing that review found -- `.publish-deny` said *"Consumed
+//! by `xtask publish-check`"* and no such subcommand existed -- was closed by
+//! [`crate::publish`], which is where that gate now lives.
 //!
 //! # The meta-gate
 //!
@@ -896,126 +897,19 @@ pub fn check_deny() -> Fallible<()> {
 }
 
 // ---------------------------------------------------------------------------
-// `publish-check` — the subcommand `.publish-deny` already named.
+// `publish-check` used to live here.
+//
+// M7 Task 6 moved it to `crate::publish` and widened it from "grep the
+// working tree for denied strings" to the whole of the overview's
+// Pre-Publication Gates: the history as well as the working tree, the commit
+// identities, the required files and the sentences they must carry, and every
+// other `check-*` subcommand. It also stopped walking the filesystem: the set
+// a publish carries is what git says it is, which is both narrower (ignored
+// files cannot be published without editing `.gitignore`) and reproducible
+// (the old walk's file count depended on whether anyone had run the fuzzer
+// locally, which is why `NEVER_SCANNED_PATHS` existed here and does not
+// exist there).
 // ---------------------------------------------------------------------------
-
-/// Directories never scanned for publish-denied strings.
-const NEVER_SCANNED: &[&str] = &[".git", "target", "node_modules", "mutants.out"];
-
-/// Directories that are never scanned, by PATH rather than by name.
-///
-/// `fuzz/corpus` and `fuzz/artifacts` are libFuzzer's working state:
-/// git-ignored, thousands of generated files, present or absent depending on
-/// whether someone has run the fuzzer locally. Scanning them made this gate's
-/// own reported evidence unreproducible -- the same commit reported 5,375
-/// file reads on one machine and 14,920 on another, and the whole difference
-/// was local fuzz state. A count printed as evidence must not depend on that.
-/// By path and not by name, because `corpus` and `artifacts` are ordinary
-/// words that a real source directory may well be called.
-const NEVER_SCANNED_PATHS: &[&str] = &["fuzz/corpus", "fuzz/artifacts"];
-
-/// Where the denied strings live. Git-ignored on purpose: the list itself is
-/// the thing that must not be published.
-pub const PUBLISH_DENY_FILE: &str = ".publish-deny";
-
-/// Non-comment, non-blank entries of a `.publish-deny` document.
-pub fn publish_denied_strings(text: &str) -> Vec<&str> {
-    text.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .collect()
-}
-
-pub fn publish_check() -> Fallible<()> {
-    let root = Path::new(".");
-    let deny_path = root.join(PUBLISH_DENY_FILE);
-    let text = std::fs::read_to_string(&deny_path).map_err(|e| {
-        format!(
-            "{PUBLISH_DENY_FILE}: {e}. This file is git-ignored, so a fresh clone does \
-             not have one and this gate is local-only by construction — which is why it \
-             is not a step in ci.yml."
-        )
-    })?;
-    let denied = publish_denied_strings(&text);
-    if denied.is_empty() {
-        return Err(format!(
-            "{PUBLISH_DENY_FILE} lists no strings, so this check would pass over any \
-             tree at all. An empty deny list is not an empty risk."
-        )
-        .into());
-    }
-
-    let mut files = Vec::new();
-    walk(root, &mut files)?;
-    let mut violations = Vec::new();
-    let mut scanned = 0usize;
-    for file in &files {
-        let relative = file
-            .strip_prefix(root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if relative == PUBLISH_DENY_FILE {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(file) else {
-            continue;
-        };
-        let Ok(content) = String::from_utf8(bytes) else {
-            continue; // binary, as `grep -I` treats it
-        };
-        scanned += 1;
-        for (index, line) in content.lines().enumerate() {
-            for needle in &denied {
-                if line.contains(needle) {
-                    violations.push(format!("{relative}:{}: {needle}", index + 1));
-                }
-            }
-        }
-    }
-
-    if scanned == 0 {
-        return Err("publish-check read no files, so it proves nothing".into());
-    }
-    if violations.is_empty() {
-        println!(
-            "publish-check: ok ({} denied string(s), {scanned} file reads, 0 violations)",
-            denied.len()
-        );
-        Ok(())
-    } else {
-        for v in &violations {
-            eprintln!("publish-check: {v}");
-        }
-        Err(format!(
-            "{} publish-denied string(s) in tracked content",
-            violations.len()
-        )
-        .into())
-    }
-}
-
-fn walk(dir: &Path, into: &mut Vec<std::path::PathBuf>) -> Fallible<()> {
-    let mut entries: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| format!("reading {}: {e}", dir.display()))?
-        .collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::path);
-    for entry in entries {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if path.is_dir() {
-            if NEVER_SCANNED.contains(&name.as_str())
-                || NEVER_SCANNED_PATHS.iter().any(|skip| path.ends_with(skip))
-            {
-                continue;
-            }
-            walk(&path, into)?;
-        } else if path.is_file() {
-            into.push(path);
-        }
-    }
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // The meta-gate: every CI step is runnable locally.
@@ -1691,7 +1585,8 @@ pub const NARROWING_CONTROLS: &[NarrowingControl] = &[
 /// bytes it was transcribed from carried `Server: nginx/1.29.8` -- the
 /// transcription step dropped the line, and a null is what AC-7.5 filters on,
 /// so the loss hid inside the criterion it corrupted. Nothing binds the file
-/// to a sweep run (that is Task 6's `publish-check` and is still open), but
+/// to a sweep run (`publish-check` is the gate that would, and it reads text
+/// rather than running the lab), but
 /// binding each *claim* to the evidence text stored beside it is checkable
 /// today, and it is the step where the error entered.
 /// The product an evidence string names outright, if any.
@@ -3428,64 +3323,6 @@ mod tests {
         );
     }
 
-    /// A gate's own evidence must not depend on whether someone has run the
-    /// fuzzer. `fuzz/corpus` is git-ignored working state of thousands of
-    /// generated files, and walking it made the reported file count differ
-    /// by three times between two checkouts of the same commit.
-    #[test]
-    fn the_fuzzers_working_state_is_not_walked_and_a_real_corpus_directory_still_is() {
-        // `tempfile::tempdir()`, not a name built out of the process id.
-        // This test and its namesake in `phrases.rs` (`walk` exists in both
-        // modules, and both need the same fixture) used to compute the
-        // byte-identical path `<tmp>/bathy-walk-<pid>-2` --
-        // `NEVER_SCANNED_PATHS.len()` is 2 in both -- and both began and
-        // ended by `remove_dir_all`-ing it. They live in the same `xtask`
-        // test binary and libtest runs them concurrently, so either could
-        // delete the other's tree mid-walk. A process id is unique per
-        // *process*; what a scratch path has to be unique per is *test*, and
-        // nothing but a comment was making it so.
-        let scratch = tempfile::tempdir().expect("a scratch directory");
-        let root = scratch.path().to_path_buf();
-        for dir in [
-            "fuzz/corpus/interpret",
-            "fuzz/artifacts/interpret",
-            "fuzz/seeds",
-            "crates/corpus",
-        ] {
-            std::fs::create_dir_all(root.join(dir)).unwrap();
-            std::fs::write(root.join(dir).join("a.txt"), "x").unwrap();
-        }
-        let mut found = Vec::new();
-        walk(&root, &mut found).unwrap();
-        let names: Vec<String> = found
-            .iter()
-            .map(|p| {
-                p.strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .into_owned()
-            })
-            .collect();
-        assert!(
-            !names.iter().any(|n| n.starts_with("fuzz/corpus")),
-            "{names:?}"
-        );
-        assert!(
-            !names.iter().any(|n| n.starts_with("fuzz/artifacts")),
-            "{names:?}"
-        );
-        assert!(names.contains(&"fuzz/seeds/a.txt".to_string()), "{names:?}");
-        // `corpus` is an ordinary word: only the fuzz one is skipped, which
-        // is why the skip list is paths and not names.
-        assert!(
-            names.contains(&"crates/corpus/a.txt".to_string()),
-            "{names:?}"
-        );
-        // No explicit removal: `scratch` deletes the tree when it drops,
-        // which also happens on the panic paths above. The hand-rolled
-        // version leaked its tree on every failure.
-    }
-
     // --- The registries themselves. See the M5 residual wave: a loop over an
     // emptied register reports success, and `phrases.rs` has asserted its own
     // non-emptiness twice since the blocker wave. ---
@@ -3939,14 +3776,6 @@ rust-version = \"1.88\"
                 "sources"
             ]
         );
-    }
-
-    // --- publish-check. ---
-
-    #[test]
-    fn comments_and_blank_lines_are_not_denied_strings() {
-        let text = "# Strings that must never appear.\n# Consumed by `xtask publish-check`.\n\nfoo@\n\nSECRET\n";
-        assert_eq!(publish_denied_strings(text), vec!["foo@", "SECRET"]);
     }
 
     // --- The meta-gate. ---

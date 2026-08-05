@@ -6,6 +6,7 @@ mod fixtures;
 mod gates;
 mod phrases;
 mod prose;
+mod publish;
 mod readme;
 mod visibility;
 
@@ -119,7 +120,22 @@ const SUBCOMMANDS: &[&str] = &[
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
+    run(args.first().map(String::as_str), &args)
+}
+
+/// Dispatch one subcommand.
+///
+/// Split out of `main` so that `publish-check` can *call* it. The
+/// pre-publication gate runs every other gate this project has, and it derives
+/// that list from [`SUBCOMMANDS`] rather than restating it — so a `check-*`
+/// added tomorrow is part of the publication gate without anyone remembering.
+/// A second hand-kept list of gates is exactly the drift `check-ci` exists to
+/// prevent one level down.
+///
+/// The `Some("…")` arm shape is load-bearing: `the_dispatch_and_the_list_agree`
+/// reads this function's own text.
+fn run(command: Option<&str>, args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
         Some("check-deps") => check_deps(),
         Some("emit-schemas") => emit_schemas(true),
         Some("check-schemas") => emit_schemas(false),
@@ -138,19 +154,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some("check-fuzz") => gates::check_fuzz(),
         Some("check-fuzz-crate") => gates::check_fuzz_crate(),
         Some("fuzz") => {
-            let seconds = flag_value(&args, "--time")
+            let seconds = flag_value(args, "--time")
                 .map(|v| {
                     v.parse::<u64>()
                         .map_err(|_| format!("--time wants a number of seconds, got `{v}`"))
                 })
                 .transpose()?
                 .unwrap_or(120);
-            gates::run_fuzz(seconds, flag_value(&args, "--target"))
+            gates::run_fuzz(seconds, flag_value(args, "--target"))
         }
         Some("check-ci") => gates::check_ci(SUBCOMMANDS),
         Some("check-ci-status") => visibility::check_ci_status(),
         Some("linux-gate") => visibility::linux_gate(args.iter().any(|a| a == "--fresh")),
-        Some("publish-check") => gates::publish_check(),
+        // The gate that runs immediately before the repository is made
+        // public. `--no-tests` skips only `cargo test --workspace` and makes
+        // the run exit non-zero regardless, so a partial run can never be
+        // read as a discharged gate.
+        Some("publish-check") => publish::publish_check(
+            !args.iter().any(|a| a == "--no-tests"),
+            SUBCOMMANDS,
+            &|name| run(Some(name), &[name.to_string()]),
+        ),
         Some(other) => Err(format!("unknown xtask: {other}").into()),
         None => Err(format!("usage: xtask <{}>", SUBCOMMANDS.join("|")).into()),
     }
