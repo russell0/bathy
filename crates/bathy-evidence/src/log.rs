@@ -92,6 +92,89 @@ pub enum LogError {
     /// therefore no longer knows that `last_sequence + 1` is still free.
     #[error("event log {path} was released by this writer and cannot be appended to")]
     Released { path: PathBuf },
+    /// A record could not be turned into bytes, or the log's byte offsets or
+    /// sequence numbers ran out of `u64`.
+    ///
+    /// Every case is unreachable on any log this project can physically
+    /// produce -- `Event` is a fixed struct of strings, integers and enums,
+    /// and exhausting `u64` byte offsets means a file larger than every
+    /// storage device ever manufactured. Each was an `expect("event
+    /// serializes")` or a bare `+` until the M7 panic-lint widening. They are
+    /// a variant rather than an `#[allow]` because "unreachable" spelled as a
+    /// panic, in the crate that owns the source of truth, is a crash in
+    /// `bathy scan events` and in the MCP server -- and an agent driving that
+    /// server can read an error, not a `SIGABRT`.
+    #[error("event log {path} cannot record this event: {detail}")]
+    Unrecordable { path: PathBuf, detail: String },
+}
+
+/// The byte offset of every record in a log.
+///
+/// This is one type, and `last_sequence` is *derived* from it, because the
+/// panic the M7 panic-lint widening found here was a bounds check against
+/// one value followed by an index into another:
+///
+/// ```text
+/// if after_sequence >= last_sequence { return Ok(Vec::new()); }
+/// let start_offset = offsets[after_sequence as usize];
+/// ```
+///
+/// That is only in bounds while `offsets.len() >= last_sequence`, an
+/// invariant between two separately-passed parameters that the function
+/// doing the indexing did not check and could not see. It happened to hold
+/// -- `scan_records` pushes an offset and bumps the expected sequence in the
+/// same branch, and returns `expected - 1`, so the two were always equal --
+/// but nothing said so, and `after_sequence` is supplied by an MCP caller.
+///
+/// Making the index the single source of both numbers means the check and
+/// the lookup are now the same operation ([`Self::start_after`]) over the
+/// same `Vec`, so there is no longer an invariant to break.
+#[derive(Debug, Default)]
+struct RecordIndex {
+    /// `starts[i]` is the byte offset where the record for sequence `i + 1`
+    /// begins.
+    starts: Vec<u64>,
+}
+
+impl RecordIndex {
+    /// Records that sequence `self.last_sequence() + 1` begins at `offset`.
+    fn push(&mut self, offset: u64) {
+        self.starts.push(offset);
+    }
+
+    /// The highest sequence number in the log, or `0` for an empty one.
+    ///
+    /// Sequences are exactly `1..=starts.len()` -- `scan_records` refuses any
+    /// log that deviates, and `append` only ever extends by one -- so the
+    /// count *is* the last sequence. `as u64` is lossless on every target
+    /// this project supports (64-bit Linux and macOS) and saturating on a
+    /// hypothetical 128-bit one; a `usize` too large for `u64` cannot be a
+    /// `Vec` length in any case.
+    fn last_sequence(&self) -> u64 {
+        u64::try_from(self.starts.len()).unwrap_or(u64::MAX)
+    }
+
+    /// The sequence number the next appended record will carry.
+    ///
+    /// `saturating_add` is exact rather than merely safe: reaching
+    /// `u64::MAX` records would require a `Vec<u64>` of 2^64 elements, i.e.
+    /// 2^67 bytes of memory.
+    fn next_sequence(&self) -> u64 {
+        self.last_sequence().saturating_add(1)
+    }
+
+    /// The byte offset of the first record with `sequence > after`, or `None`
+    /// when there is no such record.
+    ///
+    /// One `get` on the `Vec` being indexed -- not a comparison against a
+    /// number that travelled here separately. `None` covers both "the caller
+    /// is at or past the tail" and "the caller sent a cursor larger than a
+    /// `usize`", which on a 32-bit target the old `after_sequence as usize`
+    /// would have silently *truncated* into a valid-looking index.
+    fn start_after(&self, after: u64) -> Option<u64> {
+        let index = usize::try_from(after).ok()?;
+        self.starts.get(index).copied()
+    }
 }
 
 /// One append-only JSONL file per scan.
@@ -106,14 +189,13 @@ pub struct EventLog {
     path: PathBuf,
     scan_id: ScanId,
     file: File,
-    last_sequence: u64,
-    /// `offsets[i]` is the byte offset in the file where the record for
-    /// sequence `i + 1` begins. Built once from the single validating scan
-    /// `open` already has to do, and extended in `append`. This is what lets
-    /// `read_from` seek straight to the first requested record instead of
-    /// re-reading and re-parsing everything before it -- see `read_from`'s
-    /// own doc comment for why that matters.
-    offsets: Vec<u64>,
+    /// Where every record starts, and (derived from that, see
+    /// [`RecordIndex`]) the last sequence number written. Built once from the
+    /// single validating scan `open` already has to do, and extended in
+    /// `append`. This is what lets `read_from` seek straight to the first
+    /// requested record instead of re-reading and re-parsing everything
+    /// before it -- see `read_from`'s own doc comment for why that matters.
+    index: RecordIndex,
     /// Current on-disk length of `path`. Tracked here (rather than queried
     /// via `self.file.metadata()` on every `append`) because it is already
     /// known for free from the scan `open` performs, and updating a local
@@ -224,13 +306,12 @@ impl EventLog {
                 source,
             },
         })?;
-        let (last_sequence, offsets, end_offset) = Self::scan_existing(&path)?;
+        let (index, end_offset) = Self::scan_existing(&path)?;
         Ok(Self {
             path,
             scan_id,
             file,
-            last_sequence,
-            offsets,
+            index,
             end_offset,
             durable,
             sync_calls: std::sync::atomic::AtomicU64::new(0),
@@ -311,7 +392,7 @@ impl EventLog {
     /// as `LogError::Malformed`, matching this function's previous
     /// behavior, rather than surfacing as a generic `io::Error` the way
     /// `read_line`'s own built-in UTF-8 check would.
-    fn scan_existing(path: &Path) -> Result<(u64, Vec<u64>, u64), LogError> {
+    fn scan_existing(path: &Path) -> Result<(RecordIndex, u64), LogError> {
         scan_records(path, TailPolicy::RejectPartial)
     }
 
@@ -425,11 +506,11 @@ fn malformed_record(
 ///
 /// `end_offset` counts only bytes belonging to complete lines, so a skipped
 /// partial tail is never included in it.
-fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), LogError> {
+fn scan_records(path: &Path, tail: TailPolicy) -> Result<(RecordIndex, u64), LogError> {
     let file = match File::open(path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok((0, Vec::new(), 0));
+            return Ok((RecordIndex::default(), 0));
         }
         Err(source) => {
             return Err(LogError::Io {
@@ -439,8 +520,7 @@ fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), L
         }
     };
     let mut reader = BufReader::new(file);
-    let mut offsets = Vec::new();
-    let mut expected = 1u64;
+    let mut index = RecordIndex::default();
     let mut pos: u64 = 0;
     let mut line_number = 0usize;
     let mut raw_line = Vec::new();
@@ -459,8 +539,10 @@ fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), L
             // below instead).
             break;
         }
-        line_number += 1;
-        if raw_line.last() != Some(&b'\n') {
+        // `saturating_add`: `line_number` only ever appears in an error
+        // message, and a file with `usize::MAX` lines cannot be read anyway.
+        line_number = line_number.saturating_add(1);
+        let Some(content) = raw_line.strip_suffix(b"\n") else {
             // Only ever true on the FINAL call to `read_until` (every
             // earlier line, by definition, kept reading until it found
             // a `\n`), so `line_number` here is exactly "count of
@@ -476,9 +558,8 @@ fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), L
                 detail: "record is not newline-terminated (truncated or an interrupted write)"
                     .to_string(),
             });
-        }
+        };
         let line_len = raw_line.len() as u64;
-        let content = &raw_line[..raw_line.len() - 1]; // strip the trailing `\n`
         if !content.is_empty() {
             let text = std::str::from_utf8(content).map_err(|e| LogError::Malformed {
                 path: path.to_owned(),
@@ -487,6 +568,7 @@ fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), L
             })?;
             let event: Event = serde_json::from_str(text)
                 .map_err(|e| malformed_record(path, line_number, text, e))?;
+            let expected = index.next_sequence();
             if event.sequence != expected {
                 return Err(LogError::SequenceGap {
                     path: path.to_owned(),
@@ -494,17 +576,21 @@ fn scan_records(path: &Path, tail: TailPolicy) -> Result<(u64, Vec<u64>, u64), L
                     found: event.sequence,
                 });
             }
-            offsets.push(pos);
-            expected += 1;
+            index.push(pos);
         }
-        pos += line_len;
+        pos = pos
+            .checked_add(line_len)
+            .ok_or_else(|| LogError::Unrecordable {
+                path: path.to_owned(),
+                detail: format!("byte offset overflowed u64 at line {line_number}"),
+            })?;
     }
-    Ok((expected - 1, offsets, pos))
+    Ok((index, pos))
 }
 
 impl EventLog {
     pub fn last_sequence(&self) -> u64 {
-        self.last_sequence
+        self.index.last_sequence()
     }
 
     /// Appends one record and returns the fully-populated [`Event`],
@@ -527,12 +613,15 @@ impl EventLog {
         }
         let event = Event {
             scan_id: self.scan_id,
-            sequence: self.last_sequence + 1,
+            sequence: self.index.next_sequence(),
             timestamp: clock.now_rfc3339(),
             engine_version: engine_version.to_owned(),
             body,
         };
-        let mut line = serde_json::to_string(&event).expect("event serializes");
+        let mut line = serde_json::to_string(&event).map_err(|source| LogError::Unrecordable {
+            path: self.path.clone(),
+            detail: format!("event {} could not be serialized: {source}", event.sequence),
+        })?;
         line.push('\n');
         self.file
             .write_all(line.as_bytes())
@@ -553,9 +642,14 @@ impl EventLog {
             // change like a rename to also cover here).
             self.raw_sync()?;
         }
-        self.offsets.push(self.end_offset);
-        self.end_offset += line.len() as u64;
-        self.last_sequence = event.sequence;
+        self.index.push(self.end_offset);
+        self.end_offset = self
+            .end_offset
+            .checked_add(line.len() as u64)
+            .ok_or_else(|| LogError::Unrecordable {
+                path: self.path.clone(),
+                detail: format!("byte offset overflowed u64 at sequence {}", event.sequence),
+            })?;
         Ok(event)
     }
 
@@ -613,12 +707,7 @@ impl EventLog {
     /// be impossible if it fell back to scanning from the start of the file
     /// the way a naive `File::open` + filter implementation would.
     pub fn read_from(&self, after_sequence: u64) -> Result<Vec<Event>, LogError> {
-        read_records_from(
-            &self.path,
-            &self.offsets,
-            self.last_sequence,
-            after_sequence,
-        )
+        read_records_from(&self.path, &self.index, after_sequence)
     }
 }
 
@@ -627,14 +716,17 @@ impl EventLog {
 /// seek-don't-rescan contract this implements.
 fn read_records_from(
     path: &Path,
-    offsets: &[u64],
-    last_sequence: u64,
+    index: &RecordIndex,
     after_sequence: u64,
 ) -> Result<Vec<Event>, LogError> {
-    if after_sequence >= last_sequence {
+    let last_sequence = index.last_sequence();
+    // One lookup, on the `Vec` it is a lookup into. This was
+    // `if after_sequence >= last_sequence { ... }` followed by
+    // `offsets[after_sequence as usize]` -- a bounds check against one value
+    // and an index into another. See [`RecordIndex`].
+    let Some(start_offset) = index.start_after(after_sequence) else {
         return Ok(Vec::new());
-    }
-    let start_offset = offsets[after_sequence as usize];
+    };
     let mut file = File::open(path).map_err(|source| LogError::Io {
         path: path.to_owned(),
         source,
@@ -644,7 +736,10 @@ fn read_records_from(
             path: path.to_owned(),
             source,
         })?;
-    let wanted = last_sequence - after_sequence;
+    // `saturating_sub` is exact here: `start_after` returned `Some`, so
+    // `after_sequence` is a valid index into an index of `last_sequence`
+    // entries and is therefore strictly less than it.
+    let wanted = last_sequence.saturating_sub(after_sequence);
     let mut out = Vec::with_capacity(wanted as usize);
     // Line numbers in any `Malformed` error here are relative to
     // `after_sequence`'s record, not the whole file: correct under this
@@ -668,8 +763,13 @@ fn read_records_from(
         if line.is_empty() {
             continue;
         }
-        let event: Event = serde_json::from_str(&line)
-            .map_err(|e| malformed_record(path, after_sequence as usize + i + 1, &line, e))?;
+        let event: Event = serde_json::from_str(&line).map_err(|e| {
+            let line_number = usize::try_from(after_sequence)
+                .unwrap_or(usize::MAX)
+                .saturating_add(i)
+                .saturating_add(1);
+            malformed_record(path, line_number, &line, e)
+        })?;
         // Defensive, not load-bearing for correctness under normal
         // operation (the seek above should already land exactly on
         // sequence `after_sequence + 1`): costs nothing extra, since
@@ -713,8 +813,7 @@ fn read_records_from(
 pub struct EventLogReader {
     path: PathBuf,
     scan_id: ScanId,
-    last_sequence: u64,
-    offsets: Vec<u64>,
+    index: RecordIndex,
 }
 
 impl EventLogReader {
@@ -736,12 +835,11 @@ impl EventLogReader {
                 ),
             });
         }
-        let (last_sequence, offsets, _end) = scan_records(&path, TailPolicy::SkipPartial)?;
+        let (index, _end) = scan_records(&path, TailPolicy::SkipPartial)?;
         Ok(Self {
             path,
             scan_id,
-            last_sequence,
-            offsets,
+            index,
         })
     }
 
@@ -752,19 +850,19 @@ impl EventLogReader {
     /// The highest sequence this reader saw *when it opened*. See the type's
     /// doc comment.
     pub fn last_sequence(&self) -> u64 {
-        self.last_sequence
+        self.index.last_sequence()
     }
 
     /// Every complete event with `sequence > after_sequence`, in order --
     /// the same contract as [`EventLog::read_from`], bounded above by
     /// [`Self::last_sequence`].
+    ///
+    /// `after_sequence` reaches this from outside the process: `bathy scan
+    /// events --after-sequence <n>` on the CLI, and the `scan.events` MCP
+    /// tool's `after_sequence` cursor. Any `u64` at all is answered, with an
+    /// empty tail for one at or past the end -- see [`RecordIndex`].
     pub fn read_from(&self, after_sequence: u64) -> Result<Vec<Event>, LogError> {
-        read_records_from(
-            &self.path,
-            &self.offsets,
-            self.last_sequence,
-            after_sequence,
-        )
+        read_records_from(&self.path, &self.index, after_sequence)
     }
 }
 
@@ -797,6 +895,197 @@ mod tests {
 
     fn log_path(dir: &Path, id: ScanId) -> PathBuf {
         dir.join(format!("{id}.jsonl"))
+    }
+
+    // --- M7 panic-lint widening: `offsets[after_sequence as usize]`. ---
+    //
+    // `after_sequence` reaches `read_from` from outside the process (`bathy
+    // scan events --after-sequence <n>`, and the `scan.events` MCP tool's
+    // cursor), and the old code bounds-checked it against `last_sequence`
+    // before indexing `offsets` -- two different values. The question these
+    // three tests answer *by execution* is whether any byte sequence a log
+    // file can hold could make those two disagree.
+
+    /// Every line shape a log file on disk can contain, including the ones
+    /// only a crash or an old build produces.
+    fn adversarial_line_shapes() -> Vec<&'static str> {
+        vec![
+            // A well-formed record, whichever sequence the position implies.
+            "@1",
+            "@2",
+            "@3",
+            // A record whose sequence number is wrong in each direction --
+            // the shapes that would make `last_sequence` outrun the offset
+            // index if any of them were tolerated.
+            "@0",
+            "@9",
+            "@dup",
+            // Not a record at all.
+            "",
+            "{",
+            "{\"sequence\":1}",
+        ]
+    }
+
+    fn render_line(shape: &str, position: usize, template: &str) -> String {
+        let seq = |n: u64| {
+            let mut v: serde_json::Value = serde_json::from_str(template).unwrap();
+            v["sequence"] = serde_json::json!(n);
+            serde_json::to_string(&v).unwrap()
+        };
+        match shape {
+            "@1" | "@2" | "@3" => seq(position as u64 + 1),
+            "@0" => seq(0),
+            "@9" => seq(9),
+            "@dup" => seq(position.max(1) as u64),
+            other => other.to_string(),
+        }
+    }
+
+    /// Sweeps every log file buildable from [`adversarial_line_shapes`] up to
+    /// three lines, with and without a truncated final line, and drives every
+    /// cursor an MCP caller could send at each one that opens.
+    ///
+    /// This is the answer to "can `offsets[after_sequence]` panic": for a log
+    /// to reach the index at all it has to pass `scan_records`, and
+    /// `scan_records` pushes an offset in the same branch that advances the
+    /// expected sequence. The two counts are now the same `Vec` (see
+    /// [`RecordIndex`]) so they cannot diverge by construction -- this test
+    /// is what turns that from a claim into a measurement, and it is what
+    /// dies if someone re-splits them.
+    #[test]
+    fn no_log_file_and_no_cursor_can_put_a_tail_read_out_of_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        let path = log_path(dir.path(), id);
+        let template = {
+            let d2 = tempfile::tempdir().unwrap();
+            let mut l = EventLog::open(d2.path(), id).unwrap();
+            let e = l.append(progress(1), &clock(), "0.1.0").unwrap();
+            serde_json::to_string(&e).unwrap()
+        };
+
+        let shapes = adversarial_line_shapes();
+        let mut files = vec![String::new()];
+        for _ in 0..3 {
+            let mut next = Vec::new();
+            for prefix in &files {
+                for shape in &shapes {
+                    let position = prefix.lines().count();
+                    let mut f = prefix.clone();
+                    f.push_str(&render_line(shape, position, &template));
+                    f.push('\n');
+                    next.push(f);
+                }
+            }
+            files.extend(next);
+        }
+        // The truncated-tail variants: the same files with the final newline
+        // removed, which is what a crash mid-write leaves behind.
+        let truncated: Vec<String> = files
+            .iter()
+            .filter(|f| f.ends_with('\n'))
+            .map(|f| f.trim_end_matches('\n').to_string())
+            .collect();
+        files.extend(truncated);
+
+        let mut opened = 0_usize;
+        let mut multi_record = 0_usize;
+        for bytes in &files {
+            std::fs::write(&path, bytes).unwrap();
+            let Ok(reader) = EventLogReader::open(dir.path(), id) else {
+                continue;
+            };
+            opened += 1;
+            let last = reader.last_sequence();
+            if last > 1 {
+                multi_record += 1;
+            }
+            // The invariant the old guard silently depended on, asserted
+            // directly rather than inferred: the number of indexed records is
+            // the last sequence number.
+            assert_eq!(
+                reader.index.starts.len() as u64,
+                last,
+                "offset index and last_sequence disagree for {bytes:?}"
+            );
+            // Every cursor an MCP caller can send, including the exact
+            // boundary the old code indexed with and values no correct client
+            // would ever produce.
+            let mut cursors: Vec<u64> = (0..last.saturating_add(3)).collect();
+            cursors.extend([u64::MAX, u64::MAX - 1, 1 << 32, 1 << 40]);
+            for after in cursors {
+                let tail = reader
+                    .read_from(after)
+                    .unwrap_or_else(|e| panic!("read_from({after}) failed for {bytes:?}: {e}"));
+                assert_eq!(
+                    tail.len() as u64,
+                    last.saturating_sub(after),
+                    "read_from({after}) over {bytes:?} (last_sequence {last})"
+                );
+                assert!(
+                    tail.iter()
+                        .all(|e| e.sequence > after && e.sequence <= last),
+                    "read_from({after}) over {bytes:?} returned a record outside its window"
+                );
+            }
+        }
+        assert!(
+            opened > 50 && multi_record > 5,
+            "the sweep only reached {opened} openable log(s), {multi_record} with more than one \
+             record -- it is not exercising the offset index"
+        );
+    }
+
+    #[test]
+    fn a_cursor_past_the_end_is_an_empty_tail_and_never_an_error() {
+        // The MCP `scan.events` cursor is a bare `u64` from JSON. The old
+        // code truncated it with `after_sequence as usize`, which on a 32-bit
+        // target turns 2^32 + 3 into a *valid-looking index 3*; `RecordIndex`
+        // refuses the conversion instead.
+        let (_d, mut log) = log();
+        for n in 1..=3 {
+            log.append(progress(n), &clock(), "0.1.0").unwrap();
+        }
+        for after in [3, 4, 100, u32::MAX as u64, 1_u64 << 32, u64::MAX] {
+            assert!(
+                log.read_from(after).unwrap().is_empty(),
+                "read_from({after}) must be an empty tail, not an error and not a panic"
+            );
+        }
+        assert_eq!(log.read_from(2).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_record_index_is_the_only_place_last_sequence_comes_from() {
+        // `EventLog` used to carry `last_sequence` as its own field, updated
+        // in `append` beside a separate `offsets.push`. If that ever comes
+        // back, the two can drift; this asserts they are one value across a
+        // reopen, an append, and a blank line the scan tolerates.
+        let dir = tempfile::tempdir().unwrap();
+        let id = scan_id();
+        {
+            let mut log = EventLog::open(dir.path(), id).unwrap();
+            for n in 1..=2 {
+                log.append(progress(n), &clock(), "0.1.0").unwrap();
+            }
+            assert_eq!(log.index.starts.len() as u64, log.last_sequence());
+        }
+        let path = log_path(dir.path(), id);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push('\n'); // a tolerated blank line: bytes, but not a record
+        std::fs::write(&path, &text).unwrap();
+        let mut log = EventLog::open(dir.path(), id).unwrap();
+        assert_eq!(log.index.starts.len() as u64, log.last_sequence());
+        assert_eq!(log.last_sequence(), 2);
+        let appended = log.append(progress(3), &clock(), "0.1.0").unwrap();
+        assert_eq!(appended.sequence, 3);
+        assert_eq!(log.index.starts.len() as u64, log.last_sequence());
+        assert_eq!(
+            log.read_from(2).unwrap().first().map(|e| e.sequence),
+            Some(3),
+            "the offset recorded past a blank line must still point at the record"
+        );
     }
 
     // --- Brief's Step 1 tests, verbatim ---

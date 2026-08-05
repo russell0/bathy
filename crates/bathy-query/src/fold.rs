@@ -407,21 +407,23 @@ fn total_order(events: &[Event]) -> Vec<&Event> {
     // Second pass over runs of equal `sequence` only. `sort_by_key` above is
     // stable, so without this a duplicated sequence number would resolve to
     // whatever order the caller supplied.
-    let mut start = 0;
-    while start < ordered.len() {
-        let mut end = start + 1;
-        while end < ordered.len() && ordered[end].sequence == ordered[start].sequence {
-            end += 1;
-        }
-        if end - start > 1 {
+    //
+    // `chunk_by_mut` rather than a hand-rolled `start`/`end` walk: the walk
+    // was five arithmetic operations and three indexes into `ordered` to
+    // re-derive a run boundary the standard library will hand over directly,
+    // and the events being walked come out of a log an older build wrote. It
+    // yields exactly the maximal runs of equal `sequence`, so the runs are the
+    // same runs and every bound belongs to the slice rather than to a
+    // separately-tracked pair of cursors.
+    for run in ordered.chunk_by_mut(|a, b| a.sequence == b.sequence) {
+        if run.len() > 1 {
             // `sort_by`, not `sort_by_cached_key`: the key borrows from the
             // event it describes, which a cached key (whose type may not
             // depend on the element's lifetime) cannot do. The cost is
             // recomputing keys per comparison inside a tie run, which a
             // well-formed log never has and a malformed one has two of.
-            ordered[start..end].sort_by(|a, b| tie_key(a).cmp(&tie_key(b)));
+            run.sort_by(|a, b| tie_key(a).cmp(&tie_key(b)));
         }
-        start = end;
     }
 
     ordered

@@ -131,7 +131,14 @@ fuzz_target!(|data: &[u8]| {
             STATS.flag(match e {
                 LogError::Malformed { .. } => 0,
                 LogError::SequenceGap { .. } => 1,
-                LogError::Io { .. } | LogError::Locked { .. } | LogError::Released { .. } => 2,
+                LogError::Io { .. }
+                | LogError::Locked { .. }
+                | LogError::Released { .. }
+                // `Unrecordable` is about *writing* a record (M7 panic-lint
+                // widening: the `expect("event serializes")` and the unchecked
+                // offset arithmetic in `append`). This target only reads, so
+                // it joins the same collapsed bucket for the same reason.
+                | LogError::Unrecordable { .. } => 2,
             });
             STATS.tick();
             return;
@@ -181,27 +188,47 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // A tail read from a cursor derived from the input, so the offset index
-    // is indexed with something other than 0. `read_records_from` indexes
-    // `offsets[after_sequence]` directly, which is exactly the shape of
-    // out-of-bounds panic this target exists to find.
-    let after = (data.len() as u64) % (reader.last_sequence() + 2);
-    match reader.read_from(after) {
-        Ok(tail) => {
-            STATS.bump(TAIL_READS);
-            assert!(
-                tail.iter().all(|e| e.sequence > after),
-                "read_from({after}) returned an event at or before its cursor"
-            );
-            assert_eq!(
-                tail.len() as u64,
-                reader.last_sequence().saturating_sub(after),
-                "read_from({after}) returned {} of the {} event(s) past its cursor",
-                tail.len(),
-                reader.last_sequence().saturating_sub(after)
-            );
+    // Tail reads from cursors the caller chose. `after_sequence` is not
+    // derived from the log: it arrives from outside the process, as
+    // `bathy scan events --after-sequence <n>` and as the `scan.events` MCP
+    // tool's cursor, and `read_records_from` used to bounds-check it against
+    // `last_sequence` and then index `offsets` with it -- two different
+    // values.
+    //
+    // The cursor used to be `data.len() % (last_sequence + 2)` alone: always
+    // inside `0..=last_sequence + 1`, and a function of the input's *length*
+    // rather than its content. That covers the in-range boundary and nothing
+    // else. Three additions, each one a shape the old cursor could not reach:
+    // a cursor taken from the input bytes (so the fuzzer can steer it),
+    // `u64::MAX`, and a value above `u32::MAX` -- the last because
+    // `after_sequence as usize` silently *truncates* on a 32-bit target,
+    // turning `2^32 + 3` into a valid-looking index 3.
+    let last = reader.last_sequence();
+    let mut cursors = vec![
+        (data.len() as u64) % last.saturating_add(2),
+        u64::from_le_bytes(std::array::from_fn(|i| data.get(i).copied().unwrap_or(0))),
+        u64::MAX,
+        (1u64 << 32).saturating_add(u64::from(data.first().copied().unwrap_or(0))),
+    ];
+    cursors.dedup();
+    for after in cursors {
+        match reader.read_from(after) {
+            Ok(tail) => {
+                STATS.bump(TAIL_READS);
+                assert!(
+                    tail.iter().all(|e| e.sequence > after),
+                    "read_from({after}) returned an event at or before its cursor"
+                );
+                assert_eq!(
+                    tail.len() as u64,
+                    last.saturating_sub(after),
+                    "read_from({after}) returned {} of the {} event(s) past its cursor",
+                    tail.len(),
+                    last.saturating_sub(after)
+                );
+            }
+            Err(e) => panic!("a log that opened cleanly failed a tail read from {after}: {e}"),
         }
-        Err(e) => panic!("a log that opened cleanly failed a tail read from {after}: {e}"),
     }
 
     // The first thing every consumer does with a parsed log. It sees only

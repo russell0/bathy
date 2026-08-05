@@ -122,6 +122,16 @@ fuzz_target!(|data: &[u8]| {
             STATS.tick();
             return;
         }
+        // M7 panic-lint widening: the two `.expect("string encodes")` calls
+        // in `write_canonical` became this variant. It is unreachable through
+        // `serde_json` for any `&str` -- which is exactly why it used to be an
+        // `expect` -- so reaching it here is a finding about `serde_json`, not
+        // about the input, and this target says so rather than counting it as
+        // an ordinary rejection. Written out with no `_` arm, so a third
+        // `CanonicalError` variant breaks this build.
+        Err(e @ CanonicalError::StringNotEncodable { .. }) => {
+            panic!("serde_json refused to encode a string it produced: {e}: {value:?}")
+        }
     };
     STATS.bump(CANONICALIZED);
     STATS.add(CANONICAL_BYTES, canonical.len() as u64);

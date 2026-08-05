@@ -50,15 +50,41 @@ pub struct EvidenceStore {
 /// module below verify this holds for every digest the type can produce,
 /// rather than assuming it from the parser alone.
 pub fn blob_path(root: &Path, digest: &Digest) -> PathBuf {
-    let hex = digest.to_string();
-    let hex = hex
-        .strip_prefix("blake3:")
-        .expect("digest renders with prefix");
-    // Two-level fan-out keeps directory sizes manageable on ext4 and APFS.
+    blob_dir(root, digest).join(blob_hex(digest))
+}
+
+/// The directory [`blob_path`] puts a blob in -- the two-level fan-out that
+/// keeps directory sizes manageable on ext4 and APFS.
+///
+/// Split out from [`blob_path`] so `put` can create it without re-deriving it
+/// with `path.parent().expect("blob path has a parent")`, which was an
+/// `expect` over a fact stated three lines away in a different function.
+/// `blob_path_lives_directly_inside_blob_dir` pins the two together.
+fn blob_dir(root: &Path, digest: &Digest) -> PathBuf {
+    // An irrefutable pattern over `&[u8; 32]`, so the first two bytes are the
+    // compiler's fact rather than `hex[0..2]` and `hex[2..4]` -- *string*
+    // indexing, which `clippy::indexing_slicing` does not see at all.
+    let [first, second, ..] = digest.as_bytes();
     root.join("blobs")
-        .join(&hex[0..2])
-        .join(&hex[2..4])
-        .join(hex)
+        .join(format!("{first:02x}"))
+        .join(format!("{second:02x}"))
+}
+
+/// `digest` as the 64 lowercase hex characters that name its blob.
+///
+/// Built from the digest's own bytes rather than by rendering it and stripping
+/// the `blake3:` prefix back off with an `expect`. The two agree by
+/// construction (`Digest`'s `Display` is `"blake3:"` followed by exactly this
+/// loop) and `blob_hex_is_the_rendered_digest_without_its_prefix` says so.
+fn blob_hex(digest: &Digest) -> String {
+    use std::fmt::Write as _;
+    digest.as_bytes().iter().fold(String::new(), |mut out, b| {
+        // `write!` into a `String` is infallible (`fmt::Write for String`
+        // never returns `Err`), and the result is discarded rather than
+        // `expect`ed for that reason.
+        let _ = write!(out, "{b:02x}");
+        out
+    })
 }
 
 /// Monotonic counter mixed into temp filenames alongside the pid.
@@ -148,10 +174,10 @@ impl EvidenceStore {
 
     pub fn put(&self, bytes: &[u8]) -> Result<Digest, EvidenceError> {
         let digest = Digest::of_bytes(bytes);
-        let path = blob_path(&self.root, &digest);
-        let parent = path.parent().expect("blob path has a parent");
-        fs::create_dir_all(parent).map_err(|source| EvidenceError::Io {
-            path: parent.to_owned(),
+        let parent = blob_dir(&self.root, &digest);
+        let path = parent.join(blob_hex(&digest));
+        fs::create_dir_all(&parent).map_err(|source| EvidenceError::Io {
+            path: parent.clone(),
             source,
         })?;
         // Deliberately no `exists()` short-circuit: always write-then-rename,
@@ -171,7 +197,7 @@ impl EvidenceStore {
         //
         // The temp name is process- and call-unique (see `tmp_path`), so
         // concurrent writers never share one.
-        let tmp = tmp_path(parent);
+        let tmp = tmp_path(&parent);
         // C1: `fs::write` alone (the previous shape here) opens, writes, and
         // closes the file with no way to fsync it first -- closing a file
         // does not imply the kernel has flushed its data to durable
@@ -214,8 +240,8 @@ impl EvidenceStore {
             // the *old* name (or no name at all) pointing at the bytes once
             // the filesystem's journal replays, even though the data itself
             // is safely on disk.
-            fsync_dir(parent).map_err(|source| EvidenceError::Io {
-                path: parent.to_owned(),
+            fsync_dir(&parent).map_err(|source| EvidenceError::Io {
+                path: parent.clone(),
                 source,
             })?;
         }
@@ -224,7 +250,15 @@ impl EvidenceStore {
 
     pub fn put_capped(&self, bytes: &[u8], cap: usize) -> Result<(Digest, bool), EvidenceError> {
         let truncated = bytes.len() > cap;
-        let slice = if truncated { &bytes[..cap] } else { bytes };
+        // `get(..cap).unwrap_or(bytes)` rather than `&bytes[..cap]`: exactly
+        // equivalent (the slice is only taken when `cap < bytes.len()`), with
+        // the bound checked by the operation that uses it instead of by a
+        // `bool` computed on the line above.
+        let slice = if truncated {
+            bytes.get(..cap).unwrap_or(bytes)
+        } else {
+            bytes
+        };
         Ok((self.put(slice)?, truncated))
     }
 
@@ -503,6 +537,60 @@ mod tests {
     // there is no path from attacker-controlled input to `blob_path` that
     // skips that validation. These tests check the consequence (no escape,
     // ever) rather than re-deriving that reasoning at the call site.
+
+    // --- M7 panic-lint widening. `blob_path` used to render the digest and
+    // strip the prefix back off with `.expect("digest renders with prefix")`,
+    // then slice the result with `hex[0..2]` / `hex[2..4]` -- *string*
+    // indexing, invisible to `clippy::indexing_slicing`. It now reads the
+    // digest's own bytes. These two tests are what say the new path is the
+    // same path, byte for byte, as the one blobs already on disk live at. ---
+
+    #[test]
+    fn blob_hex_is_the_rendered_digest_without_its_prefix() {
+        for content in [
+            &b""[..],
+            b"a",
+            b"the quick brown fox jumps",
+            &[0u8; 4096][..],
+        ] {
+            let digest = Digest::of_bytes(content);
+            let rendered = digest.to_string();
+            assert_eq!(
+                format!("blake3:{}", blob_hex(&digest)),
+                rendered,
+                "blob_hex disagrees with Digest's Display, so blobs would move on disk"
+            );
+            assert_eq!(blob_hex(&digest).len(), 64);
+        }
+    }
+
+    #[test]
+    fn blob_path_lives_directly_inside_blob_dir() {
+        // `put` creates `blob_dir` and writes into it; it used to re-derive
+        // that directory as `blob_path(..).parent().expect(..)`. If the two
+        // ever disagreed, `put` would create one directory and rename into
+        // another.
+        for content in [&b""[..], b"a", &[0u8; 4096][..]] {
+            let digest = Digest::of_bytes(content);
+            let root = Path::new("store-root");
+            let path = blob_path(root, &digest);
+            let dir = blob_dir(root, &digest);
+            assert_eq!(path.parent(), Some(dir.as_path()));
+            assert_eq!(
+                path.file_name().and_then(|n| n.to_str()),
+                Some(blob_hex(&digest).as_str())
+            );
+            // The two-level fan-out is the first two and next two hex
+            // characters, which is where every blob written before this
+            // change already sits.
+            let hex = blob_hex(&digest);
+            assert_eq!(
+                dir,
+                root.join("blobs").join(&hex[0..2]).join(&hex[2..4]),
+                "the fan-out moved; existing stores would stop resolving"
+            );
+        }
+    }
 
     #[test]
     fn blob_path_never_escapes_the_store_root() {

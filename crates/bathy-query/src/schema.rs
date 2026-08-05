@@ -41,8 +41,10 @@ pub fn all() -> BTreeMap<&'static str, Value> {
     m
 }
 
+/// `schemars::Schema` is a newtype over `serde_json::Value`, so this is a
+/// move, not a serialization. See `bathy_types::schema`'s identical helper.
 fn to_value(schema: schemars::Schema) -> Value {
-    serde_json::to_value(schema).expect("schema serializes")
+    schema.to_value()
 }
 
 #[cfg(test)]

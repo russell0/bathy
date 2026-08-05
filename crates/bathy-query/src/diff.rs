@@ -333,7 +333,12 @@ pub fn diff(before: &ScanFold, after: &ScanFold) -> ScanDiff {
                     before: Some(b.clone()),
                     after: Some(a.clone()),
                 }),
-                None => result.unchanged += 1,
+                // `saturating_add`: a count of endpoints that agreed, whose
+                // input is a pair of folds derived from event logs. Saturating
+                // at `u64::MAX` would need more endpoints than there are
+                // addresses; the point is that the counter cannot be the thing
+                // that aborts a diff.
+                None => result.unchanged = result.unchanged.saturating_add(1),
             },
             // Present on one side only. Whether that is a change at all
             // depends on whether the silent side proved it looked.
