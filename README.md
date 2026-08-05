@@ -287,12 +287,27 @@ it is:
 - **No IPv6.** It is *refused*, not merely unimplemented — see below.
 - **No Windows.** A licensing constraint, stated in full in
   [`docs/platform-support.md`](docs/platform-support.md).
-- **No privileged scanning from the command line or over MCP.**
+- **No privileged scanning from the command line or over MCP, deliberately.**
   `bathy-packetd` can SYN scan — it builds the segment, classifies the reply,
   and tears an open port's half-open connection down with an RST — and
   `bathy-engine` can now drive it. Neither the CLI nor the MCP surface asks
-  it to: `SchedulerConfig`'s daemon path defaults to none, so every scan you
-  can start today is a TCP connect scan. When one does ask, an absent
+  it to, and **v0.1 ships no way to make it**: there is no flag, no tool
+  argument and no configuration file that puts a daemon path in front of the
+  engine, `SchedulerConfig`'s daemon path defaults to none, and every scan you
+  can start today is a TCP connect scan.
+
+  Two things make that a decision rather than an omission. SYN scanning is
+  more intrusive than connect — it leaves half-open connections on someone
+  else's machine — and this project already treats `scan.start` as a
+  destructive operation behind an approval threshold; an approval policy that
+  distinguishes the two does not exist yet, and shipping the more intrusive
+  method under the less intrusive method's threshold would be the wrong way
+  round. And `bathy-packetd` is **not published**: it carries
+  `publish = false` and is excluded from the crates this workspace releases,
+  so `cargo install bathy` installs no privileged binary for a flag to point
+  at. `cargo run -p xtask -- check-packetd` fails if either shipped surface
+  ever reaches for the daemon, so this paragraph is checked rather than
+  merely written. When one does ask, an absent
   `CAP_NET_RAW` falls back to connect scanning and says so on `scan.started`,
   and a daemon that dies mid-scan fails the scan with `packetd_unavailable`
   rather than quietly finishing by the other method. `bathy-packetd` also
@@ -435,6 +450,10 @@ in the store — so a refused resume leaves behind a created state directory and
 its empty stores, and no scan record, no plan and no packet.) `scan resume` is
 re-evaluated against the manifest handed to it, not against the decision the
 original `scan start` got. Scans carry hard packet, rate, and runtime budgets.
+`maximum_packets` counts **probes**, not segments: one plan unit is charged
+once, and one connect attempt is a SYN plus — for a port that answers — the
+rest of a handshake and a teardown. It is an upper bound on probes issued, and
+the packets they put on a wire are a small constant multiple of it.
 
 **What a scanned third party sees on their wire.** Every port is first touched by
 a plain, unprivileged TCP connect that sends no payload. A port that answers then

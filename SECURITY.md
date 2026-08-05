@@ -82,13 +82,23 @@ than trust.
   manifest cannot authorize them by naming them.
 - **Manifests expire.** A manifest carries the instant it stops being valid, and
   validity is re-checked on every scan and on every resume, not once at load.
-- **Enforcement is in two layers, and the second is not bypassable by an
-  adapter.** The CLI and MCP surfaces refuse an out-of-scope request up front,
+- **Enforcement is in three layers, and no layer is bypassable by the one
+  above it.** The CLI and MCP surfaces refuse an out-of-scope request up front,
   before any record is written. `Scheduler::run` then re-checks — that the
   manifest is the one this scan was authorized under, that it is still
   unexpired, and that each individual target is inside its allow set — on the
   path packets actually leave by. A library caller that skips the first layer
-  does not skip the second.
+  does not skip the second. `bathy-packetd`, the only process that can put an
+  arbitrary packet on a wire, then decides the question a third time from its
+  own session state, in code that shares nothing with `bathy-scope`.
+- **No privileged scanning is reachable in v0.1.** `bathy-packetd` is the only
+  component that holds a capability, and nothing a user can run starts it:
+  there is no CLI flag and no MCP tool argument that points the engine at a
+  daemon, and the crate is not published, so `cargo install bathy` installs no
+  privileged binary. This is deliberate — SYN scanning is more intrusive than
+  connect and the approval policy does not yet distinguish them — and
+  `cargo run -p xtask -- check-packetd` fails if a shipped surface ever
+  reaches for it.
 - **Refused in full, never trimmed.** If a manifest fails to cover a single one
   of the targets, the whole scan is refused. bathy does not scan the part it is
   allowed to scan and stay quiet about the rest.

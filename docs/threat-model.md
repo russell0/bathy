@@ -22,7 +22,7 @@ the rest of this document against:
 | The calling agent (over MCP or the CLI) | **Untrusted to authorize. Trusted to ask.** It can name a manifest by path; it cannot supply, edit or widen one. |
 | A scanned endpoint's response bytes | **Wholly untrusted.** Hostile input by definition. |
 | The host filesystem and its state directory | Trusted for integrity; the event log defends against truncation and gaps, not against an attacker with write access. |
-| `bathy-packetd`, when it exists (Milestone 6) | Will run privileged. Its IPC boundary will be the highest-value parsing surface in the project. |
+| `bathy-packetd` (Milestone 6) | **Runs privileged**, and is the only process in this project that ever holds a capability. Its IPC boundary is the highest-value parsing surface here: every line it reads comes from a caller it does not trust, and a parsing bug there is a privilege-escalation bug rather than a denial of service. That surface is fuzzed (`fuzz/fuzz_targets/ipc.rs`), the crate carries the panic lints from its first commit, and the code that runs while the capability is held is measured on every CI run rather than asserted. **No shipped surface can start it** — see §3. |
 
 ## 2. What bathy defends against
 
@@ -132,12 +132,19 @@ authorization.**
 - **A scope is named by a path.** No tool accepts a manifest inline or by id, so
   an agent cannot author, widen, or extend its own authorization. The most it
   can do is name a file the operator already wrote.
-- **Scope enforcement is in two layers, and the second is not bypassable by an
-  adapter.** The CLI and MCP adapters refuse upfront, before a scan record
-  exists. `bathy-engine`'s scheduler checks scope identity, expiry and
-  per-target authorization *on the actual emission path*, so a caller who skips
-  the adapter entirely — a library user, a future adapter — gets the same
-  refusal. See the design paper, §5.
+- **Scope enforcement is in three layers, and no layer below the first is
+  bypassable by the one above it.** The CLI and MCP adapters refuse upfront,
+  before a scan record exists. `bathy-engine`'s scheduler checks scope
+  identity, expiry and per-target authorization *on the actual emission path*,
+  so a caller who skips the adapter entirely — a library user, a future
+  adapter — gets the same refusal. And `bathy-packetd`, the only process that
+  can put an arbitrary packet on a wire, decides the question again from its
+  own `Init`, in code that shares nothing with `bathy-scope`. See the design
+  paper, §5. **This said "two layers" until M6's whole-branch review**, which
+  was the count before the privileged process existed; the same stale count
+  was also in `SECURITY.md` and in the design paper's own §5 heading, and the
+  `check-docs` claim that pins this sentence was pinning the outdated
+  version.
 - **A scan wider than a configured threshold does not start.** It returns an
   `input_required` result carrying an `elicitation/create`, and the client is
   expected to put the question to a human.
@@ -215,11 +222,30 @@ Stated plainly, because a threat model that lists only wins is marketing.
   scanner; it enforces a scope, it does not adjudicate whether the scope is
   honest. Authorization to scan a network is a question about the world, and
   nothing in this process can answer it.
-- **A compromised host running `packetd`** (Milestone 6, not yet present). A
-  privileged daemon on a compromised host is a privileged process under the
-  attacker's control. The mitigations planned are a narrow IPC surface, a
-  fuzzed line protocol, and no policy decisions inside the daemon — but if the
-  host is owned, the daemon is owned.
+- **A compromised host running `packetd`.** A privileged daemon on a
+  compromised host is a privileged process under the attacker's control. The
+  mitigations are a narrow IPC surface (one JSON line in, one out, with a hard
+  line cap enforced at the reader), a fuzzed line protocol, a privileged window
+  measured on every CI run at 130 lines across 15 functions, and every
+  capability dropped and *verified dropped against `/proc/self/status`* before
+  the first byte of input is read — but if the host is owned, the daemon is
+  owned.
+
+  **The daemon makes policy decisions, and this document said it did not.**
+  Until M6's whole-branch review the mitigation list here read "no policy
+  decisions inside the daemon", which is the opposite of what shipped and was
+  the opposite of the design by the time it was written: `packetd` fixes an
+  allowlist, a denylist and a packet ceiling from its `Init` and refuses every
+  probe outside them itself (AC-6.9, AC-6.10, AC-6.11), in code that shares
+  none with `bathy-scope`. That duplication is the milestone's central security
+  claim, and delegating the decision instead would mean the one process that
+  can emit an arbitrary packet takes an unprivileged caller's word for whether
+  it may.
+
+  **Nothing a user can run starts it.** `bathy-packetd` carries
+  `publish = false` and is excluded from the published crate set, so
+  `cargo install bathy` installs no privileged binary, and neither the CLI nor
+  the MCP server has any way to point a scan at one. See §3's last bullet.
 - **An attacker with write access to the state directory.** The event log
   detects truncation and sequence gaps, which catches corruption and partial
   writes. It is not a tamper-evidence scheme against someone who can rewrite

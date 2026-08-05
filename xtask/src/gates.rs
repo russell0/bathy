@@ -3883,6 +3883,87 @@ const PRIVILEGED_CI_STEPS: &[(&str, &str)] = &[
 ///    tests skip; without `BATHY_LAB_REQUIRED` the cross-validation skips.
 ///    Either way the job is green having run nothing, which is the defect one
 ///    level up from a test that silently skips itself.
+/// The two files in which a **shipped surface** builds a `Scheduler`.
+///
+/// Derived by reading, not guessed: these are the only two production
+/// `Scheduler::new` call sites in the workspace (the CLI's `scan start`/
+/// `scan resume` path and the MCP server's `spawn_scan`). Everything else
+/// that constructs one is a test.
+pub const SHIPPED_SCHEDULER_SITES: [&str; 2] = [
+    "crates/bathy/src/commands/scan.rs",
+    "crates/bathy-mcp/src/engine.rs",
+];
+
+/// What reaching for the privileged daemon looks like at one of those sites.
+///
+/// `PacketdConfig::syn_via` is the only constructor that puts a path in
+/// `SchedulerConfig.packetd.binary`, and `binary.is_some()` is the only thing
+/// that makes `Scheduler::run` spawn `bathy-packetd` at all. Naming the type
+/// as well as the constructor catches the struct-literal spelling.
+pub const PACKETD_REACH_MARKERS: [&str; 2] = ["syn_via", "PacketdConfig"];
+
+/// v0.1 does not expose SYN scanning to a user, and this is the check that
+/// makes that a fact rather than a sentence.
+///
+/// # Why a gate for an absence
+///
+/// M6's whole-branch review put it plainly: `PacketdConfig::syn_via` has zero
+/// production callers, both shipped surfaces pass `SchedulerConfig::default()`
+/// (`binary: None`), and `bathy-packetd` carries `publish = false` so
+/// `cargo install bathy` installs no privileged binary at all. That is a
+/// deliberate v0.1 decision — SYN scanning is more intrusive than connect,
+/// this project already treats `scan.start` as destructive, and the approval
+/// policy that would have to distinguish the two does not exist — and the
+/// README, `SECURITY.md`, the threat model and the design paper all now say
+/// so to an operator.
+///
+/// A promise about what the shipped product *cannot* do, backed by nothing
+/// but four paragraphs of prose, is this repository's most expensive defect
+/// class. So it is checked: if either shipped surface ever reaches for the
+/// daemon, this fails, and the failure says which documents have to change
+/// in the same commit.
+///
+/// # Why this is not the self-referential trap
+///
+/// `crates/bathy-engine/src/scheduler.rs` records an earlier guard that
+/// grepped *its own source* for a marker and so matched the comment
+/// describing itself — a check that could never usefully fail. This one reads
+/// two other files, in two other crates, neither of which is this one, and
+/// the fixture test below drives both verdicts.
+pub fn packetd_reachability_violations(root: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    for site in SHIPPED_SCHEDULER_SITES {
+        let Ok(text) = std::fs::read_to_string(root.join(site)) else {
+            // Vacuity. A renamed or deleted file must fail rather than pass
+            // by having nothing to look at.
+            found.push(format!(
+                "{site} cannot be read, so the check that no shipped surface reaches for the \
+                 privileged daemon is ranging over nothing. If this file moved, move this \
+                 rule with it."
+            ));
+            continue;
+        };
+        for marker in PACKETD_REACH_MARKERS {
+            if text.contains(marker) {
+                found.push(format!(
+                    "{site} mentions `{marker}`, so a shipped surface can now put a path in \
+                     `SchedulerConfig.packetd.binary` and start `bathy-packetd`. v0.1 \
+                     deliberately exposes no SYN path: it is more intrusive than connect, \
+                     this project treats `scan.start` as destructive, and there is no \
+                     approval policy that distinguishes the two. If that decision has \
+                     changed, it changes in `README.md`, `SECURITY.md`, \
+                     `docs/threat-model.md` and `docs/design-paper.md` in the same commit \
+                     as this line — all four tell an operator that no privileged scanning \
+                     is reachable — and `bathy-packetd`'s `publish = false` has to change \
+                     too, or the binary being pointed at is one `cargo install bathy` never \
+                     installed."
+                ));
+            }
+        }
+    }
+    found
+}
+
 pub fn packetd_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
     let mut found = Vec::new();
     for (job, step) in PRIVILEGED_CI_STEPS {
@@ -4414,6 +4495,7 @@ pub fn check_packetd() -> Fallible<()> {
     let root = Path::new(".");
     let mut violations = packetd_size_violations(root);
     violations.extend(packetd_window_violations(root));
+    violations.extend(packetd_reachability_violations(root));
     match std::fs::read_to_string(root.join(crate::visibility::CI_PATH)) {
         Ok(ci) => violations.extend(packetd_ci_job_violations(crate::visibility::CI_PATH, &ci)),
         Err(e) => violations.push(format!(
@@ -4475,6 +4557,13 @@ pub fn check_packetd() -> Fallible<()> {
             .map(|(name, site, n)| format!("{name} ({site}) {n}"))
             .collect::<Vec<_>>()
             .join(", "),
+    );
+    println!(
+        "check-packetd: ok (no shipped surface reaches for the privileged daemon: {} \
+         production Scheduler site(s) checked for {:?}, so v0.1 exposes no SYN path and the \
+         four documents that say so to an operator are true)",
+        SHIPPED_SCHEDULER_SITES.len(),
+        PACKETD_REACH_MARKERS,
     );
     println!(
         "check-packetd: ok ({} required step(s) present in the named job(s): {})",
@@ -7026,6 +7115,124 @@ jobs:
             .expect("this repository has a ci.yml");
         let found = packetd_ci_job_violations(crate::visibility::CI_PATH, &ci);
         assert!(found.is_empty(), "{found:#?}");
+    }
+
+    /// The falsifier for the absence: a shipped surface that reaches for the
+    /// daemon fails, and one that does not, passes.
+    ///
+    /// Both halves matter. Without the clean half this rule is satisfied by a
+    /// checker that reports every file; without the dirty half it is
+    /// satisfied by one that reports none, which is what a check for an
+    /// absence degrades into if nobody drives it.
+    #[test]
+    fn a_shipped_surface_that_reaches_for_the_daemon_fails_and_one_that_does_not_passes() {
+        let clean = scratch("packetd-reach-clean");
+        for site in SHIPPED_SCHEDULER_SITES {
+            let path = clean.join(site);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "let c = SchedulerConfig::default();\n").unwrap();
+        }
+        assert!(
+            packetd_reachability_violations(&clean).is_empty(),
+            "{:#?}",
+            packetd_reachability_violations(&clean)
+        );
+
+        let wired = scratch("packetd-reach-wired");
+        for (i, site) in SHIPPED_SCHEDULER_SITES.iter().enumerate() {
+            let path = wired.join(site);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            // Only the first site is wired, so this also proves the rule
+            // names WHICH surface rather than failing wholesale.
+            let body = if i == 0 {
+                "let c = SchedulerConfig { packetd: PacketdConfig::syn_via(p), ..d };\n"
+            } else {
+                "let c = SchedulerConfig::default();\n"
+            };
+            std::fs::write(&path, body).unwrap();
+        }
+        let found = packetd_reachability_violations(&wired);
+        assert!(
+            found.iter().any(|v| v.contains(SHIPPED_SCHEDULER_SITES[0])),
+            "{found:#?}"
+        );
+        assert!(
+            !found.iter().any(|v| v.contains(SHIPPED_SCHEDULER_SITES[1])),
+            "the surface that did not reach must not be named: {found:#?}"
+        );
+
+        // Vacuity: a renamed file fails rather than passing over nothing.
+        let absent = scratch("packetd-reach-absent");
+        std::fs::create_dir_all(&absent).unwrap();
+        assert_eq!(
+            packetd_reachability_violations(&absent).len(),
+            SHIPPED_SCHEDULER_SITES.len(),
+            "every missing site must be reported"
+        );
+    }
+
+    /// The two sites this rule names are the workspace's only production
+    /// `Scheduler::new` call sites. A rule over a list that has silently
+    /// stopped being the whole list is a rule over a subset, and the subset
+    /// is where the wiring would go.
+    #[test]
+    fn the_shipped_scheduler_sites_are_every_production_scheduler_in_this_workspace() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let mut sites: Vec<String> = Vec::new();
+        let mut stack = vec![root.join("crates")];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    // `tests/` and `benches/` are separate crates and are
+                    // test code by construction.
+                    if !matches!(
+                        path.file_name().and_then(|n| n.to_str()),
+                        Some("tests") | Some("benches") | Some("target")
+                    ) {
+                        stack.push(path);
+                    }
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                // Production only: everything from the file's own
+                // `#[cfg(test)]` marker onwards is its unit-test harness.
+                let production: String = text
+                    .lines()
+                    .take_while(|l| l.trim() != TEST_MODULE_MARKER)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if production.contains("Scheduler::new(") {
+                    sites.push(
+                        path.strip_prefix(&root)
+                            .unwrap_or(&path)
+                            .to_string_lossy()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        sites.sort();
+        let mut expected: Vec<String> = SHIPPED_SCHEDULER_SITES
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        expected.sort();
+        // `scheduler.rs` defines `Scheduler::new`; it does not call it
+        // outside its own test module.
+        assert_eq!(
+            sites, expected,
+            "the production Scheduler call sites have changed; SHIPPED_SCHEDULER_SITES has \
+             to change with them or this gate covers a subset"
+        );
     }
 
     /// This repository's own daemon, measured. Not a fixture: a gate whose

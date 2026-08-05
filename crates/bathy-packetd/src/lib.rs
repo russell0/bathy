@@ -58,8 +58,15 @@
 //! this repository where a parsing bug is a privilege-escalation bug rather
 //! than only a denial of service. The lint was enabled from the crate's first
 //! commit rather than retrofitted -- the three crates that were retrofitted a
-//! week earlier turned up 102 real panic sites between them, one of which was
-//! on the first line of a hostile-peer read path.
+//! week earlier turned up **59** real panic sites between them (`bathy-types`
+//! 37, `bathy-evidence` 15, `bathy-query` 7), and the two retrofitted before
+//! those turned up 43, one of which was on the first line of a hostile-peer
+//! read path. This paragraph read `102` until M6's whole-branch review, which
+//! is those two disjoint groups added together and reported under the label
+//! of one -- a number about the security posture of the privileged component,
+//! and `check-docs` does not read rustdoc. Both figures are in the Global
+//! Constraints in `docs/superpowers/plans/2026-07-31-bathy-v0.1-overview.md`,
+//! which is where they are kept.
 //!
 //! What the lint does **not** see, and what was therefore checked by reading:
 //! `clippy::indexing_slicing` does not cover `str` indexing (`&s[i..j]`) or a

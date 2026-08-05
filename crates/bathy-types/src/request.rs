@@ -138,6 +138,32 @@ impl TryFrom<RawServiceDetection> for ServiceDetection {
 /// Hard ceilings. The scheduler aborts the scan when any is exhausted; these
 /// are not advisory hints. Every field is mandatory: an unbounded scan is not
 /// an expressible request.
+///
+/// # What `maximum_packets` actually counts, which is not packets
+///
+/// It counts **probes**, and it has always counted probes. `Scheduler::run`
+/// charges the ledger once per plan unit, and one plan unit is one connect
+/// attempt — which is a SYN, and then, for a port that answers, the rest of a
+/// handshake and a teardown. A SYN probe through `bathy-packetd` is the same
+/// shape: AC-6.13 requires an open port's SYN-ACK to be answered with a
+/// teardown RST, so an open port costs two packets and is charged one. The
+/// host-discovery phase is charged its worst case up front (one echo request
+/// plus one connect per configured discovery port) and may then emit fewer.
+///
+/// The bound is therefore real and is an **upper bound on probes, not on
+/// segments**: a scan cannot issue more than `maximum_packets` probes, and the
+/// number of packets those probes put on a wire is a small constant multiple
+/// of that. `packetd`'s own session ceiling is the one place a genuine packet
+/// count is enforced -- `packets_emitted()` there counts the teardown RST --
+/// and the two ceilings are deliberately independent (AC-6.11).
+///
+/// This is named rather than fixed. Making the field count segments would
+/// require the connect path to know how many the kernel sent, which it cannot
+/// observe; renaming it would break every published schema and every stored
+/// request. **What was wrong was that nothing said so**, here or in the
+/// README, which M6 made newly visible by adding a probe that emits two
+/// packets and says so in its own module doc. `RunSummary::packets_spent`
+/// reads this ledger and inherits the same meaning.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields, try_from = "RawBudgets")]
 pub struct Budgets {

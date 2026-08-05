@@ -3740,18 +3740,22 @@ mod tests {
     }
 
     // Carried requirement (Tasks 5/6): empty `probe_ports` must be a hard
-    // error "wherever the scheduler builds a `DiscoveryConfig`". This
-    // scheduler never does -- neither `Scheduler::run` nor anything else in
-    // `scheduler.rs` constructs a `DiscoveryConfig` or calls `discover_host`
-    // at all (v0.1's scheduler probes every plan unit directly; the
-    // Milestone Exit Criteria's own end-to-end test expects `scan.started`,
-    // `port.state`, `scan.completed` only, no `host.discovered`). Not
-    // pinned by an executable test here (an earlier version of this test
-    // grepped this file's own source for the string "DiscoveryConfig",
-    // which trivially matched this very comment -- a self-referential check
-    // that could never usefully fail); see this task's report for the full
-    // reasoning and why this carried requirement has no code footprint in
-    // this task's actual deliverable.
+    // error "wherever the scheduler builds a `DiscoveryConfig`". As of the
+    // M6 fix wave this scheduler DOES build one -- `Scheduler::run`'s
+    // discovery phase uses `DiscoveryConfig::default()` -- and the
+    // requirement is met by construction rather than by a check here:
+    // `probe_ports` is private, `DiscoveryConfig::new` is the only fallible
+    // constructor and refuses an empty list, and `Default` is the sanctioned
+    // non-empty one. There is no way to reach this phase with nothing to
+    // probe. `crate::discovery`'s own tests pin both halves.
+    //
+    // This comment said "this scheduler never does" from M3 until then, and
+    // it stayed correct only because nothing had wired discovery yet; the
+    // note below about the earlier self-referential test is the reason it was
+    // prose rather than a test in the first place. That test grepped this
+    // file's own source for the string "DiscoveryConfig" and so matched this
+    // very comment -- a check that could never usefully fail. It is not
+    // resurrected here: the property is now structural.
 
     // ------------------------------------------------------------------
     // The real round trip: run, cancel mid-flight, resume, then assert the

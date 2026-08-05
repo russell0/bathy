@@ -407,11 +407,19 @@ pub const CLAIMS: &[Claim] = &[
     Claim {
         path: THREAT_MODEL,
         criterion: "Task 4 Step 4",
-        requirement: "the two-layer scope enforcement is described",
-        pattern: r"(?i)two layers, and the second is not bypassable by an adapter",
+        requirement: "the three-layer scope enforcement is described",
+        pattern: r"(?i)three layers, and no layer below the first is\s+bypassable",
         because: "The layers are not redundant and the difference is the whole point: the \
-                  adapter's check is bypassable by a library caller, and the scheduler's is on \
-                  the path packets actually leave by.",
+                  adapter's check is bypassable by a library caller, the scheduler's is on the \
+                  path packets actually leave by, and packetd's is inside the only process \
+                  that holds a capability, in code that shares nothing with bathy-scope. \
+                  This pattern read `two layers` from M4 until M6's whole-branch review, \
+                  which is a demonstration of what this checker cannot do: a claim pattern \
+                  keeps a sentence PRESENT, and a sentence that has become false is kept \
+                  present just as faithfully as one that is true. M6 added the third layer \
+                  and this gate stayed green over the outdated count in three documents. \
+                  The pattern is part of the claim and has to be re-read when the claim \
+                  changes.",
     },
     Claim {
         path: THREAT_MODEL,

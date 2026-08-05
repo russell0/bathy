@@ -179,10 +179,12 @@ digest-pinned lab must diff to no substantive changes. That is a claim about the
 *scanner's* stability, which is ours to keep, rather than about the network's,
 which is not.
 
-## 5. Two-layer scope enforcement
+## 5. Three-layer scope enforcement
 
-Authorization is deny-by-default and is checked in two places that are
-deliberately not redundant.
+Authorization is deny-by-default and is checked in three places that are
+deliberately not redundant. Two of them are in the unprivileged half; the
+third is inside the one process that holds a capability, and it shares no
+code with the other two.
 
 **Layer 1 — the upfront refusal, in the CLI and the MCP adapter.** `scan
 preview`, `scan start` and `scan resume` each call `bathy_scope::evaluate` over
@@ -199,7 +201,7 @@ set. Service identification re-checks the manifest before opening any
 connection.
 
 **Layer 3 — inside the privileged process, in `bathy-packetd`.** The two layers
-above are in the *unprivileged* half. `packetd` is the only component that can
+above are both in the *unprivileged* half. `packetd` is the only component that can
 put an arbitrary packet on a wire, so it does not delegate the question of
 whether it may: its `Init` fixes an allowlist, a denylist and a packet ceiling
 for the process lifetime, a second `Init` is fatal rather than widening, and
@@ -341,7 +343,12 @@ another tool's output.**
 - **No OS detection, no UDP, no traceroute, no IPv6, no Windows, and no
   privileged scanning from the CLI or over MCP** in v0.1. `bathy-packetd` sends
   SYN probes and ICMP echo requests, and `bathy-engine` can drive both, but no
-  surface asks it to. Host discovery **is** in the output, for one objective:
+  surface asks it to and v0.1 ships no way to ask. That is a decision, not an
+  unfinished wire: SYN scanning is more intrusive than connect, the approval
+  threshold that gates `scan.start` does not yet distinguish the two, and the
+  daemon is not published, so there is no privileged binary in an installed
+  `bathy` for a flag to point at. A gate fails if either shipped surface
+  reaches for it. Host discovery **is** in the output, for one objective:
   a scan requesting `host-inventory` runs a discovery phase and emits
   `host.discovered` events recording the method that decided, and every other
   objective emits none, so `hosts_up` is empty for them and an address with no
