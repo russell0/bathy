@@ -3041,13 +3041,46 @@ pub const PACKETD_PRIVILEGED_WINDOW_BUDGET: usize = 140;
 /// its dependency set at length -- is the other half of the argument.
 pub const PACKETD_PRIVILEGED_WINDOW_FUNCTIONS: usize = 16;
 
-/// The two boundaries of the privileged window, in `main.rs`, in order.
+/// The two *calls* that structure the privileged window, in `main.rs`, in
+/// order. **Neither of them is where the window opens.**
 ///
 /// Named as data rather than matched inline because
 /// `the_window_is_reported_when_its_boundaries_are_missing_or_reversed`
 /// drives both failures, and because a reader of this gate should be able to
 /// see the boundary without reading the daemon.
+///
+/// # The window opens at process entry, not at the acquisition
+///
+/// M6's whole-branch review, CRITICAL-1. The first version of this gate
+/// measured the interval *between* these two calls, and that interval is not
+/// the one in which the capability is held. `bathy-packetd` is spawned with
+/// `CAP_NET_RAW` already in its permitted and effective sets — that is *why*
+/// [`PACKETD_WINDOW_BOUNDS`]`.0` can succeed — so the process is privileged
+/// from its first instruction. Everything `main` did before the acquisition
+/// was privileged and uncounted.
+///
+/// That is not hypothetical: the reviewer moved the argv parse above the
+/// acquisition and added an environment read beside it — attacker-influenced
+/// input parsed while `CAP_NET_RAW` is held — and this check reported the
+/// identical `130/140` over `15/16`, with every test and the whole privileged
+/// container job green. It is the same blindness, one boundary over, that
+/// this measure was introduced to replace the 800-line crate cap *for*.
+///
+/// So the window is now `main`'s opening brace → `drop_all_capabilities(`,
+/// and [`PACKETD_MAIN_FN`] is how it is found. `.0` keeps two jobs: it seeds
+/// the reachability closure with the acquisition's own body, and it is the
+/// subject of [`packetd_window_violations`]'s prelude rule — the code between
+/// entering `main` and reaching it must be **zero lines**, because a budget
+/// alone would let eight lines of argv parsing in under the headroom.
 pub const PACKETD_WINDOW_BOUNDS: (&str, &str) = ("acquire_raw_sockets(", "drop_all_capabilities(");
+
+/// Where the privileged window actually opens: the daemon's entry point.
+///
+/// Matched against the noise-stripped source, so a `fn main(` inside a
+/// comment or a string literal cannot be it. The window starts at the first
+/// `{` after this — see [`PACKETD_WINDOW_BOUNDS`] for why not at the
+/// acquisition call.
+pub const PACKETD_MAIN_FN: &str = "fn main(";
 
 /// The crate the budget is about.
 pub const PACKETD_SRC: &str = "crates/bathy-packetd/src";
@@ -3380,6 +3413,20 @@ fn code_lines_of(text: &str) -> usize {
         .count()
 }
 
+/// The byte offset just past `fn main`'s opening brace in already-stripped
+/// source, which is where the privileged window opens.
+///
+/// The first `{` after `fn main(` is the body brace: `main` takes no
+/// parameters and its return type cannot contain a brace, and
+/// [`strip_rust_noise`] has already removed anything inside a comment or a
+/// string literal — the defect class `c690e5b` recorded, where a gate was
+/// satisfied by the comment describing it.
+fn main_body_start(stripped: &str) -> Option<usize> {
+    let at = stripped.find(PACKETD_MAIN_FN)?;
+    let brace = stripped.get(at..)?.find('{')?;
+    at.checked_add(brace)?.checked_add(1)
+}
+
 /// Every `impl` block in `stripped`, as `(type name, start, end)` character
 /// offsets.
 ///
@@ -3563,8 +3610,17 @@ pub struct PrivilegedWindow {
     /// Reasons the window could not be located at all. Non-empty means the
     /// measurement below is meaningless and must not be read as a pass.
     pub bounds: Vec<String>,
-    /// Code lines of `main`'s statements between the two boundaries.
+    /// Code lines of `main`'s statements from its opening brace up to
+    /// `drop_all_capabilities(` — the whole interval in which this process
+    /// holds `CAP_NET_RAW`, not merely the part after it opens a socket.
     pub inline_lines: usize,
+    /// How much of [`Self::inline_lines`] runs **before** the acquisition.
+    ///
+    /// Zero in this repository and required to stay zero: this is the blind
+    /// spot CRITICAL-1 lived in, and the sub-count exists so the rule that
+    /// closes it can name the lines rather than only report a total that the
+    /// budget's headroom would have absorbed. See [`PACKETD_WINDOW_BOUNDS`].
+    pub prelude_lines: usize,
     /// Every crate function transitively reachable from the two entry
     /// points, as `(name, site, code lines)`, sorted.
     pub reachable: Vec<(String, String, usize)>,
@@ -3581,9 +3637,11 @@ impl PrivilegedWindow {
 
 /// Measure the privileged window.
 ///
-/// The window is `main.rs`'s statements from `acquire_raw_sockets(` to
+/// The window is `main.rs`'s statements from **`main`'s opening brace** to
 /// `drop_all_capabilities(` inclusive, plus the transitive closure of this
-/// crate's own functions called from there. See
+/// crate's own functions called from there. It opens at process entry
+/// because that is when the capability is already held — see
+/// [`PACKETD_WINDOW_BOUNDS`] — and see
 /// [`PACKETD_PRIVILEGED_WINDOW_BUDGET`] for why this and not the crate
 /// total.
 ///
@@ -3613,9 +3671,9 @@ pub fn packetd_privileged_window(root: &Path) -> PrivilegedWindow {
     let (Some(start), Some(end)) = (main_src.find(open), main_src.find(close)) else {
         window.bounds.push(format!(
             "{main_name} does not contain both `{open}` and `{close}`, which are the two \
-             boundaries of the window in which this process holds CAP_NET_RAW. Either the \
-             daemon's startup order changed or this check no longer knows where to look; \
-             both are failures."
+             calls that structure the window in which this process holds CAP_NET_RAW. \
+             Either the daemon's startup order changed or this check no longer knows where \
+             to look; both are failures."
         ));
         return window;
     };
@@ -3628,12 +3686,40 @@ pub fn packetd_privileged_window(root: &Path) -> PrivilegedWindow {
         ));
         return window;
     }
-    let inline: String = main_src
-        .get(start..end)
-        .unwrap_or_default()
-        .chars()
-        .collect();
+    // Where the capability is actually first held: process entry. Not
+    // `start` — see PACKETD_WINDOW_BOUNDS for the reproduction that made
+    // this the difference between a gate and a decoration.
+    let Some(entry) = main_body_start(main_src) else {
+        window.bounds.push(format!(
+            "{main_name} has no `{PACKETD_MAIN_FN}` with a body, so this check cannot find \
+             process entry — which is where CAP_NET_RAW is first held and therefore where \
+             the privileged window opens. It is not `{open}`: the capability is in this \
+             process's permitted set before its first instruction, which is why that call \
+             can succeed at all."
+        ));
+        return window;
+    };
+    if entry > start {
+        window.bounds.push(format!(
+            "{main_name} calls `{open}` outside `main`, so the window has no located \
+             opening. This check measures from `main`'s own opening brace."
+        ));
+        return window;
+    }
+    let inline: String = main_src.get(entry..end).unwrap_or_default().to_string();
     window.inline_lines = code_lines_of(&inline);
+    // Whole lines, cut at the start of the acquisition's own line rather
+    // than at the call itself: `let sockets = match privilege::` is a
+    // fragment of the line that acquires, not a statement that ran before
+    // it, and a prelude rule that counted it would fail on the correct
+    // daemon -- a gate that is red on the good shape gets its threshold
+    // raised until it is red on nothing.
+    let prelude_end = main_src
+        .get(..start)
+        .and_then(|head| head.rfind('\n').map(|nl| nl.saturating_add(1)))
+        .unwrap_or(entry)
+        .max(entry);
+    window.prelude_lines = code_lines_of(main_src.get(entry..prelude_end).unwrap_or_default());
 
     // The closure. Seeded with the two entry points by name and with
     // anything the inline window calls directly.
@@ -3687,6 +3773,25 @@ pub fn packetd_window_violations(root: &Path) -> Vec<String> {
         );
     }
     let (open, close) = PACKETD_WINDOW_BOUNDS;
+    // M6 whole-branch review, CRITICAL-1. The budget below is a bound on
+    // the window; this is a bound on where the window *starts doing work*.
+    // Both are needed: the reproduction that survived the first version of
+    // this gate was eight lines of argv and environment parsing, which the
+    // budget's ten lines of headroom would have absorbed in silence.
+    if window.prelude_lines > 0 {
+        found.push(format!(
+            "{} line(s) of `main` run before `{open}` and therefore run while CAP_NET_RAW \
+             is held: this process is spawned with the capability already in its permitted \
+             and effective sets, which is why that call can succeed, so the privileged \
+             window opens at process entry and not at the acquisition. Nothing may execute \
+             there. Argv, the environment and stdin are all chosen by the parent, and \
+             parsing any of them at this point is parsing attacker-influenced input inside \
+             the only process in this repository that holds a capability. Move it below \
+             `{close}` — everything after that runs unprivileged, holding sockets that are \
+             already open.",
+            window.prelude_lines,
+        ));
+    }
     for entry in [open, close] {
         let name = entry.trim_end_matches('(');
         if !window.reachable.iter().any(|(n, _, _)| n == name) {
@@ -4356,10 +4461,12 @@ pub fn check_packetd() -> Fallible<()> {
     println!(
         "check-packetd: ok ({}/{PACKETD_PRIVILEGED_WINDOW_BUDGET} line(s) and {}/\
          {PACKETD_PRIVILEGED_WINDOW_FUNCTIONS} function(s) run while CAP_NET_RAW is held: \
-         main.rs's {} inline line(s) between `{}` and `{}`, plus {})",
+         main.rs's {} inline line(s) from entering `main` (where the capability is already \
+         held; {} of them before `{}`) to `{}`, plus {})",
         window.total_lines(),
         window.reachable.len(),
         window.inline_lines,
+        window.prelude_lines,
         PACKETD_WINDOW_BOUNDS.0,
         PACKETD_WINDOW_BOUNDS.1,
         window
@@ -6428,12 +6535,21 @@ jobs:
     /// and a large amount of code *after* the drop that the window must not
     /// count. That last part is the whole point -- a measure that counted it
     /// would be the crate-wide cap again.
-    fn window_fixture(root: &Path, between: &str, after: &str) {
+    ///
+    /// **`before` is the parameter this fixture did not have, and CRITICAL-1
+    /// is what it cost.** The old version hardcoded the acquisition as
+    /// `main`'s first statement, so the one shape that mattered -- work
+    /// running privileged *before* the capability is used to open anything --
+    /// was unrepresentable in every test built on it, and the gate stayed
+    /// green over a build that parsed argv while holding `CAP_NET_RAW`. Every
+    /// caller now states it, so "no prelude" is an assertion each test makes
+    /// rather than a property of the harness.
+    fn window_fixture(root: &Path, before: &str, between: &str, after: &str) {
         packetd_file(
             root,
             "main.rs",
             &format!(
-                "fn main() {{\n    let s = privilege::acquire_raw_sockets();\n{between}\
+                "fn main() {{\n{before}\n    let s = privilege::acquire_raw_sockets();\n{between}\
                  \n    privilege::drop_all_capabilities();\n{after}\n}}\n\
                  fn helper() {{\n    let x = 1;\n}}\n"
             ),
@@ -6456,13 +6572,18 @@ jobs:
             .map(|i| format!("    let after{i} = {i};"))
             .collect::<Vec<_>>()
             .join("\n");
-        window_fixture(&root, "    let mid = 1;", &after);
+        window_fixture(&root, "", "    let mid = 1;", &after);
         let window = packetd_privileged_window(&root);
         assert!(window.bounds.is_empty(), "{window:#?}");
-        // The slice runs from the acquisition call to the drop call, so it
-        // is that line, the one statement between, and the fragment of the
-        // drop's own line -- three, and nothing from after the drop.
+        // The slice runs from `main`'s opening brace to the drop call, so
+        // it is the acquisition's line, the one statement between, and the
+        // fragment of the drop's own line -- three, and nothing from after
+        // the drop. The fixture states an empty prelude, so the count from
+        // process entry and the count from the acquisition coincide here;
+        // `work_before_the_acquisition_is_privileged_and_fails_the_check`
+        // is where they come apart.
         assert_eq!(window.inline_lines, 3, "{window:#?}");
+        assert_eq!(window.prelude_lines, 0, "{window:#?}");
         // Both entry points, and neither `main` nor `helper`.
         let names: Vec<&str> = window
             .reachable
@@ -6494,14 +6615,14 @@ jobs:
             .join("\n");
 
         let safe = scratch("packetd-window-after");
-        window_fixture(&safe, "    let mid = 1;", &work);
+        window_fixture(&safe, "", "    let mid = 1;", &work);
         assert!(
             packetd_window_violations(&safe).is_empty(),
             "200 lines AFTER the drop are unprivileged and are not this gate's business"
         );
 
         let unsafe_root = scratch("packetd-window-before");
-        window_fixture(&unsafe_root, &work, "    let after = 1;");
+        window_fixture(&unsafe_root, "", &work, "    let after = 1;");
         let found = packetd_window_violations(&unsafe_root);
         assert!(
             found
@@ -6514,7 +6635,12 @@ jobs:
         // And the same for a call reaching new code, which is how the window
         // grows without a single line moving.
         let via_call = scratch("packetd-window-call");
-        window_fixture(&via_call, "    let mid = grown();", "    let after = 1;");
+        window_fixture(
+            &via_call,
+            "",
+            "    let mid = grown();",
+            "    let after = 1;",
+        );
         packetd_file(
             &via_call,
             "grown.rs",
@@ -6525,6 +6651,123 @@ jobs:
             found.iter().any(|v| v.contains("grown")),
             "a call from the window into 200 lines must be reported, and must name the \
              function: {found:#?}"
+        );
+    }
+
+    /// The mirror falsifier, and the one M6's whole-branch review had to
+    /// write by hand because no test in this file could express it:
+    /// **work moved *before* the acquisition is privileged too, and must
+    /// fail.**
+    ///
+    /// The process is spawned with `CAP_NET_RAW` in its permitted and
+    /// effective sets, so the interval that matters opens at process entry.
+    /// The reviewer's reproduction was not 200 lines: it was the argv parse
+    /// moved above the acquisition with an environment read added beside it,
+    /// **eight lines**, which the budget's ten lines of headroom absorb
+    /// without a murmur. So this test asserts the small case first -- the
+    /// one a budget cannot catch -- and only then the large one.
+    #[test]
+    fn work_before_the_acquisition_is_privileged_and_fails_the_check() {
+        // The reviewer's own falsifier, to the line: argv and the
+        // environment, parsed while the capability is held.
+        let reproduction = concat!(
+            "    let self_check = std::env::args_os().skip(1).any(|a| a == \"--self-check\");\n",
+            "    let raw = std::env::var(\"BATHY_PACKETD_OPTS\").unwrap_or_default();\n",
+            "    let tuning: Vec<&str> = raw.split(',').collect();\n",
+            "    let _ = (self_check, tuning);"
+        );
+        let smuggled = scratch("packetd-window-prelude-small");
+        window_fixture(
+            &smuggled,
+            reproduction,
+            "    let mid = 1;",
+            "    let a = 1;",
+        );
+        let window = packetd_privileged_window(&smuggled);
+        assert!(window.bounds.is_empty(), "{window:#?}");
+        assert_eq!(
+            window.prelude_lines, 4,
+            "the four statements before the acquisition run privileged and must be \
+             counted: {window:#?}"
+        );
+        assert!(
+            window.total_lines() <= PACKETD_PRIVILEGED_WINDOW_BUDGET,
+            "this fixture must be INSIDE the line budget or it proves nothing about the \
+             prelude rule -- a budget-sized reproduction is the case the old gate already \
+             caught: {} lines",
+            window.total_lines()
+        );
+        let found = packetd_window_violations(&smuggled);
+        assert!(
+            found.iter().any(|v| v.contains("run before")
+                && v.contains("attacker-influenced input")
+                && v.contains(PACKETD_WINDOW_BOUNDS.0)),
+            "four lines of argv and environment parsing before the acquisition must fail, \
+             and the failure must name the boundary they belong on the far side of: \
+             {found:#?}"
+        );
+
+        // The narrowing control: the identical four lines *after* the drop
+        // are unprivileged and are not this gate's business. Without it a
+        // rule that failed on the presence of the lines anywhere in `main`
+        // would pass the assertion above while measuring nothing.
+        let permitted = scratch("packetd-window-prelude-control");
+        window_fixture(&permitted, "", "    let mid = 1;", reproduction);
+        assert_eq!(
+            packetd_privileged_window(&permitted).prelude_lines,
+            0,
+            "the same lines below the drop are not in the window"
+        );
+        assert!(
+            packetd_window_violations(&permitted).is_empty(),
+            "{:#?}",
+            packetd_window_violations(&permitted)
+        );
+
+        // And the large case, which must fail on both counts: it is a
+        // prelude *and* it blows the budget.
+        let work = (0..200)
+            .map(|i| format!("    let w{i} = {i};"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let bulk = scratch("packetd-window-prelude-bulk");
+        window_fixture(&bulk, &work, "    let mid = 1;", "    let a = 1;");
+        let found = packetd_window_violations(&bulk);
+        assert!(found.iter().any(|v| v.contains("run before")), "{found:#?}");
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("run while CAP_NET_RAW is held")
+                    && v.contains(&format!("{PACKETD_PRIVILEGED_WINDOW_BUDGET}-line"))),
+            "200 lines before the acquisition are 200 lines in the window, so the budget \
+             must fire as well: {found:#?}"
+        );
+    }
+
+    /// The window has to be *locatable* from process entry, not only from
+    /// the acquisition -- so a `main.rs` this check cannot find `main` in is
+    /// reported rather than measured from the acquisition as a fallback.
+    /// Silently narrowing to the old, wrong interval is exactly how
+    /// CRITICAL-1 read as a pass.
+    #[test]
+    fn a_main_this_check_cannot_locate_is_reported_rather_than_measured_from_the_acquisition() {
+        let root = scratch("packetd-window-no-main");
+        packetd_file(
+            &root,
+            "main.rs",
+            "fn start() {\n    let s = privilege::acquire_raw_sockets();\n    \
+             privilege::drop_all_capabilities();\n}\n",
+        );
+        packetd_file(
+            &root,
+            "privilege.rs",
+            "pub fn acquire_raw_sockets() {\n    let a = 1;\n}\n\
+             pub fn drop_all_capabilities() {\n    let c = 3;\n}\n",
+        );
+        let found = packetd_window_violations(&root);
+        assert!(
+            found.iter().any(|v| v.contains("process entry")),
+            "{found:#?}"
         );
     }
 
@@ -6572,7 +6815,7 @@ jobs:
             .map(|i| format!("    let c{i} = tiny{i}();"))
             .collect::<Vec<_>>()
             .join("\n");
-        window_fixture(&root, &calls, "    let after = 1;");
+        window_fixture(&root, "", &calls, "    let after = 1;");
         let bodies = (0..PACKETD_PRIVILEGED_WINDOW_FUNCTIONS)
             .map(|i| format!("pub fn tiny{i}() {{\n    let a = {i};\n}}\n"))
             .collect::<Vec<_>>()
@@ -6789,10 +7032,20 @@ jobs:
     /// only evidence is a fixture it wrote itself has never read the thing
     /// it guards.
     #[test]
-    fn this_repositorys_privileged_window_is_the_acquisition_and_the_drop() {
+    fn this_repositorys_privileged_window_is_process_entry_to_the_drop() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
         let window = packetd_privileged_window(&root);
         assert!(window.bounds.is_empty(), "{window:#?}");
+        // The property CRITICAL-1 found nothing asserted: `main` does no
+        // work at all before the acquisition. This is the fact the old
+        // measurement *assumed* -- it started counting at the acquisition,
+        // so a `main` that parsed argv first measured the same 130 lines.
+        assert_eq!(
+            window.prelude_lines, 0,
+            "this daemon must reach `{}` without executing a statement first; it is \
+             privileged from its first instruction: {window:#?}",
+            PACKETD_WINDOW_BOUNDS.0
+        );
         let names: Vec<&str> = window
             .reachable
             .iter()
