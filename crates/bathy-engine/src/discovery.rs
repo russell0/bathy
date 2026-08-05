@@ -659,6 +659,45 @@ mod tests {
             );
         }
 
+        /// The echo request is a packet, so it is paced like one.
+        ///
+        /// Nothing else here can tell a combined discovery that calls
+        /// `limiter.acquire` before the ICMP probe from one that skips it:
+        /// every other test uses the permissive `limiter()`. This one uses a
+        /// 1-pps limiter, a paused clock and a conclusive `up` (so exactly
+        /// one probe happens and the TCP path never runs), and spends the
+        /// bucket's free token first -- so the ICMP probe's own acquire is
+        /// the only thing that can account for the wait. Skipping it makes
+        /// the elapsed time a small fraction of this.
+        #[tokio::test]
+        async fn the_icmp_probe_passes_through_the_rate_limiter() {
+            let dir = tempfile::tempdir().unwrap();
+            let client = daemon(
+                dir.path(),
+                "paced.sh",
+                r#"{"type":"host_result","id":1,"state":"up"}"#,
+            );
+            let (_held, cfg) = open_port();
+            let l = RateLimiter::new(1);
+            // The starting token, spent so the measured acquire must refill.
+            l.acquire(1).await;
+            tokio::time::pause();
+            let t = tokio::time::Instant::now();
+            let r = discover_host_combined("127.0.0.1".parse().unwrap(), &cfg, &l, Some(&client))
+                .await
+                .unwrap();
+            let elapsed = t.elapsed();
+            assert_eq!(
+                r.method, METHOD_ICMP_UP,
+                "one probe, and it was the ICMP one"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(900),
+                "took {elapsed:?}; expected about a second refilling at 1 pps -- a much \
+                 shorter time means the echo request skipped the rate limiter entirely"
+            );
+        }
+
         /// A daemon that has stopped answering is terminal too, for AC-6.16's
         /// reason: quietly finishing by another method produces one result
         /// set assembled two ways.

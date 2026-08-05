@@ -592,6 +592,25 @@ mod tests {
         );
     }
 
+    /// The shared out-of-state guard, reached the way only a direct call
+    /// reaches it: `handle_line`'s dispatch answers a pre-`init` line from its
+    /// own arm, so a test that goes through the line protocol never gets here.
+    /// Found by mutation -- neutering this guard left every ICMP test passing,
+    /// and only `syn.rs`'s equivalent test failed.
+    #[test]
+    fn handle_icmp_probe_called_directly_before_init_is_fatal_and_emits_nothing() {
+        let wire = Shared::default();
+        let mut session = crate::protocol::Session::new(true, Box::new(wire.clone()));
+        session.set_reply_deadline(Duration::ZERO);
+        let r = session.handle_icmp_probe(1, ip("10.30.0.10"));
+        assert!(matches!(r, Response::Fatal { .. }), "{r:?}");
+        assert!(
+            session.is_terminated() && session.ended_fatally(),
+            "a probe before init must end the session, not be refused one probe at a time"
+        );
+        assert!(wire.0.borrow().sent.is_empty(), "and emit nothing");
+    }
+
     /// The mirror of `the_ceiling_counts_icmp_and_syn_probes_against_one_
     /// budget`: a budget spent entirely by ICMP refuses a SYN probe. A SYN
     /// path reading its own counter would still admit this one.
