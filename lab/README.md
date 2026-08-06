@@ -287,18 +287,25 @@ Recorded here because the milestone plan is a requirements document and a
 defect in it outlives the task that hit it.
 
 1. **AC-7.4's drafted test could not fail.** The plan asserts
-   `!fold.hosts_up.contains(&ip)`. `Scheduler` has no call to `discover_host`
-   in v0.1 — unprivileged ICMP is impossible, so host discovery ships with
-   `packetd` in M6, and the overview's Gap Register says so — which means
-   `ScanFold::hosts_up` is empty after *every* scan. The assertion would have
-   passed against a scanner that reported the entire subnet live: a decoration
-   test, and the thing the overview's "manual verification does not close an
-   acceptance criterion" constraint exists to prevent. The test now asserts the
-   property that is real in v0.1 — every endpoint on an address with no host is
-   `Filtered`, never `Open` (we invented a service) and never `Closed` (we
-   claim an RST arrived, which is itself evidence a host is there) — and
-   separately asserts that `hosts_up` *is* empty, so that wiring host discovery
-   in makes this test fail and demand the stronger assertion.
+   `!fold.hosts_up.contains(&ip)`. When it was written `Scheduler` had no call
+   to `discover_host` at all — unprivileged ICMP is impossible, so host
+   discovery shipped with `packetd` in M6, and the overview's Gap Register said
+   so — which meant `ScanFold::hosts_up` was empty after *every* scan. The
+   assertion would have passed against a scanner that reported the entire
+   subnet live: a decoration test, and the thing the overview's "manual
+   verification does not close an acceptance criterion" constraint exists to
+   prevent. The test now asserts the property that is real either way — every
+   endpoint on an address with no host is `Filtered`, never `Open` (we invented
+   a service) and never `Closed` (we claim an RST arrived, which is itself
+   evidence a host is there).
+
+   **M6's AC-6.20 fix wave then wired the discovery phase**, so `hosts_up` is
+   no longer empty by construction. The suite's separate `hosts_up` assertion
+   survived that and changed meaning rather than going stale: this scan
+   requests `Objective::InventoryExposedServices`, discovery runs only for
+   `Objective::HostInventory`, so the assertion is now the objective gate's
+   lab-side control. If it goes red, either the gate has stopped gating or
+   something is emitting `host.discovered` outside it.
 
 2. **The plan's ground truth was written from the compose file.** Its four
    hosts omit 33060, 587, 443 and 853, every one of which is genuinely open;

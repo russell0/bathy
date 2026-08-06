@@ -461,8 +461,10 @@ fn harness(
 /// starts, `scan.started` says `tcp-syn` -- and because the targets here are
 /// loopback, `packetd`'s own independent scope check refuses every probe
 /// (AC-6.10) even though the engine's manifest permits them, so the scan
-/// fails with `packetd_refused`. That is the two-layer design working, and it
-/// is the narrowing control this test needs: an engine that never actually
+/// fails with `packetd_refused`. That is Layers 2 and 3 of the three-layer
+/// scope design working -- the engine's manifest check and `packetd`'s own,
+/// which share no code -- and it is the narrowing control this test needs:
+/// an engine that never actually
 /// used the daemon would record `tcp-connect` here and fail.
 #[tokio::test]
 async fn the_engine_records_which_method_actually_ran() {

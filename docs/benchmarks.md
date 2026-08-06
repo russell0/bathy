@@ -103,7 +103,7 @@ the published numbers cannot quietly stop being the numbers the run produced.
 | Tool | Flag | Why |
 |---|---|---|
 | bathy | `--no-service-detection` | Only on the `bathy-ports-only` row, and it exists for fairness rather than for speed: `nmap -sT` performs port discovery and nothing else, so comparing it against bathy's default — which identifies services on every open port — would charge us for work the other tool was not asked to do. Both rows are published. |
-| Nmap | `-Pn` | bathy performs no host discovery in v0.1 (unprivileged ICMP is impossible; it ships with `packetd`). Without `-Pn`, Nmap would solve a strictly harder problem and be charged for it. |
+| Nmap | `-Pn` | bathy runs a host-discovery phase only for `--objective host-inventory`, and every row here uses the default objective, so no bathy row performs host discovery. Without `-Pn`, Nmap would solve a strictly harder problem and be charged for it. |
 | Nmap | `-n` | bathy performs no reverse DNS. With resolution on, Nmap's wall clock would include lookups against addresses that have no PTR record. |
 | Nmap | `--max-rtt-timeout` | Set to bathy's own fixed per-connection timeout, so neither tool is waiting longer than the other on the two addresses with no host. |
 | Nmap, Masscan | `--max-rate` / `--rate` | Set to the rate ceiling `lab/scope.json` authorizes: 100,000 pps. See below — the choice was measured, not asserted. |
