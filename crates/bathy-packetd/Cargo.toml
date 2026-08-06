@@ -15,6 +15,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+# The manifest-level half of the guarantee three documents already stated.
+# `xtask`'s EXCLUDED_FROM_PUBLICATION keeps this crate out of the release
+# order and `release.yml` derives that order from it, so the guarantee held
+# without this line -- but the README, the threat model and the publication
+# gate's own remediation text all said "it carries `publish = false`", and it
+# did not. `cargo publish -p bathy-packetd` now refuses on the file that
+# decides, not on a list a future workflow might stop reading.
+publish = false
 
 [dependencies]
 # The dependency graph of the ONLY privileged component in this workspace, and

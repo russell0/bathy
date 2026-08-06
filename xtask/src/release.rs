@@ -67,9 +67,11 @@ pub const EXCLUDED_FROM_PUBLICATION: &[(&str, &str)] = &[
         "xtask",
         "it is this workspace's own build tool, not a library anyone can consume. Its \
          entire surface is `check-*` gates over THIS repository's file layout, so a \
-         published copy would be inert in any other tree. It already carries \
+         published copy would be inert in any other tree. It carries \
          `publish = false` in its manifest, which is what makes this entry a statement \
-         of the same fact rather than the only thing enforcing it.",
+         of the same fact rather than the only thing enforcing it -- a property every \
+         entry in this list is now required to have, rather than one this entry \
+         happened to describe.",
     ),
     (
         "bathy-packetd",
@@ -80,7 +82,10 @@ pub const EXCLUDED_FROM_PUBLICATION: &[(&str, &str)] = &[
          `#![forbid(unsafe_code)]`, and its IPC line protocol is still moving -- \
          publishing it now would put a permanent, stable-looking version number on the \
          wire format of the component that runs with elevated privileges. Publishing it \
-         later costs nothing; publishing it now cannot be undone.",
+         later costs nothing; publishing it now cannot be undone. It carries \
+         `publish = false` in its manifest as of M6's close-out; until then it did not, \
+         while `README.md`, `docs/threat-model.md` and the publication gate's own \
+         remediation text all said it did.",
     ),
 ];
 
@@ -240,6 +245,24 @@ pub fn release_violations(
                 "`{name}`'s exclusion reason is {} characters. A crate not published is a \
                  crate nobody can depend on; that trade needs an argument, not a label.",
                 why.len()
+            ));
+        }
+        // The manifest half. This list keeps a crate out of the order this
+        // module computes and `release.yml` derives; `publish = false` is
+        // what makes `cargo publish -p <name>` refuse regardless of who is
+        // driving it. Asserted rather than assumed because `bathy-packetd`
+        // had no such key while `README.md`, `docs/threat-model.md` and
+        // `gates::packetd_reachability_violations`'s own remediation text
+        // all told a reader it did -- a second guard that existed only in
+        // prose, over the one crate in this workspace that will hold
+        // CAP_NET_RAW.
+        if crates.iter().any(|c| c.name == *name && c.publishable) {
+            found.push(format!(
+                "`{name}` is in EXCLUDED_FROM_PUBLICATION but its manifest has no \
+                 `publish = false`. This list is the only thing keeping it off the \
+                 registry, and it is read by exactly one program. Add `publish = false` \
+                 to `crates/{name}/Cargo.toml` so the refusal lives in the file that \
+                 decides, not only in a list and the documents that describe it."
             ));
         }
     }
@@ -1156,6 +1179,46 @@ mod tests {
                 why.len()
             );
         }
+    }
+
+    /// M6 close-out, NEW-2. `bathy-packetd` had no `publish` key at all while
+    /// three documents told a reader it carried one, so the privileged crate
+    /// was singly protected and described as doubly protected.
+    #[test]
+    fn an_excluded_crate_whose_manifest_does_not_say_publish_false_is_reported() {
+        let crates = a_publishable_workspace(); // every member `publishable: true`
+        let excluded: &[(&str, &str)] = &[(
+            "bathy-scope",
+            "a reason long enough to satisfy the rule that an exclusion must be argued \
+             rather than merely labelled, which is what this padding is for",
+        )];
+        let order = publish_order(&crates, TEST_LAYERS, &["bathy-scope"]).expect("an order");
+        let found = release_violations(&crates, &order, TEST_LAYERS, excluded);
+        assert!(
+            found
+                .iter()
+                .any(|v| v.contains("bathy-scope") && v.contains("no `publish = false`")),
+            "{found:#?}"
+        );
+    }
+
+    /// The narrowing control for the test above. Without it the rule could be
+    /// "report every excluded crate" and the test would still pass.
+    #[test]
+    fn an_excluded_crate_that_does_say_publish_false_is_not_reported() {
+        let mut crates = a_publishable_workspace();
+        crates[1].publishable = false;
+        let excluded: &[(&str, &str)] = &[(
+            "bathy-scope",
+            "a reason long enough to satisfy the rule that an exclusion must be argued \
+             rather than merely labelled, which is what this padding is for",
+        )];
+        let order = publish_order(&crates, TEST_LAYERS, &["bathy-scope"]).expect("an order");
+        let found = release_violations(&crates, &order, TEST_LAYERS, excluded);
+        assert!(
+            !found.iter().any(|v| v.contains("publish = false")),
+            "a crate whose manifest already refuses is not a violation: {found:#?}"
+        );
     }
 
     // --- the tag ------------------------------------------------------------
