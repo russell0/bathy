@@ -3865,24 +3865,6 @@ const PRIVILEGED_CI_STEPS: &[(&str, &str)] = &[
     ),
 ];
 
-/// M6 Task 4: the privileged assertions must have a job, and it must be the
-/// right one.
-///
-/// Four rules, and the last two are what stop this passing over nothing:
-///
-/// 1. Each `(job, step)` in [`PRIVILEGED_CI_STEPS`] is present **in that
-///    job**.
-/// 2. The cross-validation job is scheduled rather than per-push, because
-///    the lab costs 2.8 GiB of image pulls -- and it must therefore say so
-///    with an `if:`, or it is a per-push job nobody meant to write.
-/// 3. The privileged job is *not* gated that way. It needs no lab and must
-///    run on every push; an `if:` on it would make the whole thing daily
-///    again by accident.
-/// 4. The two container scripts still set the variables that turn a skip into
-///    a failure. Without `BATHY_PACKETD_PRIVILEGED_TESTS` the privileged
-///    tests skip; without `BATHY_LAB_REQUIRED` the cross-validation skips.
-///    Either way the job is green having run nothing, which is the defect one
-///    level up from a test that silently skips itself.
 /// The two files in which a **shipped surface** builds a `Scheduler`.
 ///
 /// Derived by reading, not guessed: these are the only two production
@@ -3964,6 +3946,24 @@ pub fn packetd_reachability_violations(root: &Path) -> Vec<String> {
     found
 }
 
+/// M6 Task 4: the privileged assertions must have a job, and it must be the
+/// right one.
+///
+/// Four rules, and the last two are what stop this passing over nothing:
+///
+/// 1. Each `(job, step)` in [`PRIVILEGED_CI_STEPS`] is present **in that
+///    job**.
+/// 2. The cross-validation job is scheduled rather than per-push, because
+///    the lab costs 2.8 GiB of image pulls -- and it must therefore say so
+///    with an `if:`, or it is a per-push job nobody meant to write.
+/// 3. The privileged job is *not* gated that way. It needs no lab and must
+///    run on every push; an `if:` on it would make the whole thing daily
+///    again by accident.
+/// 4. The two container scripts still set the variables that turn a skip into
+///    a failure. Without `BATHY_PACKETD_PRIVILEGED_TESTS` the privileged
+///    tests skip; without `BATHY_LAB_REQUIRED` the cross-validation skips.
+///    Either way the job is green having run nothing, which is the defect one
+///    level up from a test that silently skips itself.
 pub fn packetd_ci_job_violations(ci_path: &str, ci: &str) -> Vec<String> {
     let mut found = Vec::new();
     for (job, step) in PRIVILEGED_CI_STEPS {
