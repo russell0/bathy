@@ -107,8 +107,18 @@ pub struct ResultQueryOutput {
     /// Hosts a `host.discovered` event named. Never narrowed by the filter,
     /// which selects endpoints.
     ///
-    /// **Empty is not evidence that no host is up.** No scan emits
-    /// `host.discovered` in v0.1.
+    /// **Empty means one of two different things and this document does not
+    /// say which.** A scan whose request carried the `host_inventory`
+    /// objective runs a host-discovery phase and names each address that
+    /// answered here; a scan with any other objective runs no discovery
+    /// phase and emits no `host.discovered` at all, so this array is empty
+    /// for it whatever the network looked like. The objective is not carried
+    /// in this document; a consumer that has to tell the two apart reads it
+    /// from the request the scan was started with. Even under
+    /// `host_inventory`, a scan that was denied, cancelled, or stopped by a
+    /// ceiling can end its discovery phase before every address has been
+    /// asked, so empty is still not proof that nothing was up — `terminal`
+    /// is what says whether it finished.
     ///
     /// This and `plan_hash` are here because the command-line surface
     /// reported them and this document did not. Both surfaces publish one

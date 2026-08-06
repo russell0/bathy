@@ -2,7 +2,7 @@
   "$defs": {
     "Budgets": {
       "additionalProperties": false,
-      "description": "Hard ceilings. The scheduler aborts the scan when any is exhausted; these\nare not advisory hints. Every field is mandatory: an unbounded scan is not\nan expressible request.",
+      "description": "Hard ceilings. The scheduler aborts the scan when any is exhausted; these\nare not advisory hints. Every field is mandatory: an unbounded scan is not\nan expressible request.\n\n`maximum_packets` bounds **probes**, not segments on a wire. One planned\nprobe is charged exactly once, and a single TCP connect attempt is more\nthan one segment, so the packets a scan puts on a wire are a small\nconstant multiple of this number rather than equal to it.",
       "properties": {
         "maximum_packets": {
           "format": "uint64",

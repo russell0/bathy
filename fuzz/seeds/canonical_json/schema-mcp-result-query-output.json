@@ -254,7 +254,7 @@
       "type": "array"
     },
     "hosts_up": {
-      "description": "Hosts a `host.discovered` event named. Never narrowed by the filter,\nwhich selects endpoints.\n\n**Empty is not evidence that no host is up.** No scan emits\n`host.discovered` in v0.1.\n\nThis and `plan_hash` are here because the command-line surface\nreported them and this document did not. Both surfaces publish one\ndocument, and the way to make two answers agree is not to delete a\nfact from the one that had it.",
+      "description": "Hosts a `host.discovered` event named. Never narrowed by the filter,\nwhich selects endpoints.\n\n**Empty means one of two different things and this document does not\nsay which.** A scan whose request carried the `host_inventory`\nobjective runs a host-discovery phase and names each address that\nanswered here; a scan with any other objective runs no discovery\nphase and emits no `host.discovered` at all, so this array is empty\nfor it whatever the network looked like. The objective is not carried\nin this document; a consumer that has to tell the two apart reads it\nfrom the request the scan was started with. Even under\n`host_inventory`, a scan that was denied, cancelled, or stopped by a\nceiling can end its discovery phase before every address has been\nasked, so empty is still not proof that nothing was up — `terminal`\nis what says whether it finished.\n\nThis and `plan_hash` are here because the command-line surface\nreported them and this document did not. Both surfaces publish one\ndocument, and the way to make two answers agree is not to delete a\nfact from the one that had it.",
       "items": {
         "format": "ip",
         "type": "string"

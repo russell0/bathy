@@ -29,14 +29,24 @@ pub struct ScanFold {
     pub endpoints: BTreeMap<EndpointKey, EndpointState>,
     /// Hosts a `host.discovered` event named.
     ///
-    /// **Unpopulated as of M5, and empty is not evidence that no host is
-    /// up.** No code in `bathy-engine` constructs `EventBody::HostDiscovered`
-    /// -- `discovery.rs` ships unprivileged TCP host discovery as a library
-    /// building block that the scheduler does not yet call, so no real scan
-    /// emits the event and this set is empty for every log the engine
-    /// produces today. It is wired up in M6, when discovery joins the
-    /// scheduler. A consumer must read this as "the log said nothing about
-    /// host liveness", never as "these are all the hosts that were up".
+    /// **Empty is not evidence that no host is up, and it means two
+    /// different things.** M6's AC-6.20 fix wave gave
+    /// `EventBody::HostDiscovered` its production construction site:
+    /// `bathy_engine::Scheduler::run` runs a discovery phase, and appends the
+    /// event, only for a scan whose request carried
+    /// `Objective::HostInventory`. For such a scan this set is the liveness
+    /// answer; for every other objective it is empty because no discovery
+    /// phase ran at all. **The fold cannot distinguish the two** -- no event
+    /// in the log carries the objective, `scan.started` included -- so a
+    /// consumer that must tell them apart reads it from the scan's request.
+    ///
+    /// Even under `HostInventory`, empty is not proof of absence: a scan
+    /// denied, cancelled or stopped by a packet or runtime ceiling can end
+    /// discovery before every address has been asked, and
+    /// [`ScanFold::terminal`] is what says whether it finished. This field
+    /// was unpopulated by construction until M6, which is why every doc site
+    /// describing it said so; that sentence is the thing the fix wave
+    /// falsified and nothing caught.
     pub hosts_up: BTreeSet<IpAddr>,
     /// The scan's terminal event, if it reached one.
     ///

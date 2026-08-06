@@ -255,7 +255,7 @@
       "type": "array"
     },
     "hosts_up": {
-      "description": "Hosts a `host.discovered` event named.\n\n**Empty is not evidence that no host is up.** No scan emits\n`host.discovered` in v0.1, so this array is empty for every log the\nengine produces today; read it as \"the log said nothing about host\nliveness\", never as \"these are all the hosts that were up\".",
+      "description": "Hosts a `host.discovered` event named.\n\n**Empty means one of two different things and this document does not\nsay which.** A scan whose request carried the `host_inventory`\nobjective runs a host-discovery phase over every planned address\nbefore its first port probe and names each address that answered\nhere, so for that scan this array is the liveness answer it asked\nfor. A scan with any other objective runs no discovery phase and\nemits no `host.discovered` at all, so this array is empty for it\nwhatever the network looked like. The objective is not carried in\nthis document; a consumer that has to tell the two apart reads it\nfrom the request the scan was started with.\n\nEven under `host_inventory`, empty is not proof that nothing was up.\nA scan that was denied, cancelled, or stopped by its packet or\nruntime ceiling can end its discovery phase before every address has\nbeen asked, and `terminal` is what says whether it finished.",
       "items": {
         "format": "ip",
         "type": "string"

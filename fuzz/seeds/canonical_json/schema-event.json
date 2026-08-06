@@ -101,6 +101,21 @@
       "pattern": "^scan_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
       "type": "string"
     },
+    "ScanMode": {
+      "description": "Which probing method produced a scan's port states.\n\nA consumer comparing two scans of the same targets needs to know whether a\ndifference is the network or the method. This is recorded on\n`scan.started`, so a result is self-describing without a reader having to\nknow which build or which privilege level produced it.\n\nThe two are not interchangeable in what they establish. A `tcp-connect`\n`open` is a completed three-way handshake; a `tcp-syn` `open` is a SYN-ACK\nthat was answered with a reset and never became a connection. They are\nrequired to agree on every endpoint, which is what makes one a valid\nsubstitute for the other.",
+      "oneOf": [
+        {
+          "const": "tcp-connect",
+          "description": "A full TCP connect. Needs no privilege.",
+          "type": "string"
+        },
+        {
+          "const": "tcp-syn",
+          "description": "Half-open SYN probing through a separately privileged helper.",
+          "type": "string"
+        }
+      ]
+    },
     "Target": {
       "additionalProperties": false,
       "properties": {
@@ -143,6 +158,24 @@
         },
         "plan_hash": {
           "$ref": "#/$defs/Digest"
+        },
+        "scan_mode": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ScanMode"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Which probing method produced this scan's port states. Absent\nmeans the record was written by a build that had only one method;\nabsence dates a record rather than describing an unknown method."
+        },
+        "scan_mode_detail": {
+          "description": "Why `scan_mode` is what it is, when that needs saying. Present\nonly when the mode is not the one that was asked for: a scan that\nrequested `tcp-syn` and ran as `tcp-connect` records the reason\nhere. Absent means the mode is unremarkable, never that the\nreason is unknown.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [

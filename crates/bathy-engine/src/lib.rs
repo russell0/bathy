@@ -22,15 +22,25 @@
 //! discovery stops at the first conclusive answer rather than working
 //! through the whole configured probe list. See the `discovery` module doc
 //! for why `Filtered`/`Unreachable` are never promoted into evidence about
-//! the target -- and (M3 whole-branch review, IMPORTANT-4) for why this
-//! component ships in v0.1 as a correct, independently tested library
-//! building block with no caller in [`scheduler::Scheduler`] yet. M6 Task 5
-//! added [`discovery::discover_host_combined`], which tries privileged ICMP
-//! first (via `bathy-packetd`) and falls back to exactly this module's TCP
-//! method on an inconclusive result, reporting whichever one decided --
-//! but nothing in production constructs `EventBody::HostDiscovered` even
-//! now, because `bathy_plan::ScanPlan` carries no objective for the
-//! scheduler to branch on. See the `discovery` module doc.
+//! the target. M6 Task 5 added [`discovery::discover_host_combined`], which
+//! tries privileged ICMP first (via `bathy-packetd`) and falls back to
+//! exactly this module's TCP method on an inconclusive result, reporting
+//! whichever one decided; M6's fix wave then gave it the production caller
+//! it had lacked since M3 (AC-6.20). [`scheduler::Scheduler`] runs a
+//! discovery phase before its unit loop, and constructs
+//! `EventBody::HostDiscovered`, for a scan whose request carries
+//! `bathy_types::request::Objective::HostInventory` and for no other
+//! objective -- that phase is the only production construction site of the
+//! event, and `discover_host` itself is now reached only through
+//! `discover_host_combined`'s fallback arm.
+//!
+//! The reason recorded here from M3 until that wave -- that
+//! `bathy_plan::ScanPlan` carries no objective for the scheduler to branch
+//! on -- was a true clause with a conclusion that did not follow, and it was
+//! copied into four other places before anyone checked it. This was the
+//! fifth, and it survived the correction of the other four. See the
+//! `discovery` module doc for why the wrong version of it mattered: it sent
+//! the next reader at the one structure here that must not change.
 //!
 //! The fourth component is [`durable_log::GroupCommitLog`]: the M2-decided
 //! group-commit batching that makes it safe for the fifth component to

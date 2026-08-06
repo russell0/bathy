@@ -869,6 +869,14 @@ fn check_deps() -> Result<(), Box<dyn std::error::Error>> {
 /// they differ. A missing file is treated as drift too (surfaced as an `Err`
 /// naming the path, same as any other read failure), not silently skipped,
 /// so a schema that was never committed at all is still caught.
+///
+/// # What a green run means, and what it does not
+///
+/// It means the committed documents are what regeneration would produce.
+/// That is a statement about **two artifacts agreeing**, and two artifacts
+/// agree just as faithfully when both are wrong. See
+/// [`SCHEMA_DRIFT_NOT_CHECKED`], printed on every successful run, for the
+/// class this cannot reach and the one instance of it that shipped.
 fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     // Every crate that publishes a wire type owns its own `schema::all()`,
     // and this is the one place they are merged -- so a new published type is
@@ -878,7 +886,209 @@ fn emit_schemas(write: bool) -> Result<(), Box<dyn std::error::Error>> {
     // named from `bathy-types` without moving the fold below the layer that
     // owns it.
     let schemas = union_schemas(vec![bathy_types::schema::all(), bathy_query::schema::all()])?;
-    emit_schemas_into(&schemas, Path::new("schemas"), write)
+    let committed = emit_schemas_into(&schemas, Path::new("schemas"), write);
+    // Both, always, and joined -- not `?` on the first. A run that reports
+    // schema drift and stops leaves the maintainer fixing one copy of the
+    // contract while the other stays stale, which is the exact history below.
+    let seeds = mirror_schema_seeds(&schemas, Path::new(SCHEMA_SEED_DIR), write);
+    match (committed, seeds) {
+        (Ok(()), Ok(())) => {
+            println!(
+                "{}: ok ({} schema(s), {} mirrored seed(s)) -- {} THING(S) THIS DOES NOT DECIDE.",
+                if write {
+                    "emit-schemas"
+                } else {
+                    "check-schemas"
+                },
+                schemas.len(),
+                schemas.len(),
+                SCHEMA_DRIFT_NOT_CHECKED.len()
+            );
+            for (what, why) in SCHEMA_DRIFT_NOT_CHECKED {
+                println!("  - {what}\n      {why}");
+            }
+            Ok(())
+        }
+        (a, b) => {
+            let mut problems = Vec::new();
+            if let Err(e) = a {
+                problems.push(e.to_string());
+            }
+            if let Err(e) = b {
+                problems.push(e.to_string());
+            }
+            Err(problems.join("\n").into())
+        }
+    }
+}
+
+/// What a green `check-schemas` does not decide, printed on every successful
+/// run — same practice as `release::NOT_CHECKED_HERE`, `fixtures::UNCHECKABLE`
+/// and `prose`'s `WHAT STILL GETS THROUGH`.
+///
+/// # Why this list exists
+///
+/// M6's close-out review found `schemas/scan-fold.json` and
+/// `schemas/mcp-result-query-output.json` telling every consumer that
+/// `hosts_up` is empty for every log the engine produces and instructing them
+/// **never** to read the field as the set of hosts that were up — while the
+/// shipped binary, in the same five commits, had started populating it. A
+/// consumer implementing against the published contract would have discarded
+/// correct data. `check-schemas` was green throughout, and correctly so: the
+/// document matched the doc comment it is generated from, to the byte.
+///
+/// That is the whole shape of the limit. **This gate compares a generated
+/// artifact with its generator.** Agreement between the two is evidence that
+/// nobody edited the committed file by hand and that nobody changed a type
+/// without regenerating. It is not evidence about the world, because a
+/// generator and its output agree exactly as well when the generator is
+/// wrong. Every check in this repository that compares two artifacts has the
+/// same ceiling, and the honest response is to say so where the green appears
+/// rather than to imply a coverage the mechanism cannot have.
+///
+/// # What could actually be built, and what could not
+///
+/// Nothing here can read English and decide whether it is true, so the class
+/// is not closable by a checker. Two narrower things **are** mechanizable and
+/// are worth naming rather than leaving as an implied absence:
+///
+/// - A description that names a field's value under a *stated condition*
+///   could be tested by driving that condition and reading the field back.
+///   That is not a schema check; it is an end-to-end test with the sentence
+///   as its assertion, and this repository already has the surface for it
+///   (`crates/bathy/tests/lab_conformance.rs` asserts `hosts_up` is empty
+///   *because the objective is not `HostInventory`*, and now says so).
+///   Nothing generalizes it: the sentences are prose, and only a person can
+///   say which of them names a testable condition.
+/// - A description that goes stale is usually one whose *subject* changed in
+///   the same commit. A rule that failed any commit touching both
+///   `EventBody::HostDiscovered` and no `hosts_up` description would have
+///   caught this exact instance — and would fire on almost every commit that
+///   touches either, which is a check people learn to pass rather than read.
+///
+/// So the disposition is: the limit is stated, the one instance that shipped
+/// is named, and the mechanism is not extended into a rule that manufactures
+/// noise. This entry is the record.
+pub const SCHEMA_DRIFT_NOT_CHECKED: &[(&str, &str)] = &[
+    (
+        "Whether any description is TRUE",
+        "This compares a generated document with its generator. Two artifacts agreeing \
+         says nothing about whether either is correct: `scan-fold.json` and \
+         `mcp-result-query-output.json` told consumers that `hosts_up` is empty for \
+         every log and to never read it as host liveness, for the whole of the wave \
+         that made both statements false, and every run of this gate was green. \
+         Nothing mechanical reads a sentence against the behaviour it describes.",
+    ),
+    (
+        "Whether a description went stale because the CODE changed",
+        "Drift is detected in one direction only -- a committed file that no longer \
+         matches its doc comment. A doc comment that stopped being true while the \
+         file kept matching it is, to this gate, a clean tree. That is the failure \
+         mode that reached the published contract in M6.",
+    ),
+    (
+        "Whether a `//` comment should have been a `///`",
+        "The inverse of a prose leak: contract text a caller needs, kept out of the \
+         document because a maintainer chose the wrong comment marker. `prose` \
+         discloses the same hole from its own side. Nothing in this repository sees \
+         it.",
+    ),
+    (
+        "Whether the schema set is the RIGHT set",
+        "Every type with a `JsonSchema` derive and an entry in a crate's `schema::all()` \
+         is checked. A published type that was never added to `schema::all()` at all \
+         is not drift here; it is a document that does not exist, and this gate has \
+         nothing to compare.",
+    ),
+];
+
+/// The fuzz corpus directory holding one verbatim copy of every committed
+/// schema, as a seed for the JCS canonicalizer's target.
+pub const SCHEMA_SEED_DIR: &str = "fuzz/seeds/canonical_json";
+
+/// The filename convention in [`SCHEMA_SEED_DIR`]: `schemas/scan-fold.json`
+/// is seeded as `schema-scan-fold.json`.
+const SCHEMA_SEED_PREFIX: &str = "schema-";
+
+/// A second copy of the published contract, and until this function existed
+/// nothing kept it current.
+///
+/// # Why this is a gate and not a convention
+///
+/// Twenty-seven of these seeds were committed as verbatim copies of
+/// `schemas/*.json` and then maintained by whoever remembered. By M6's
+/// close-out **four had silently drifted**: `schema-event.json` and
+/// `schema-mcp-scan-events-output.json` predate the `scan_mode` field M6
+/// added, and `schema-scan-request.json` and `schema-scope-manifest.json`
+/// predate the `Budgets` correction made in the same five commits that
+/// falsified the `hosts_up` description. None of it went red, because the
+/// only thing reading this directory counted the files in it.
+///
+/// That matters beyond tidiness for one reason: a stale copy of a published
+/// contract is a published contract that says something false, sitting in
+/// the tree, indistinguishable from a current one. The `hosts_up` sentence
+/// this round corrects was mirrored here too, so the correction had to be
+/// applied in four files rather than two and there was nothing to say so.
+///
+/// # Both directions
+///
+/// A seed naming a schema that no longer exists is reported rather than
+/// ignored: it is a copy of a document nothing generates, which is the same
+/// failure `prose::check_dir` reads the whole directory to catch.
+fn mirror_schema_seeds(
+    schemas: &BTreeMap<&'static str, serde_json::Value>,
+    seed_dir: &Path,
+    write: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut problems = Vec::new();
+    let mut expected: BTreeSet<String> = BTreeSet::new();
+    for (name, schema) in schemas {
+        let file = format!("{SCHEMA_SEED_PREFIX}{name}.json");
+        expected.insert(file.clone());
+        let path = seed_dir.join(&file);
+        let rendered = format!("{}\n", serde_json::to_string_pretty(schema)?);
+        if write {
+            std::fs::create_dir_all(seed_dir)?;
+            std::fs::write(&path, rendered)?;
+        } else {
+            match std::fs::read_to_string(&path) {
+                Ok(on_disk) if on_disk == rendered => {}
+                Ok(_) => problems.push(format!(
+                    "{} is a stale copy of schemas/{name}.json",
+                    path.display()
+                )),
+                Err(e) => problems.push(format!("{}: {e}", path.display())),
+            }
+        }
+    }
+
+    // The orphan direction, in both modes: writing the expected set never
+    // removes a seed for a schema that has been deleted or renamed.
+    let entries = std::fs::read_dir(seed_dir)
+        .map_err(|e| format!("{}: {e}", seed_dir.display()))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(SCHEMA_SEED_PREFIX) && !expected.contains(&name) {
+            problems.push(format!(
+                "{}/{name} is a copy of a schema no crate generates any more -- it was \
+                 renamed or deleted without its seed. Delete it: a committed copy of a \
+                 contract that does not exist reads as current and is not.",
+                seed_dir.display()
+            ));
+        }
+    }
+
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "the fuzz corpus's copies of the published schemas are out of date -- run \
+             `cargo run -p xtask -- emit-schemas` and commit:\n{}",
+            problems.join("\n")
+        )
+        .into())
+    }
 }
 
 /// The body of [`emit_schemas`], against a given schema set and directory so
@@ -1973,6 +2183,118 @@ mod tests {
             clean,
             "check mode must leave the committed document alone"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The disclosure is printed on every green run, so an empty or
+    /// unargued list would turn "4 THING(S) THIS DOES NOT DECIDE" into a
+    /// heading over nothing — which is the shape of overclaim this list
+    /// exists to prevent.
+    #[test]
+    fn what_check_schemas_does_not_decide_is_stated_and_argued() {
+        assert!(
+            SCHEMA_DRIFT_NOT_CHECKED.len() >= 3,
+            "a gate that compares an artifact with its generator has more than two \
+             limits; a shortened list reads as a narrower gap than there is"
+        );
+        for (what, why) in SCHEMA_DRIFT_NOT_CHECKED {
+            assert!(
+                why.len() > 80,
+                "`{what}` is disclosed in {} characters. A limit stated without its \
+                 reason is a label, and this project has a constraint about that",
+                why.len()
+            );
+        }
+        // The one that must never be dropped: it is the finding.
+        assert!(
+            SCHEMA_DRIFT_NOT_CHECKED
+                .iter()
+                .any(|(what, _)| what.contains("TRUE")),
+            "the disclosure must lead with the limit M6's close-out found -- internal \
+             consistency standing in for truth"
+        );
+    }
+
+    // --- mirror_schema_seeds: the fuzz corpus's copies of the published
+    // contract. Four of the twenty-seven had silently drifted by M6's
+    // close-out, because the only thing reading that directory counted the
+    // files in it. ---
+
+    #[test]
+    fn a_seed_that_is_a_stale_copy_of_its_schema_is_named_as_stale() {
+        let dir = scratch_dir("seed-stale");
+        mirror_schema_seeds(&one_schema(), &dir, true).expect("write mode seeds the corpus");
+
+        // Exactly the shape the four real ones had: a copy of an EARLIER
+        // revision of a schema that is still generated. Byte-edited rather
+        // than deleted, because a deleted file is caught by the read error
+        // and would let a content check that never runs look green.
+        let path = dir.join("schema-thing.json");
+        std::fs::write(&path, "{\n  \"type\": \"string\"\n}\n").unwrap();
+
+        let err = mirror_schema_seeds(&one_schema(), &dir, false)
+            .expect_err("a stale copy of a published contract must fail")
+            .to_string();
+        assert!(err.contains("schema-thing.json"), "{err}");
+        assert!(err.contains("stale copy"), "{err}");
+        assert!(
+            err.contains("emit-schemas"),
+            "the failure must name the command that fixes it: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seed_matching_its_schema_byte_for_byte_is_accepted() {
+        // The narrowing control for the test above: without it, a
+        // `mirror_schema_seeds` that failed on every input would pass it.
+        let dir = scratch_dir("seed-current");
+        mirror_schema_seeds(&one_schema(), &dir, true).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("schema-thing.json")).unwrap(),
+            "{\n  \"type\": \"object\"\n}\n",
+            "the seed must be the schema verbatim, not a re-rendering of it"
+        );
+        mirror_schema_seeds(&one_schema(), &dir, false)
+            .expect("a seed that matches its schema is not drift");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seed_for_a_schema_no_crate_generates_any_more_is_reported() {
+        // The other direction. Writing the expected set never removes an
+        // orphan, so a rename leaves a copy of a contract that does not
+        // exist sitting in the tree reading as current.
+        let dir = scratch_dir("seed-orphan");
+        mirror_schema_seeds(&one_schema(), &dir, true).unwrap();
+        std::fs::write(dir.join("schema-renamed-away.json"), "{}\n").unwrap();
+        // A non-seed file in the same directory must NOT be reported: the
+        // corpus also holds real documents that are not schemas.
+        std::fs::write(dir.join("lab-scope.json"), "{}\n").unwrap();
+
+        let err = mirror_schema_seeds(&one_schema(), &dir, false)
+            .expect_err("an orphan seed must fail")
+            .to_string();
+        assert!(err.contains("schema-renamed-away.json"), "{err}");
+        assert!(
+            !err.contains("lab-scope.json"),
+            "a corpus file that is not a schema copy is not this rule's business: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_mode_reports_an_orphan_rather_than_leaving_it_behind() {
+        // `emit-schemas` is the remedy the check-mode failure names, so if
+        // write mode passed over an orphan the instruction would be a loop:
+        // run the command, still red, run it again.
+        let dir = scratch_dir("seed-orphan-write");
+        mirror_schema_seeds(&one_schema(), &dir, true).unwrap();
+        std::fs::write(dir.join("schema-renamed-away.json"), "{}\n").unwrap();
+        let err = mirror_schema_seeds(&one_schema(), &dir, true)
+            .expect_err("write mode must not silently accept an orphan")
+            .to_string();
+        assert!(err.contains("schema-renamed-away.json"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

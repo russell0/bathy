@@ -123,10 +123,21 @@ pub struct ScanFoldWire {
     pub endpoints: Vec<FoldEntry>,
     /// Hosts a `host.discovered` event named.
     ///
-    /// **Empty is not evidence that no host is up.** No scan emits
-    /// `host.discovered` in v0.1, so this array is empty for every log the
-    /// engine produces today; read it as "the log said nothing about host
-    /// liveness", never as "these are all the hosts that were up".
+    /// **Empty means one of two different things and this document does not
+    /// say which.** A scan whose request carried the `host_inventory`
+    /// objective runs a host-discovery phase over every planned address
+    /// before its first port probe and names each address that answered
+    /// here, so for that scan this array is the liveness answer it asked
+    /// for. A scan with any other objective runs no discovery phase and
+    /// emits no `host.discovered` at all, so this array is empty for it
+    /// whatever the network looked like. The objective is not carried in
+    /// this document; a consumer that has to tell the two apart reads it
+    /// from the request the scan was started with.
+    ///
+    /// Even under `host_inventory`, empty is not proof that nothing was up.
+    /// A scan that was denied, cancelled, or stopped by its packet or
+    /// runtime ceiling can end its discovery phase before every address has
+    /// been asked, and `terminal` is what says whether it finished.
     pub hosts_up: Vec<IpAddr>,
     /// How the scan ended, or `null` if it is still running or was cancelled
     /// mid-flight. `null` never means "refused".
