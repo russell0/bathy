@@ -1,0 +1,150 @@
+<title>Why bathy</title>
+<style>
+  @page { size: letter; margin: 8mm 10mm 6mm 10mm; }
+
+  :root { --ink:#111; --dim:#4a4a4a; --rule:#c9c9c9; --faint:#f2f2f0; }
+
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  body {
+    font: 8pt/1.17 Georgia, "Times New Roman", serif;
+    color: var(--ink); background:#fff;
+    margin: 0 auto; max-width: 47em; padding: 2rem 1.25rem 3rem;
+  }
+  @media print { body { max-width:none; padding:0; } }
+
+  h1 { font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; font-size:14pt; font-weight:700;
+       letter-spacing:-.01em; margin:0 0 .1em; }
+  .lede { font-size:8.9pt; margin:0 0 .24em; }
+  .meta { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:6.7pt; color:var(--dim);
+          margin:0 0 .45em; padding-bottom:.3em; border-bottom:1.5px solid var(--ink); }
+
+  h2 { font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; font-size:7.5pt; font-weight:700;
+       text-transform:uppercase; letter-spacing:.09em; margin:.4em 0 .13em; padding-bottom:.08em;
+       border-bottom:.5px solid var(--rule); break-after:avoid; }
+  h3 { font-family:"Helvetica Neue",Helvetica,Arial,sans-serif; font-size:8.2pt; font-weight:700;
+       margin:.38em 0 .08em; break-after:avoid; }
+  p { margin:0 0 .19em; }
+  ul { margin:0 0 .22em; padding-left:1em; }
+  li { margin-bottom:.09em; }
+
+  code,.ref,.num,caption { font-variant-ligatures:none; font-feature-settings:"liga" 0,"calt" 0; }
+  code,.ref { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; }
+  code { font-size:7.1pt; }
+  .ref { font-size:6.5pt; line-height:1.1; color:var(--dim); }
+  .ref::before { content:"\2192\00a0"; }
+
+  table { width:100%; border-collapse:collapse; margin:.2em 0 .22em; font-size:7.3pt; break-inside:avoid; }
+  caption { caption-side:top; text-align:left; font-size:6.5pt; line-height:1.13; color:var(--dim);
+            font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; padding-bottom:.12em; }
+  th,td { text-align:right; padding:1.2px 5px; border-bottom:.5px solid var(--rule); }
+  th:first-child, td:first-child { text-align:left; }
+  thead th { border-bottom:1px solid var(--ink); font-family:"Helvetica Neue",Helvetica,Arial,sans-serif;
+             font-size:6.7pt; text-transform:uppercase; letter-spacing:.05em; }
+  tbody tr:last-child td { border-bottom:1px solid var(--ink); }
+  .num { font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace; font-size:7pt; }
+  tr.hi td { background:var(--faint); font-weight:700; }
+  .note { font-size:7pt; color:var(--dim); margin:-.02em 0 .3em; }
+
+  .two { column-count:2; column-gap:1.1em; }
+  .two > div { break-inside:avoid; }
+  .two h3 { margin-top:0; }
+
+  .install { border:.5px solid var(--rule); background:var(--faint); padding:.24em .5em;
+             margin:.2em 0 .22em; break-inside:avoid; }
+  .install code { font-size:8pt; letter-spacing:.06em; }
+
+  footer { margin-top:.35em; padding-top:.2em; border-top:.5px solid var(--rule);
+           font-size:6.6pt; line-height:1.24; color:var(--dim); }
+</style>
+
+<h1>bathy</h1>
+<p class="lede">A TCP discovery scanner for <em>authorized</em> network questions, whose primary interface is a typed MCP tool surface: eleven tools with published JSON Schemas, service findings that carry the digest of the bytes that produced them, and an authorization manifest an agent has no field in which to supply.</p>
+<p class="meta">v0.1.0-alpha.2 &middot; crates.io/crates/bathy &middot; github.com/russell0/bathy &middot; Apache-2.0 OR MIT &middot; file:line references at git HEAD 33dce4d</p>
+
+<h2>What breaks when a model drives a scanner</h2>
+<p>Nmap is excellent at what it is for. This is an argument about a different consumer, and it states what the trade costs. Three failure modes, all properties of the interface rather than the model. A field that holds a command line gets filled with a generated one, and a sanitizer becomes the only thing between the loop and the network. If scope is a parameter, scope is negotiable. And if the output is a complete record, the agent pays for the whole record and authors the predicate itself.</p>
+<p>That third one is measurable. In an <code>nmap -sV --open -oX</code> document from the lab, the two open TLS-wrapped :443 endpoints are spelled <code>name="http" tunnel="ssl" method="probed" conf="10"</code> and <code>name="https" tunnel="ssl" method="table" conf="3"</code>: the obvious XPath finds the first and misses the second; its mirror image does the reverse. No flag fixes that: the format is faithfully recording a real difference between a probed answer and a port-table guess, and the consumer makes the judgement. The rest of the mess is flag-dependent, and the document says so: the same target set scanned without <code>--open</code> is 143 <code>&lt;port&gt;</code> elements, 131 not open and every one still carrying a <code>&lt;service&gt;</code>, so that XPath returns 12 hits of which 2 are open, two being addresses the ground truth lists as <code>absent</code> &mdash; present only because <code>-Pn</code> was passed, and marked <code>filtered</code>. With <code>--open</code> it collapses to 2 hits, both open. Two thirds of the problem is a better XPath. The <code>:443</code> pair is not.
+<span class="ref">census over target/agentcost/nmap-version-open.xml and nmap-version.xml; lab/ground-truth.json:86</span></p>
+
+<h2>Three differences, each with a test behind it</h2>
+
+<h3>1. No input schema can express a command line</h3>
+<p>Eleven tools from one compiled-in constant, confirmed on the wire against <code>bathy serve mcp</code>. All eleven input schemas set <code>additionalProperties: false</code> via <code>#[serde(deny_unknown_fields)]</code>: an unrecognised argument is a parse refusal the model can see, not a field silently dropped. Three tests &mdash; over the live wire schema, the in-process descriptor, and the derived schema set <code>check-schemas</code> holds the 27 committed documents to &mdash; render each schema to a string, <code>$defs</code> included, and assert it contains none of <code>command</code>, <code>args</code>, <code>flags</code>, <code>argv</code>, <code>raw</code>. Structurally: <code>grep -rn 'Command::new' crates/bathy-mcp/src/</code> is empty, and the workspace's only production subprocess spawn is <code>packetd.rs:308</code>, which passes no arguments &mdash; the path it runs is a <code>PacketdConfig</code> field set by the host, absent from every request type.
+<span class="ref">descriptors.rs:36-48,417 &middot; tests/mcp.rs:1102 &middot; bathy-types/src/tools.rs:545, schema.rs:14 &middot; bathy-engine/src/packetd.rs:62,77-90,308</span></p>
+
+<h3>2. The agent cannot author, widen, or self-grant its authorization through the tool surface</h3>
+<p>A manifest is twelve lines of JSON an operator writes: id, description, expiry, allowed and denied CIDRs, a packets/runtime/rate ceiling &mdash; 451 bytes in <code>lab/scope.json</code>. No input schema accepts an inline manifest or a scope id. The four scope-taking tools name a file by <code>manifest_path</code>, asserted both ways, so the test fails if a fifth gains the field or one of the four loses it. On the CLI <code>--scope &lt;PATH&gt;</code> is a required clap field: not <code>Option</code>, no default, no env var.</p>
+<p>The check runs on the emission path, not only at the adapter. <code>manifest.allows(target)</code> is re-checked immediately before every dispatch, and again before service detection's second connection; four tests assert <em>zero accepts on a live <code>TcpListener</code></em> for a denied target, a mismatched scope, an expired manifest and that second connection &mdash; real counters, not the scanner's own ledger. One out-of-scope address refuses the whole scan, not the address.</p>
+<p>Scans wider than 64 addresses &mdash; a <code>/26</code>; the default, and server configuration with no spelling in any schema &mdash; return <code>input_required</code> with an <code>elicitation/create</code> and start nothing, so a routine <code>/24</code> sweep blocks on a human. <code>skip_approval</code> and <code>auto_approve</code> fail to parse rather than being rejected. The resume token is HMAC-sealed, argument-bound, TTL-limited and single-use: an approval for one scan cannot start a wider one, and a declined answer starts nothing however valid the token.</p>
+<p><em>Limits.</em> v0.1 records a manifest signature but does not verify it: the file is the authorization, and whoever can write it can authorize a scan &mdash; <strong>including this agent, if the same loop holds a file-write tool.</strong> The design assumes the manifest lives where the loop cannot write. And the shipped connect path checks scope <em>twice</em> before every packet, not three times: the third check is <code>bathy-packetd</code>'s own, deciding from its own <code>Init</code> and importing nothing from <code>bathy-scope</code>, but no shipped surface spawns that daemon in v0.1, so it guards a SYN path no user can reach. Stdio carries no authenticated principal, so a host that auto-answers the elicitation satisfies the gate, and the principal bound is the constant <code>"\0unidentified"</code>. The CLI builds no approval gate at all, deliberately, with a test pinning the exemption. Scope is exempt nowhere.
+<span class="ref">tests/mcp.rs:1137,2841,3057,3086,3114,3260 &middot; cli.rs:204,452 &middot; scheduler.rs:984,1409,3979,4133,4194,5006 &middot; mcp/config.rs:11-15 &middot; mcp/approval.rs:69,197-278 &middot; scope/manifest.rs:49-57 &middot; gates.rs:3874 with <code>xtask check-packetd</code> &middot; the two scope implementations are cross-checked by proptest at 1024 cases in CI (syn.rs:1539) and at <code>PROPTEST_CASES=310000 cargo test -p bathy-packetd --lib the_two_scope_implementations_agree_on_every_generated_address</code>, zero disagreements, <code>bathy-scope</code> a dev-dependency</span></p>
+
+<h3>3. Every service finding cites the bytes it came from</h3>
+<p><code>evidence_refs</code> on <code>service.observed</code> and <code>host.discovered</code> is <code>NonEmpty&lt;Digest&gt;</code>: private inner <code>Vec</code>, <code>Deserialize</code> routed through a rejecting <code>TryFrom</code>. An evidence-free finding is not a representable value, and a stored document with <code>"evidence_refs": []</code> fails to parse. The published contract carries the same constraint: <code>schemas/event.json</code> resolves the field to <code>minItems: 1</code>, and <code>check-schemas</code> regenerates all 27 schemas from the types, failing on any difference. Evidence is stored before the event citing it is appended; <code>evidence.get</code> re-hashes on read and returns <code>Corrupt</code> rather than bytes on a mismatch, and an end-to-end test asserts it returns byte-for-byte what the peer sent. <code>fingerprint.explain</code> resolves the rule a finding names to a rationale and a source: <code>bathy --json explain http.server.nginx.v1</code> returns RFC 9112 &sect;4, RFC 9110 &sect;10.2.4, and a capture from <code>nginx:1.27-alpine sha256:65645c7b&hellip;</code>.</p>
+<p><em>Precisions.</em> The port event's wire name is <code>port.state</code> (<code>PortStateObserved</code> in Rust) and its evidence is <code>Option</code>, so a port record with no service finding still serialises <code>"evidence_refs": []</code> &mdash; one does, at 10.30.0.13:33060, in the very document tabled below. The guarantee is on service and host findings, not the field name. The matched byte range is checked but not published: capped evidence could leave the span past what <code>evidence.get</code> returns.
+<span class="ref">nonempty.rs:43-120 &middot; event.rs:220,223,229,433 &middot; scheduler.rs:481-490,1493,4877 &middot; evidence/src/store.rs:286 &middot; end_to_end_scan.rs:333 &middot; interpret/src/rules.rs:822-836</span></p>
+
+<h2>What the output costs to consume</h2>
+<table>
+  <caption>Runs of 2026-08-09, same lab: nmap at 23:24:43 (whole scan) and 23:30:00 (<code>--open</code>); bathy twice, keys <code>agentcost-sv</code>, <code>agentcost-po</code>. tiktoken 0.12.0 <code>cl100k_base</code>, a GPT-family encoder &mdash; ratios load-bearing, absolutes not. Artifacts sit in <code>target/agentcost/</code>, kept out of the repository by <code>.gitignore:1</code>; <code>measure.sh</code> there produces every row but the <code>--open</code> pair, run by hand with <code>--open</code> and <code>--state open</code>.</caption>
+  <thead><tr><th>CLI stdout &mdash; 11 addresses &times; 13 ports, 12 open endpoints</th><th class="num">nmap B / tok</th><th class="num">bathy B / tok</th><th class="num">ratio B / tok</th></tr></thead>
+  <tbody>
+    <tr><td><code>nmap -n -Pn -sT -sV --open -oX -</code> vs <code>bathy result query --state open --json</code></td><td class="num">13,190 / 5,957</td><td class="num">3,749 / 1,283</td><td class="num">3.5&times; / 4.6&times;</td></tr>
+    <tr class="hi"><td>the same pair, nmap's five <code>servicefp</code> attributes removed</td><td class="num">7,158 / 2,648</td><td class="num">3,749 / 1,283</td><td class="num">1.9&times; / 2.1&times;</td></tr>
+    <tr><td>no <code>--open</code>: all 143 endpoints, 131 of them not open</td><td class="num">32,536 / 11,440</td><td class="num">23,770 / 6,977</td><td class="num">1.4&times; / 1.6&times;</td></tr>
+    <tr><td>ports only, neither side identifying anything</td><td class="num">25,404 / 7,635</td><td class="num">22,064 / 6,298</td><td class="num">1.2&times; / 1.2&times;</td></tr>
+    <tr><td>open <code>+ service=http</code>, filtered server-side (no nmap equivalent)</td><td class="num">&mdash;</td><td class="num">557 / 190</td><td class="num">&mdash;</td></tr>
+  </tbody>
+</table>
+<p class="note">Those rows are CLI stdout. On the MCP wire the same unfiltered result is 23,769 B / 6,977 tok as <code>structuredContent</code>, or 51,391 B / 14,923 tok for the whole reply if the client also forwards the equal JSON text mirror, which is a client decision; <code>tools/list</code> is 62,835 B / 14,497 tok, once per session. The <code>--open</code> result was not captured on that plane. <code>servicefp</code> is Nmap's raw service-fingerprint blob, the probe response encoded for submission to its fingerprint database and discardable by a consumer not submitting one: five of them are 45.7% of that document's bytes and 55.5% of its tokens, so 1.9&times;/2.1&times; is the headline that survives scrutiny and 4.6&times; is the one that does not. On the other side, 47% of bathy's tabled document (1,769 of 3,749 B) is provenance the XML has no equivalent for &mdash; <code>evidence_refs</code>, <code>probe_id</code>, <code>rule_id</code>. An agent that never audits a finding should strip it.</p>
+
+<h2>Where bathy loses</h2>
+<table>
+  <caption>Medians and observed ranges over 5 repetitions, 11 addresses &times; 13 ports, Linux aarch64 container on the lab bridge, 2026-08-05. bathy 0.1.0-alpha.1, Nmap 7.93, Masscan 1.3.2, RustScan 2.3.0. docs/benchmarks.md:182-272. Unverified: that <code>bench/results.json</code> records the run it claims to. Every figure here is 143 address-port pairs and 12 open ports; nothing on this page establishes how bathy behaves above a <code>/24</code>, where concurrency, pacing and the 2,000 ms per-connection timeout (scheduler.rs:365) decide the answer.</caption>
+  <thead><tr><th>Operation</th><th class="num">bathy ms</th><th>Against</th><th class="num">ms</th><th class="num">bathy is</th></tr></thead>
+  <tbody>
+    <tr><td>port discovery only</td><td class="num">2,105 (993&ndash;2,353)</td><td><code>nmap -sT</code></td><td class="num">1,473 (1,467&ndash;2,376)</td><td class="num">1.4&times; slower</td></tr>
+    <tr><td>port discovery only</td><td class="num">2,105 (993&ndash;2,353)</td><td><code>nmap -sS</code></td><td class="num">1,355 (1,320&ndash;1,389)</td><td class="num">1.6&times; slower</td></tr>
+    <tr><td>port discovery only</td><td class="num">2,105 (993&ndash;2,353)</td><td>rustscan</td><td class="num">2,053 (1,013&ndash;2,076)</td><td class="num">1.0&times;</td></tr>
+    <tr><td>service detection (the default)</td><td class="num">26,315 (26,303&ndash;38,025)</td><td><code>nmap -sV</code></td><td class="num">17,790 (17,784&ndash;17,952)</td><td class="num">1.5&times; slower</td></tr>
+  </tbody>
+</table>
+<p>Not like-for-like, and published anyway: against bare port sweeps that identify nothing, bathy's identifying default is 17.9&times; <code>nmap -sT</code>, 19.4&times; <code>nmap -sS</code>, 12.8&times; rustscan and 7.1&times; masscan. The informative numbers are 1.4&times; on identical work and 1.5&times; on identification, where detection costs bathy about 24 s and Nmap about 16 over twelve open ports &mdash; and bathy's are the noisy timings here: at the top of its range, 38.0 s against 17.95 s, that gap is 2.1&times;. The kernel's <code>Tcp: ActiveOpens</code> counter corroborates those rows from outside every scanner's self-report: bathy-ports-only and rustscan each open exactly 143 connections for the plan's 143 address-port pairs; <code>nmap -sT</code> opens 170, <code>-sV</code> 294, both SYN rows 0.</p>
+<ul>
+  <li><strong>Coverage is a fraction of Nmap's.</strong> Eight protocols and thirteen interpretation rules against 28 years of community fingerprints. Scored against the six products the lab establishes, the two identifying tools tie at 5/6 products and 3/4 versions; as a raw census over the tabled run's twelve open endpoints, Nmap named a product on 8 and a version on 6, bathy on 6 and 4. The lab was built to exercise exactly those thirteen rules, so it flatters bathy and the gap widens elsewhere. <span class="ref">docs/benchmarks.md:257-258,329-330,350-356; target/agentcost/nmap-version-open.xml, bathy-query-open.json</span></li>
+  <li><strong>bathy identifies nothing behind TLS.</strong> On any TLS-wrapped port the answer is <code>tls</code> and stops &mdash; three of the twelve open endpoints in that run (10.30.0.16:443, :853, 10.30.0.17:443), a quarter of the result, and far more on a network where TLS is the norm. The cause is scheduler policy, not a missing rule: <code>detect_service</code> returns on the first probe that interprets to anything, so <code>tls-v1</code> wins and the HTTP probe never runs, while the nginx rule matches those exact bytes under test. Per endpoint, Nmap names a product at three the tabled bathy document does not (PostgreSQL :5432, Redis :6379, nginx :443 on .17); bathy names MySQL at 10.30.0.13:3306 where Nmap does not. Against ground truth only nginx is a loss &mdash; the lab records <code>product: null</code> at 5432 and 6379, neither service volunteering bytes &mdash; and it holds that endpoint to being unidentified, so the day bathy closes it the conformance suite fails until the concession is deleted. <span class="ref">scheduler.rs:1452-1461; rules.rs:1344; lab/ground-truth.json:31,48,75-77; docs/benchmarks.md:344</span></li>
+  <li><strong>Whole capabilities are absent, not slower.</strong> No UDP, no OS detection, no scripting engine, no host discovery, no <code>-oG</code>/<code>-oN</code>/<code>-oX</code>; no IPv6, which is refused rather than unimplemented. And every scan needs a manifest an operator wrote first: there is no ad-hoc mode, and one typo in a target list refuses the whole run rather than the address.</li>
+  <li><strong>The typed surface is a real per-session tax.</strong> 14,497 tokens for <code>tools/list</code> against about 4,674 saved per query &mdash; but only per fresh scan result the agent has to read. An agent that scans once and asks one in-context nmap XML ten questions pays 5,957 once, and never reaches break-even. bathy's case is the long session over changing state, not one scan interrogated repeatedly.</li>
+  <li><strong>Accuracy distinguished nothing.</strong> All seven runs from all four scanners: 12/12 known-open ports, 0 false negatives, 0 false positives &mdash; on a container bridge with no loss or latency. RustScan's repetitions were bimodal, so the 1.0&times; row is soft, and <code>nmap -sV</code> is bimodal across executions: the other taken that day gives 1.1&times; rather than 1.5&times;. This is the project's own benchmark of its competitors &mdash; one machine, one of two executions committed.</li>
+</ul>
+<p><code>docs/benchmarks.md</code>'s loss list is generated from the results by code and guarded by two CI detectors: editing bathy's median from 2,105 to a flattering 1,105 ms exits 1, and deleting the identification-loss bullet exits 1 with a second violation naming the omitted category, both verified by mutating the live document. This page is hand-written from that source and under no gate: <code>grep -rn why-bathy xtask/src/</code> is empty. <span class="ref">xtask/src/bench.rs:58,886; <code>cargo run -p xtask -- check-bench</code></span></p>
+
+<h2>Who this is for</h2>
+<div class="two">
+  <div>
+    <h3>Reach for Nmap</h3>
+    <ul>
+      <li>You need breadth of identification, or anything at all behind TLS. Thirteen rules is thirteen rules.</li>
+      <li>You need half-open scanning: v0.1 exposes no SYN path to any user, and a CI gate proves neither production scheduler site reaches the privileged daemon. <span class="ref">gates.rs:3874; <code>xtask check-packetd</code></span></li>
+      <li>You need IPv6, refused outright in v0.1 rather than unimplemented, or Windows without WSL2. Linux x86-64/aarch64 is the tested target; macOS builds and passes, but the Docker lab is unreachable from a Mac host. <span class="ref">README.md:291,340; docs/platform-support.md:5-8</span></li>
+      <li>You are doing red-team work that must model an attacker's traffic. That is a real need and bathy is the wrong instrument for it: every HTTP probe sends a fixed <code>User-Agent</code>, every SMTP probe a fixed <code>EHLO bathy.invalid</code>, compile-time constants with no flag to remove them. Evasion and anonymization are permanent non-goals <em>here</em> &mdash; not a judgement about tools that implement them. <span class="ref">SECURITY.md:112-118,157-162</span></li>
+    </ul>
+  </div>
+  <div>
+    <h3>Reach for bathy</h3>
+    <ul>
+      <li>A model authors the call and consumes the result, and you want the call to be un-authorable as a command string.</li>
+      <li>The authorization has to be a document an operator wrote, which the loop cannot supply, widen or exempt itself from through the tool surface &mdash; checked twice before every packet on the shipped connect path, and a third time in the privileged daemon v0.1 does not expose.</li>
+      <li>You need to answer "which bytes justified this?" from a digest the finding already carries, without a second scan.</li>
+      <li>A long-lived connection that queries results repeatedly &mdash; one <code>tools/list</code> to a session. One scan and one look, and the 14,497-token schema tax is pure loss.</li>
+    </ul>
+  </div>
+</div>
+
+<h2>Try it</h2>
+<p><strong>bathy is for scanning networks you are authorized to scan.</strong> Scanning without authorization may be unlawful in your jurisdiction and may violate your provider's terms of service &mdash; that is your responsibility, not the tool's. <span class="ref">README.md:11-12,27-29</span></p>
+<div class="install"><code>cargo install bathy --version 0.1.0-alpha.2</code></div>
+<p>Then write a scope manifest and pick a non-loopback address on an interface you own: <code>127.0.0.0/8</code> is refused on every platform, so localhost is not the smoke test. README's quickstart is six steps; step 2 cannot be worked around. <code>bathy serve mcp</code> implements MCP revision <code>2026-07-28</code>, which dropped the <code>initialize</code> handshake &mdash; not what most clients speak. A Legacy client that still sends one is answered with the version this server implements, and its next <code>tools/list</code>, carrying no <code>_meta</code>, returns all eleven tools; naming a different version in <code>_meta</code> gets <code>-32022</code> with <code>data.supported</code>. <span class="ref">README.md:90-98,109-114,328-331 &middot; tests/mcp.rs:984 &middot; bathy-mcp/src/server.rs:57,165 &middot; docs/protocol-notes.md:12-19</span></p>
+
+<footer><code>crates.io/crates/bathy</code> &middot; <code>github.com/russell0/bathy</code> &middot; Apache-2.0 OR MIT &middot; alpha.2 published 2026-08-09. Every figure is measured, or asserted by a named test or a printed command, at HEAD 33dce4d. Two fabricated RFC quotations shipped in this repository and were caught; <code>CONTRIBUTING.md:56-61</code> now requires verbatim quotation from three checkable artifact kinds, pinned by <code>check-docs</code>. Clean room: no Nmap data file was read.</footer>
